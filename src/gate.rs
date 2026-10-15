@@ -1,11 +1,54 @@
 //! The gate: an action passes only if a proof exists from measured and
-//! declared facts under a mandate. The proof, or the failed attempt at one,
-//! is the derivation `why` prints.
+//! declared facts under a mandate. Mandates and records are facts;
+//! permissions are rules. The proof, or the failed attempt at one, is the
+//! derivation `why` prints.
 
+use std::collections::BTreeSet;
+use std::fmt;
+use std::hash::{Hash, Hasher};
+
+use ascent::ascent;
 use serde::{Deserialize, Serialize};
 
-use crate::mandate::{Cap, Mandate};
-use crate::record::{Claim, Entry, Kind, Record, Seq};
+use crate::mandate::{Cap, Controller, Mandate};
+use crate::record::{Claim, Entry, Kind, Record, Seq, Verdict};
+
+/// The action that always passes.
+pub const STOP: &str = "stop";
+/// The action that needs a declared decision.
+pub const RESUME: &str = "resume";
+/// The built-in venture that watches avsm itself.
+pub const SELF: &str = "self";
+
+/// Actions the self venture can never take, whatever its mandate says.
+pub const HARDWIRED: &[(&str, &str)] = &[
+    (
+        "edit-mandate",
+        "the self venture cannot edit its own mandate",
+    ),
+    ("merge-main", "the self venture cannot merge to main"),
+    ("touch-keys", "the self venture cannot touch keys"),
+];
+
+/// Command fragments that mark a self action as one of the above.
+const HARDWIRED_RUN: &[(&str, &str)] = &[
+    (
+        "mandate.yaml",
+        "the self venture cannot edit its own mandate",
+    ),
+    ("git merge", "the self venture cannot merge to main"),
+    ("git push", "the self venture cannot merge to main"),
+    ("keys", "the self venture cannot touch keys"),
+];
+
+/// An action about to be taken: for which venture, which action, and the
+/// records it rests on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    pub venture: String,
+    pub action: String,
+    pub cites: Vec<Seq>,
+}
 
 /// A mandate as adopted: tied to the declared record that adopted it.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,9 +72,10 @@ pub enum Step {
         reversible: bool,
         delegated: bool,
     },
-    /// A measured report the proof uses.
+    /// A report the proof uses.
     Report {
         seq: Seq,
+        claim: Claim,
         metric: String,
         value: f64,
     },
@@ -92,14 +136,1266 @@ pub struct Refusal {
     pub reasons: Vec<Reason>,
 }
 
-/// Decide whether `candidate` (an action or intent record not yet in the
-/// ledger) may happen, given the ledger so far and the adopted mandates.
-/// `now` is unix seconds, used for caps.
+/// A number that can be a Datalog fact (f64 is not hashable).
+#[derive(Clone, Copy, Debug)]
+struct Num(f64);
+
+impl PartialEq for Num {
+    fn eq(&self, other: &Num) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for Num {}
+
+impl Hash for Num {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        self.0.to_bits().hash(h)
+    }
+}
+
+/// The kind of a decision, as a fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Dk {
+    Approve,
+    Deny,
+    Pause,
+    Resume,
+    Adopt,
+}
+
+ascent! {
+    struct Rules;
+
+    // What the ledger and the mandates say.
+    relation candidate(String, String);
+    relation cites(Seq);
+    relation record(Seq, String, Claim, Kind);
+    relation report(Seq, String, String, Num);
+    relation decision(Seq, String, Dk, Seq);
+    relation ask(Seq, String, String);
+    relation proposal(Seq, String, String);
+    relation stopped(Seq, String);
+    relation mandate(Seq, String, String);
+    // venture, action, cap count, reversible, delegated
+    relation permitted(String, String, u32, bool, bool);
+    // venture, action, times run inside the cap window
+    relation used(String, String, u32);
+    relation forbidden(String, String);
+    relation hardwired(String, String, String);
+    // venture, metric, above, bound, action
+    relation threshold(String, String, bool, Num, String);
+
+    // Non-negotiable 2: only measured and declared records can authorize.
+    relation trusted(Seq);
+    trusted(s) <-- record(s, _, c, _), if c.authorizes();
+
+    // Non-negotiable 5: stopping is always allowed; resuming needs a
+    // declared record. A venture is paused after a declared pause or a
+    // stop action, until a declared resume comes later.
+    relation pause_at(String, Seq);
+    pause_at(v, s) <-- decision(s, v, Dk::Pause, _), trusted(s);
+    pause_at(v, s) <-- stopped(s, v);
+    relation resume_at(String, Seq);
+    resume_at(v, s) <-- decision(s, v, Dk::Resume, _), trusted(s);
+    relation resumed_after(String, Seq);
+    resumed_after(v, p) <-- pause_at(v, p), resume_at(v, r), if r > p;
+    relation paused(String);
+    paused(v) <-- pause_at(v, p), !resumed_after(v, p);
+
+    // A report is stale once a trusted later report of the same metric exists.
+    relation stale(Seq);
+    stale(s) <-- report(s, v, m, _), report(t, v, m, _), trusted(t), if t > s;
+
+    // What calls for the action. Each rests on trusted facts only; an
+    // inferred record can be the occasion, never the premise.
+    relation crossed(String, String, Seq);
+    crossed(v, a, s) <--
+        candidate(v, a),
+        threshold(v, m, above, bound, a),
+        report(s, v, m, val), cites(s), trusted(s), !stale(s),
+        if (*above && val.0 > bound.0) || (!*above && val.0 < bound.0);
+    relation approved(String, String, Seq, Seq);
+    approved(v, a, d, q) <--
+        candidate(v, a),
+        decision(d, v, Dk::Approve, q), cites(d), trusted(d),
+        ask(q, v, a);
+    relation proposed(String, String, Seq);
+    proposed(v, a, s) <-- candidate(v, a), proposal(s, v, a), cites(s);
+
+    relation justified(String, String);
+    justified(v, a) <-- crossed(v, a, _);
+    justified(v, a) <-- approved(v, a, _, _);
+    justified(v, a) <-- proposed(v, a, _), permitted(v, a, _, rev, del), if *rev || *del;
+
+    // Non-negotiable 6: irreversible actions default to asks. They pass
+    // only when the mandate delegates them or a declared decision approves.
+    relation irreversible_ok(String, String);
+    irreversible_ok(v, a) <-- permitted(v, a, _, false, true);
+    irreversible_ok(v, a) <-- permitted(v, a, _, false, _), approved(v, a, _, _);
+    relation needs_decision(String, String);
+    needs_decision(v, a) <-- candidate(v, a), permitted(v, a, _, false, _), !irreversible_ok(v, a);
+
+    relation hard(String, String);
+    hard(v, a) <-- hardwired(v, a, _);
+    relation under_cap(String, String);
+    under_cap(v, a) <-- permitted(v, a, cap, _, _), used(v, a, n), if n < cap;
+
+    // Non-negotiable 1: no action without a mandate and a proof.
+    relation allowed(String, String);
+    allowed(v, a) <-- candidate(v, a), if a.as_str() == STOP;
+    allowed(v, a) <--
+        candidate(v, a), if a.as_str() == RESUME,
+        decision(d, v, Dk::Resume, _), cites(d), trusted(d);
+    allowed(v, a) <--
+        candidate(v, a), if a.as_str() != STOP && a.as_str() != RESUME,
+        mandate(_, v, _),
+        permitted(v, a, _, _, _),
+        !forbidden(v, a),
+        !hard(v, a),
+        justified(v, a),
+        !needs_decision(v, a),
+        under_cap(v, a),
+        !paused(v);
+}
+
+/// Decide whether an action may happen, given the ledger so far and the
+/// adopted mandates. `now` is unix seconds, used for caps.
 pub fn gate(
-    _candidate: &Record,
-    _ledger: &[Entry],
-    _mandates: &[Adopted],
-    _now: i64,
+    candidate: &Candidate,
+    ledger: &[Entry],
+    mandates: &[Adopted],
+    now: i64,
 ) -> Result<Proof, Refusal> {
-    unimplemented!("issue 3")
+    let v = candidate.venture.as_str();
+    let a = candidate.action.as_str();
+    let mut p = Rules::default();
+    p.candidate.push((v.to_string(), a.to_string()));
+    p.cites = candidate.cites.iter().map(|s| (*s,)).collect();
+
+    for e in ledger {
+        let r = &e.record;
+        let venture = r.venture().to_string();
+        p.record.push((e.seq, venture.clone(), r.claim(), r.kind()));
+        match r {
+            Record::Report {
+                metric,
+                value: Some(val),
+                ..
+            } => p.report.push((e.seq, venture, metric.clone(), Num(*val))),
+            Record::Decision { verdict, .. } => {
+                let (dk, target) = match verdict {
+                    Verdict::Approve { ask } => (Dk::Approve, *ask),
+                    Verdict::Deny { ask, .. } => (Dk::Deny, *ask),
+                    Verdict::Pause => (Dk::Pause, 0),
+                    Verdict::Resume => (Dk::Resume, 0),
+                    Verdict::Adopt { .. } => (Dk::Adopt, 0),
+                };
+                p.decision.push((e.seq, venture, dk, target));
+            }
+            Record::Ask {
+                action: Some(act), ..
+            } => p.ask.push((e.seq, venture, act.clone())),
+            Record::Proposal { action, .. } => p.proposal.push((e.seq, venture, action.clone())),
+            Record::Action { action, .. } if action == STOP => p.stopped.push((e.seq, venture)),
+            _ => {}
+        }
+    }
+
+    // Only mandates the ledger shows adopted by a declared decision count.
+    let adopted: Vec<&Adopted> = mandates
+        .iter()
+        .filter(|m| {
+            ledger.iter().any(|e| {
+                e.seq == m.seq
+                    && matches!(&e.record,
+                        Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Adopt { mandate, .. } }
+                        if *venture == m.venture && *mandate == m.hash)
+            })
+        })
+        .collect();
+    for m in &adopted {
+        let venture = m.venture.clone();
+        p.mandate.push((m.seq, venture.clone(), m.hash.clone()));
+        for perm in &m.mandate.permitted {
+            p.permitted.push((
+                venture.clone(),
+                perm.name.clone(),
+                perm.cap.count,
+                perm.reversible,
+                perm.delegated,
+            ));
+            let window = perm.cap.per.as_secs() as i64;
+            let used = ledger
+                .iter()
+                .filter(|e| {
+                    e.record.venture() == venture
+                        && e.record.action() == Some(perm.name.as_str())
+                        && matches!(e.record.kind(), Kind::Action | Kind::Intent)
+                        && e.at > now - window
+                })
+                .count() as u32;
+            p.used.push((venture.clone(), perm.name.clone(), used));
+            if venture == SELF {
+                for (fragment, why) in HARDWIRED_RUN {
+                    if perm.run.contains(fragment) {
+                        p.hardwired
+                            .push((venture.clone(), perm.name.clone(), why.to_string()));
+                    }
+                }
+            }
+        }
+        for f in &m.mandate.forbidden {
+            p.forbidden.push((venture.clone(), f.clone()));
+        }
+        if let Controller::Threshold {
+            above,
+            below,
+            action,
+        } = &m.mandate.controller
+        {
+            if let Some(b) = above {
+                p.threshold.push((
+                    venture.clone(),
+                    m.mandate.metric.clone(),
+                    true,
+                    Num(*b),
+                    action.clone(),
+                ));
+            }
+            if let Some(b) = below {
+                p.threshold.push((
+                    venture.clone(),
+                    m.mandate.metric.clone(),
+                    false,
+                    Num(*b),
+                    action.clone(),
+                ));
+            }
+        }
+    }
+    for (name, why) in HARDWIRED {
+        p.hardwired
+            .push((SELF.to_string(), name.to_string(), why.to_string()));
+    }
+
+    p.run();
+    assemble(&p, candidate, ledger, &adopted)
+}
+
+/// Turn the derived facts into a proof or a refusal that reads top to bottom.
+fn assemble(
+    p: &Rules,
+    candidate: &Candidate,
+    ledger: &[Entry],
+    adopted: &[&Adopted],
+) -> Result<Proof, Refusal> {
+    let v = &candidate.venture;
+    let a = &candidate.action;
+    let allowed = p.allowed.iter().any(|(x, y)| x == v && y == a);
+    let mut steps = Vec::new();
+    let mut reasons = Vec::new();
+    let find = |seq: Seq| ledger.iter().find(|e| e.seq == seq);
+    let occasion = |e: &Entry| Step::Occasion {
+        seq: e.seq,
+        claim: e.record.claim(),
+        kind: e.record.kind(),
+        what: e.record.summary(),
+    };
+
+    if a == STOP {
+        steps.push(Step::Axiom {
+            text: "stopping is always allowed".to_string(),
+        });
+        for &s in &candidate.cites {
+            if let Some(e) = find(s) {
+                steps.push(occasion(e));
+            }
+        }
+        return Ok(Proof {
+            venture: v.clone(),
+            action: a.clone(),
+            steps,
+        });
+    }
+
+    for &s in &candidate.cites {
+        if find(s).is_none() {
+            reasons.push(Reason::UnknownRecord { seq: s });
+        }
+    }
+
+    if a == RESUME {
+        steps.push(Step::Axiom {
+            text: "resuming needs a declared record".to_string(),
+        });
+        let mut found = false;
+        for &s in &candidate.cites {
+            if let Some(e) = find(s) {
+                let declared_resume = matches!(&e.record,
+                    Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Resume }
+                    if venture == v);
+                if declared_resume {
+                    steps.push(Step::Decision {
+                        seq: e.seq,
+                        what: "resumed".to_string(),
+                    });
+                    found = true;
+                } else {
+                    steps.push(occasion(e));
+                }
+            }
+        }
+        if !found {
+            reasons.push(Reason::NeedsDeclaredResume { venture: v.clone() });
+        }
+        return finish(allowed, v, a, steps, reasons);
+    }
+
+    let mandate = adopted.iter().find(|m| m.venture == *v);
+    let permitted = mandate.and_then(|m| m.mandate.permitted(a));
+    match mandate {
+        Some(m) => {
+            steps.push(Step::Mandate {
+                seq: m.seq,
+                hash: m.hash.clone(),
+            });
+            match permitted {
+                Some(perm) => steps.push(Step::Permitted {
+                    action: perm.name.clone(),
+                    cap: perm.cap,
+                    reversible: perm.reversible,
+                    delegated: perm.delegated,
+                }),
+                None => reasons.push(Reason::NotPermitted { action: a.clone() }),
+            }
+            if m.mandate.forbidden.iter().any(|f| f == a) {
+                reasons.push(Reason::Forbidden { action: a.clone() });
+            }
+        }
+        None => reasons.push(Reason::NoMandate { venture: v.clone() }),
+    }
+    let mut whys = BTreeSet::new();
+    for (_, _, why) in p.hardwired.iter().filter(|(x, y, _)| x == v && y == a) {
+        if whys.insert(why.clone()) {
+            reasons.push(Reason::Hardwired {
+                action: a.clone(),
+                why: why.clone(),
+            });
+        }
+    }
+
+    let mut cited = BTreeSet::new();
+    for (_, _, s) in p.crossed.iter().filter(|(x, y, _)| x == v && y == a) {
+        if let Some(e) = find(*s) {
+            if let Record::Report {
+                metric,
+                value: Some(value),
+                ..
+            } = &e.record
+            {
+                steps.push(Step::Report {
+                    seq: e.seq,
+                    claim: e.record.claim(),
+                    metric: metric.clone(),
+                    value: *value,
+                });
+                if let Some((_, _, above, bound, _)) = p
+                    .threshold
+                    .iter()
+                    .find(|(x, m, _, _, act)| x == v && m == metric && act == a)
+                {
+                    steps.push(Step::Threshold {
+                        metric: metric.clone(),
+                        bound: bound.0,
+                        above: *above,
+                    });
+                }
+            }
+            cited.insert(*s);
+        }
+    }
+    for (_, _, d, q) in p.approved.iter().filter(|(x, y, _, _)| x == v && y == a) {
+        steps.push(Step::Decision {
+            seq: *d,
+            what: format!("approved ask #{q}"),
+        });
+        cited.insert(*d);
+        if let Some(e) = find(*q) {
+            steps.push(occasion(e));
+            cited.insert(*q);
+        }
+    }
+    for (_, _, s) in p.proposed.iter().filter(|(x, y, _)| x == v && y == a) {
+        if let Some(e) = find(*s) {
+            steps.push(occasion(e));
+            cited.insert(*s);
+        }
+    }
+    for &s in &candidate.cites {
+        if !cited.contains(&s) {
+            if let Some(e) = find(s) {
+                steps.push(occasion(e));
+                cited.insert(s);
+            }
+        }
+    }
+
+    let justified = p.justified.iter().any(|(x, y)| x == v && y == a);
+    if !justified {
+        let inferred: Vec<Seq> = candidate
+            .cites
+            .iter()
+            .copied()
+            .filter(|s| find(*s).is_some_and(|e| !e.record.claim().authorizes()))
+            .collect();
+        if !inferred.is_empty() && inferred.len() == candidate.cites.len() {
+            reasons.push(Reason::OnlyInferred { seqs: inferred });
+        }
+        reasons.push(Reason::NotJustified { action: a.clone() });
+    }
+    if p.needs_decision.iter().any(|(x, y)| x == v && y == a) {
+        reasons.push(Reason::NeedsDecision { action: a.clone() });
+    }
+    if let Some(perm) = permitted {
+        let used = p
+            .used
+            .iter()
+            .find(|(x, y, _)| x == v && y == a)
+            .map_or(0, |(_, _, n)| *n);
+        steps.push(Step::Cap {
+            used,
+            cap: perm.cap,
+        });
+        if used >= perm.cap.count {
+            reasons.push(Reason::OverCap {
+                used,
+                cap: perm.cap,
+            });
+        }
+    }
+    if p.paused.iter().any(|(x,)| x == v) {
+        reasons.push(Reason::Paused { venture: v.clone() });
+    } else {
+        steps.push(Step::Running { venture: v.clone() });
+    }
+    finish(allowed, v, a, steps, reasons)
+}
+
+fn finish(
+    allowed: bool,
+    venture: &str,
+    action: &str,
+    steps: Vec<Step>,
+    mut reasons: Vec<Reason>,
+) -> Result<Proof, Refusal> {
+    if allowed && reasons.is_empty() {
+        return Ok(Proof {
+            venture: venture.to_string(),
+            action: action.to_string(),
+            steps,
+        });
+    }
+    if reasons.is_empty() {
+        reasons.push(Reason::NotJustified {
+            action: action.to_string(),
+        });
+    }
+    Err(Refusal {
+        venture: venture.to_string(),
+        action: action.to_string(),
+        steps,
+        reasons,
+    })
+}
+
+fn short(hash: &str) -> &str {
+    &hash[..hash.len().min(12)]
+}
+
+impl fmt::Display for Step {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Step::Mandate { seq, hash } => {
+                write!(
+                    f,
+                    "mandate    #{seq}  declared  adopted mandate {}",
+                    short(hash)
+                )
+            }
+            Step::Permitted {
+                action,
+                cap,
+                reversible,
+                delegated,
+            } => write!(
+                f,
+                "permitted  {action}  {cap}  {}{}",
+                if *reversible {
+                    "reversible"
+                } else {
+                    "irreversible"
+                },
+                if !*reversible && *delegated {
+                    ", delegated"
+                } else {
+                    ""
+                }
+            ),
+            Step::Report {
+                seq,
+                claim,
+                metric,
+                value,
+            } => write!(f, "report     #{seq}  {claim}  {metric}={value}"),
+            Step::Threshold {
+                metric,
+                bound,
+                above,
+            } => write!(
+                f,
+                "threshold  {metric} {} {bound}",
+                if *above { "above" } else { "below" }
+            ),
+            Step::Decision { seq, what } => write!(f, "decision   #{seq}  declared  {what}"),
+            Step::Occasion {
+                seq,
+                claim,
+                kind,
+                what,
+            } => write!(
+                f,
+                "occasion   #{seq}  {claim}  {kind}: {what}{}",
+                if claim.authorizes() {
+                    ""
+                } else {
+                    "  (authorizes nothing)"
+                }
+            ),
+            Step::Cap { used, cap } => write!(f, "cap        {used} of {cap} used"),
+            Step::Running { venture } => write!(f, "running    {venture} is not paused"),
+            Step::Axiom { text } => write!(f, "axiom      {text}"),
+        }
+    }
+}
+
+impl fmt::Display for Reason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Reason::NoMandate { venture } => write!(f, "{venture} has no adopted mandate"),
+            Reason::NotPermitted { action } => write!(f, "the mandate does not permit {action}"),
+            Reason::Forbidden { action } => write!(f, "the mandate forbids {action}"),
+            Reason::Hardwired { why, .. } => write!(f, "{why}"),
+            Reason::Paused { venture } => write!(f, "{venture} is paused"),
+            Reason::OverCap { used, cap } => {
+                write!(f, "the cap is {cap} and {used} are already used")
+            }
+            Reason::NeedsDecision { action } => write!(
+                f,
+                "{action} is irreversible and no declared decision approves it"
+            ),
+            Reason::NotJustified { action } => {
+                write!(f, "nothing measured or declared calls for {action}")
+            }
+            Reason::OnlyInferred { seqs } => {
+                let list: Vec<String> = seqs.iter().map(|s| format!("#{s}")).collect();
+                write!(
+                    f,
+                    "the cited records ({}) are all inferred; inferred records cannot authorize",
+                    list.join(", ")
+                )
+            }
+            Reason::UnknownRecord { seq } => write!(f, "record #{seq} is not in the ledger"),
+            Reason::NeedsDeclaredResume { venture } => {
+                write!(f, "resuming {venture} needs a declared decision")
+            }
+        }
+    }
+}
+
+impl fmt::Display for Proof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}: {} is allowed", self.venture, self.action)?;
+        for s in &self.steps {
+            writeln!(f, "  {s}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}: {} is refused", self.venture, self.action)?;
+        for s in &self.steps {
+            writeln!(f, "  {s}")?;
+        }
+        for r in &self.reasons {
+            writeln!(f, "  because    {r}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The derivation behind a record, in plain text: the proof for an action
+/// or intent, the failed derivation behind an ask, or where any other
+/// record came from.
+pub fn why(entry: &Entry) -> String {
+    let head = entry.line();
+    match &entry.record {
+        Record::Action { proof, .. } | Record::Intent { proof, .. } => format!("{head}\n{proof}"),
+        Record::Ask {
+            refusal: Some(r), ..
+        } => format!("{head}\n{r}"),
+        Record::Ask { question, .. } => format!("{head}\n  asked: {question}\n"),
+        Record::Report { claim, .. } => format!("{head}\n  {claim} by {}\n", by(*claim)),
+        Record::Proposal { reason, .. } => {
+            format!("{head}\n  inferred by a model: {reason}\n  authorizes nothing on its own\n")
+        }
+        Record::Decision { claim, .. } => format!("{head}\n  {claim} by {}\n", by(*claim)),
+        Record::Outcome { intent, .. } => format!("{head}\n  outcome of intent #{intent}\n"),
+    }
+}
+
+fn by(claim: Claim) -> &'static str {
+    match claim {
+        Claim::Measured => "code",
+        Claim::Declared => "a human",
+        Claim::Inferred => "a model",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mandate::{Permitted, Restart};
+    use crate::record::GENESIS;
+    use std::time::Duration;
+
+    const NOW: i64 = 1_700_000_000;
+    const DAY: i64 = 86_400;
+    const V: &str = "counter";
+
+    fn permit(name: &str, cap: u32, reversible: bool, delegated: bool) -> Permitted {
+        Permitted {
+            name: name.to_string(),
+            run: format!("./{name}"),
+            cap: Cap {
+                count: cap,
+                per: Cap::DAY,
+            },
+            reversible,
+            delegated,
+        }
+    }
+
+    fn mandate(controller: Controller, permitted: Vec<Permitted>, forbidden: &[&str]) -> Mandate {
+        Mandate {
+            purpose: "keep the counter low".to_string(),
+            metric: "count".to_string(),
+            controller,
+            permitted,
+            forbidden: forbidden.iter().map(|s| s.to_string()).collect(),
+            cadence: Duration::from_secs(60),
+            context_budget: 8000,
+            restart: Restart::OnFailure,
+        }
+    }
+
+    fn above(bound: f64, action: &str) -> Controller {
+        Controller::Threshold {
+            above: Some(bound),
+            below: None,
+            action: action.to_string(),
+        }
+    }
+
+    fn model() -> Controller {
+        Controller::Model { backend: None }
+    }
+
+    fn report(claim: Claim, value: f64) -> Record {
+        Record::Report {
+            claim,
+            venture: V.to_string(),
+            metric: "count".to_string(),
+            value: Some(value),
+            note: String::new(),
+        }
+    }
+
+    fn proposal(claim: Claim, action: &str) -> Record {
+        Record::Proposal {
+            claim,
+            venture: V.to_string(),
+            action: action.to_string(),
+            reason: "it seemed right".to_string(),
+        }
+    }
+
+    fn ask(claim: Claim, action: &str) -> Record {
+        Record::Ask {
+            claim,
+            venture: V.to_string(),
+            action: Some(action.to_string()),
+            question: format!("may I {action}?"),
+            refusal: None,
+        }
+    }
+
+    fn decision(claim: Claim, verdict: Verdict) -> Record {
+        Record::Decision {
+            claim,
+            venture: V.to_string(),
+            verdict,
+        }
+    }
+
+    fn done(action: &str) -> Record {
+        Record::Action {
+            claim: Claim::Measured,
+            venture: V.to_string(),
+            action: action.to_string(),
+            proof: Proof {
+                venture: V.to_string(),
+                action: action.to_string(),
+                steps: vec![],
+            },
+            ok: true,
+            detail: String::new(),
+        }
+    }
+
+    /// A hand-written ledger.
+    struct Fx {
+        entries: Vec<Entry>,
+        adopted: Vec<Adopted>,
+        at: i64,
+    }
+
+    impl Fx {
+        fn new() -> Fx {
+            Fx {
+                entries: vec![],
+                adopted: vec![],
+                at: NOW - 3600,
+            }
+        }
+
+        fn push_at(&mut self, at: i64, record: Record) -> Seq {
+            let seq = self.entries.len() as Seq + 1;
+            let prev = self
+                .entries
+                .last()
+                .map_or(GENESIS.to_string(), |e| e.hash.clone());
+            self.entries.push(Entry::new(seq, at, &prev, record));
+            seq
+        }
+
+        fn push(&mut self, record: Record) -> Seq {
+            self.at += 1;
+            let at = self.at;
+            self.push_at(at, record)
+        }
+
+        fn adopt(&mut self, venture: &str, m: Mandate) -> Seq {
+            let hash = Mandate::hash(&serde_yaml::to_string(&m).unwrap());
+            let seq = self.push(Record::Decision {
+                claim: Claim::Declared,
+                venture: venture.to_string(),
+                verdict: Verdict::Adopt {
+                    mandate: hash.clone(),
+                    path: format!("/ventures/{venture}"),
+                },
+            });
+            self.adopted.push(Adopted {
+                seq,
+                venture: venture.to_string(),
+                hash,
+                mandate: m,
+            });
+            seq
+        }
+
+        fn gate(&self, venture: &str, action: &str, cites: &[Seq]) -> Result<Proof, Refusal> {
+            gate(
+                &Candidate {
+                    venture: venture.to_string(),
+                    action: action.to_string(),
+                    cites: cites.to_vec(),
+                },
+                &self.entries,
+                &self.adopted,
+                NOW,
+            )
+        }
+    }
+
+    fn reasons(r: &Refusal) -> Vec<String> {
+        r.reasons.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn threshold_crossed_on_measured_report_is_allowed() {
+        let mut fx = Fx::new();
+        let m = fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        let r = fx.push(report(Claim::Measured, 12.0));
+        let proof = fx.gate(V, "reset", &[r]).expect("allowed");
+        assert!(matches!(proof.steps[0], Step::Mandate { seq, .. } if seq == m));
+        assert!(proof
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::Report { seq, claim: Claim::Measured, .. } if *seq == r)));
+        assert!(proof
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::Threshold { above: true, .. })));
+        let text = proof.to_string();
+        assert!(text.starts_with("counter: reset is allowed\n"), "{text}");
+        assert!(text.contains("report     #2  measured  count=12"), "{text}");
+    }
+
+    #[test]
+    fn threshold_not_crossed_is_refused() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        let r = fx.push(report(Claim::Measured, 9.0));
+        let refusal = fx.gate(V, "reset", &[r]).unwrap_err();
+        assert!(
+            reasons(&refusal).contains(&"nothing measured or declared calls for reset".to_string())
+        );
+    }
+
+    #[test]
+    fn inferred_only_chain_is_refused() {
+        // A model-written report cannot cross a threshold.
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        let r = fx.push(report(Claim::Inferred, 99.0));
+        let refusal = fx.gate(V, "reset", &[r]).unwrap_err();
+        let why = refusal.to_string();
+        assert!(
+            why.contains("(#2) are all inferred; inferred records cannot authorize"),
+            "{why}"
+        );
+        assert!(
+            why.contains("occasion   #2  inferred  report: count=99  (authorizes nothing)"),
+            "{why}"
+        );
+        assert!(refusal
+            .reasons
+            .iter()
+            .any(|r| matches!(r, Reason::NotJustified { .. })));
+
+        // A model-written decision cannot approve an irreversible action.
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(model(), vec![permit("deploy", 1, false, false)], &[]),
+        );
+        let q = fx.push(ask(Claim::Inferred, "deploy"));
+        let d = fx.push(decision(Claim::Inferred, Verdict::Approve { ask: q }));
+        let refusal = fx.gate(V, "deploy", &[q, d]).unwrap_err();
+        assert!(refusal
+            .reasons
+            .iter()
+            .any(|r| matches!(r, Reason::NeedsDecision { .. })));
+        assert!(refusal
+            .reasons
+            .iter()
+            .any(|r| matches!(r, Reason::OnlyInferred { seqs } if *seqs == vec![q, d])));
+    }
+
+    #[test]
+    fn declared_approval_allows_irreversible_action() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(model(), vec![permit("deploy", 1, false, false)], &[]),
+        );
+        let q = fx.push(ask(Claim::Inferred, "deploy"));
+        let d = fx.push(decision(Claim::Declared, Verdict::Approve { ask: q }));
+        let proof = fx.gate(V, "deploy", &[d]).expect("approved");
+        assert!(proof
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::Decision { seq, .. } if *seq == d)));
+        // A denial is not an approval.
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(model(), vec![permit("deploy", 1, false, false)], &[]),
+        );
+        let q = fx.push(ask(Claim::Inferred, "deploy"));
+        let d = fx.push(decision(
+            Claim::Declared,
+            Verdict::Deny {
+                ask: q,
+                reason: "no".into(),
+            },
+        ));
+        assert!(fx.gate(V, "deploy", &[d]).is_err());
+    }
+
+    #[test]
+    fn proposal_justifies_reversible_permitted_action() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(model(), vec![permit("tidy", 3, true, false)], &[]),
+        );
+        let s = fx.push(proposal(Claim::Inferred, "tidy"));
+        let proof = fx.gate(V, "tidy", &[s]).expect("allowed");
+        let text = proof.to_string();
+        assert!(
+            text.contains(
+                "occasion   #2  inferred  proposal: tidy: it seemed right  (authorizes nothing)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("cap        0 of 3/day used"), "{text}");
+    }
+
+    #[test]
+    fn proposal_for_irreversible_action_needs_decision_unless_delegated() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(model(), vec![permit("deploy", 1, false, false)], &[]),
+        );
+        let s = fx.push(proposal(Claim::Inferred, "deploy"));
+        let refusal = fx.gate(V, "deploy", &[s]).unwrap_err();
+        assert!(reasons(&refusal)
+            .contains(&"deploy is irreversible and no declared decision approves it".to_string()));
+
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(model(), vec![permit("deploy", 1, false, true)], &[]),
+        );
+        let s = fx.push(proposal(Claim::Inferred, "deploy"));
+        let proof = fx.gate(V, "deploy", &[s]).expect("delegated");
+        assert!(proof.to_string().contains("irreversible, delegated"));
+    }
+
+    #[test]
+    fn cap_exceeding_action_is_refused() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        for _ in 0..3 {
+            fx.push(done("reset"));
+        }
+        let r = fx.push(report(Claim::Measured, 12.0));
+        let refusal = fx.gate(V, "reset", &[r]).unwrap_err();
+        assert!(refusal.reasons.contains(&Reason::OverCap {
+            used: 3,
+            cap: Cap {
+                count: 3,
+                per: Cap::DAY
+            }
+        }));
+        assert!(refusal
+            .to_string()
+            .contains("because    the cap is 3/day and 3 are already used"));
+
+        // Runs older than the cap window do not count.
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        for i in 0..3 {
+            fx.push_at(NOW - 2 * DAY + i, done("reset"));
+        }
+        let r = fx.push_at(NOW - 1, report(Claim::Measured, 12.0));
+        assert!(fx.gate(V, "reset", &[r]).is_ok());
+    }
+
+    #[test]
+    fn stop_always_passes() {
+        // No mandate, paused, forbidden, cited only inferred records: still allowed.
+        let mut fx = Fx::new();
+        let s = fx.push(proposal(Claim::Inferred, STOP));
+        let proof = fx.gate(V, STOP, &[s]).expect("stop");
+        assert!(matches!(proof.steps[0], Step::Axiom { .. }));
+
+        let mut fx = Fx::new();
+        fx.adopt(V, mandate(model(), vec![], &[STOP]));
+        fx.push(decision(Claim::Declared, Verdict::Pause));
+        assert!(fx.gate(V, STOP, &[]).is_ok());
+    }
+
+    #[test]
+    fn resume_without_declared_record_is_refused() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(model(), vec![permit("tidy", 3, true, false)], &[]),
+        );
+        fx.push(decision(Claim::Declared, Verdict::Pause));
+        let fake = fx.push(decision(Claim::Inferred, Verdict::Resume));
+        let refusal = fx.gate(V, RESUME, &[fake]).unwrap_err();
+        assert!(
+            reasons(&refusal).contains(&"resuming counter needs a declared decision".to_string())
+        );
+        assert!(fx.gate(V, RESUME, &[]).is_err());
+
+        let real = fx.push(decision(Claim::Declared, Verdict::Resume));
+        let proof = fx.gate(V, RESUME, &[real]).expect("declared resume");
+        assert!(proof
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::Decision { seq, .. } if *seq == real)));
+    }
+
+    #[test]
+    fn paused_venture_refuses_actions_until_declared_resume() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        fx.push(decision(Claim::Declared, Verdict::Pause));
+        let r = fx.push(report(Claim::Measured, 12.0));
+        let refusal = fx.gate(V, "reset", &[r]).unwrap_err();
+        assert!(refusal
+            .reasons
+            .contains(&Reason::Paused { venture: V.into() }));
+
+        // An inferred resume changes nothing; a declared one does.
+        fx.push(decision(Claim::Inferred, Verdict::Resume));
+        let r = fx.push(report(Claim::Measured, 12.0));
+        assert!(fx.gate(V, "reset", &[r]).is_err());
+        fx.push(decision(Claim::Declared, Verdict::Resume));
+        let r = fx.push(report(Claim::Measured, 12.0));
+        assert!(fx.gate(V, "reset", &[r]).is_ok());
+
+        // A stop action pauses too.
+        fx.push(done(STOP));
+        let r = fx.push(report(Claim::Measured, 12.0));
+        assert!(fx.gate(V, "reset", &[r]).is_err());
+    }
+
+    #[test]
+    fn forbidden_and_unpermitted_actions_are_refused() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                model(),
+                vec![
+                    permit("tidy", 3, true, false),
+                    permit("wipe", 1, true, false),
+                ],
+                &["wipe"],
+            ),
+        );
+        let s = fx.push(proposal(Claim::Inferred, "wipe"));
+        let refusal = fx.gate(V, "wipe", &[s]).unwrap_err();
+        assert!(refusal.reasons.contains(&Reason::Forbidden {
+            action: "wipe".into()
+        }));
+        let s = fx.push(proposal(Claim::Inferred, "launch"));
+        let refusal = fx.gate(V, "launch", &[s]).unwrap_err();
+        assert!(refusal.reasons.contains(&Reason::NotPermitted {
+            action: "launch".into()
+        }));
+    }
+
+    #[test]
+    fn no_mandate_or_mismatched_mandate_is_refused() {
+        let mut fx = Fx::new();
+        let r = fx.push(report(Claim::Measured, 12.0));
+        let refusal = fx.gate(V, "reset", &[r]).unwrap_err();
+        assert!(refusal
+            .reasons
+            .contains(&Reason::NoMandate { venture: V.into() }));
+
+        // The adopted hash must match the declared record.
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        fx.adopted[0].hash = "edited-on-disk".to_string();
+        let r = fx.push(report(Claim::Measured, 12.0));
+        let refusal = fx.gate(V, "reset", &[r]).unwrap_err();
+        assert!(refusal
+            .reasons
+            .contains(&Reason::NoMandate { venture: V.into() }));
+    }
+
+    #[test]
+    fn stale_report_does_not_justify() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        let old = fx.push(report(Claim::Measured, 12.0));
+        fx.push(report(Claim::Measured, 3.0));
+        assert!(fx.gate(V, "reset", &[old]).is_err());
+    }
+
+    #[test]
+    fn unknown_cited_record_is_refused() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        let refusal = fx.gate(V, "reset", &[42]).unwrap_err();
+        assert!(refusal.reasons.contains(&Reason::UnknownRecord { seq: 42 }));
+    }
+
+    #[test]
+    fn self_hardwired_list_is_refused_even_when_permitted() {
+        for (name, why) in HARDWIRED {
+            let mut fx = Fx::new();
+            fx.adopt(
+                SELF,
+                mandate(model(), vec![permit(name, 9, true, true)], &[]),
+            );
+            let s = fx.push(Record::Proposal {
+                claim: Claim::Inferred,
+                venture: SELF.into(),
+                action: name.to_string(),
+                reason: "why not".into(),
+            });
+            let refusal = fx.gate(SELF, name, &[s]).unwrap_err();
+            assert!(reasons(&refusal).contains(&why.to_string()), "{refusal}");
+        }
+        // A differently named self action whose command touches keys is caught too.
+        let mut fx = Fx::new();
+        let mut perm = permit("rotate", 9, true, true);
+        perm.run = "cat ~/.avsm/keys".to_string();
+        fx.adopt(SELF, mandate(model(), vec![perm], &[]));
+        let s = fx.push(Record::Proposal {
+            claim: Claim::Inferred,
+            venture: SELF.into(),
+            action: "rotate".into(),
+            reason: "why not".into(),
+        });
+        let refusal = fx.gate(SELF, "rotate", &[s]).unwrap_err();
+        assert!(reasons(&refusal).contains(&"the self venture cannot touch keys".to_string()));
+        // The same action name in another venture is fine.
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(model(), vec![permit("merge-main", 9, true, false)], &[]),
+        );
+        let s = fx.push(proposal(Claim::Inferred, "merge-main"));
+        assert!(fx.gate(V, "merge-main", &[s]).is_ok());
+    }
+
+    #[test]
+    fn why_renders_every_kind() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        let r = fx.push(report(Claim::Measured, 12.0));
+        let proof = fx.gate(V, "reset", &[r]).unwrap();
+        let a = fx.push(Record::Action {
+            claim: Claim::Measured,
+            venture: V.into(),
+            action: "reset".into(),
+            proof,
+            ok: true,
+            detail: String::new(),
+        });
+        let text = why(&fx.entries[(a - 1) as usize]);
+        assert!(text.starts_with(&format!("#{a}")), "{text}");
+        assert!(text.contains("counter: reset is allowed"), "{text}");
+        assert!(text.contains("threshold  count above 10"), "{text}");
+        for e in &fx.entries {
+            assert!(!why(e).is_empty());
+        }
+        let q = fx.push(Record::Ask {
+            claim: Claim::Inferred,
+            venture: V.into(),
+            action: Some("deploy".into()),
+            question: "may I?".into(),
+            refusal: Some(Refusal {
+                venture: V.into(),
+                action: "deploy".into(),
+                steps: vec![],
+                reasons: vec![Reason::NeedsDecision {
+                    action: "deploy".into(),
+                }],
+            }),
+        });
+        let text = why(&fx.entries[(q - 1) as usize]);
+        assert!(text.contains("because    deploy is irreversible"), "{text}");
+    }
+
+    #[test]
+    fn proof_round_trips_through_json() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        let r = fx.push(report(Claim::Measured, 12.0));
+        let proof = fx.gate(V, "reset", &[r]).unwrap();
+        let json = serde_json::to_string(&proof).unwrap();
+        let back: Proof = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, proof);
+    }
 }
