@@ -1,0 +1,7 @@
+#!/bin/sh
+# Prints the count, one higher each time it runs. The count stands in for
+# anything you can measure.
+n=$(cat count 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > count
+echo "$n"

@@ -1,0 +1,14 @@
+# The smallest venture: a number that climbs, and one lever that puts it back.
+purpose: Keep the counter below ten.
+metric: count
+controller:
+  kind: threshold
+  above: 10
+  action: reset
+cadence: 5s
+permitted:
+  - name: reset
+    run: ./reset
+    cap: 6/hour
+    reversible: true
+forbidden: [rm]

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Puts the count back to zero. Reversible: the next report bumps it again.
+echo 0 > count
+echo "count is 0 again"

@@ -289,3 +289,55 @@ fn approve_and_deny_answer_open_asks() {
     assert!(text.contains("asked: may I deploy?"), "{text}");
     assert_eq!(kernel.ledger.verify().unwrap(), 4);
 }
+
+/// The README walkthrough: add examples/counter, watch the count cross the
+/// threshold, read the proof. The count is seeded at 10 so it crosses on
+/// the first report.
+#[test]
+fn examples_counter_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = tmp.path().join("counter");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/counter");
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["mandate.yaml", "report", "reset"] {
+        std::fs::copy(src.join(name), dir.join(name)).unwrap();
+    }
+    std::fs::write(dir.join("count"), "10\n").unwrap();
+    let _daemon = start(&home);
+    let (ok, text) = avsm(&home, &["add", dir.to_str().unwrap()]);
+    assert!(ok, "{text}");
+
+    let began = Instant::now();
+    let action = loop {
+        let (ok, text) = avsm(&home, &["tail", "50"]);
+        assert!(ok, "{text}");
+        if let Some(line) = text
+            .lines()
+            .find(|l| l.contains("measured  action    reset: done"))
+        {
+            break line.to_string();
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "no action yet:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(action.contains("count is 0 again"), "{action}");
+    let seq = action
+        .trim_start_matches('#')
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let (ok, why) = avsm(&home, &["why", seq]);
+    assert!(ok, "{why}");
+    assert!(why.contains("counter: reset is allowed"), "{why}");
+    assert!(why.contains("measured  count=11"), "{why}");
+    assert!(why.contains("threshold  count above 10"), "{why}");
+    assert!(why.contains("cap        0 of 6/hour used"), "{why}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("count")).unwrap().trim(),
+        "0"
+    );
+}
