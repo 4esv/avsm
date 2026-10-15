@@ -1,0 +1,13 @@
+# A metric is one word, the name of the number the report prints.
+purpose: Keep the counter from running away.
+metric: the current count
+controller:
+  kind: threshold
+  above: 10
+  action: reset
+cadence: 30s
+permitted:
+  - name: reset
+    run: ./reset.sh
+    cap: 3/day
+    reversible: true
