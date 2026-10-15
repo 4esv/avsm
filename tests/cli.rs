@@ -63,7 +63,7 @@ fn counter_venture(parent: &Path) -> std::path::PathBuf {
          permitted:\n  - name: reset\n    run: ./reset\n    cap: 3/day\n    reversible: true\n",
     )
     .unwrap();
-    std::fs::write(dir.join("report"), "#!/bin/sh\necho 12\n").unwrap();
+    std::fs::write(dir.join("report"), "#!/bin/sh\necho 3\n").unwrap();
     std::fs::set_permissions(dir.join("report"), std::fs::Permissions::from_mode(0o755)).unwrap();
     dir
 }
@@ -122,14 +122,28 @@ fn every_command_against_a_temp_ledger() {
     let home = tmp.path().join("home");
     let _daemon = start(&home);
     let run = |args: &[&str]| avsm(&home, args);
+    let seq_of = |line: &str| -> String {
+        line.trim_start_matches('#')
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string()
+    };
 
+    // The self venture exists from the first start.
     let (ok, text) = run(&["status"]);
     assert!(ok, "{text}");
-    assert_eq!(text, "no ventures; add one with: avsm add <directory>\n");
+    assert!(text.starts_with("self         running  "), "{text}");
 
     let (ok, text) = run(&["tail"]);
     assert!(ok);
-    assert_eq!(text, "the ledger is empty\n");
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .contains("self         declared  decision  adopted mandate"),
+        "{text}"
+    );
 
     let (ok, text) = run(&["add", tmp.path().join("missing").to_str().unwrap()]);
     assert!(!ok);
@@ -141,27 +155,28 @@ fn every_command_against_a_temp_ledger() {
     assert!(text.starts_with("added counter from "), "{text}");
     assert!(text.contains("watching count every 30s"), "{text}");
     assert!(text.contains("may reset  3/day  reversible"), "{text}");
+    let adopt_line = text.lines().last().unwrap().trim().to_string();
     assert!(
-        text.contains("declared  decision  adopted mandate"),
+        adopt_line.contains("counter      declared  decision  adopted mandate"),
         "{text}"
     );
+    let adopt = seq_of(&adopt_line);
 
     let (ok, text) = run(&["status"]);
     assert!(ok, "{text}");
+    assert!(text.starts_with("counter      running  "), "{text}");
     assert!(
-        text.starts_with("counter      running  no report yet\n"),
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("self         running  "),
         "{text}"
     );
 
     let (ok, text) = run(&["tail", "1"]);
     assert!(ok);
-    let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 1);
-    assert!(lines[0].starts_with("#1 "), "{text}");
-    assert!(
-        lines[0].contains("counter      declared  decision  adopted mandate"),
-        "{text}"
-    );
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.starts_with('#'), "{text}");
 
     let (ok, text) = run(&["asks"]);
     assert!(ok);
@@ -182,7 +197,10 @@ fn every_command_against_a_temp_ledger() {
 
     let (ok, text) = run(&["pause", "counter"]);
     assert!(ok, "{text}");
-    assert!(text.contains("declared  decision  paused"), "{text}");
+    assert!(
+        text.contains("counter      declared  decision  paused"),
+        "{text}"
+    );
     let (ok, text) = run(&["status"]);
     assert!(ok);
     assert!(text.starts_with("counter      paused   "), "{text}");
@@ -192,25 +210,29 @@ fn every_command_against_a_temp_ledger() {
 
     let (ok, text) = run(&["resume", "counter"]);
     assert!(ok, "{text}");
-    assert!(text.contains("declared  decision  resumed"), "{text}");
+    assert!(
+        text.contains("counter      declared  decision  resumed"),
+        "{text}"
+    );
+    let resumed = seq_of(text.trim());
     let (ok, text) = run(&["status"]);
     assert!(ok);
     assert!(text.starts_with("counter      running  "), "{text}");
 
-    let (ok, text) = run(&["why", "1"]);
+    let (ok, text) = run(&["why", &adopt]);
     assert!(ok, "{text}");
-    assert!(text.starts_with("#1 "), "{text}");
+    assert!(text.starts_with(&format!("#{adopt} ")), "{text}");
     assert!(text.contains("declared by a human"), "{text}");
-    let (ok, text) = run(&["why", "#3"]);
+    let (ok, text) = run(&["why", &format!("#{resumed}")]);
     assert!(ok, "{text}");
     assert!(text.contains("resumed"), "{text}");
-    let (ok, text) = run(&["why", "99"]);
+    let (ok, text) = run(&["why", "999"]);
     assert!(!ok);
-    assert!(text.contains("no record #99"), "{text}");
+    assert!(text.contains("no record #999"), "{text}");
 
     let (ok, text) = run(&["tail"]);
     assert!(ok);
-    assert_eq!(text.lines().count(), 3, "{text}");
+    assert!(text.lines().count() >= 4, "{text}");
     for line in text.lines() {
         assert!(line.starts_with('#'), "{line}");
     }

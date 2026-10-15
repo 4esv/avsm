@@ -517,9 +517,28 @@ impl Kernel {
         }
     }
 
+    /// Make sure the built-in self venture is adopted under the mandate
+    /// this binary ships. Called on start.
+    pub fn adopt_self(&mut self) -> Result<(), String> {
+        let current = self
+            .ventures
+            .get(SELF)
+            .filter(|v| v.problem.is_none())
+            .is_some();
+        if !current {
+            let entry = self.append(crate::selfventure::adopt_record())?;
+            log(&entry.line());
+            self.reload()?;
+        }
+        Ok(())
+    }
+
     /// Read a venture's metric: run its `report` and take the last line.
     /// The built-in self venture measures itself.
     fn measure(&mut self, v: &Venture) -> Option<(Option<f64>, String)> {
+        if v.name == SELF && v.path.is_none() {
+            return Some(crate::selfventure::measure(&self.ledger));
+        }
         let dir = v.path.clone()?;
         let report = v.report()?;
         let ran = warden::run(&dir, &report.to_string_lossy(), &[], "", REPORT_TIMEOUT);
@@ -1191,7 +1210,8 @@ pub fn start(home: &Path) -> Result<(), String> {
         warden.id(),
         roles.id()
     ));
-    let kernel = Kernel::with(home, Box::new(roles), Box::new(warden))?;
+    let mut kernel = Kernel::with(home, Box::new(roles), Box::new(warden))?;
+    kernel.adopt_self()?;
     let kernel = Arc::new(Mutex::new(kernel));
     // SAFETY: the handler only stores to an atomic.
     unsafe {

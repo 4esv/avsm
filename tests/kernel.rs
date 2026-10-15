@@ -496,3 +496,101 @@ fn keys_are_unreadable_to_the_dropped_user_when_root() {
         .unwrap();
     assert!(out.status.success(), "the owner can");
 }
+
+#[test]
+fn self_reports_integrity_and_halts_everything_when_it_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = venture(
+        tmp.path(),
+        "counter",
+        "purpose: Keep the counter low.\nmetric: count\n\
+         controller: {kind: threshold, above: 10, action: reset}\ncadence: 1h\n\
+         permitted:\n- {name: reset, run: echo reset >> resets, cap: 9/day, reversible: true}\n",
+    );
+    script(&dir, "report", "echo 12");
+    let mut k = kernel(&home, Box::new(FakeRole(VecDeque::new())));
+    k.adopt_self().unwrap();
+    k.add(&dir).unwrap();
+    k.tick();
+    let got = kinds(&k.entries().unwrap());
+    assert_eq!(got[0].0, Kind::Decision, "{got:?}");
+    assert!(got[0].1.starts_with("adopted mandate"), "{got:?}");
+    let self_report = got
+        .iter()
+        .find(|(kind, s)| *kind == Kind::Report && s.starts_with("integrity=1"))
+        .expect("self reported");
+    assert!(
+        self_report.1.contains("chain ok") && self_report.1.contains("canary ok"),
+        "{got:?}"
+    );
+    assert!(
+        got.iter()
+            .any(|(kind, s)| *kind == Kind::Action && s.starts_with("reset: done")),
+        "{got:?}"
+    );
+    assert!(k
+        .status()
+        .unwrap()
+        .contains("self         running  integrity=1"));
+
+    // Tamper with the ledger behind avsm's back. The next self report sees it.
+    let conn = rusqlite::Connection::open(home.join("ledger.db")).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER records_no_update; UPDATE records SET at = at + 1 WHERE seq = 1;",
+    )
+    .unwrap();
+    k.report("self", false);
+    let got = kinds(&k.entries().unwrap());
+    let n = got.len();
+    assert!(
+        got[n - 2]
+            .1
+            .starts_with("integrity=0  chain broken: record #1"),
+        "{got:?}"
+    );
+    assert_eq!(
+        got[n - 1],
+        (Kind::Action, "stop: done".to_string()),
+        "{got:?}"
+    );
+    assert!(k.status().unwrap().contains("self         paused"));
+    let why = k.why(n as u64).unwrap();
+    assert!(
+        why.contains("axiom      stopping is always allowed"),
+        "{why}"
+    );
+
+    // Halted: the counter still reports but nothing acts, and its run is stopped.
+    let resets_before = std::fs::read_to_string(dir.join("resets"))
+        .unwrap()
+        .lines()
+        .count();
+    k.report("counter", true);
+    k.tick();
+    let got = kinds(&k.entries().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("resets"))
+            .unwrap()
+            .lines()
+            .count(),
+        resets_before
+    );
+    assert!(
+        got.iter().filter(|(kind, _)| *kind == Kind::Action).count() == 2,
+        "{got:?}"
+    );
+
+    // A human resumes self; the next report acts again.
+    k.resume("self").unwrap();
+    k.tick();
+    assert!(k.status().unwrap().contains("self         running"));
+    k.report("counter", false);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("resets"))
+            .unwrap()
+            .lines()
+            .count(),
+        resets_before + 1
+    );
+}

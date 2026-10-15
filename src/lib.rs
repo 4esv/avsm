@@ -11,5 +11,6 @@ pub mod mandate;
 pub mod protocol;
 pub mod record;
 pub mod role;
+pub mod selfventure;
 pub mod venture;
 pub mod warden;

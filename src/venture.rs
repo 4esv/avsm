@@ -72,6 +72,7 @@ pub fn load_all(entries: &[Entry]) -> BTreeMap<String, Venture> {
     let mut ventures = BTreeMap::new();
     for (name, (seq, hash, path)) in latest {
         if name == crate::gate::SELF {
+            ventures.insert(name, crate::selfventure::venture(seq, &hash));
             continue;
         }
         let dir = PathBuf::from(&path);
