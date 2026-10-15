@@ -1,0 +1,37 @@
+[package]
+name = "avsm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "The obedient paperclip maximizer: an agentic daemon that pursues the goals you give it, acts only within the limits you set, and has proof for everything it does."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/4esv/avsm"
+readme = "README.md"
+keywords = ["agent", "daemon", "supervisor", "ledger", "datalog"]
+categories = ["command-line-utilities"]
+exclude = [".github/"]
+
+[dependencies]
+anyhow = "1"
+ascent = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+humantime = "2"
+libc = "0.2"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.11"
+thiserror = "2"
+ureq = { version = "3", features = ["json"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

@@ -1,0 +1,9 @@
+//! avsm: the obedient paperclip maximizer.
+//!
+//! A supervisor kernel where models only propose, code only proves, and
+//! every fact carries its provenance.
+
+pub mod gate;
+pub mod ledger;
+pub mod mandate;
+pub mod record;
