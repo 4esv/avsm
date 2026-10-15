@@ -1,0 +1,21 @@
+# A counter venture: watch a count, reset it when it climbs past 10.
+purpose: Keep the counter from running away.
+metric: count
+controller:
+  kind: threshold
+  above: 10
+  action: reset
+cadence: 30s
+context_budget: 4000
+restart: on-failure
+permitted:
+  - name: reset
+    run: ./reset.sh
+    cap: 3/day
+    reversible: true
+  - name: deploy
+    run: ./deploy.sh
+    cap: 1/day
+    reversible: false
+    delegated: false
+forbidden: [rm]

@@ -1,0 +1,12 @@
+# No metric: the daemon would not know which number to watch.
+purpose: Keep the counter from running away.
+controller:
+  kind: threshold
+  above: 10
+  action: reset
+cadence: 30s
+permitted:
+  - name: reset
+    run: ./reset.sh
+    cap: 3/day
+    reversible: true
