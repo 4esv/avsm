@@ -245,13 +245,47 @@ fn post_json(
     serde_json::from_str(&text).map_err(|e| format!("{url} did not answer JSON: {e}"))
 }
 
-/// Run a shell command in a directory with a clean environment, feeding it
-/// `stdin`, and wait up to `timeout`. Returns whether it exited 0 and the
-/// tail of what it printed.
-pub fn run_command(dir: &Path, run: &str, stdin: &str, timeout: Duration) -> (bool, String) {
-    let mut child = match Command::new("sh")
-        .arg("-c")
-        .arg(run)
+/// What running something came to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ran {
+    /// Exited 0.
+    pub ok: bool,
+    pub stdout: String,
+    pub stderr: String,
+    /// Exit code, if it exited on its own.
+    pub code: Option<i32>,
+    /// Killed at the timeout.
+    pub killed: bool,
+}
+
+impl Ran {
+    /// One line of what happened, for a record: the tail of the output,
+    /// with the exit code or the timeout when it failed.
+    pub fn detail(&self, timeout: Duration) -> String {
+        let mut text = self.stdout.trim().to_string();
+        let err = self.stderr.trim();
+        if !err.is_empty() {
+            if !text.is_empty() {
+                text.push_str("  ");
+            }
+            text.push_str(err);
+        }
+        let text = text.replace('\n', "  ");
+        if self.killed {
+            tail(format!("killed after {}s  {text}", timeout.as_secs()).trim())
+        } else if self.ok {
+            tail(&text)
+        } else {
+            tail(format!("exit {}  {text}", self.code.unwrap_or(-1)).trim())
+        }
+    }
+}
+
+/// Run a program in a directory with a clean environment, feeding it
+/// `stdin`, and wait up to `timeout`.
+pub fn run(dir: &Path, program: &str, args: &[&str], stdin: &str, timeout: Duration) -> Ran {
+    let mut child = match Command::new(program)
+        .args(args)
         .current_dir(dir)
         .env_clear()
         .env(
@@ -269,7 +303,12 @@ pub fn run_command(dir: &Path, run: &str, stdin: &str, timeout: Duration) -> (bo
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return (false, format!("cannot run {run:?}: {e}")),
+        Err(e) => {
+            return Ran {
+                stderr: format!("cannot run {program}: {e}"),
+                ..Ran::default()
+            }
+        }
     };
     if !stdin.is_empty() {
         if let Some(mut input) = child.stdin.take() {
@@ -303,26 +342,21 @@ pub fn run_command(dir: &Path, run: &str, stdin: &str, timeout: Duration) -> (bo
             Err(_) => break None,
         }
     };
-    let (out, err) = reader.join().unwrap_or_default();
-    let mut detail = out.trim().to_string();
-    let err = err.trim();
-    if !err.is_empty() {
-        if !detail.is_empty() {
-            detail.push_str("  ");
-        }
-        detail.push_str(err);
+    let (stdout, stderr) = reader.join().unwrap_or_default();
+    Ran {
+        ok: status.is_some_and(|s| s.success()),
+        stdout,
+        stderr,
+        code: status.and_then(|s| s.code()),
+        killed: status.is_none(),
     }
-    match status {
-        Some(s) if s.success() => (true, tail(&detail)),
-        Some(s) => (
-            false,
-            tail(format!("exit {}  {detail}", s.code().unwrap_or(-1)).trim()),
-        ),
-        None => (
-            false,
-            tail(&format!("killed after {}s  {detail}", timeout.as_secs())),
-        ),
-    }
+}
+
+/// Run a shell command in a directory; see `run`. Returns whether it
+/// exited 0 and one line of what happened.
+pub fn run_command(dir: &Path, command: &str, stdin: &str, timeout: Duration) -> (bool, String) {
+    let ran = run(dir, "sh", &["-c", command], stdin, timeout);
+    (ran.ok, ran.detail(timeout))
 }
 
 fn tail(s: &str) -> String {

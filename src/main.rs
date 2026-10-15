@@ -62,21 +62,31 @@ enum Command {
         /// The record number
         number: String,
     },
+    /// The warden process; avsm start runs it for you
+    #[command(hide = true)]
+    Warden,
+    /// The roles process; avsm start runs it for you
+    #[command(hide = true)]
+    Roles,
+}
+
+fn done(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("avsm: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let home = cli.home.unwrap_or_else(avsm::kernel::default_home);
     let args: Vec<String> = match cli.command {
-        Command::Start => {
-            return match avsm::kernel::start(&home) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("avsm: {e}");
-                    ExitCode::FAILURE
-                }
-            };
-        }
+        Command::Start => return done(avsm::kernel::start(&home)),
+        Command::Warden => return done(avsm::kernel::warden_main(&home)),
+        Command::Roles => return done(avsm::kernel::roles_main()),
         Command::Add { dir } => {
             let dir = dir.canonicalize().unwrap_or(dir);
             vec!["add".to_string(), dir.to_string_lossy().into_owned()]

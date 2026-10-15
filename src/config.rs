@@ -14,7 +14,7 @@ pub const KEYS_FILE: &str = "keys";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Local time of the nightly cycle, as HH:MM.
+    /// Local time of the nightly cycle, as HH:MM, or `never`.
     #[serde(default = "default_nightly")]
     pub nightly: String,
     /// The backend a mandate gets when it names none.
@@ -121,16 +121,24 @@ impl Config {
         Ok(config)
     }
 
-    /// The nightly time as minutes after local midnight.
-    pub fn nightly_minutes(&self) -> Result<u32, String> {
-        let bad = || format!("nightly is a time like 03:00, not {:?}", self.nightly);
+    /// The nightly time as minutes after local midnight; None for `never`.
+    pub fn nightly_minutes(&self) -> Result<Option<u32>, String> {
+        if self.nightly.trim() == "never" {
+            return Ok(None);
+        }
+        let bad = || {
+            format!(
+                "nightly is a time like 03:00 or never, not {:?}",
+                self.nightly
+            )
+        };
         let (h, m) = self.nightly.split_once(':').ok_or_else(bad)?;
         let h: u32 = h.parse().map_err(|_| bad())?;
         let m: u32 = m.parse().map_err(|_| bad())?;
         if h > 23 || m > 59 {
             return Err(bad());
         }
-        Ok(h * 60 + m)
+        Ok(Some(h * 60 + m))
     }
 
     /// The backend a mandate asks for, or the default.
@@ -197,7 +205,14 @@ mod tests {
             "nightly: \"02:30\"\ndefault: a\nbackends:\n  a: {kind: anthropic, model: claude-opus-5-5}\n  d: {kind: openai, url: http://x/v1/chat/completions, model: m, key: deepseek}\n  k: {kind: command, run: ./classify}\n",
         )
         .unwrap();
-        assert_eq!(c.nightly_minutes().unwrap(), 150);
+        assert_eq!(c.nightly_minutes().unwrap(), Some(150));
+        assert_eq!(
+            Config::parse("nightly: never\n")
+                .unwrap()
+                .nightly_minutes()
+                .unwrap(),
+            None
+        );
         assert_eq!(c.backend(None).unwrap().0, "a");
         assert_eq!(c.backend(Some("k")).unwrap().0, "k");
         assert!(
