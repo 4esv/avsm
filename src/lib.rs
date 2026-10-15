@@ -4,6 +4,9 @@
 //! every fact carries its provenance.
 
 pub mod gate;
+pub mod kernel;
 pub mod ledger;
 pub mod mandate;
+pub mod protocol;
 pub mod record;
+pub mod venture;

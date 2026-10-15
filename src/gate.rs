@@ -43,7 +43,7 @@ const HARDWIRED_RUN: &[(&str, &str)] = &[
 
 /// An action about to be taken: for which venture, which action, and the
 /// records it rests on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
     pub venture: String,
     pub action: String,
@@ -174,6 +174,7 @@ ascent! {
     relation report(Seq, String, String, Num);
     relation decision(Seq, String, Dk, Seq);
     relation ask(Seq, String, String);
+    relation asked(Seq, String);
     relation proposal(Seq, String, String);
     relation stopped(Seq, String);
     relation mandate(Seq, String, String);
@@ -236,6 +237,13 @@ ascent! {
     relation needs_decision(String, String);
     needs_decision(v, a) <-- candidate(v, a), permitted(v, a, _, false, _), !irreversible_ok(v, a);
 
+    // An ask stays open until a declared decision answers it.
+    relation decided(Seq);
+    decided(q) <-- decision(d, _, Dk::Approve, q), trusted(d);
+    decided(q) <-- decision(d, _, Dk::Deny, q), trusted(d);
+    relation open_ask(Seq, String);
+    open_ask(q, v) <-- asked(q, v), !decided(q);
+
     relation hard(String, String);
     hard(v, a) <-- hardwired(v, a, _);
     relation under_cap(String, String);
@@ -272,35 +280,7 @@ pub fn gate(
     let mut p = Rules::default();
     p.candidate.push((v.to_string(), a.to_string()));
     p.cites = candidate.cites.iter().map(|s| (*s,)).collect();
-
-    for e in ledger {
-        let r = &e.record;
-        let venture = r.venture().to_string();
-        p.record.push((e.seq, venture.clone(), r.claim(), r.kind()));
-        match r {
-            Record::Report {
-                metric,
-                value: Some(val),
-                ..
-            } => p.report.push((e.seq, venture, metric.clone(), Num(*val))),
-            Record::Decision { verdict, .. } => {
-                let (dk, target) = match verdict {
-                    Verdict::Approve { ask } => (Dk::Approve, *ask),
-                    Verdict::Deny { ask, .. } => (Dk::Deny, *ask),
-                    Verdict::Pause => (Dk::Pause, 0),
-                    Verdict::Resume => (Dk::Resume, 0),
-                    Verdict::Adopt { .. } => (Dk::Adopt, 0),
-                };
-                p.decision.push((e.seq, venture, dk, target));
-            }
-            Record::Ask {
-                action: Some(act), ..
-            } => p.ask.push((e.seq, venture, act.clone())),
-            Record::Proposal { action, .. } => p.proposal.push((e.seq, venture, action.clone())),
-            Record::Action { action, .. } if action == STOP => p.stopped.push((e.seq, venture)),
-            _ => {}
-        }
-    }
+    load_ledger(&mut p, ledger);
 
     // Only mandates the ledger shows adopted by a declared decision count.
     let adopted: Vec<&Adopted> = mandates
@@ -381,6 +361,85 @@ pub fn gate(
 
     p.run();
     assemble(&p, candidate, ledger, &adopted)
+}
+
+/// Every ledger entry as facts.
+fn load_ledger(p: &mut Rules, ledger: &[Entry]) {
+    for e in ledger {
+        let r = &e.record;
+        let venture = r.venture().to_string();
+        p.record.push((e.seq, venture.clone(), r.claim(), r.kind()));
+        match r {
+            Record::Report {
+                metric,
+                value: Some(val),
+                ..
+            } => p.report.push((e.seq, venture, metric.clone(), Num(*val))),
+            Record::Decision { verdict, .. } => {
+                let (dk, target) = match verdict {
+                    Verdict::Approve { ask } => (Dk::Approve, *ask),
+                    Verdict::Deny { ask, .. } => (Dk::Deny, *ask),
+                    Verdict::Pause => (Dk::Pause, 0),
+                    Verdict::Resume => (Dk::Resume, 0),
+                    Verdict::Adopt { .. } => (Dk::Adopt, 0),
+                };
+                p.decision.push((e.seq, venture, dk, target));
+            }
+            Record::Ask { action, .. } => {
+                p.asked.push((e.seq, venture.clone()));
+                if let Some(act) = action {
+                    p.ask.push((e.seq, venture, act.clone()));
+                }
+            }
+            Record::Proposal { action, .. } => p.proposal.push((e.seq, venture, action.clone())),
+            Record::Action { action, .. } if action == STOP => p.stopped.push((e.seq, venture)),
+            _ => {}
+        }
+    }
+}
+
+/// What a venture is doing, as the ledger tells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Running,
+    Asking,
+    Paused,
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            State::Running => "running",
+            State::Asking => "asking",
+            State::Paused => "paused",
+        })
+    }
+}
+
+/// The state of a venture: paused after a declared pause or a stop action
+/// until a declared resume; asking while an ask has no declared decision;
+/// running otherwise.
+pub fn state(ledger: &[Entry], venture: &str) -> State {
+    let mut p = Rules::default();
+    load_ledger(&mut p, ledger);
+    p.run();
+    if p.paused.iter().any(|(v,)| v == venture) {
+        State::Paused
+    } else if p.open_ask.iter().any(|(_, v)| v == venture) {
+        State::Asking
+    } else {
+        State::Running
+    }
+}
+
+/// Asks with no declared decision yet, oldest first.
+pub fn open_asks(ledger: &[Entry]) -> Vec<Seq> {
+    let mut p = Rules::default();
+    load_ledger(&mut p, ledger);
+    p.run();
+    let mut open: Vec<Seq> = p.open_ask.iter().map(|(q, _)| *q).collect();
+    open.sort_unstable();
+    open
 }
 
 /// Turn the derived facts into a proof or a refusal that reads top to bottom.
@@ -1379,6 +1438,49 @@ mod tests {
         });
         let text = why(&fx.entries[(q - 1) as usize]);
         assert!(text.contains("because    deploy is irreversible"), "{text}");
+    }
+
+    #[test]
+    fn state_and_open_asks_follow_the_ledger() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(model(), vec![permit("deploy", 1, false, false)], &[]),
+        );
+        assert_eq!(state(&fx.entries, V), State::Running);
+        let q = fx.push(ask(Claim::Inferred, "deploy"));
+        assert_eq!(state(&fx.entries, V), State::Asking);
+        assert_eq!(open_asks(&fx.entries), vec![q]);
+        fx.push(decision(
+            Claim::Inferred,
+            Verdict::Deny {
+                ask: q,
+                reason: "model says no".into(),
+            },
+        ));
+        assert_eq!(
+            open_asks(&fx.entries),
+            vec![q],
+            "an inferred decision does not answer an ask"
+        );
+        fx.push(decision(
+            Claim::Declared,
+            Verdict::Deny {
+                ask: q,
+                reason: "no".into(),
+            },
+        ));
+        assert_eq!(open_asks(&fx.entries), Vec::<Seq>::new());
+        assert_eq!(state(&fx.entries, V), State::Running);
+        fx.push(decision(Claim::Declared, Verdict::Pause));
+        let q2 = fx.push(ask(Claim::Inferred, "deploy"));
+        assert_eq!(
+            state(&fx.entries, V),
+            State::Paused,
+            "paused wins over asking"
+        );
+        assert_eq!(open_asks(&fx.entries), vec![q2]);
+        assert_eq!(state(&fx.entries, "other"), State::Running);
     }
 
     #[test]

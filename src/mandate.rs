@@ -196,6 +196,21 @@ impl Mandate {
         hex::encode(Sha256::digest(text.as_bytes()))
     }
 
+    /// A mandate that permits nothing, for a venture whose mandate cannot
+    /// be read.
+    pub fn empty() -> Mandate {
+        Mandate {
+            purpose: String::new(),
+            metric: String::new(),
+            controller: Controller::Model { backend: None },
+            permitted: vec![],
+            forbidden: vec![],
+            cadence: Duration::from_secs(60),
+            context_budget: default_context_budget(),
+            restart: Restart::default(),
+        }
+    }
+
     /// The permitted action with this name, if any.
     pub fn permitted(&self, name: &str) -> Option<&Permitted> {
         self.permitted.iter().find(|p| p.name == name)
