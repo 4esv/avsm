@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - unreleased
+## 0.1.0 - 2026-10-15
 
 - Ledger: append-only, hash-chained records in SQLite; every record is measured, declared, or inferred.
 - Mandates: `mandate.yaml` says what a venture is for, what number to watch, what it may do, and what it may not.
