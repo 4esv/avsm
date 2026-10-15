@@ -14,7 +14,7 @@ use crate::mandate::{Cap, Controller, Mandate};
 use crate::record::{Claim, Entry, Kind, Record, Seq, Verdict};
 
 /// The action that always passes.
-pub const STOP: &str = "stop";
+pub const STOP: &str = crate::mandate::STOP;
 /// The action that needs a declared decision.
 pub const RESUME: &str = "resume";
 /// The built-in venture that watches avsm itself.
