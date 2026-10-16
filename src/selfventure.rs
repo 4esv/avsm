@@ -124,6 +124,7 @@ pub fn canary() -> Result<(), String> {
         forbidden: vec![],
         cadence: std::time::Duration::from_secs(60),
         context_budget: 1000,
+        summarize_after: 200,
         restart: Restart::Never,
         network: None,
         children: vec![],

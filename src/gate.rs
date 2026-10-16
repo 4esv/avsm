@@ -391,6 +391,48 @@ ascent! {
         !paused(v);
 }
 
+ascent! {
+    /// What the ledger holds true now. Every report is a fact about a
+    /// topic. A measured fact is superseded by a later measured fact on
+    /// the same topic; any fact is superseded by a later one that cites
+    /// it. The rest is current.
+    struct Facts;
+
+    // seq, venture, topic, measured or declared
+    relation fact(Seq, String, String, bool);
+    relation cites(Seq, Seq);
+    relation superseded(Seq);
+    superseded(o) <-- fact(o, v, t, true), fact(n, v, t, true), if n > o;
+    superseded(o) <-- fact(o, v, t, _), fact(n, v, t, _), cites(n, o), if n > o;
+    relation current(Seq, String, String);
+    current(s, v, t) <-- fact(s, v, t, _), !superseded(s);
+}
+
+/// The current facts: (seq, venture, topic), oldest first.
+pub fn current_facts(ledger: &[Entry]) -> Vec<(Seq, String, String)> {
+    let mut f = Facts::default();
+    for e in ledger {
+        if let Record::Report {
+            claim,
+            venture,
+            metric,
+            cites,
+            ..
+        } = &e.record
+        {
+            f.fact
+                .push((e.seq, venture.clone(), metric.clone(), claim.authorizes()));
+            for c in cites {
+                f.cites.push((e.seq, *c));
+            }
+        }
+    }
+    f.run();
+    let mut out: Vec<(Seq, String, String)> = f.current.into_iter().collect();
+    out.sort_unstable();
+    out
+}
+
 /// A threshold as it stands for a venture: the mandate's, or the one its
 /// parent set.
 #[derive(Clone, Debug, PartialEq)]
@@ -1408,6 +1450,7 @@ mod tests {
             forbidden: forbidden.iter().map(|s| s.to_string()).collect(),
             cadence: Duration::from_secs(60),
             context_budget: 8000,
+            summarize_after: 200,
             restart: Restart::OnFailure,
             network: None,
             children: vec![],
@@ -2551,5 +2594,55 @@ mod tests {
         // Without quotas nothing of this applies.
         let s = fx.push(proposal(Claim::Inferred, "buy"));
         assert!(fx.gate(V, "buy", &[s]).is_ok());
+    }
+
+    #[test]
+    fn current_facts_follow_time_for_measured_and_citation_for_the_rest() {
+        let mut fx = Fx::new();
+        let a = fx.push(report(Claim::Measured, 1.0));
+        let b = fx.push(report(Claim::Measured, 2.0));
+        let finding = |note: &str, cites: Vec<Seq>| Record::Report {
+            claim: Claim::Inferred,
+            venture: V.into(),
+            metric: "pricing".into(),
+            value: None,
+            note: note.into(),
+            source: None,
+            confidence: None,
+            cites,
+        };
+        let f1 = fx.push(finding("rivals charge 9", vec![]));
+        let f2 = fx.push(finding("rivals charge 8", vec![]));
+        let f3 = fx.push(finding("rivals charge 7, superseding", vec![f1]));
+        let summary = fx.push(Record::Report {
+            claim: Claim::Inferred,
+            venture: V.into(),
+            metric: "summary".into(),
+            value: None,
+            note: "all of it".into(),
+            source: None,
+            confidence: None,
+            cites: vec![a, b, f1, f2],
+        });
+        let current: Vec<Seq> = current_facts(&fx.entries)
+            .into_iter()
+            .map(|(s, _, _)| s)
+            .collect();
+        assert!(
+            !current.contains(&a),
+            "an older reading is superseded by a newer one"
+        );
+        assert!(current.contains(&b));
+        assert!(
+            !current.contains(&f1),
+            "cited by a later fact on the same topic"
+        );
+        assert!(current.contains(&f2), "a finding is not superseded by time");
+        assert!(current.contains(&f3));
+        assert!(
+            current.contains(&summary),
+            "a summary supersedes no leaf: it has its own topic"
+        );
+        assert_eq!(current, vec![b, f2, f3, summary]);
     }
 }

@@ -23,6 +23,7 @@ impl Role for FakeRole {
         &mut self,
         _ctx: &Context,
         _infer: &mut dyn FnMut(&InferRequest) -> Result<String, String>,
+        _drill: &mut dyn FnMut(&str, &str) -> Result<String, String>,
     ) -> Result<Vec<Record>, String> {
         Ok(self.0.pop_front().unwrap_or_default())
     }

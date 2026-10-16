@@ -27,6 +27,7 @@ impl Role for Scripted {
         &mut self,
         ctx: &Context,
         _infer: &mut dyn FnMut(&InferRequest) -> Result<String, String>,
+        _drill: &mut dyn FnMut(&str, &str) -> Result<String, String>,
     ) -> Result<Vec<Record>, String> {
         self.seen.lock().unwrap().push(ctx.clone());
         Ok(self.replies.pop_front().unwrap_or_default())

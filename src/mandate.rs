@@ -36,6 +36,11 @@ pub struct Mandate {
     /// How much of the ledger a model gets to see, in tokens.
     #[serde(default = "default_context_budget")]
     pub context_budget: u32,
+    /// Past this many records since the last summary, the nightly call
+    /// summarizes the older ones; the leaves stay in the ledger and leave
+    /// the context.
+    #[serde(default = "default_summarize_after")]
+    pub summarize_after: u32,
     /// What to do when `run` dies.
     #[serde(default)]
     pub restart: Restart,
@@ -88,6 +93,10 @@ pub mod network {
 
 fn default_context_budget() -> u32 {
     8000
+}
+
+fn default_summarize_after() -> u32 {
+    200
 }
 
 /// What decides when to act.
@@ -257,6 +266,7 @@ const FIELDS: &[&str] = &[
     "forbidden",
     "cadence",
     "context_budget",
+    "summarize_after",
     "restart",
     "network",
     "children",
@@ -385,6 +395,7 @@ const NEEDS_CADENCE: &str =
 const NEEDS_ACTION: &str =
     "a threshold controller needs an action: the name of a permitted action, or stop";
 const BUDGET: &str = "context_budget must be a whole number of tokens greater than 0, like 4000";
+const SUMMARIZE: &str = "summarize_after must be a whole number of records, at least 2, like 200";
 
 impl Mandate {
     /// Parse and check mandate text.
@@ -605,6 +616,9 @@ impl Mandate {
         if self.context_budget == 0 {
             return fail(format!("{BUDGET}, not 0"));
         }
+        if self.summarize_after < 2 {
+            return fail(format!("{SUMMARIZE}, not {}", self.summarize_after));
+        }
         for c in &self.children {
             if !is_word(c) {
                 return fail(format!("children names ventures, one word each, not {c:?}"));
@@ -673,6 +687,7 @@ impl Mandate {
             forbidden: vec![],
             cadence: Duration::from_secs(60),
             context_budget: default_context_budget(),
+            summarize_after: default_summarize_after(),
             restart: Restart::default(),
             network: None,
             children: vec![],
@@ -793,6 +808,13 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
     check_forbidden(map.get("forbidden"))?;
     check_cadence(map.get("cadence"))?;
     check_context_budget(map.get("context_budget"))?;
+    match map.get("summarize_after") {
+        None => {}
+        Some(value) => match value.as_u64() {
+            Some(n) if (2..=u64::from(u32::MAX)).contains(&n) => {}
+            _ => return fail(format!("{SUMMARIZE}, not {}", describe(value))),
+        },
+    }
     check_restart(map.get("restart"))?;
     check_network(map.get("network"))?;
     match map.get("children") {
@@ -1383,7 +1405,7 @@ forbidden: [rm]
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, restart, network, children, parent"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");
@@ -1943,6 +1965,17 @@ forbidden: [rm]
             ));
             assert_eq!(msg, format!("{BUDGET}, not {found}"));
         }
+    }
+
+    #[test]
+    fn summarize_after_is_a_count_of_records() {
+        assert_eq!(Mandate::parse(VALID).unwrap().summarize_after, 200);
+        let m = Mandate::parse(&format!("{VALID}summarize_after: 40\n")).unwrap();
+        assert_eq!(m.summarize_after, 40);
+        let msg = fails(&format!("{VALID}summarize_after: 1\n"));
+        assert_eq!(msg, format!("{SUMMARIZE}, not the number 1"));
+        let msg = fails(&format!("{VALID}summarize_after: many\n"));
+        assert_eq!(msg, format!("{SUMMARIZE}, not the text \"many\""));
     }
 
     #[test]

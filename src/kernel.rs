@@ -20,7 +20,7 @@ use crate::gate::{self, Adopted, Candidate, Reason, State, Step, SELF};
 use crate::ledger::Ledger;
 use crate::mandate::{Controller, Permitted, Restart};
 use crate::record::{Claim, Entry, Payload, Record, Seq, Verdict};
-use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role};
+use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role, SUMMARY};
 use crate::venture::{self, Venture};
 use crate::warden::{self, FromWarden, LocalWarden, ToWarden, Warden};
 
@@ -94,6 +94,7 @@ impl Role for NoRole {
         &mut self,
         _ctx: &Context,
         _infer: &mut dyn FnMut(&InferRequest) -> Result<String, String>,
+        _drill: &mut dyn FnMut(&str, &str) -> Result<String, String>,
     ) -> Result<Vec<Record>, String> {
         Err("no roles process; start avsm with: avsm start".to_string())
     }
@@ -207,6 +208,7 @@ impl Kernel {
             ("pause", [name]) => self.pause(name),
             ("resume", [name]) => self.resume(name),
             ("why", [seq]) => self.why(parse_seq(seq)?),
+            ("know", [what]) => self.know(what),
             ("propose", [venture, lever]) => self.propose(venture, lever, None),
             ("propose", [venture, lever, payload @ ..]) => {
                 self.propose(venture, lever, Some(&payload.join(" ")))
@@ -603,30 +605,16 @@ impl Kernel {
     /// The proof behind a record. A proposal is gated afresh, so the text
     /// says what would happen if it were acted on now.
     pub fn why(&self, seq: Seq) -> Result<String, String> {
-        let entry = self.entry(seq)?;
-        if let Record::Proposal {
-            venture, action, ..
-        } = &entry.record
-        {
-            let entries = self.entries()?;
-            let candidate = Candidate {
-                venture: venture.clone(),
-                action: action.clone(),
-                cites: vec![seq],
-            };
-            let derivation = match gate::gate_with(
-                &candidate,
-                &entries,
-                &self.adopted(),
-                &self.config.quotas,
-                now(),
-            ) {
-                Ok(proof) => proof.to_string(),
-                Err(refusal) => refusal.to_string(),
-            };
-            return Ok(format!("{}\n{derivation}", entry.line()));
-        }
-        Ok(gate::why(&entry))
+        let entries = self.entries()?;
+        why_in(&entries, &self.adopted(), &self.config.quotas, seq)
+    }
+
+    /// What is held true now about a venture, or about a topic across
+    /// ventures: each current fact with its age, claim and leaves.
+    pub fn know(&self, what: &str) -> Result<String, String> {
+        let entries = self.entries()?;
+        let ventures: BTreeSet<String> = self.ventures.keys().cloned().collect();
+        Ok(know_in(&entries, &ventures, what))
     }
 
     // ----- the loop -----
@@ -1058,6 +1046,53 @@ impl Kernel {
             .filter(|e| e.record.venture() == name)
             .cloned()
             .collect();
+        // Context by budget: the mandate, the latest summary, the records
+        // it does not stand for, and the open asks. Past the venture's
+        // bound, the older records go to the role to be summarized first;
+        // the previous summary goes with them so the new one carries it.
+        let is_summary = |e: &Entry| {
+            matches!(&e.record, Record::Report { claim: Claim::Inferred, metric, cites, .. }
+                if metric == SUMMARY && !cites.is_empty())
+        };
+        let summaries: Vec<Entry> = mine.iter().filter(|e| is_summary(e)).cloned().collect();
+        let covered: Seq = summaries
+            .iter()
+            .flat_map(|s| s.record.cites().iter().copied())
+            .max()
+            .unwrap_or(0);
+        let latest_summary: Vec<Entry> = summaries
+            .last()
+            .filter(|s| s.seq > covered)
+            .cloned()
+            .into_iter()
+            .collect();
+        let open = gate::open_asks(&entries);
+        let asks: Vec<Entry> = mine
+            .iter()
+            .filter(|e| open.contains(&e.seq))
+            .cloned()
+            .collect();
+        let uncovered: Vec<Entry> = mine
+            .iter()
+            .filter(|e| e.seq > covered && !is_summary(e) && !open.contains(&e.seq))
+            .cloned()
+            .collect();
+        let bound = v.mandate.summarize_after as usize;
+        let (to_summarize, recent) = if uncovered.len() > bound {
+            let keep = bound / 2;
+            let mut older: Vec<Entry> = latest_summary.clone();
+            older.extend_from_slice(&uncovered[..uncovered.len() - keep]);
+            (older, uncovered[uncovered.len() - keep..].to_vec())
+        } else {
+            (vec![], uncovered)
+        };
+        let fixed: usize = serde_yaml::to_string(&v.mandate).map_or(0, |t| t.len())
+            + asks.iter().map(|e| e.line().len() + 1).sum::<usize>()
+            + latest_summary
+                .iter()
+                .map(|e| e.record.summary().len() + 1)
+                .sum::<usize>();
+        let limit = (v.mandate.context_budget as usize * 4).saturating_sub(fixed);
         // A parent sees its children's metrics and records: what code
         // measured and humans declared, never a model's or the world's
         // raw input into them.
@@ -1101,15 +1136,49 @@ impl Kernel {
         let ctx = Context {
             venture: name.to_string(),
             mandate: v.mandate.clone(),
-            entries: role::trim_to_budget(&mine, v.mandate.context_budget),
+            entries: role::trim_to_chars(&recent, limit),
             state: gate::state(&entries, &self.adopted(), name).to_string(),
             now: now(),
             backend,
             children,
+            summaries: latest_summary,
+            asks,
+            to_summarize,
         };
+        let adopted = self.adopted();
+        let ventures: BTreeSet<String> = self.ventures.keys().cloned().collect();
+        let quotas = self.config.quotas.clone();
         let records = {
-            let Kernel { role, warden, .. } = self;
-            role.decide(&ctx, &mut |req| warden.infer(req))
+            let Kernel {
+                role,
+                warden,
+                ledger,
+                ..
+            } = self;
+            // A drill reads the ledger as it stood when the cycle began,
+            // and is itself a record.
+            let mut drill = |what: &str, arg: &str| -> Result<String, String> {
+                let text = match what {
+                    "know" => know_in(&entries, &ventures, arg),
+                    "why" => why_in(&entries, &adopted, &quotas, parse_seq(arg)?)?,
+                    _ => return Err(format!("a drill is know or why, not {what}")),
+                };
+                let note = format!("{arg}: {} lines shown", text.lines().count());
+                ledger
+                    .append(Record::Report {
+                        claim: Claim::Inferred,
+                        venture: name.to_string(),
+                        metric: what.to_string(),
+                        value: None,
+                        note,
+                        source: None,
+                        confidence: None,
+                        cites: vec![],
+                    })
+                    .map_err(|e| e.to_string())?;
+                Ok(text.chars().take(6000).collect())
+            };
+            role.decide(&ctx, &mut |req| warden.infer(req), &mut drill)
         };
         let records = match records {
             Ok(r) => r,
@@ -1159,9 +1228,34 @@ impl Kernel {
                         payload,
                     }
                 }
+                Record::Report {
+                    metric,
+                    note,
+                    cites,
+                    ..
+                } if metric == SUMMARY => {
+                    // A summary stands only for this venture's own records.
+                    let own = cites.iter().all(|c| mine.iter().any(|e| e.seq == *c));
+                    if cites.is_empty() || !own || note.trim().is_empty() {
+                        log(&format!(
+                            "{name}: role returned a summary that cites no records of its own"
+                        ));
+                        continue;
+                    }
+                    Record::Report {
+                        claim: Claim::Inferred,
+                        venture: name.to_string(),
+                        metric,
+                        value: None,
+                        note: note.chars().take(role::SUMMARY_MAX + 1).collect(),
+                        source: None,
+                        confidence: None,
+                        cites,
+                    }
+                }
                 other => {
                     log(&format!(
-                        "{name}: role returned a {} record; only proposals and asks count",
+                        "{name}: role returned a {} record; only proposals, asks and summaries count",
                         other.kind()
                     ));
                     continue;
@@ -1309,6 +1403,102 @@ fn spawn_run(home: &Path, name: &str, path: &Path, confine: bool) -> Result<Chil
         .map_err(|e| format!("cannot run {}: {e}", path.display()))
 }
 
+/// The proof behind a record, from a snapshot of the ledger.
+fn why_in(
+    entries: &[Entry],
+    adopted: &[Adopted],
+    quotas: &crate::config::Quotas,
+    seq: Seq,
+) -> Result<String, String> {
+    let entry = entries
+        .iter()
+        .find(|e| e.seq == seq)
+        .ok_or_else(|| format!("no record #{seq}"))?;
+    if let Record::Proposal {
+        venture, action, ..
+    } = &entry.record
+    {
+        let candidate = Candidate {
+            venture: venture.clone(),
+            action: action.clone(),
+            cites: vec![seq],
+        };
+        let derivation = match gate::gate_with(&candidate, entries, adopted, quotas, now()) {
+            Ok(proof) => proof.to_string(),
+            Err(refusal) => refusal.to_string(),
+        };
+        return Ok(format!("{}\n{derivation}", entry.line()));
+    }
+    Ok(gate::why(entry))
+}
+
+/// The current facts about a venture (when `what` names one) or a topic,
+/// from a snapshot of the ledger: number, age, claim, the fact, and what
+/// it rests on.
+fn know_in(entries: &[Entry], ventures: &BTreeSet<String>, what: &str) -> String {
+    let by_venture = ventures.contains(what) || what == SELF;
+    let current = gate::current_facts(entries);
+    let picked: Vec<&Entry> = current
+        .iter()
+        .filter(|(_, v, t)| if by_venture { v == what } else { t == what })
+        .filter_map(|(s, _, _)| entries.iter().find(|e| e.seq == *s))
+        .collect();
+    if picked.is_empty() {
+        return format!(
+            "nothing is known about {what}; it is {}\n",
+            if by_venture {
+                "a venture with no report yet"
+            } else {
+                "neither a venture nor a topic any record carries"
+            }
+        );
+    }
+    let now = now();
+    let mut out = format!(
+        "{what}: {} current {}\n",
+        picked.len(),
+        if picked.len() == 1 { "fact" } else { "facts" }
+    );
+    for e in picked {
+        let mut rests = Vec::new();
+        if let Record::Report {
+            source,
+            confidence,
+            cites,
+            ..
+        } = &e.record
+        {
+            if let Some(s) = source {
+                rests.push(format!("source {s}"));
+            }
+            if let Some(c) = confidence {
+                rests.push(format!("confidence {c}"));
+            }
+            if !cites.is_empty() {
+                let list: Vec<String> = cites.iter().map(|c| format!("#{c}")).collect();
+                rests.push(format!("leaves {}", list.join(" ")));
+            }
+        }
+        let line = if by_venture {
+            e.record.summary()
+        } else {
+            format!("{}  {}", e.record.venture(), e.record.summary())
+        };
+        out.push_str(&format!(
+            "#{:<5} {:<8} {:<9} {line}{}\n",
+            e.seq,
+            ago(now - e.at),
+            e.record.claim(),
+            if rests.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", rests.join("; "))
+            }
+        ));
+    }
+    out
+}
+
 /// A payload as the lever takes it: dropped when the lever takes none,
 /// re-read into the lever's shape when the role gave another.
 fn fit_payload(
@@ -1386,6 +1576,7 @@ pub enum ToRoles {
 #[serde(rename_all = "snake_case")]
 pub enum FromRoles {
     Infer(InferRequest),
+    Drill(String, String),
     Records(Vec<Record>),
     Err(String),
 }
@@ -1574,12 +1765,20 @@ impl Role for RolesProcess {
         &mut self,
         ctx: &Context,
         infer: &mut dyn FnMut(&InferRequest) -> Result<String, String>,
+        drill: &mut dyn FnMut(&str, &str) -> Result<String, String>,
     ) -> Result<Vec<Record>, String> {
         self.0.send(&ToRoles::Decide(Box::new(ctx.clone())))?;
         loop {
             match self.0.recv::<FromRoles>()? {
                 FromRoles::Infer(req) => {
                     let reply = match infer(&req) {
+                        Ok(t) => ToRoles::Text(t),
+                        Err(e) => ToRoles::Err(e),
+                    };
+                    self.0.send(&reply)?;
+                }
+                FromRoles::Drill(what, arg) => {
+                    let reply = match drill(&what, &arg) {
                         Ok(t) => ToRoles::Text(t),
                         Err(e) => ToRoles::Err(e),
                     };
@@ -1651,9 +1850,11 @@ pub fn roles_main() -> Result<(), String> {
                 continue;
             }
         };
-        let mut infer = |req: &InferRequest| -> Result<String, String> {
-            say(&FromRoles::Infer(req.clone()))?;
+        let lines = std::cell::RefCell::new(&mut lines);
+        let ask = |msg: &FromRoles| -> Result<String, String> {
+            say(msg)?;
             let line = lines
+                .borrow_mut()
                 .next()
                 .ok_or_else(|| "the kernel hung up".to_string())?
                 .map_err(|e| e.to_string())?;
@@ -1664,7 +1865,10 @@ pub fn roles_main() -> Result<(), String> {
                 Err(e) => Err(format!("bad reply: {e}")),
             }
         };
-        let reply = match role.decide(&ctx, &mut infer) {
+        let mut infer = |req: &InferRequest| ask(&FromRoles::Infer(req.clone()));
+        let mut drill =
+            |what: &str, arg: &str| ask(&FromRoles::Drill(what.to_string(), arg.to_string()));
+        let reply = match role.decide(&ctx, &mut infer, &mut drill) {
             Ok(records) => FromRoles::Records(records),
             Err(e) => FromRoles::Err(e),
         };

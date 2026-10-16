@@ -24,6 +24,7 @@ impl Role for Quiet {
         &mut self,
         _ctx: &Context,
         _infer: &mut dyn FnMut(&InferRequest) -> Result<String, String>,
+        _drill: &mut dyn FnMut(&str, &str) -> Result<String, String>,
     ) -> Result<Vec<Record>, String> {
         Ok(vec![])
     }

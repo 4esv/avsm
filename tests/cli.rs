@@ -88,7 +88,7 @@ fn help_reads_plainly() {
     let help = String::from_utf8_lossy(&out.stdout).to_lowercase();
     for cmd in [
         "start", "add", "status", "tail", "asks", "approve", "deny", "pause", "resume", "why",
-        "propose",
+        "propose", "know",
     ] {
         assert!(
             help.contains(&format!("  {cmd} ")),
@@ -101,7 +101,7 @@ fn help_reads_plainly() {
         assert!(!help.contains(word), "help uses jargon {word:?}:\n{help}");
     }
     for cmd in [
-        "add", "tail", "approve", "deny", "pause", "resume", "why", "propose",
+        "add", "tail", "approve", "deny", "pause", "resume", "why", "propose", "know",
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_avsm"))
             .args([cmd, "--help"])

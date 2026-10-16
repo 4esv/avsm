@@ -64,6 +64,7 @@ fn valid_fixture_parses_field_by_field() {
         forbidden: vec!["rm".into()],
         cadence: Duration::from_secs(30),
         context_budget: 4000,
+        summarize_after: 200,
         restart: Restart::OnFailure,
         network: None,
         children: vec![],
