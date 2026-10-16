@@ -16,10 +16,10 @@ use chrono::{Local, NaiveDate, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::gate::{self, Adopted, Candidate, Reason, State, Step, SELF};
+use crate::gate::{self, Adopted, Candidate, Reason, State, Step, DELEGATE, SELF};
 use crate::ledger::Ledger;
-use crate::mandate::{Controller, Permitted, Restart};
-use crate::record::{Claim, Entry, Payload, Record, Seq, Verdict};
+use crate::mandate::{self, Cap, Controller, Permitted, Restart};
+use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Verdict};
 use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role, SUMMARY};
 use crate::venture::{self, Venture};
 use crate::warden::{self, FromWarden, LocalWarden, ToWarden, Warden};
@@ -44,6 +44,8 @@ pub struct Kernel {
     handled: BTreeSet<Seq>,
     /// The local date each venture last had its nightly cycle.
     cycled: BTreeMap<String, NaiveDate>,
+    /// The local date the digest was last written.
+    digested: Option<NaiveDate>,
     /// Who is giving the command being handled, when the path it came in
     /// over knows: a Tailscale login. The socket knows nobody.
     by: Option<String>,
@@ -144,6 +146,7 @@ impl Kernel {
             runtime: BTreeMap::new(),
             handled: BTreeSet::new(),
             cycled: BTreeMap::new(),
+            digested: None,
             by: None,
             namespaces: None,
         };
@@ -209,6 +212,7 @@ impl Kernel {
             ("resume", [name]) => self.resume(name),
             ("why", [seq]) => self.why(parse_seq(seq)?),
             ("know", [what]) => self.know(what),
+            ("digest", []) => self.digest(),
             ("propose", [venture, lever]) => self.propose(venture, lever, None),
             ("propose", [venture, lever, payload @ ..]) => {
                 self.propose(venture, lever, Some(&payload.join(" ")))
@@ -644,12 +648,198 @@ impl Kernel {
         }
         if !halted {
             self.act_on_decisions();
+            self.ratchet();
             for name in &names {
                 if self.nightly_due(name) {
                     self.cycle(name);
                 }
             }
+            if self.digest_due() {
+                match self.record_digest() {
+                    Ok(e) => log(&e.line()),
+                    Err(e) => log(&format!("cannot write the digest: {e}")),
+                }
+            }
         }
+    }
+
+    /// Self watches decisions: when a lever that asks each time has been
+    /// approved `ratchet` times with the same shape of payload since the
+    /// last word on delegating it, self proposes the mandate change that
+    /// delegates it, with the approvals as evidence. The proposal goes
+    /// through the gate like any other, and becomes an ask.
+    fn ratchet(&mut self) {
+        let n = self.config.ratchet as usize;
+        if n == 0 {
+            return;
+        }
+        let Ok(entries) = self.entries() else { return };
+        let open = gate::open_asks(&entries);
+        let ventures: Vec<Venture> = self
+            .ventures
+            .values()
+            .filter(|v| v.name != SELF && v.problem.is_none() && v.path.is_some())
+            .cloned()
+            .collect();
+        for v in ventures {
+            let asked_already = entries.iter().any(|e| {
+                open.contains(&e.seq)
+                    && e.record.venture() == v.name
+                    && e.record.action() == Some(DELEGATE)
+            });
+            if asked_already {
+                continue;
+            }
+            for perm in &v.mandate.permitted {
+                let asks_each_time =
+                    !perm.delegated && (!perm.reversible || perm.takes().is_some());
+                if !asks_each_time || (perm.is_parent_lever() && perm.name == "resume") {
+                    continue;
+                }
+                // The last word on delegating this lever: an approval or
+                // denial of an earlier delegate ask naming it.
+                let since = entries
+                    .iter()
+                    .rev()
+                    .find(|e| {
+                        matches!(&e.record, Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Approve { ask, .. } | Verdict::Deny { ask, .. }, .. }
+                            if *venture == v.name && delegate_ask_names(&entries, *ask, &perm.name))
+                    })
+                    .map_or(0, |e| e.seq);
+                let approvals: Vec<(Seq, String)> = entries
+                    .iter()
+                    .filter(|e| e.seq > since)
+                    .filter_map(|e| match &e.record {
+                        Record::Decision {
+                            claim: Claim::Declared,
+                            venture,
+                            verdict: Verdict::Approve { ask, payload },
+                            ..
+                        } if *venture == v.name => {
+                            let asked = entries.iter().find(|a| a.seq == *ask)?;
+                            if asked.record.action() != Some(perm.name.as_str()) {
+                                return None;
+                            }
+                            let shape = payload
+                                .as_ref()
+                                .or(asked.record.payload())
+                                .map_or("none".to_string(), Payload::shape);
+                            Some((e.seq, shape))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let mut by_shape: BTreeMap<&str, Vec<Seq>> = BTreeMap::new();
+                for (seq, shape) in &approvals {
+                    by_shape.entry(shape.as_str()).or_default().push(*seq);
+                }
+                let Some((shape, seqs)) = by_shape.iter().find(|(_, s)| s.len() >= n) else {
+                    continue;
+                };
+                let Some(dir) = v.path.as_ref() else { continue };
+                let text = match std::fs::read_to_string(dir.join(venture::MANDATE_FILE)) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log(&format!("{}: cannot read the mandate: {e}", v.name));
+                        continue;
+                    }
+                };
+                let changed = match mandate::delegate_text(&text, &perm.name) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log(&format!("{}: cannot delegate {}: {e}", v.name, perm.name));
+                        continue;
+                    }
+                };
+                let list: Vec<String> = seqs.iter().map(|s| format!("#{s}")).collect();
+                let reason = format!(
+                    "{} was approved {} times with {} ({}); delegating it ends the asks",
+                    perm.name,
+                    seqs.len(),
+                    if *shape == "none" {
+                        "no payload".to_string()
+                    } else {
+                        format!("a {shape} payload")
+                    },
+                    list.join(", ")
+                );
+                let proposal = match self.append(Record::Proposal {
+                    claim: Claim::Measured,
+                    venture: v.name.clone(),
+                    action: DELEGATE.to_string(),
+                    reason,
+                    payload: Some(Payload::Text { text: changed }),
+                }) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log(&format!("{}: cannot write the proposal: {e}", v.name));
+                        continue;
+                    }
+                };
+                log(&proposal.line());
+                self.act(&v.name, DELEGATE, vec![proposal.seq], Claim::Measured);
+                break;
+            }
+        }
+    }
+
+    /// Is the nightly digest due: past the nightly time, with none written
+    /// today?
+    fn digest_due(&self) -> bool {
+        let Ok(Some(at)) = self.config.nightly_minutes() else {
+            return false;
+        };
+        let local = Local::now();
+        if local.hour() * 60 + local.minute() < at {
+            return false;
+        }
+        let today = local.date_naive();
+        if self.digested == Some(today) {
+            return false;
+        }
+        let Ok(entries) = self.entries() else {
+            return false;
+        };
+        !entries.iter().any(|e| {
+            matches!(&e.record, Record::Report { venture, metric, .. } if venture == SELF && metric == "digest")
+                && Local
+                    .timestamp_opt(e.at, 0)
+                    .single()
+                    .is_some_and(|t| t.date_naive() == today)
+        })
+    }
+
+    /// What happened since the last digest, or over the last day: one
+    /// line per venture with its metric and how it moved, the actions,
+    /// the asks, the cost; and self's asks and incidents a week.
+    pub fn digest(&self) -> Result<String, String> {
+        let entries = self.entries()?;
+        Ok(digest_text(&entries, &self.ventures, now()))
+    }
+
+    /// Write the digest as a record of self, with self's weekly counts.
+    pub fn record_digest(&mut self) -> Result<Entry, String> {
+        let entries = self.entries()?;
+        let now = now();
+        let text = digest_text(&entries, &self.ventures, now);
+        let (asks, incidents) = weekly(&entries, now);
+        self.digested = Some(Local::now().date_naive());
+        let entry = self.append(Record::report(Claim::Measured, SELF, "digest", None, &text))?;
+        self.append(Record::report(
+            Claim::Measured,
+            SELF,
+            "asks_per_week",
+            Some(f64::from(asks)),
+            "",
+        ))?;
+        self.append(Record::report(
+            Claim::Measured,
+            SELF,
+            "incidents_per_week",
+            Some(f64::from(incidents)),
+            "failed actions, broken chains and stops",
+        ))?;
+        Ok(entry)
     }
 
     /// Start, restart or stop a venture's `run` as its state and policy say.
@@ -870,7 +1060,28 @@ impl Kernel {
             now(),
         ) {
             Ok(_) => match self.warden.execute(&candidate) {
-                Ok(written) => lines.extend(written.iter().map(Entry::line)),
+                Ok(written) => {
+                    lines.extend(written.iter().map(Entry::line));
+                    // A changed mandate adopted: take it on afresh, as
+                    // `avsm add` would.
+                    let adopted = written.iter().any(|e| {
+                        matches!(
+                            &e.record,
+                            Record::Decision {
+                                verdict: Verdict::Adopt { .. },
+                                ..
+                            }
+                        )
+                    });
+                    if adopted {
+                        if let Err(e) = self.reload() {
+                            lines.push(format!("{name}: cannot reload: {e}"));
+                        }
+                        if let Some(mut rt) = self.runtime.remove(name) {
+                            kill(&mut rt);
+                        }
+                    }
+                }
                 Err(e) => lines.push(format!("{name}: {action} did not run: {e}")),
             },
             Err(refusal) => {
@@ -897,9 +1108,20 @@ impl Kernel {
                         .iter()
                         .filter_map(|s| entries.iter().find(|e| e.seq == *s))
                         .find_map(|e| e.record.payload().cloned());
+                    // The question carries the proposal's reason, so the
+                    // human sees why without a drill.
+                    let reason = candidate
+                        .cites
+                        .iter()
+                        .filter_map(|s| entries.iter().find(|e| e.seq == *s))
+                        .find_map(|e| match &e.record {
+                            Record::Proposal { reason, .. } => Some(format!("  {reason}")),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
                     let question = match &payload {
-                        Some(_) => format!("may I {action} with this?"),
-                        None => format!("may I {action}? it is irreversible"),
+                        Some(_) => format!("may I {action} with this?{reason}"),
+                        None => format!("may I {action}? it is irreversible{reason}"),
                     };
                     match self.append(Record::Ask {
                         claim,
@@ -1401,6 +1623,150 @@ fn spawn_run(home: &Path, name: &str, path: &Path, confine: bool) -> Result<Chil
     }
     cmd.spawn()
         .map_err(|e| format!("cannot run {}: {e}", path.display()))
+}
+
+/// Does this ask, a delegate ask, name the lever? The question says so.
+fn delegate_ask_names(entries: &[Entry], ask: Seq, lever: &str) -> bool {
+    entries.iter().any(|e| {
+        e.seq == ask
+            && e.record.action() == Some(DELEGATE)
+            && matches!(&e.record, Record::Proposal { reason, .. } | Record::Ask { question: reason, .. }
+                if reason.starts_with(&format!("{lever} was approved")) || reason.contains(&format!(" {lever} was approved")))
+    })
+}
+
+/// Asks this week, and incidents this week: failed actions and outcomes,
+/// a broken chain or canary, and stops.
+fn weekly(entries: &[Entry], now: i64) -> (u32, u32) {
+    let since = now - 7 * Cap::DAY.as_secs() as i64;
+    let week = entries.iter().filter(|e| e.at > since);
+    let mut asks = 0;
+    let mut incidents = 0;
+    for e in week {
+        match &e.record {
+            Record::Ask { .. } => asks += 1,
+            Record::Action { ok: false, .. } | Record::Outcome { ok: false, .. } => incidents += 1,
+            Record::Action { action, .. } if action == crate::gate::STOP => incidents += 1,
+            Record::Report {
+                venture,
+                metric,
+                value: Some(v),
+                ..
+            } if venture == SELF && metric == "integrity" && *v < 1.0 => incidents += 1,
+            _ => {}
+        }
+    }
+    (asks, incidents)
+}
+
+/// The digest text: since the last digest when there is one this week,
+/// else the last day.
+fn digest_text(entries: &[Entry], ventures: &BTreeMap<String, Venture>, now: i64) -> String {
+    let day = Cap::DAY.as_secs() as i64;
+    // Since the last digest record when there is one this week, by its
+    // place in the ledger; else the last day, by time.
+    let last_digest = entries
+        .iter()
+        .rev()
+        .find(|e| matches!(&e.record, Record::Report { venture, metric, .. } if venture == SELF && metric == "digest"))
+        .filter(|e| e.at > now - 7 * day);
+    let since = last_digest.map_or(now - day, |e| e.at);
+    let window: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| match last_digest {
+            Some(d) => e.seq > d.seq,
+            None => e.at > since,
+        })
+        .collect();
+    let count = |kinds: &[Kind], v: Option<&str>| {
+        window
+            .iter()
+            .filter(|e| kinds.contains(&e.record.kind()))
+            .filter(|e| v.is_none_or(|v| e.record.venture() == v))
+            .count()
+    };
+    let cost_of = |e: &Entry| -> u32 {
+        ventures
+            .get(e.record.venture())
+            .and_then(|v| e.record.action().and_then(|a| v.mandate.permitted(a)))
+            .map_or(0, |p| p.cost)
+    };
+    let total_cost: u32 = window
+        .iter()
+        .filter(|e| matches!(e.record.kind(), Kind::Action | Kind::Intent))
+        .map(|e| cost_of(e))
+        .sum();
+    let since_text = chrono::DateTime::from_timestamp(since, 0).map_or(since.to_string(), |t| {
+        t.format("%Y-%m-%dT%H:%MZ").to_string()
+    });
+    let mut out = format!(
+        "digest since {since_text}: {} ventures, {} actions, {} asks, cost {total_cost}
+",
+        ventures.len(),
+        count(&[Kind::Action, Kind::Intent], None),
+        count(&[Kind::Ask], None),
+    );
+    let mut names: Vec<&String> = ventures.keys().filter(|n| *n != SELF).collect();
+    names.push(&ventures[SELF].name);
+    let (asks_week, incidents_week) = weekly(entries, now);
+    for name in names.into_iter().filter(|n| ventures.contains_key(*n)) {
+        let v = &ventures[name];
+        let metric = v.mandate.metric_name();
+        let reading = |e: &&Entry| -> Option<f64> {
+            match &e.record {
+                Record::Report {
+                    venture,
+                    metric: m,
+                    value,
+                    ..
+                } if venture == name && m == metric => *value,
+                _ => None,
+            }
+        };
+        let latest = window.iter().rev().find_map(reading);
+        let before = entries
+            .iter()
+            .filter(|e| e.at <= since)
+            .rev()
+            .find_map(|e| reading(&e));
+        let metric_text = match latest {
+            Some(value) => {
+                let delta = match before {
+                    Some(b) if (value - b).abs() < f64::EPSILON => " (=)".to_string(),
+                    Some(b) => format!(" ({:+})", value - b),
+                    None => String::new(),
+                };
+                format!("{metric}={value}{delta}")
+            }
+            None => format!("{metric}: no report"),
+        };
+        if name == SELF {
+            out.push_str(&format!(
+                "{name:<12} {metric_text:<20} asks {asks_week}/week  incidents {incidents_week}/week
+"
+            ));
+        } else {
+            out.push_str(&format!(
+                "{name:<12} {metric_text:<20} {} actions  {} asks  cost {}
+",
+                count(&[Kind::Action, Kind::Intent], Some(name)),
+                count(&[Kind::Ask], Some(name)),
+                window
+                    .iter()
+                    .filter(|e| e.record.venture() == name
+                        && matches!(e.record.kind(), Kind::Action | Kind::Intent))
+                    .map(|e| cost_of(e))
+                    .sum::<u32>()
+            ));
+        }
+    }
+    let open = gate::open_asks(entries).len();
+    out.push_str(&format!(
+        "open asks: {open}{}
+",
+        if open > 0 { "  (avsm asks)" } else { "" }
+    ));
+    out
 }
 
 /// The proof behind a record, from a snapshot of the ledger.

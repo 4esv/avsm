@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapter::{self, Occasion};
 use crate::config::{self, Backend, Config};
-use crate::gate::{self, Candidate, RESUME, STOP};
+use crate::gate::{self, Candidate, DELEGATE, RESUME, STOP};
 use crate::ledger::Ledger;
-use crate::mandate::ParentCall;
+use crate::mandate::{Mandate, ParentCall};
+use crate::record::Verdict;
 use crate::record::{Claim, Entry, Payload, Record};
 use crate::research;
 use crate::role::InferRequest;
@@ -73,6 +74,67 @@ impl Warden for LocalWarden {
             .get(&venture)
             .and_then(|v| v.mandate.permitted(&action))
             .is_some_and(crate::mandate::Permitted::is_parent_lever);
+        if action == DELEGATE {
+            // The changed mandate is the payload the proof names; writing
+            // it and adopting it is the action, and the adoption is
+            // declared because the decision that allowed it was.
+            let v = ventures
+                .get(&venture)
+                .ok_or_else(|| format!("no venture named {venture}"))?;
+            let dir = v
+                .path
+                .clone()
+                .ok_or_else(|| format!("{venture} has no mandate file to rewrite"))?;
+            let text = proof
+                .payload_from()
+                .and_then(|seq| entries.iter().find(|e| e.seq == seq))
+                .and_then(|e| e.record.payload().map(Payload::text))
+                .ok_or("the proof names no mandate text")?;
+            let mandate = Mandate::parse(&text).map_err(|e| format!("the new mandate: {e}"))?;
+            let by = proof
+                .decision()
+                .and_then(|seq| entries.iter().find(|e| e.seq == seq))
+                .and_then(|e| match &e.record {
+                    Record::Decision { by, .. } => by.clone(),
+                    _ => None,
+                });
+            let path = dir.join(venture::MANDATE_FILE);
+            std::fs::write(&path, &text)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            let hash = Mandate::hash(&text);
+            let delegated: Vec<&str> = mandate
+                .permitted
+                .iter()
+                .filter(|p| p.delegated)
+                .map(|p| p.name.as_str())
+                .collect();
+            written.push(append(Record::Action {
+                claim: Claim::Measured,
+                venture: venture.clone(),
+                action,
+                proof,
+                ok: true,
+                detail: format!(
+                    "mandate rewritten; delegated: {}",
+                    if delegated.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        delegated.join(", ")
+                    }
+                ),
+                payload: None,
+            })?);
+            written.push(append(Record::Decision {
+                claim: Claim::Declared,
+                venture,
+                verdict: Verdict::Adopt {
+                    mandate: hash,
+                    path: dir.to_string_lossy().into_owned(),
+                },
+                by,
+            })?);
+            return Ok(written);
+        }
         if (action == STOP || action == RESUME) && !parent_lever {
             written.push(append(Record::Action {
                 claim: Claim::Measured,

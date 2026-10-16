@@ -211,7 +211,9 @@ fn a_child_paused_by_its_parent_cannot_act_and_its_run_stops() {
     // The parent's resume is declared-only: it asks, a human approves.
     let out = lines_of(&mut k, "portfolio", "resume", "shop");
     assert!(
-        out.contains("ask       resume? may I resume with this?  [text \"shop\"]"),
+        out.contains(
+            "ask       resume? may I resume with this?  proposed by hand  [text \"shop\"]"
+        ),
         "{out}"
     );
     let ask = out

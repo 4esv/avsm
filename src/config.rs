@@ -45,6 +45,14 @@ pub struct Config {
     /// them before the gate sees it.
     #[serde(default)]
     pub quotas: Quotas,
+    /// After this many approvals of the same lever with the same shape of
+    /// payload, self proposes delegating it. 0 turns the ratchet off.
+    #[serde(default = "default_ratchet")]
+    pub ratchet: u32,
+}
+
+fn default_ratchet() -> u32 {
+    5
 }
 
 /// Limits shared by every venture, each like `20/day`.
@@ -149,6 +157,7 @@ impl Default for Config {
             port: default_port(),
             remote_users: vec![],
             quotas: Quotas::default(),
+            ratchet: default_ratchet(),
         }
     }
 }
@@ -403,6 +412,14 @@ mod tests {
         assert!(Config::parse("adapters:\n  mail: {command: \"\"}\n")
             .unwrap_err()
             .contains("sendmail"));
+    }
+
+    #[test]
+    fn the_ratchet_defaults_to_five() {
+        assert_eq!(Config::default().ratchet, 5);
+        assert_eq!(Config::parse("ratchet: 3\n").unwrap().ratchet, 3);
+        assert_eq!(Config::parse("ratchet: 0\n").unwrap().ratchet, 0);
+        assert!(Config::parse("ratchet: often\n").is_err());
     }
 
     #[test]

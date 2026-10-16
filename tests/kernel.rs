@@ -652,7 +652,7 @@ fn payload_levers_ask_first_run_with_what_the_human_approved() {
         ),
         (
             Kind::Ask,
-            "announce? may I announce with this?  [text \"Hello all\"]",
+            "announce? may I announce with this?  the night is long  [text \"Hello all\"]",
         ),
         (
             Kind::Proposal,

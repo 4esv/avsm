@@ -88,7 +88,7 @@ fn help_reads_plainly() {
     let help = String::from_utf8_lossy(&out.stdout).to_lowercase();
     for cmd in [
         "start", "add", "status", "tail", "asks", "approve", "deny", "pause", "resume", "why",
-        "propose", "know",
+        "propose", "know", "digest",
     ] {
         assert!(
             help.contains(&format!("  {cmd} ")),
@@ -399,7 +399,7 @@ fn propose_asks_and_approve_edit_over_the_socket() {
     let (ok, text) = run(&["propose", "shop", "mail", "Dear all,"]);
     assert!(ok, "{text}");
     assert!(
-        text.contains("declared  ask       mail? may I mail with this?  [text \"Dear all,\"]"),
+        text.contains("declared  ask       mail? may I mail with this?  proposed by hand  [text \"Dear all,\"]"),
         "{text}"
     );
     let ask = text

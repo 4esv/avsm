@@ -716,6 +716,99 @@ impl Mandate {
     }
 }
 
+/// The mandate text with one lever delegated, the rest of the text as the
+/// human wrote it: comments, order and spacing kept. When the text cannot
+/// be edited in place, the mandate is written out afresh instead.
+pub fn delegate_text(text: &str, lever: &str) -> Result<String, String> {
+    let before = Mandate::parse(text).map_err(|e| e.0)?;
+    let at = before
+        .permitted
+        .iter()
+        .position(|p| p.name == lever)
+        .ok_or_else(|| format!("the mandate does not permit {lever}"))?;
+    if before.permitted[at].delegated {
+        return Err(format!("{lever} is already delegated"));
+    }
+    let mut expected = before.clone();
+    expected.permitted[at].delegated = true;
+    expected
+        .validate()
+        .map_err(|e| format!("delegating {lever} makes the mandate invalid: {e}"))?;
+    if let Some(edited) = edit_delegated(text, lever) {
+        if Mandate::parse(&edited).ok().as_ref() == Some(&expected) {
+            return Ok(edited);
+        }
+    }
+    serde_yaml::to_string(&expected).map_err(|e| e.to_string())
+}
+
+/// Set `delegated: true` on one lever in mandate text, in place.
+fn edit_delegated(text: &str, lever: &str) -> Option<String> {
+    let names_lever = |line: &str| {
+        line.split(['{', ',', '}'])
+            .any(|part| part.trim() == format!("name: {lever}"))
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    // Flow style: the lever's item sits on one line inside braces.
+    if let Some(i) = lines
+        .iter()
+        .position(|l| l.contains('{') && l.contains('}') && names_lever(l))
+    {
+        let line = lines[i];
+        out[i] = if line.contains("delegated: false") {
+            line.replacen("delegated: false", "delegated: true", 1)
+        } else {
+            let close = line.rfind('}')?;
+            format!(
+                "{}, delegated: true{}",
+                line[..close].trim_end(),
+                &line[close..]
+            )
+        };
+        return Some(out.join("\n") + if text.ends_with('\n') { "\n" } else { "" });
+    }
+    // Block style: find the line naming the lever, then the item around it.
+    let name_at = lines.iter().position(|l| {
+        let t = l.trim_start();
+        t.strip_prefix("- ").unwrap_or(t).trim() == format!("name: {lever}")
+    })?;
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    // The item starts at the nearest line above (or this one) with a dash.
+    let start = (0..=name_at)
+        .rev()
+        .find(|&i| lines[i].trim_start().starts_with("- "))?;
+    let dash_indent = indent_of(lines[start]);
+    let key_indent = {
+        let t = lines[start].trim_start();
+        dash_indent + (t.len() - t.trim_start_matches('-').trim_start().len())
+    };
+    let mut end = start + 1;
+    while end < lines.len() {
+        let l = lines[end];
+        if l.trim().is_empty() || l.trim_start().starts_with('#') {
+            end += 1;
+            continue;
+        }
+        if indent_of(l) < key_indent {
+            break;
+        }
+        end += 1;
+    }
+    // Trim trailing blank and comment lines back off the item.
+    while end > start + 1
+        && (lines[end - 1].trim().is_empty() || lines[end - 1].trim_start().starts_with('#'))
+    {
+        end -= 1;
+    }
+    if let Some(i) = (start..end).find(|&i| lines[i].trim() == "delegated: false") {
+        out[i] = lines[i].replacen("delegated: false", "delegated: true", 1);
+    } else {
+        out.insert(end, format!("{}delegated: true", " ".repeat(key_indent)));
+    }
+    Some(out.join("\n") + if text.ends_with('\n') { "\n" } else { "" })
+}
+
 impl Permitted {
     /// The shape of payload the lever consumes: as declared, or as the
     /// built-in action takes it. Research takes the question as text.
@@ -2091,6 +2184,62 @@ forbidden: [rm]
             ParentCall::parse("pause", "").unwrap_err(),
             "pause names a child first, like: pause shop"
         );
+    }
+
+    #[test]
+    fn delegating_a_lever_keeps_the_text_as_written() {
+        let block = "# the shop\npurpose: Sell.\nmetric: orders\ncontroller: {kind: model}\ncadence: 1h\n\
+                     permitted:\n  # talk\n  - name: announce\n    run: ./announce\n    cap: 3/day\n    reversible: true\n    takes: text\n\n  - name: deploy\n    run: ./deploy\n    cap: 1/day\n    reversible: false\n    delegated: false\n";
+        let text = delegate_text(block, "announce").unwrap();
+        assert_eq!(
+            text,
+            "# the shop\npurpose: Sell.\nmetric: orders\ncontroller: {kind: model}\ncadence: 1h\n\
+             permitted:\n  # talk\n  - name: announce\n    run: ./announce\n    cap: 3/day\n    reversible: true\n    takes: text\n    delegated: true\n\n  - name: deploy\n    run: ./deploy\n    cap: 1/day\n    reversible: false\n    delegated: false\n"
+        );
+        assert!(
+            Mandate::parse(&text)
+                .unwrap()
+                .permitted("announce")
+                .unwrap()
+                .delegated
+        );
+        let text = delegate_text(block, "deploy").unwrap();
+        assert!(
+            text.ends_with("    reversible: false\n    delegated: true\n"),
+            "{text}"
+        );
+        assert!(text.starts_with("# the shop\n"));
+
+        let flow = "purpose: Sell.\nmetric: orders\ncontroller: {kind: model}\ncadence: 1h\n\
+                    permitted:\n- {name: announce, run: ./announce, cap: 3/day, reversible: true, takes: text}  # hi\n- {name: wipe, run: ./wipe, cap: 1/day, reversible: false, delegated: false}\n";
+        let text = delegate_text(flow, "announce").unwrap();
+        assert!(text.contains("- {name: announce, run: ./announce, cap: 3/day, reversible: true, takes: text, delegated: true}  # hi\n"), "{text}");
+        let text = delegate_text(flow, "wipe").unwrap();
+        assert!(
+            text.contains("reversible: false, delegated: true}"),
+            "{text}"
+        );
+        assert!(
+            Mandate::parse(&text)
+                .unwrap()
+                .permitted("wipe")
+                .unwrap()
+                .delegated
+        );
+
+        assert!(delegate_text(block, "nothing")
+            .unwrap_err()
+            .contains("does not permit nothing"));
+        assert!(
+            delegate_text(&delegate_text(block, "announce").unwrap(), "announce")
+                .unwrap_err()
+                .contains("already delegated")
+        );
+        // The parent lever resume cannot be delegated: the mandate would be invalid.
+        let parent = "purpose: Allocate.\nmetric: shell echo 1\ncontroller: {kind: model}\ncadence: 1h\nchildren: [shop]\npermitted:\n- {name: resume, cap: 9/day, reversible: true}\n";
+        assert!(delegate_text(parent, "resume")
+            .unwrap_err()
+            .contains("declared-only"));
     }
 
     #[test]

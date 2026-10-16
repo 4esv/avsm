@@ -69,6 +69,8 @@ enum Command {
         /// The record number
         number: String,
     },
+    /// Show what happened since the last digest: actions, asks, cost, one line per venture
+    Digest,
     /// Show what is held true now about a venture, or a topic across ventures
     Know {
         /// A venture's name, or a topic like pricing or digest
@@ -231,6 +233,7 @@ fn main() -> ExitCode {
         Command::Resume { venture } => vec!["resume".to_string(), venture],
         Command::Why { number } => vec!["why".to_string(), number],
         Command::Know { what } => vec!["know".to_string(), what],
+        Command::Digest => vec!["digest".to_string()],
     };
     let answer = match &remote {
         Some(at) => avsm::protocol::request_remote(at, &args),

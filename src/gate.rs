@@ -18,6 +18,9 @@ use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Takes, Verdict};
 pub const STOP: &str = crate::mandate::STOP;
 /// The action that needs a declared decision.
 pub const RESUME: &str = "resume";
+/// The built-in action that adopts a changed mandate: self proposes it,
+/// only a declared decision runs it.
+pub const DELEGATE: &str = "delegate";
 /// The built-in venture that watches avsm itself.
 pub const SELF: &str = "self";
 
@@ -27,6 +30,7 @@ pub const HARDWIRED: &[(&str, &str)] = &[
         "edit-mandate",
         "the self venture cannot edit its own mandate",
     ),
+    (DELEGATE, "the self venture cannot edit its own mandate"),
     ("merge-main", "the self venture cannot merge to main"),
     ("touch-keys", "the self venture cannot touch keys"),
 ];
@@ -261,6 +265,8 @@ ascent! {
     relation decision(Seq, String, Dk, Seq);
     relation ask(Seq, String, String);
     relation asked(Seq, String);
+    // an ask that code wrote, not a model
+    relation code_ask(Seq);
     relation proposal(Seq, String, String);
     relation stopped(Seq, String);
     relation mandate(Seq, String, String);
@@ -352,6 +358,9 @@ ascent! {
     needs_decision(v, a) <-- candidate(v, a), takes(v, a), !payload_ok(v, a);
     // A parent's resume is declared-only: a human decides each time.
     needs_decision(v, a) <-- candidate(v, a), if a.as_str() == RESUME, parent_resume_lever(v), !approved(v, a, _, _);
+    // Non-negotiable 12: self-modification is a proposal; only a declared
+    // decision adopts one, and only on an ask that code wrote.
+    needs_decision(v, a) <-- candidate(v, a), if a.as_str() == DELEGATE, !approved(v, a, _, _);
 
     // An ask stays open until a declared decision answers it.
     relation decided(Seq);
@@ -368,7 +377,7 @@ ascent! {
     // What goes through the mandate: everything but stop and the venture's
     // own resume; a parent's resume lever is a lever like any other.
     relation plain(String, String);
-    plain(v, a) <-- candidate(v, a), if a.as_str() != STOP && a.as_str() != RESUME;
+    plain(v, a) <-- candidate(v, a), if a.as_str() != STOP && a.as_str() != RESUME && a.as_str() != DELEGATE;
     plain(v, a) <-- candidate(v, a), if a.as_str() == RESUME, parent_resume_lever(v);
 
     // Non-negotiable 1: no action without a mandate and a proof.
@@ -377,6 +386,12 @@ ascent! {
     allowed(v, a) <--
         candidate(v, a), if a.as_str() == RESUME, !parent_resume_lever(v),
         decision(d, v, Dk::Resume, _), cites(d), trusted(d);
+    allowed(v, a) <--
+        candidate(v, a), if a.as_str() == DELEGATE,
+        mandate(_, v, _),
+        !hard(v, a),
+        approved(v, a, _, q), code_ask(q),
+        !paused(v);
     allowed(v, a) <--
         plain(v, a),
         mandate(_, v, _),
@@ -836,8 +851,11 @@ fn load_ledger(p: &mut Rules, ledger: &[Entry]) {
                 };
                 p.decision.push((e.seq, venture, dk, target));
             }
-            Record::Ask { action, .. } => {
+            Record::Ask { action, claim, .. } => {
                 p.asked.push((e.seq, venture.clone()));
+                if *claim == Claim::Measured {
+                    p.code_ask.push((e.seq,));
+                }
                 if let Some(act) = action {
                     p.ask.push((e.seq, venture, act.clone()));
                 }
@@ -937,6 +955,70 @@ fn assemble(
         if find(s).is_none() {
             reasons.push(Reason::UnknownRecord { seq: s });
         }
+    }
+
+    if a == DELEGATE {
+        steps.push(Step::Axiom {
+            text: "a changed mandate is adopted only by a declared decision".to_string(),
+        });
+        if !adopted.iter().any(|m| m.venture == *v) {
+            reasons.push(Reason::NoMandate { venture: v.clone() });
+        }
+        for (_, _, why) in p.hardwired.iter().filter(|(x, y, _)| x == v && y == a) {
+            reasons.push(Reason::Hardwired {
+                action: a.clone(),
+                why: why.clone(),
+            });
+        }
+        let mut approved_by_code = false;
+        for (_, _, d, q) in p.approved.iter().filter(|(x, y, _, _)| x == v && y == a) {
+            let by = find(*d)
+                .and_then(|e| match &e.record {
+                    Record::Decision { by: Some(who), .. } => Some(format!("  by {who}")),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            steps.push(Step::Decision {
+                seq: *d,
+                what: format!("approved ask #{q}{by}"),
+            });
+            if let Some(e) = find(*q) {
+                steps.push(occasion(e));
+                approved_by_code |= e.record.claim() == Claim::Measured;
+                if let Some((from, payload)) = find(*d)
+                    .filter(|e| e.record.payload().is_some())
+                    .or(Some(e))
+                    .and_then(|e| e.record.payload().map(|pl| (e.seq, pl)))
+                {
+                    steps.push(Step::Payload {
+                        from,
+                        claim: find(from).map_or(Claim::Measured, |e| e.record.claim()),
+                        kind: payload.takes(),
+                        summary: payload.summary(),
+                    });
+                }
+            }
+        }
+        for &s in &candidate.cites {
+            if let Some(e) = find(s) {
+                if !p
+                    .approved
+                    .iter()
+                    .any(|(x, y, d, _)| x == v && y == a && *d == s)
+                {
+                    steps.push(occasion(e));
+                }
+            }
+        }
+        if p.needs_decision.iter().any(|(x, y)| x == v && y == a) {
+            reasons.push(Reason::NeedsDecision { action: a.clone() });
+        } else if !approved_by_code {
+            reasons.push(Reason::NotJustified { action: a.clone() });
+        }
+        if p.paused.iter().any(|(x,)| x == v) {
+            reasons.push(Reason::Paused { venture: v.clone() });
+        }
+        return finish(allowed, v, a, steps, reasons);
     }
 
     let parent_resume = p.parent_resume_lever.iter().any(|(x,)| x == v);
@@ -2644,5 +2726,103 @@ mod tests {
             "a summary supersedes no leaf: it has its own topic"
         );
         assert_eq!(current, vec![b, f2, f3, summary]);
+    }
+
+    #[test]
+    fn delegate_runs_only_from_a_declared_approval_of_an_ask_code_wrote() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                model(),
+                vec![takes("announce", Takes::Text, true, false)],
+                &[],
+            ),
+        );
+        let new_text = text("purpose: ...\nmetric: count\n");
+        let s = fx.push(Record::Proposal {
+            claim: Claim::Measured,
+            venture: V.into(),
+            action: DELEGATE.into(),
+            reason: "announce was approved 5 times".into(),
+            payload: Some(new_text.clone()),
+        });
+        let refusal = fx.gate(V, DELEGATE, &[s]).unwrap_err();
+        assert!(
+            refusal
+                .reasons
+                .iter()
+                .any(|r| matches!(r, Reason::NeedsDecision { .. })),
+            "{refusal}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("axiom      a changed mandate is adopted only by a declared decision"),
+            "{refusal}"
+        );
+        let q = fx.push(Record::Ask {
+            claim: Claim::Measured,
+            venture: V.into(),
+            action: Some(DELEGATE.into()),
+            question: "delegate announce?".into(),
+            refusal: None,
+            payload: Some(new_text.clone()),
+        });
+        let fake = fx.push(decision(Claim::Inferred, approve(q)));
+        assert!(
+            fx.gate(V, DELEGATE, &[fake]).is_err(),
+            "an inferred approval is nothing"
+        );
+        let d = fx.push(decision(Claim::Declared, approve(q)));
+        let proof = fx.gate(V, DELEGATE, &[d]).expect("declared");
+        assert_eq!(proof.decision(), Some(d));
+        assert_eq!(proof.payload_from(), Some(q));
+        assert!(
+            proof
+                .to_string()
+                .contains(&format!("payload    #{q}  measured  text")),
+            "{proof}"
+        );
+        // An ask a model wrote cannot carry a mandate change, approved or not.
+        let mq = fx.push(Record::Ask {
+            claim: Claim::Inferred,
+            venture: V.into(),
+            action: Some(DELEGATE.into()),
+            question: "delegate everything?".into(),
+            refusal: None,
+            payload: Some(new_text.clone()),
+        });
+        let md = fx.push(decision(Claim::Declared, approve(mq)));
+        let refusal = fx.gate(V, DELEGATE, &[md]).unwrap_err();
+        assert!(
+            refusal
+                .reasons
+                .iter()
+                .any(|r| matches!(r, Reason::NotJustified { .. })),
+            "{refusal}"
+        );
+        // Self can never have its mandate changed this way.
+        let mut fx = Fx::new();
+        fx.adopt(SELF, mandate(model(), vec![], &[]));
+        let q = fx.push(Record::Ask {
+            claim: Claim::Measured,
+            venture: SELF.into(),
+            action: Some(DELEGATE.into()),
+            question: "delegate?".into(),
+            refusal: None,
+            payload: Some(new_text),
+        });
+        let d = fx.push(Record::Decision {
+            claim: Claim::Declared,
+            venture: SELF.into(),
+            verdict: approve(q),
+            by: None,
+        });
+        let refusal = fx.gate(SELF, DELEGATE, &[d]).unwrap_err();
+        assert!(
+            reasons(&refusal).contains(&"the self venture cannot edit its own mandate".to_string()),
+            "{refusal}"
+        );
     }
 }
