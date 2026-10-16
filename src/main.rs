@@ -13,6 +13,9 @@ struct Cli {
     /// Where avsm keeps its files (default: $AVSM_HOME, else ~/.avsm)
     #[arg(long, global = true, value_name = "DIR")]
     home: Option<PathBuf>,
+    /// Talk to an avsm on another machine over Tailscale, as host:port
+    #[arg(long, global = true, value_name = "HOST:PORT")]
+    remote: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -118,9 +121,17 @@ fn payload_argument(words: Vec<String>) -> Result<Option<String>, String> {
 
 /// Fetch an ask's payload, let the human change it in their editor, and
 /// approve with what they saved.
-fn approve_edited(sock: &std::path::Path, number: &str) -> Result<(), String> {
+fn approve_edited(
+    sock: &std::path::Path,
+    remote: Option<&str>,
+    number: &str,
+) -> Result<(), String> {
+    let send = |args: &[String]| match remote {
+        Some(at) => avsm::protocol::request_remote(at, args),
+        None => avsm::protocol::request(sock, args),
+    };
     let args = vec!["payload".to_string(), number.to_string()];
-    let answer = avsm::protocol::request(sock, &args)?;
+    let answer = send(&args)?;
     if !answer.ok {
         return Err(answer.text.trim_end().to_string());
     }
@@ -161,7 +172,7 @@ fn approve_edited(sock: &std::path::Path, number: &str) -> Result<(), String> {
         "--payload".to_string(),
         edited,
     ];
-    let answer = avsm::protocol::request(sock, &args)?;
+    let answer = send(&args)?;
     print!("{}", answer.text);
     if answer.ok {
         Ok(())
@@ -173,6 +184,7 @@ fn approve_edited(sock: &std::path::Path, number: &str) -> Result<(), String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let home = cli.home.unwrap_or_else(avsm::kernel::default_home);
+    let remote = cli.remote;
     let args: Vec<String> = match cli.command {
         Command::Start => return done(avsm::kernel::start(&home)),
         Command::Warden => return done(avsm::kernel::warden_main(&home)),
@@ -190,7 +202,7 @@ fn main() -> ExitCode {
         } => vec!["approve".to_string(), number],
         Command::Approve { number, edit: true } => {
             let sock = avsm::kernel::socket_path(&home);
-            return done(approve_edited(&sock, &number));
+            return done(approve_edited(&sock, remote.as_deref(), &number));
         }
         Command::Propose {
             venture,
@@ -214,7 +226,11 @@ fn main() -> ExitCode {
         Command::Resume { venture } => vec!["resume".to_string(), venture],
         Command::Why { number } => vec!["why".to_string(), number],
     };
-    match avsm::protocol::request(&avsm::kernel::socket_path(&home), &args) {
+    let answer = match &remote {
+        Some(at) => avsm::protocol::request_remote(at, &args),
+        None => avsm::protocol::request(&avsm::kernel::socket_path(&home), &args),
+    };
+    match answer {
         Ok(answer) => {
             print!("{}", answer.text);
             if answer.ok {

@@ -2,8 +2,8 @@
 //! arguments as one JSON line over a Unix socket; the kernel answers with
 //! one JSON line holding the text to print and whether it went well.
 
-use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::net::Shutdown;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -22,20 +22,39 @@ pub struct Response {
 
 /// Send a command to a running avsm and wait for the answer.
 pub fn request(sock: &Path, args: &[String]) -> Result<Response, String> {
-    let mut stream = UnixStream::connect(sock).map_err(|e| match e.kind() {
+    let stream = UnixStream::connect(sock).map_err(|e| match e.kind() {
         ErrorKind::NotFound | ErrorKind::ConnectionRefused => {
             "avsm is not running; start it with: avsm start".to_string()
         }
         _ => format!("cannot reach avsm at {}: {e}", sock.display()),
     })?;
+    exchange(&stream, |s| s.shutdown(Shutdown::Write), args)
+}
+
+/// Send a command to an avsm listening on the tailnet at `host:port` and
+/// wait for the answer. The command carries no identity: tailscaled tells
+/// the daemon who is asking.
+pub fn request_remote(at: &str, args: &[String]) -> Result<Response, String> {
+    let stream = TcpStream::connect(at).map_err(|e| format!("cannot reach avsm at {at}: {e}"))?;
+    exchange(&stream, |s| s.shutdown(Shutdown::Write), args)
+}
+
+fn exchange<S>(
+    mut stream: &S,
+    shutdown: impl Fn(&S) -> std::io::Result<()>,
+    args: &[String],
+) -> Result<Response, String>
+where
+    for<'a> &'a S: Read + Write,
+{
     let line = serde_json::to_string(args).map_err(|e| e.to_string())?;
     stream
         .write_all(line.as_bytes())
         .and_then(|_| stream.write_all(b"\n"))
-        .and_then(|_| stream.shutdown(Shutdown::Write))
+        .and_then(|_| shutdown(stream))
         .map_err(|e| format!("cannot talk to avsm: {e}"))?;
     let mut answer = String::new();
-    BufReader::new(&stream)
+    BufReader::new(stream)
         .read_line(&mut answer)
         .map_err(|e| format!("avsm did not answer: {e}"))?;
     serde_json::from_str(&answer).map_err(|e| format!("avsm gave a bad answer: {e}"))
@@ -63,19 +82,22 @@ pub fn bind(sock: &Path) -> Result<UnixListener, String> {
 }
 
 /// Answer commands until the listener closes. Each command runs with the
-/// kernel locked, one at a time.
+/// kernel locked, one at a time. The socket knows nobody's name.
 pub fn serve(listener: UnixListener, kernel: Arc<Mutex<Kernel>>) {
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => answer(stream, &kernel),
+            Ok(stream) => answer(stream, &kernel, None),
             Err(_) => return,
         }
     }
 }
 
-fn answer(mut stream: UnixStream, kernel: &Arc<Mutex<Kernel>>) {
+/// Read one command from a stream, run it as `by` when the path knows who
+/// is asking, and write the answer.
+pub fn answer<S: Read + Write>(mut stream: S, kernel: &Arc<Mutex<Kernel>>, by: Option<&str>) {
     let mut line = String::new();
-    let response = match BufReader::new(&stream).read_line(&mut line) {
+    let read = BufReader::new(Read::by_ref(&mut stream)).read_line(&mut line);
+    let response = match read {
         Err(e) => Response {
             ok: false,
             text: format!("could not read the command: {e}"),
@@ -89,7 +111,7 @@ fn answer(mut stream: UnixStream, kernel: &Arc<Mutex<Kernel>>) {
                 let mut kernel = kernel
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match kernel.handle(&args) {
+                match kernel.handle_as(&args, by) {
                     Ok(text) => Response { ok: true, text },
                     Err(text) => Response { ok: false, text },
                 }

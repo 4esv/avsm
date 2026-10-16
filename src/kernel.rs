@@ -1424,6 +1424,15 @@ pub fn start(home: &Path) -> Result<(), String> {
     log(&format!("listening at {}", sock.display()));
     let server = Arc::clone(&kernel);
     std::thread::spawn(move || crate::protocol::serve(listener, server));
+    let config = Config::load(home)?;
+    match crate::tailscale::start(&config, Arc::clone(&kernel)) {
+        Ok(Some(at)) => log(&format!(
+            "listening on the tailnet at {at} for {}",
+            config.remote_users.join(", ")
+        )),
+        Ok(None) => {}
+        Err(e) => log(&e),
+    }
     while !STOP.load(Ordering::SeqCst) {
         {
             let mut k = kernel.lock().unwrap_or_else(|p| p.into_inner());

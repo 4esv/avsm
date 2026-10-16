@@ -30,6 +30,19 @@ pub struct Config {
     /// Where the built-in adapters reach, and how mail goes out.
     #[serde(default)]
     pub adapters: Adapters,
+    /// `tailscale` to answer commands over the tailnet too; off when absent.
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// The port the tailnet listener takes.
+    #[serde(default = "default_port")]
+    pub port: u16,
+    /// The Tailscale logins allowed to give commands over the tailnet.
+    #[serde(default)]
+    pub remote_users: Vec<String>,
+}
+
+fn default_port() -> u16 {
+    crate::tailscale::DEFAULT_PORT
 }
 
 /// Where the built-in adapters reach. The defaults are the real services;
@@ -110,6 +123,9 @@ impl Default for Config {
             backends: BTreeMap::new(),
             research: None,
             adapters: Adapters::default(),
+            listen: None,
+            port: default_port(),
+            remote_users: vec![],
         }
     }
 }
@@ -176,6 +192,20 @@ impl Config {
                     "adapters.{name}.url starts with http:// or https://, not {url:?}"
                 ));
             }
+        }
+        match config.listen.as_deref() {
+            None | Some("tailscale") => {}
+            Some(other) => {
+                return Err(format!(
+                    "listen is tailscale or left out, not {other:?}; avsm has no other listener"
+                ))
+            }
+        }
+        if config.listen.is_some() && config.remote_users.is_empty() {
+            return Err(
+                "listen: tailscale needs remote_users: the Tailscale logins allowed in, like alice@github"
+                    .to_string(),
+            );
         }
         if config.adapters.mail.command.trim().is_empty() {
             return Err(
@@ -350,6 +380,24 @@ mod tests {
         assert!(Config::parse("adapters:\n  mail: {command: \"\"}\n")
             .unwrap_err()
             .contains("sendmail"));
+    }
+
+    #[test]
+    fn the_tailnet_listener_is_off_unless_asked_for_with_users() {
+        let c = Config::default();
+        assert_eq!(c.listen, None);
+        assert_eq!(c.port, 2876);
+        let c =
+            Config::parse("listen: tailscale\nremote_users: [alice@github]\nport: 4000\n").unwrap();
+        assert_eq!(c.listen.as_deref(), Some("tailscale"));
+        assert_eq!(c.port, 4000);
+        assert_eq!(c.remote_users, vec!["alice@github"]);
+        assert!(Config::parse("listen: tailscale\n")
+            .unwrap_err()
+            .contains("needs remote_users"));
+        assert!(Config::parse("listen: public\n")
+            .unwrap_err()
+            .contains("no other listener"));
     }
 
     #[test]

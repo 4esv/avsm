@@ -578,9 +578,13 @@ fn assemble(
                     Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Resume, .. }
                     if venture == v);
                 if declared_resume {
+                    let by = match &e.record {
+                        Record::Decision { by: Some(who), .. } => format!("  by {who}"),
+                        _ => String::new(),
+                    };
                     steps.push(Step::Decision {
                         seq: e.seq,
-                        what: "resumed".to_string(),
+                        what: format!("resumed{by}"),
                     });
                     found = true;
                 } else {
@@ -659,9 +663,15 @@ fn assemble(
         }
     }
     for (_, _, d, q) in p.approved.iter().filter(|(x, y, _, _)| x == v && y == a) {
+        let by = find(*d)
+            .and_then(|e| match &e.record {
+                Record::Decision { by: Some(who), .. } => Some(format!("  by {who}")),
+                _ => None,
+            })
+            .unwrap_or_default();
         steps.push(Step::Decision {
             seq: *d,
-            what: format!("approved ask #{q}"),
+            what: format!("approved ask #{q}{by}"),
         });
         cited.insert(*d);
         if let Some(e) = find(*q) {
@@ -978,6 +988,11 @@ pub fn why(entry: &Entry) -> String {
         Record::Proposal { reason, .. } => {
             format!("{head}\n  inferred by a model: {reason}\n  authorizes nothing on its own\n")
         }
+        Record::Decision {
+            claim,
+            by: Some(who),
+            ..
+        } => format!("{head}\n  {claim} by {who}, over the tailnet\n"),
         Record::Decision { claim, .. } => format!("{head}\n  {claim} by {}\n", by(*claim)),
         Record::Outcome { intent, .. } => format!("{head}\n  outcome of intent #{intent}\n"),
     }
