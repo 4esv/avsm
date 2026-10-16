@@ -11,6 +11,7 @@ pub mod ledger;
 pub mod mandate;
 pub mod protocol;
 pub mod record;
+pub mod research;
 pub mod role;
 pub mod selfventure;
 pub mod venture;

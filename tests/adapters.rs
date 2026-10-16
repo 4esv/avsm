@@ -454,3 +454,104 @@ fn a_mandate_alone_is_a_venture_when_everything_is_an_adapter() {
     assert!(err.contains("holds no report program"), "{err}");
     assert!(err.contains("stripe.mrr"), "{err}");
 }
+
+/// The research lever: a human's question goes to the stub command as
+/// JSON, and its findings come back as inferred records that cite the
+/// action, with source and confidence; a model's question asks first.
+#[test]
+fn research_runs_the_configured_command_and_writes_inferred_findings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = Stub::start(vec![]);
+    let home = home(tmp.path(), &stub.url, "cat > sent.eml");
+    let finder = tmp.path().join("finder");
+    std::fs::write(
+        &finder,
+        format!(
+            "#!/bin/sh\ncat > {}/asked.json\nprintf '%s' '{{\"results\": [\
+             {{\"text\": \"Rivals charge 9\", \"source\": \"https://rival.example/pricing\", \"confidence\": 0.8, \"value\": 9, \"topic\": \"pricing\", \"api_key\": \"leak\"}},\
+             {{\"text\": \"Nobody knows\"}}]}}'\n",
+            tmp.path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&finder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "nightly: never\nresearch: finder\nbackends:\n  finder: {{kind: command, run: {}}}\n",
+            finder.display()
+        ),
+    )
+    .unwrap();
+    let dir = venture(
+        tmp.path(),
+        "shop",
+        "purpose: Sell more.\nmetric: shell echo 3\ncontroller: {kind: model}\ncadence: 1h\n\
+         permitted:\n- {name: research, cap: 5/day, reversible: true, delegated: true}\n",
+    );
+    let mut k = kernel(&home);
+    let out = k.add(&dir).unwrap();
+    assert!(
+        out.contains("may research  5/day  reversible, takes text"),
+        "{out}"
+    );
+    let out = k
+        .propose("shop", "research", Some("What do rivals charge?"))
+        .unwrap();
+    assert!(
+        out.contains("measured  action    research: done  2 findings"),
+        "{out}"
+    );
+    assert!(
+        out.contains("inferred  report    pricing=9  Rivals charge 9"),
+        "{out}"
+    );
+    assert!(
+        out.contains("inferred  report    research=?  Nobody knows"),
+        "{out}"
+    );
+    let asked: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tmp.path().join("asked.json")).unwrap())
+            .unwrap();
+    assert_eq!(asked["question"], "What do rivals charge?");
+    assert_eq!(asked["venture"], "shop");
+    let entries = k.entries().unwrap();
+    let action = entries
+        .iter()
+        .find(|e| e.record.kind() == Kind::Action)
+        .unwrap();
+    let finding = entries
+        .iter()
+        .find(|e| e.record.summary().starts_with("pricing=9"))
+        .unwrap();
+    assert!(
+        matches!(&finding.record, Record::Report { source: Some(s), confidence: Some(c), cites, .. }
+        if s == "https://rival.example/pricing" && *c == 0.8 && *cites == vec![action.seq])
+    );
+    assert!(!finding.record.canonical().contains("leak"), "stripped");
+    let why = k.why(finding.seq).unwrap();
+    assert!(why.contains("inferred by a model"), "{why}");
+    assert!(
+        why.contains("source     https://rival.example/pricing"),
+        "{why}"
+    );
+    assert!(why.contains("confidence 0.8"), "{why}");
+    assert!(
+        why.contains(&format!("cites      #{}", action.seq)),
+        "{why}"
+    );
+    assert!(why.contains("authorizes nothing on its own"), "{why}");
+
+    // A question nobody can answer: no backend, the action fails and says so.
+    std::fs::write(home.join("config.yaml"), "nightly: never\n").unwrap();
+    let mut k = kernel(&home);
+    let out = k.propose("shop", "research", Some("Anything?")).unwrap();
+    assert!(
+        out.contains("research: failed  no research backend"),
+        "{out}"
+    );
+    assert_eq!(
+        k.ledger.verify().unwrap(),
+        k.entries().unwrap().len() as u64
+    );
+}

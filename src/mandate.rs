@@ -221,6 +221,10 @@ const ACTION_FIELDS: &[&str] = &[
 /// Names no permitted action may take: they are built in.
 pub const BUILT_IN: &[&str] = &[STOP, "resume", "delegate"];
 
+/// The built-in lever that asks the research role a question. A mandate
+/// permits it by name alone, with no run and no adapter.
+pub const RESEARCH: &str = "research";
+
 const KINDS: &str = "threshold, classifier or model";
 const NEEDS_PURPOSE: &str = "mandate needs a purpose: what the venture is for, in your own words";
 const NEEDS_METRIC: &str =
@@ -292,6 +296,25 @@ impl Mandate {
             }
             names.push(&p.name);
             match (&p.run, &p.adapter) {
+                (None, None) if p.name == RESEARCH => {
+                    if let Some(t) = p.takes {
+                        if t != Takes::Text {
+                            return fail(
+                                "permitted action \"research\" takes text, the question; leave takes out",
+                            );
+                        }
+                    }
+                    if !p.reversible {
+                        return fail(
+                            "permitted action \"research\" only reads; say reversible: true",
+                        );
+                    }
+                }
+                (Some(_), None) | (None, Some(_)) if p.name == RESEARCH => {
+                    return fail(
+                        "research is built in; permit it by name alone, with no run and no adapter",
+                    )
+                }
                 (Some(run), None) if run.trim().is_empty() => {
                     return fail(format!(
                         "permitted action {:?} has an empty run; give it the command to run, like ./reset.sh",
@@ -329,7 +352,7 @@ impl Mandate {
                 }
                 (None, None) => {
                     return fail(format!(
-                        "permitted action {:?} needs run (a command) or adapter (a built-in: {})",
+                        "permitted action {:?} needs run (a command) or adapter (a built-in: {}); only research needs neither",
                         p.name,
                         adapter::LEVERS.join(", ")
                     ))
@@ -460,14 +483,21 @@ impl Mandate {
 
 impl Permitted {
     /// The shape of payload the lever consumes: as declared, or as the
-    /// built-in action takes it.
+    /// built-in action takes it. Research takes the question as text.
     pub fn takes(&self) -> Option<Takes> {
-        self.takes.or_else(|| {
-            self.adapter
-                .as_deref()
-                .and_then(|a| adapter::Lever::parse(a).ok())
-                .map(|l| l.takes())
-        })
+        self.takes
+            .or_else(|| {
+                self.adapter
+                    .as_deref()
+                    .and_then(|a| adapter::Lever::parse(a).ok())
+                    .map(|l| l.takes())
+            })
+            .or_else(|| self.is_research().then_some(Takes::Text))
+    }
+
+    /// Is this the built-in research lever?
+    pub fn is_research(&self) -> bool {
+        self.name == RESEARCH && self.run.is_none() && self.adapter.is_none()
     }
 
     /// The built-in action, when the lever names one.
@@ -699,6 +729,8 @@ fn check_action(position: usize, item: &Value) -> Result<(), MandateError> {
         }
     }
     match (map.get("run"), map.get("adapter")) {
+        (None | Some(Value::Null), None | Some(Value::Null))
+            if map.get("name").and_then(Value::as_str) == Some(RESEARCH) => {}
         (None | Some(Value::Null), None | Some(Value::Null)) => {
             return fail(format!(
                 "{who} needs run: the command to run, like ./reset.sh; or adapter: a built-in action like github.issue owner/repo"
@@ -1482,6 +1514,34 @@ forbidden: [rm]
         assert!(
             m.metric_adapter().is_some() && m.permitted("nudge").unwrap().lever_adapter().is_some()
         );
+    }
+
+    #[test]
+    fn research_is_permitted_by_name_alone() {
+        let text = edit(
+            "  - name: deploy\n    run: ./deploy.sh\n    cap: 1/day\n    reversible: false\n    delegated: false\n",
+            "  - name: research\n    cap: 5/day\n    reversible: true\n    delegated: true\n",
+        );
+        let m = Mandate::parse(&text).unwrap();
+        let p = m.permitted("research").unwrap();
+        assert!(p.is_research());
+        assert_eq!(p.takes(), Some(Takes::Text));
+        assert!(p.delegated);
+        let msg = fails(&text.replace(
+            "    reversible: true\n    delegated: true\n",
+            "    reversible: false\n",
+        ));
+        assert_eq!(
+            msg,
+            "permitted action \"research\" only reads; say reversible: true"
+        );
+        let msg = fails(&text.replace(
+            "  - name: research\n",
+            "  - name: research\n    run: ./find\n",
+        ));
+        assert!(msg.starts_with("research is built in"), "{msg}");
+        let msg = fails(&text.replace("    cap: 5/day\n", "    cap: 5/day\n    takes: json\n"));
+        assert!(msg.contains("takes text, the question"), "{msg}");
     }
 
     #[test]

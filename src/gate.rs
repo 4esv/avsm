@@ -947,7 +947,29 @@ pub fn why(entry: &Entry) -> String {
             refusal: Some(r), ..
         } => format!("{head}\n{r}"),
         Record::Ask { question, .. } => format!("{head}\n  asked: {question}\n"),
-        Record::Report { claim, .. } => format!("{head}\n  {claim} by {}\n", by(*claim)),
+        Record::Report {
+            claim,
+            source,
+            confidence,
+            cites,
+            ..
+        } => {
+            let mut text = format!("{head}\n  {claim} by {}\n", by(*claim));
+            if let Some(s) = source {
+                text.push_str(&format!("  source     {s}\n"));
+            }
+            if let Some(c) = confidence {
+                text.push_str(&format!("  confidence {c}\n"));
+            }
+            if !cites.is_empty() {
+                let list: Vec<String> = cites.iter().map(|s| format!("#{s}")).collect();
+                text.push_str(&format!("  cites      {}\n", list.join(", ")));
+            }
+            if !claim.authorizes() {
+                text.push_str("  authorizes nothing on its own\n");
+            }
+            text
+        }
         Record::Proposal {
             claim: Claim::Declared,
             reason,

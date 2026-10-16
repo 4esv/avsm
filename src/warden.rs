@@ -15,6 +15,7 @@ use crate::config::{self, Backend, Config};
 use crate::gate::{self, Candidate, RESUME, STOP};
 use crate::ledger::Ledger;
 use crate::record::{Claim, Entry, Payload, Record};
+use crate::research;
 use crate::role::InferRequest;
 use crate::venture;
 
@@ -97,6 +98,37 @@ impl Warden for LocalWarden {
         };
         if perm.takes().is_some() && payload.is_none() {
             return Err(format!("{action} takes a payload and the proof names none"));
+        }
+        if perm.is_research() {
+            let question = payload.as_ref().map(Payload::text).unwrap_or_default();
+            let (ok, detail, findings) =
+                match research(&self.config, &self.home, &question, &venture) {
+                    Ok(f) => (
+                        true,
+                        format!(
+                            "{} {}",
+                            f.len(),
+                            if f.len() == 1 { "finding" } else { "findings" }
+                        ),
+                        f,
+                    ),
+                    Err(e) => (false, e, vec![]),
+                };
+            let done = append(Record::Action {
+                claim: Claim::Measured,
+                venture: venture.clone(),
+                action,
+                proof,
+                ok,
+                detail,
+                payload,
+            })?;
+            let seq = done.seq;
+            written.push(done);
+            for record in research::records(&venture, &findings, seq) {
+                written.push(append(record)?);
+            }
+            return Ok(written);
         }
         let proof_text = proof.to_string();
         let (for_venture, for_action) = (venture.clone(), action.clone());
@@ -246,7 +278,17 @@ impl Warden for LocalWarden {
 
     fn measure(&mut self, venture: &str) -> Result<(Option<f64>, String), String> {
         let entries = self.ledger.all().map_err(|e| e.to_string())?;
-        let ventures = venture::load_all(&entries);
+        self.measure_in(&entries, venture)
+    }
+}
+
+impl LocalWarden {
+    fn measure_in(
+        &self,
+        entries: &[Entry],
+        venture: &str,
+    ) -> Result<(Option<f64>, String), String> {
+        let ventures = venture::load_all(entries);
         let v = ventures
             .get(venture)
             .ok_or_else(|| format!("no venture named {venture}"))?;
@@ -261,6 +303,36 @@ impl Warden for LocalWarden {
             .map(String::as_str);
         Ok(metric.measure(&dir, key, &self.config.adapters))
     }
+}
+
+/// Ask the research command a question and read its findings. The command
+/// is the provider; the warden only extracts what fits the record schema.
+fn research(
+    config: &Config,
+    home: &Path,
+    question: &str,
+    venture: &str,
+) -> Result<Vec<research::Finding>, String> {
+    let name = config
+        .research
+        .as_deref()
+        .ok_or("no research backend; name a command backend under research: in config.yaml")?;
+    let (_, backend) = config.backend(Some(name))?;
+    let Backend::Command { run: command } = backend else {
+        return Err(format!("research backend {name} must be kind: command"));
+    };
+    if question.trim().is_empty() {
+        return Err("research needs a question".to_string());
+    }
+    let stdin = research::request(question, venture);
+    let ran = run(home, "sh", &["-c", command], &stdin, ACTION_TIMEOUT);
+    if !ran.ok {
+        return Err(format!(
+            "research command failed: {}",
+            ran.detail(ACTION_TIMEOUT)
+        ));
+    }
+    research::parse(&ran.stdout)
 }
 
 /// Models whose API takes `fallbacks: "default"`.

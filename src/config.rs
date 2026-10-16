@@ -23,6 +23,10 @@ pub struct Config {
     /// Backends by name.
     #[serde(default)]
     pub backends: BTreeMap<String, Backend>,
+    /// The command backend that answers research questions: a JSON
+    /// question on its standard input, JSON results on its output.
+    #[serde(default)]
+    pub research: Option<String>,
     /// Where the built-in adapters reach, and how mail goes out.
     #[serde(default)]
     pub adapters: Adapters,
@@ -104,6 +108,7 @@ impl Default for Config {
             nightly: default_nightly(),
             default: None,
             backends: BTreeMap::new(),
+            research: None,
             adapters: Adapters::default(),
         }
     }
@@ -183,6 +188,21 @@ impl Config {
                 return Err(format!(
                     "default names a backend that is not listed: {d}; list it under backends"
                 ));
+            }
+        }
+        if let Some(r) = &config.research {
+            match config.backends.get(r) {
+                Some(Backend::Command { .. }) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "research names backend {r}, which must be kind: command: a program that reads a JSON question and prints JSON results"
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "research names a backend that is not listed: {r}; list it under backends"
+                    ))
+                }
             }
         }
         for (name, b) in &config.backends {
@@ -330,6 +350,22 @@ mod tests {
         assert!(Config::parse("adapters:\n  mail: {command: \"\"}\n")
             .unwrap_err()
             .contains("sendmail"));
+    }
+
+    #[test]
+    fn research_names_a_command_backend() {
+        let c =
+            Config::parse("research: finder\nbackends:\n  finder: {kind: command, run: ./find}\n")
+                .unwrap();
+        assert_eq!(c.research.as_deref(), Some("finder"));
+        assert!(Config::parse("research: x\n")
+            .unwrap_err()
+            .contains("not listed"));
+        assert!(
+            Config::parse("research: a\nbackends:\n  a: {kind: anthropic, model: m}\n")
+                .unwrap_err()
+                .contains("kind: command")
+        );
     }
 
     #[test]
