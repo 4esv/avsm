@@ -100,7 +100,8 @@ enum Command {
         /// How far the clock jumps each step, like 1h or 15m
         #[arg(long, default_value = "1h")]
         step: String,
-        /// Who answers the asks: all (approve every one) or none
+        /// Who answers the asks: all (approve every one), none, or mixed
+        /// (deny every third, edit text payloads, approve the rest)
         #[arg(long, default_value = "all")]
         approve: String,
         /// Venture directories to take on first
@@ -224,7 +225,8 @@ fn main() -> ExitCode {
             let human = match approve.as_str() {
                 "all" => avsm::simulate::Human::ApproveAll,
                 "none" => avsm::simulate::Human::Away,
-                other => return done(Err(format!("approve is all or none, not {other:?}"))),
+                "mixed" => avsm::simulate::Human::Mixed,
+                other => return done(Err(format!("approve is all, none or mixed, not {other:?}"))),
             };
             let plan = avsm::simulate::Plan {
                 days,

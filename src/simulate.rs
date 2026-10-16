@@ -24,7 +24,13 @@ pub enum Human {
     ApproveAll,
     /// Leave every ask open.
     Away,
+    /// Deny every third ask it answers; approve the rest, a text payload
+    /// with a line added first, as `approve --edit` would.
+    Mixed,
 }
+
+/// The line the mixed human adds to a text payload before approving it.
+pub const EDIT: &str = "Edited by simulation.";
 
 /// The name declared records carry when the policy decided.
 pub const BY: &str = "simulation";
@@ -107,17 +113,23 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
             match plan.human {
                 Human::ApproveAll => "approves every ask",
                 Human::Away => "is away",
+                Human::Mixed => "denies every third ask and edits text payloads",
             }
         ),
     );
+    let mut answered = 0u64;
     while clock::now() < end {
         kernel.tick();
-        if plan.human == Human::ApproveAll {
+        if plan.human != Human::Away {
             let entries = kernel.entries()?;
             for q in gate::open_asks(&entries) {
-                let args = vec!["approve".to_string(), q.to_string()];
+                let args = answer(&kernel, plan.human, q, answered);
+                answered += 1;
                 if let Err(e) = kernel.handle_as(&args, Some(BY)) {
-                    say(out, &format!("  (could not approve #{q}: {})\n", e.trim()));
+                    say(
+                        out,
+                        &format!("  (could not {} #{q}: {})\n", args[0], e.trim()),
+                    );
                 }
             }
         }
@@ -138,6 +150,29 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
     say(out, &format!("=== end ===\n{}", kernel.status()?));
     kernel.shutdown();
     Ok(())
+}
+
+/// What the human says to ask `q`, the `n`th it has answered.
+fn answer(kernel: &Kernel, human: Human, seq: Seq, n: u64) -> Vec<String> {
+    let q = seq.to_string();
+    if human == Human::Mixed {
+        if n % 3 == 2 {
+            return vec![
+                "deny".to_string(),
+                q,
+                "the simulation denies every third ask".to_string(),
+            ];
+        }
+        if let Some(text) = kernel
+            .payload(seq)
+            .ok()
+            .and_then(|p| p.strip_prefix("text\n").map(str::to_string))
+        {
+            let edited = format!("{}\n\n{EDIT}\n", text.trim_end());
+            return vec!["approve".to_string(), q, "--payload".to_string(), edited];
+        }
+    }
+    vec!["approve".to_string(), q]
 }
 
 use chrono::Timelike;
