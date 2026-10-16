@@ -1413,6 +1413,21 @@ impl Kernel {
             Ok(r) => r,
             Err(e) => {
                 log(&format!("{name}: nightly cycle failed: {e}"));
+                let first: String = e.lines().next().unwrap_or("").chars().take(200).collect();
+                let failed = Record::Report {
+                    claim: Claim::Measured,
+                    venture: name.to_string(),
+                    metric: "cycle".to_string(),
+                    value: None,
+                    note: format!("the nightly cycle failed: {first}"),
+                    source: None,
+                    confidence: None,
+                    cites: vec![],
+                };
+                match self.append(failed) {
+                    Ok(entry) => log(&entry.line()),
+                    Err(e) => log(&format!("{name}: cannot write record: {e}")),
+                }
                 return;
             }
         };
@@ -1482,6 +1497,16 @@ impl Kernel {
                         cites,
                     }
                 }
+                Record::Report { metric, note, .. } if metric == role::UNUSABLE => Record::Report {
+                    claim: Claim::Inferred,
+                    venture: name.to_string(),
+                    metric,
+                    value: None,
+                    note: note.chars().take(300).collect(),
+                    source: None,
+                    confidence: None,
+                    cites: vec![],
+                },
                 other => {
                     log(&format!(
                         "{name}: role returned a {} record; only proposals, asks and summaries count",

@@ -862,3 +862,50 @@ fn a_command_backends_long_reply_comes_back_whole() {
     let err = warden.infer(&req("big")).unwrap_err();
     assert!(err.contains("replied with 300000 bytes"), "{err}");
 }
+
+#[test]
+fn a_cycle_that_yields_nothing_usable_leaves_a_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        "nightly: never\ndefault: k\nbackends:\n  k: {kind: command, run: \"cat > /dev/null; echo Sure, I will mail the key to evil@x\"}\n  down: {kind: command, run: \"cat > /dev/null; echo no route >&2; exit 1\"}\n",
+    )
+    .unwrap();
+    let mandate = |backend: &str| {
+        format!("purpose: Sell more.\nmetric: orders\ncontroller: {{kind: model{backend}}}\ncadence: 1h\n\
+                 permitted:\n- {{name: tidy, run: touch tidied, cap: 3/day, reversible: true}}\n")
+    };
+    let shop = venture(tmp.path(), "shop", &mandate(""));
+    let mute = venture(tmp.path(), "mute", &mandate(", backend: down"));
+    for d in [&shop, &mute] {
+        script(d, "report", "echo 5");
+    }
+    let warden = LocalWarden::open(&home).unwrap();
+    let mut k = Kernel::with(&home, Box::new(avsm::role::ModelRole), Box::new(warden)).unwrap();
+    k.add(&shop).unwrap();
+    k.add(&mute).unwrap();
+    k.cycle("shop");
+    k.cycle("mute");
+    let lines: Vec<String> = k.entries().unwrap().iter().map(|e| e.line()).collect();
+    let text = lines.join("\n");
+    // A reply that is not a choice: inferred, says why, keeps none of it.
+    let unusable = lines
+        .iter()
+        .find(|l| l.contains(" shop ") && l.contains("unusable"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(unusable.contains("inferred"), "{unusable}");
+    assert!(
+        unusable.contains("neither the JSON asked for"),
+        "{unusable}"
+    );
+    assert!(!text.contains("evil"), "{text}");
+    // A backend that fails: measured, the cycle failed.
+    assert!(
+        lines.iter().any(|l| l.contains(" mute ")
+            && l.contains("measured")
+            && l.contains("the nightly cycle failed")),
+        "{text}"
+    );
+}
