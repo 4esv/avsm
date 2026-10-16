@@ -47,6 +47,9 @@ pub struct Kernel {
     /// Who is giving the command being handled, when the path it came in
     /// over knows: a Tailscale login. The socket knows nobody.
     by: Option<String>,
+    /// Can a `run` be put in a network namespace of its own here? Found
+    /// out once, the first time one needs it.
+    namespaces: Option<bool>,
 }
 
 /// What the kernel knows about a venture beyond the ledger.
@@ -60,6 +63,8 @@ struct Runtime {
     restart_at: Option<Instant>,
     /// The run exited and the policy says leave it.
     dead: bool,
+    /// Something a human should know about how the run is running.
+    note: Option<String>,
 }
 
 /// Unix seconds now.
@@ -139,6 +144,7 @@ impl Kernel {
             handled: BTreeSet::new(),
             cycled: BTreeMap::new(),
             by: None,
+            namespaces: None,
         };
         kernel.reload()?;
         Ok(kernel)
@@ -302,13 +308,16 @@ impl Kernel {
             let last = entries.iter().rev().find(|e| {
                 e.record.venture() == v.name && matches!(e.record, Record::Report { .. })
             });
-            let detail = match &v.problem {
+            let mut detail = match &v.problem {
                 Some(p) => p.clone(),
                 None => match last {
                     Some(e) => format!("{}  reported {}", e.record.summary(), ago(now - e.at)),
                     None => "no report yet".to_string(),
                 },
             };
+            if let Some(note) = self.runtime.get(&v.name).and_then(|rt| rt.note.as_deref()) {
+                detail.push_str(&format!("  ({note})"));
+            }
             out.push_str(&format!("{:<12} {:<8} {detail}\n", v.name, state));
         }
         Ok(out)
@@ -564,12 +573,37 @@ impl Kernel {
         let waiting = rt.restart_at.is_some_and(|t| Instant::now() < t);
         if rt.run.is_none() && !paused && !rt.dead && !waiting {
             if let Some(path) = v.run() {
-                match spawn_run(&self.home, name, &path) {
+                // `network: none` means a network namespace of its own,
+                // where Linux allows one; a list of hosts cannot be held
+                // to for a run, only for adapters.
+                let wants_none = v.mandate.network.as_ref().is_some_and(Vec::is_empty);
+                let confine =
+                    wants_none && *self.namespaces.get_or_insert_with(namespaces_available);
+                let note = match &v.mandate.network {
+                    Some(hosts) if hosts.is_empty() && !confine => Some(
+                        "network: none is not enforced here; this Linux allows no network namespace, so run has network"
+                            .to_string(),
+                    ),
+                    Some(hosts) if !hosts.is_empty() => Some(
+                        "network list holds adapters only; run is not held to it".to_string(),
+                    ),
+                    _ => None,
+                };
+                let rt = self.runtime.entry(name.to_string()).or_default();
+                match spawn_run(&self.home, name, &path, confine) {
                     Ok(child) => {
-                        log(&format!("{name}: run started (pid {})", child.id()));
+                        log(&format!(
+                            "{name}: run started (pid {}){}",
+                            child.id(),
+                            if confine { " with no network" } else { "" }
+                        ));
+                        if let Some(n) = &note {
+                            log(&format!("{name}: {n}"));
+                        }
                         rt.run = Some(child);
                         rt.started = Some(Instant::now());
                         rt.restart_at = None;
+                        rt.note = note;
                     }
                     Err(e) => {
                         log(&format!("{name}: cannot start run: {e}"));
@@ -998,9 +1032,39 @@ fn kill(rt: &mut Runtime) {
     rt.started = None;
 }
 
+/// Can this process put a child in a network namespace of its own: as
+/// root with a new network namespace, or as anyone with a new user
+/// namespace around it? Found out by trying on a child that does nothing.
+pub fn namespaces_available() -> bool {
+    let mut cmd = Command::new("true");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: the hook only calls unshare, which is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(unshare_network);
+    }
+    cmd.status().is_ok_and(|s| s.success())
+}
+
+/// Leave the network behind: a new network namespace, through a new user
+/// namespace when not root. Runs in the child before exec.
+fn unshare_network() -> std::io::Result<()> {
+    // SAFETY: unshare has no memory preconditions.
+    if unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0 {
+        return Ok(());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+}
+
 /// Start a venture's `run` in its directory, with a clean environment, its
-/// output appended to `<home>/log/<name>.log`.
-fn spawn_run(home: &Path, name: &str, path: &Path) -> Result<Child, String> {
+/// output appended to `<home>/log/<name>.log`, and with no network when
+/// `confine` is set.
+fn spawn_run(home: &Path, name: &str, path: &Path, confine: bool) -> Result<Child, String> {
     let dir = path
         .parent()
         .ok_or_else(|| "run has no directory".to_string())?;
@@ -1012,8 +1076,8 @@ fn spawn_run(home: &Path, name: &str, path: &Path) -> Result<Child, String> {
         .open(logs.join(format!("{name}.log")))
         .map_err(|e| format!("cannot open log: {e}"))?;
     let err = file.try_clone().map_err(|e| e.to_string())?;
-    Command::new(path)
-        .current_dir(dir)
+    let mut cmd = Command::new(path);
+    cmd.current_dir(dir)
         .env_clear()
         .env(
             "PATH",
@@ -1022,8 +1086,14 @@ fn spawn_run(home: &Path, name: &str, path: &Path) -> Result<Child, String> {
         .env("HOME", dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
-        .stderr(Stdio::from(err))
-        .spawn()
+        .stderr(Stdio::from(err));
+    if confine {
+        // SAFETY: the hook only calls unshare, which is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(unshare_network);
+        }
+    }
+    cmd.spawn()
         .map_err(|e| format!("cannot run {}: {e}", path.display()))
 }
 

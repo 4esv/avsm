@@ -760,3 +760,68 @@ fn payload_levers_ask_first_run_with_what_the_human_approved() {
         k.entries().unwrap().len() as u64
     );
 }
+
+/// `network: none` puts the run in a network namespace of its own where
+/// Linux allows one; where it does not, the run starts anyway and status
+/// says so. Either way the mandate's word is visible.
+#[test]
+fn network_none_confines_the_run_where_namespaces_exist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dir = venture(
+        tmp.path(),
+        "sealed",
+        "purpose: Serve offline.\nmetric: up\ncontroller: {kind: model}\ncadence: 1h\nrestart: never\nnetwork: none\n",
+    );
+    script(&dir, "report", "echo 1");
+    // bash can open a TCP connection by itself: no other tool is needed.
+    std::fs::write(
+        dir.join("run"),
+        format!(
+            "#!/bin/bash\nif exec 3<>/dev/tcp/127.0.0.1/{port}; then echo connected > verdict; else echo failed > verdict; fi\nsleep 30\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(dir.join("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut k = kernel(&home, Box::new(FakeRole(VecDeque::new())));
+    k.add(&dir).unwrap();
+    k.tick();
+    let began = std::time::Instant::now();
+    while !dir.join("verdict").exists() {
+        assert!(began.elapsed() < Duration::from_secs(10), "run never spoke");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let verdict = std::fs::read_to_string(dir.join("verdict")).unwrap();
+    let status = k.status().unwrap();
+    if avsm::kernel::namespaces_available() {
+        assert_eq!(verdict.trim(), "failed", "{status}");
+        assert!(!status.contains("not enforced"), "{status}");
+    } else {
+        assert_eq!(verdict.trim(), "connected", "{status}");
+        assert!(
+            status.contains("network: none is not enforced here"),
+            "{status}"
+        );
+    }
+    drop(listener);
+
+    // A list of hosts is for adapters; the run is not held to it, and status says so.
+    let dir = venture(
+        tmp.path(),
+        "listed",
+        "purpose: Serve.\nmetric: up\ncontroller: {kind: model}\ncadence: 1h\nrestart: never\nnetwork: [api.example.com]\n",
+    );
+    script(&dir, "report", "echo 1");
+    script(&dir, "run", "sleep 30");
+    k.add(&dir).unwrap();
+    k.tick();
+    let status = k.status().unwrap();
+    assert!(
+        status.contains("listed       running  no report yet  (network list holds adapters only; run is not held to it)")
+            || status.contains("(network list holds adapters only; run is not held to it)"),
+        "{status}"
+    );
+}

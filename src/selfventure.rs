@@ -124,6 +124,7 @@ pub fn canary() -> Result<(), String> {
         cadence: std::time::Duration::from_secs(60),
         context_budget: 1000,
         restart: Restart::Never,
+        network: None,
     };
     let mandate_hash = Mandate::hash(&serde_yaml::to_string(&permissive).unwrap_or_default());
     let adopt = Record::Decision {

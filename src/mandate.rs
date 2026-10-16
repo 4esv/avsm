@@ -39,6 +39,44 @@ pub struct Mandate {
     /// What to do when `run` dies.
     #[serde(default)]
     pub restart: Restart,
+    /// The hosts the venture may reach: `none` for no network, a list for
+    /// those hosts only, left out for no limit. Held to for adapters by the
+    /// warden, and for `run` when it is `none`, by a network namespace
+    /// where Linux allows one. Script levers are not held to it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "network")]
+    pub network: Option<Vec<String>>,
+}
+
+/// `network:` as `none`, or a list of hosts.
+pub mod network {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(n: &Option<Vec<String>>, s: S) -> Result<S::Ok, S::Error> {
+        match n {
+            Some(hosts) if hosts.is_empty() => s.serialize_str("none"),
+            Some(hosts) => hosts.serialize(s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Word(String),
+            Hosts(Vec<String>),
+        }
+        Ok(match Option::<Raw>::deserialize(d)? {
+            None => None,
+            Some(Raw::Word(w)) if w.trim() == "none" => Some(vec![]),
+            Some(Raw::Word(w)) => {
+                return Err(serde::de::Error::custom(format!(
+                    "network is none or a list of hosts, not {w:?}"
+                )))
+            }
+            Some(Raw::Hosts(h)) => Some(h),
+        })
+    }
 }
 
 fn default_context_budget() -> u32 {
@@ -205,6 +243,7 @@ const FIELDS: &[&str] = &[
     "cadence",
     "context_budget",
     "restart",
+    "network",
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action"];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
@@ -430,7 +469,28 @@ impl Mandate {
         if self.context_budget == 0 {
             return fail(format!("{BUDGET}, not 0"));
         }
+        if let Some(hosts) = &self.network {
+            for h in hosts {
+                let ok = !h.is_empty()
+                    && h.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'));
+                if !ok {
+                    return fail(format!(
+                        "network lists hosts, like api.stripe.com, not {h:?}"
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// May the venture reach this host? Yes when the mandate sets no
+    /// limit; else only when the host is listed.
+    pub fn allows_host(&self, host: &str) -> bool {
+        match &self.network {
+            None => true,
+            Some(hosts) => hosts.iter().any(|h| h.eq_ignore_ascii_case(host)),
+        }
     }
 
     /// Read and parse a mandate.yaml.
@@ -457,6 +517,7 @@ impl Mandate {
             cadence: Duration::from_secs(60),
             context_budget: default_context_budget(),
             restart: Restart::default(),
+            network: None,
         }
     }
 
@@ -562,7 +623,30 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
     check_forbidden(map.get("forbidden"))?;
     check_cadence(map.get("cadence"))?;
     check_context_budget(map.get("context_budget"))?;
-    check_restart(map.get("restart"))
+    check_restart(map.get("restart"))?;
+    check_network(map.get("network"))
+}
+
+fn check_network(v: Option<&Value>) -> Result<(), MandateError> {
+    match v {
+        None => Ok(()),
+        Some(Value::String(s)) if s.trim() == "none" => Ok(()),
+        Some(Value::Sequence(items)) => {
+            for item in items {
+                if !matches!(item, Value::String(_)) {
+                    return fail(format!(
+                        "network lists hosts, like api.stripe.com, not {}",
+                        describe(item)
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Some(other) => fail(format!(
+            "network is none, or a list of hosts the venture may reach, not {}",
+            describe(other)
+        )),
+    }
 }
 
 /// The first field of `map` whose name is not in `known`, if any. A field
@@ -1088,7 +1172,7 @@ forbidden: [rm]
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, restart"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, restart, network"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");
@@ -1662,6 +1746,37 @@ forbidden: [rm]
         );
         let m = Mandate::parse(&edit("restart: on-failure", "restart: never")).unwrap();
         assert_eq!(m.restart, Restart::Never);
+    }
+
+    #[test]
+    fn network_is_none_a_list_or_left_out() {
+        let m = Mandate::parse(VALID).unwrap();
+        assert_eq!(m.network, None);
+        assert!(m.allows_host("anything.example"));
+        let m = Mandate::parse(&format!("{VALID}network: none\n")).unwrap();
+        assert_eq!(m.network, Some(vec![]));
+        assert!(!m.allows_host("api.stripe.com"));
+        let m = Mandate::parse(&format!("{VALID}network: [api.stripe.com, 127.0.0.1]\n")).unwrap();
+        assert!(m.allows_host("API.stripe.com") && m.allows_host("127.0.0.1"));
+        assert!(!m.allows_host("api.github.com"));
+        assert!(serde_yaml::to_string(&m)
+            .unwrap()
+            .contains("network:\n- api.stripe.com"));
+        let msg = fails(&format!("{VALID}network: all\n"));
+        assert_eq!(
+            msg,
+            "network is none, or a list of hosts the venture may reach, not the text \"all\""
+        );
+        let msg = fails(&format!("{VALID}network: [1]\n"));
+        assert_eq!(
+            msg,
+            "network lists hosts, like api.stripe.com, not the number 1"
+        );
+        let msg = fails(&format!("{VALID}network: [\"api stripe\"]\n"));
+        assert_eq!(
+            msg,
+            "network lists hosts, like api.stripe.com, not \"api stripe\""
+        );
     }
 
     #[test]

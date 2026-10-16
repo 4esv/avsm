@@ -11,7 +11,8 @@ Use these words and no synonyms.
 - report, proposal, action, ask, decision, intent, outcome
 - running, asking, paused
 - ledger, gate, proof, adapter, canary, warden
-- Commands: start, add, status, tail, asks, approve, deny, pause, resume, why
+- parent, child, payload, adapter (built-in metric or lever), digest, know
+- Commands: start, add, status, tail, asks, approve, deny, pause, resume, why, know, propose, digest
 
 ## Non-negotiables
 
@@ -23,6 +24,22 @@ Use these words and no synonyms.
 6. Irreversible actions default to asks; if delegated, record intent then outcome.
 7. The built-in `self` venture cannot edit its own mandate, merge to main, or touch keys. Hardcoded.
 8. No public listener. Unix socket. No live steering; humans change mandates.
+9. Content a model produced is inferred until a human approves it; the record that runs it cites the declared decision, not the proposal.
+10. Parents allocate; children act. A parent never runs a child's lever.
+11. Anything that reads the open world is inferred by construction, schema-validated, size-bounded, and stripped of anything that is not a field before it becomes a record.
+12. Self-modification is a proposal. Only a declared decision adopts one.
+13. The only listener is the Tailscale one, off by default, bound to the tailnet interface only, identity from tailscaled, never from the client.
+
+## Warden
+
+The warden extracts text from backend replies and never interprets it. It
+hands the text to the role or reads the fields the record schema names;
+what the text means is never the warden's to decide.
+
+`run` and script levers are not sandboxed. Only adapters and payload levers
+are constrained by the warden. A mandate's `network: none` puts `run` in a
+network namespace of its own where Linux allows one; a list of hosts holds
+adapters only.
 
 ## Tests
 

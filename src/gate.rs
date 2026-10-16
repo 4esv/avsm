@@ -1042,6 +1042,7 @@ mod tests {
             cadence: Duration::from_secs(60),
             context_budget: 8000,
             restart: Restart::OnFailure,
+            network: None,
         }
     }
 

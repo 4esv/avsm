@@ -325,6 +325,7 @@ mod tests {
                 cadence: Duration::from_secs(60),
                 context_budget: 100,
                 restart: Restart::OnFailure,
+                network: None,
             },
             entries: vec![Entry::new(
                 1,

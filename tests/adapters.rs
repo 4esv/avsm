@@ -555,3 +555,60 @@ fn research_runs_the_configured_command_and_writes_inferred_findings() {
         k.entries().unwrap().len() as u64
     );
 }
+
+/// A venture's network list binds its adapters: a metric or lever that
+/// would reach a host not listed does not run, and the ledger says why.
+#[test]
+fn the_network_list_holds_adapters_to_their_hosts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = Stub::start(vec![
+        route("GET", "/health", 200, "{}"),
+        route("POST", "/hook", 200, "{}"),
+    ]);
+    let home = home(tmp.path(), &stub.url, "cat > sent.eml");
+    let mut k = kernel(&home);
+    let host = stub
+        .url
+        .trim_start_matches("http://")
+        .split(':')
+        .next()
+        .unwrap()
+        .to_string();
+    let mandate = |network: &str| {
+        format!(
+            "purpose: Watch.\nmetric: http.status {0}/health\ncontroller: {{kind: model}}\ncadence: 1h\nnetwork: {network}\n\
+             permitted:\n- {{name: hook, adapter: http.post {0}/hook, cap: 3/day, reversible: false, delegated: true}}\n",
+            stub.url
+        )
+    };
+    let shut = venture(tmp.path(), "shut", &mandate("none"));
+    k.add(&shut).unwrap();
+    k.report("shut", false);
+    let (value, note) = last_report(&k, "shut");
+    assert_eq!(value, None);
+    assert_eq!(
+        note,
+        format!("http.status would reach {host}, which is not in the venture's network list")
+    );
+    let out = k.propose("shut", "hook", Some("{\"a\":1}")).unwrap();
+    assert!(
+        out.contains(&format!(
+            "hook did not run: hook would reach {host}, which is not in shut's network list"
+        )),
+        "{out}"
+    );
+    assert!(stub.seen().is_empty(), "nothing reached the stub");
+
+    let open = venture(
+        tmp.path(),
+        "open",
+        &mandate(&format!("[{host}, api.example.com]")),
+    );
+    k.add(&open).unwrap();
+    k.report("open", false);
+    assert_eq!(last_report(&k, "open").0, Some(200.0));
+    let out = k.propose("open", "hook", Some("{\"a\":1}")).unwrap();
+    assert!(out.contains("outcome   #"), "{out}");
+    assert!(out.contains(" done"), "{out}");
+    assert_eq!(stub.seen().len(), 2);
+}

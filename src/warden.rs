@@ -130,6 +130,15 @@ impl Warden for LocalWarden {
             }
             return Ok(written);
         }
+        if let Some(lever) = perm.lever_adapter() {
+            if let Some(host) = lever.host(&self.config.adapters) {
+                if !v.mandate.allows_host(&host) {
+                    return Err(format!(
+                        "{action} would reach {host}, which is not in {venture}'s network list"
+                    ));
+                }
+            }
+        }
         let proof_text = proof.to_string();
         let (for_venture, for_action) = (venture.clone(), action.clone());
         let pull = |payload: Option<&Payload>| -> (bool, String) {
@@ -296,6 +305,17 @@ impl LocalWarden {
             .mandate
             .metric_adapter()
             .ok_or_else(|| format!("{venture} watches {}, not an adapter", v.mandate.metric))?;
+        if let Some(host) = metric.host(&self.config.adapters) {
+            if !v.mandate.allows_host(&host) {
+                return Ok((
+                    None,
+                    format!(
+                        "{} would reach {host}, which is not in the venture's network list",
+                        metric.name()
+                    ),
+                ));
+            }
+        }
         let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
         let key = metric
             .key_name()
