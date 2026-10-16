@@ -17,7 +17,7 @@
 //! should be.
 
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, Params, TransactionBehavior};
 
@@ -210,10 +210,7 @@ impl Ledger {
 
 /// Unix seconds now. Before 1970 the clock reads negative, as it should.
 fn now() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(since) => since.as_secs() as i64,
-        Err(before) => -(before.duration().as_secs() as i64),
-    }
+    crate::clock::now()
 }
 
 /// SQLite integers are signed; sequence numbers and counts are not.

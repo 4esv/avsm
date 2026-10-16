@@ -4,6 +4,7 @@
 //! every fact carries its provenance.
 
 pub mod adapter;
+pub mod clock;
 pub mod config;
 pub mod gate;
 pub mod kernel;

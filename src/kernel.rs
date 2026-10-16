@@ -789,7 +789,7 @@ impl Kernel {
         let Ok(Some(at)) = self.config.nightly_minutes() else {
             return false;
         };
-        let local = Local::now();
+        let local = crate::clock::local();
         if local.hour() * 60 + local.minute() < at {
             return false;
         }
@@ -823,7 +823,7 @@ impl Kernel {
         let now = now();
         let text = digest_text(&entries, &self.ventures, now);
         let (asks, incidents) = weekly(&entries, now);
-        self.digested = Some(Local::now().date_naive());
+        self.digested = Some(crate::clock::local().date_naive());
         let entry = self.append(Record::report(Claim::Measured, SELF, "digest", None, &text))?;
         self.append(Record::report(
             Claim::Measured,
@@ -1217,7 +1217,7 @@ impl Kernel {
         let Ok(Some(at)) = self.config.nightly_minutes() else {
             return false;
         };
-        let local = Local::now();
+        let local = crate::clock::local();
         if local.hour() * 60 + local.minute() < at {
             return false;
         }
@@ -1244,7 +1244,7 @@ impl Kernel {
     /// each proposal through the gate.
     pub fn cycle(&mut self, name: &str) {
         self.cycled
-            .insert(name.to_string(), Local::now().date_naive());
+            .insert(name.to_string(), crate::clock::local().date_naive());
         let Some(v) = self.ventures.get(name).cloned() else {
             return;
         };
@@ -1585,15 +1585,25 @@ pub fn namespaces_available() -> bool {
 /// Leave the network behind: a new network namespace, through a new user
 /// namespace when not root. Runs in the child before exec.
 fn unshare_network() -> std::io::Result<()> {
-    // SAFETY: unshare has no memory preconditions.
-    if unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0 {
-        return Ok(());
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: unshare has no memory preconditions.
+        if unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0 {
+            return Ok(());
+        }
+        // SAFETY: as above.
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } == 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
     }
-    // SAFETY: as above.
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } == 0 {
-        return Ok(());
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "network namespaces are Linux only",
+        ))
     }
-    Err(std::io::Error::last_os_error())
 }
 
 /// Start a venture's `run` in its directory, with a clean environment, its

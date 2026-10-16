@@ -114,7 +114,7 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
     // First tick: the run starts and the first report is read at once.
     k.tick();
     let pid = k.run_pid("shop").expect("run started");
-    assert!(Path::new(&format!("/proc/{pid}")).exists());
+    assert!(alive(pid), "the run is alive");
     let entries = k.entries().unwrap();
     assert_eq!(
         kinds(&entries)[1],
@@ -283,7 +283,7 @@ fn run_is_restarted_per_policy_and_stopped_when_paused() {
     k.pause("svc").unwrap();
     k.tick();
     assert_eq!(k.run_pid("svc"), None);
-    assert!(!Path::new(&format!("/proc/{second}")).exists() || zombie(second));
+    assert!(!alive(second), "the old run is gone");
     k.tick();
     assert_eq!(k.run_pid("svc"), None, "stays stopped while paused");
     k.resume("svc").unwrap();
@@ -308,10 +308,11 @@ fn run_is_restarted_per_policy_and_stopped_when_paused() {
     assert_eq!(k.run_pid("once"), None, "exited 0: not restarted");
 }
 
-fn zombie(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .map(|s| s.contains("State:\tZ"))
-        .unwrap_or(true)
+/// Is a process alive? Signal 0 checks without sending anything; a
+/// reaped child is gone. Works where there is no /proc.
+fn alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 only checks the pid.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 /// A one-shot HTTP server that records the request and answers with a body.

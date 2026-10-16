@@ -364,6 +364,8 @@ fn propose_asks_and_approve_edit_over_the_socket() {
     .unwrap();
     std::fs::write(dir.join("report"), "#!/bin/sh\necho 3\n").unwrap();
     std::fs::set_permissions(dir.join("report"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.yaml"), "nightly: never\n").unwrap();
     let _daemon = start(&home);
     let run = |args: &[&str]| avsm(&home, args);
     let (ok, text) = run(&["add", dir.to_str().unwrap()]);
@@ -425,6 +427,7 @@ fn propose_asks_and_approve_edit_over_the_socket() {
         .arg(&home)
         .args(["approve", &ask, "--edit"])
         .env("EDITOR", &editor)
+        .env("VISUAL", &editor)
         .output()
         .unwrap();
     let text =
