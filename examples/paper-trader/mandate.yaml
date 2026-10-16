@@ -1,0 +1,13 @@
+# A paper trader: no money and no market, just a price that wanders and a
+# book that follows it. run keeps the book; report prints the drawdown
+# from the peak, in percent; and past ten percent the built-in stop halts
+# the venture until you resume it. That is the whole risk policy.
+purpose: Trade on paper, and halt when the drawdown passes ten percent.
+metric: drawdown
+controller:
+  kind: threshold
+  above: 10
+  action: stop
+cadence: 10s
+restart: on-failure
+forbidden: [withdraw]

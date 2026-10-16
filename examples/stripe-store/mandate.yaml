@@ -1,0 +1,20 @@
+# A shop on Stripe, run from this one file. Revenue is read with the
+# stripe key, questions go to the research command named in config.yaml,
+# and every mail is an ask. Put your address in place of owner@example.com.
+# It can be a child of the portfolio example, or stand alone.
+purpose: Grow monthly revenue without annoying a single customer.
+metric: stripe.mrr
+controller:
+  kind: model
+cadence: 1h
+parent: portfolio
+permitted:
+  - name: research
+    cap: 5/day
+    reversible: true
+    delegated: true
+  - name: nudge
+    adapter: mail.send owner@example.com
+    cap: 1/day
+    reversible: false
+network: [api.stripe.com]

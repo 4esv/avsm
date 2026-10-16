@@ -1,0 +1,16 @@
+# A greenhouse: a thermometer, a vent, and a line not to cross. report
+# reads the thermometer (a file here; a sensor in life) and vent opens
+# the vent. Above thirty degrees avsm opens it, at most twelve times an
+# hour, and the proof says which reading made it do so.
+purpose: Keep the greenhouse under thirty degrees.
+metric: temperature
+controller:
+  kind: threshold
+  above: 30
+  action: vent
+cadence: 1m
+permitted:
+  - name: vent
+    run: ./vent
+    cap: 12/hour
+    reversible: true

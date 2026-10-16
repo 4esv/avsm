@@ -14,7 +14,7 @@ measured and declared facts under a mandate, and `avsm why` prints that proof.
 
 Models propose. Code proves. Nothing a model says can authorize anything by
 itself, so leaving avsm running overnight is safe because harm is underivable,
-not because the model is good.
+not because the model is good. You wake up to work done, not work to do.
 
 ## Install
 
@@ -80,6 +80,14 @@ model's word. It asks instead; `avsm asks` lists the questions, `avsm approve
 on an irreversible action to let it run unasked; avsm then records its intent
 before and the outcome after.
 
+A lever may take content: `takes: text`, `json`, `diff` or `file`. A model can
+then propose the text of an announcement or the diff of a change, and what it
+wrote waits for you. `avsm asks` shows it under the question, `avsm approve
+<number> --edit` opens it in your editor so what you save is what runs, and
+`avsm propose <venture> <lever> <content>` files a proposal of your own. Content
+a model produced runs only after a human approves it, unless the mandate
+delegates the lever.
+
 `avsm pause <venture>` stops a venture and nothing but `avsm resume <venture>`
 starts it again. There is no other steering. To change what a venture may do,
 edit its mandate and run `avsm add` again; the old permissions end with the old
@@ -108,6 +116,84 @@ Only the warden, the one process avsm starts that may act, ever reads them; the
 process that talks to models holds no keys and runs as `nobody` when avsm runs
 as root.
 
+Before it chooses, the model may look things up with `know` and `why`, a few
+times, and every look is a record. A mandate may also permit `research`, a
+lever that sends a question to a command you name under `research:` in the
+config and keeps what comes back as inferred facts, each with its source. No
+provider is built in; the command is the provider.
+
+## Ventures from one file
+
+A mandate alone is a venture when its metric and levers are built in. A metric
+may be `stripe.mrr`, `stripe.charges_today`, `github.open_issues owner/repo`,
+`github.failed_ci owner/repo`, `imap.unread mail.example.com`,
+`http.status https://example.com/health`, `file.number path` or `shell command`.
+A lever may name `adapter: github.issue owner/repo`, `github.comment owner/repo`,
+`github.pr owner/repo`, `mail.send you@example.com` or `http.post https://...`
+instead of a command. The warden runs them with the one key each is scoped to
+(`stripe`, `github`, `imap` in the keys file); a model never sees one. A mandate
+may say `network: none` or list the hosts the venture may reach, and the warden
+holds its adapters to that.
+
+## Parents
+
+A venture can own other ventures. The parent lists them under `children:`, each
+child names it under `parent:`, and `avsm add` refuses any disagreement or loop.
+A parent has four levers and no other: `budget <child> <amount>` sets what a
+child may spend a day (levers say what one run costs with `cost:`), `pause
+<child>` stops it, `resume <child>` asks you each time, and `threshold <child>
+above 25` moves the line a child's reports cross. Parents allocate; children
+act. A parent never runs a child's lever, and its nightly call sees its
+children's numbers and records, not what the world told them.
+
+Limits shared by every venture go in the config as `quotas: {asks: 20/day,
+spend: 100/day, sends: 10/day}`; avsm refuses what would pass one before the
+gate is even asked, and `avsm why` shows the quota.
+
+## Examples
+
+Each of these is in `examples/` and runs end to end with nothing but stubs.
+
+- `counter`: a number that climbs and one lever that puts it back. Three
+  files, the smallest venture there is. Start here.
+- `github-repo`: one file. Watches failed checks on the main branch, files
+  issues and comments on its own, and asks before a pull request.
+- `stripe-store`: one file. Reads monthly revenue through the Stripe key,
+  researches freely, and asks before every mail to a customer.
+- `mail-inbox`: one file. Counts unread mail over IMAP and drafts replies;
+  every send is an ask, so nothing leaves without your word.
+- `paper-trader`: a book that follows a wandering price. Past ten percent
+  of drawdown the built-in stop halts it, and only you can resume it.
+- `greenhouse`: a thermometer and a vent. Above thirty degrees avsm opens
+  the vent, and the proof names the reading that made it.
+- `portfolio`: a parent over the store and the inbox. It moves budget
+  between them, pauses one, and sees their records each night.
+
+## The morning after
+
+    avsm digest
+
+says what the night did: actions, asks, cost, and one line per venture with its
+metric and how it moved. It is also written nightly as a record, so `avsm know
+digest` finds it later. `avsm know <venture>` lists what avsm currently holds
+true about a venture, each fact with its age, who claimed it, and what it rests
+on; `avsm know <topic>` does the same across ventures. When a venture's records
+pile up, the nightly call summarizes the older ones into one record that cites
+them; they leave the model's view and never leave the ledger.
+
+As you approve the same thing again and again, avsm notices. After five
+approvals of one lever with the same shape of content, the built-in `self`
+venture proposes the mandate change that delegates it, with the five approvals
+as evidence. Approve that and the mandate file is rewritten and taken on
+afresh; the asks end.
+
+## Over Tailscale
+
+With `listen: tailscale` and `remote_users: [you@github]` in the config, avsm
+answers the same commands over your tailnet and nowhere else, and asks
+tailscaled who is calling; `avsm --remote host:2876 asks` works from your laptop,
+and the records say which login decided.
+
 ## Why
 
     avsm why 9
@@ -128,10 +214,20 @@ as the occasion, marked "authorizes nothing", because the rules are few and
 fixed: no action without a mandate and a proof from measured or declared facts;
 inferred records never authorize, they only propose or ask; stopping is always
 allowed and resuming needs a declared record; irreversible actions default to
-asks; the ledger is append-only and hash-chained; only the warden holds
-credentials; and the built-in `self` venture, which checks the chain and the
-gate every ten minutes and stops everything if either fails, can never edit its
-own mandate, merge to main, or touch keys.
+asks; content a model produced is inferred until a human approves it; parents
+allocate and children act; anything read from the open world is inferred,
+checked against the record's shape, bounded in size, and stripped of everything
+else; a change to a mandate is a proposal that only a declared decision adopts;
+the ledger is append-only and hash-chained; only the warden holds credentials;
+and the built-in `self` venture, which checks the chain and the gate every ten
+minutes and stops everything if either fails, can never edit its own mandate,
+merge to main, or touch keys.
+
+Plainly: `run` and script levers are not sandboxed. They are your programs, run
+as you wrote them. Only adapters and payload levers are constrained by the
+warden, which hands them their one key and holds them to the mandate's network
+list. `network: none` cuts `run` off from the network where Linux allows it,
+and `avsm status` says so when it cannot.
 
 ## Where this comes from
 
@@ -139,6 +235,7 @@ avsm is built on Stafford Beer's Viable System Model, the cybernetics of
 organisations that stay alive. A venture's `run` is the operation; the cadence,
 the caps and the gate are the regulation that keeps it inside its mandate; the
 nightly model call is the part that looks outward and ahead; the mandate is
-policy, the one place a human steers; and the `self` venture is the alarm that
-bypasses everything when the system itself is in danger. None of that needs
-knowing to use avsm. If you want it anyway, read Beer's *Brain of the Firm*.
+policy, the one place a human steers; the parent is the level above, allocating
+and never operating; and the `self` venture is the alarm that bypasses
+everything when the system itself is in danger. None of that needs knowing to
+use avsm. If you want it anyway, read Beer's *Brain of the Firm*.

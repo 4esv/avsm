@@ -1,0 +1,25 @@
+# A repository, kept tidy from this one file. The metric and the levers
+# are built in; the github key in ~/.avsm/keys does the rest. Put your
+# owner/repo in place of OWNER/REPO. The pr lever needs this directory to
+# be a checkout of the repository; leave it out otherwise.
+purpose: Keep the main branch green and the issue list honest.
+metric: github.failed_ci OWNER/REPO
+controller:
+  kind: model
+cadence: 15m
+permitted:
+  - name: file-issue
+    adapter: github.issue OWNER/REPO
+    cap: 2/day
+    reversible: true
+    delegated: true
+  - name: comment
+    adapter: github.comment OWNER/REPO
+    cap: 5/day
+    reversible: true
+    delegated: true
+  - name: pr
+    adapter: github.pr OWNER/REPO
+    cap: 1/day
+    reversible: false
+network: [api.github.com, github.com]

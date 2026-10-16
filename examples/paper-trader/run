@@ -1,0 +1,14 @@
+#!/bin/sh
+# Keeps the book: equity moves a little each second, the peak follows it
+# up, and the drawdown from the peak goes to a file, in percent.
+equity=$(cat equity 2>/dev/null || echo 10000)
+peak=$(cat peak 2>/dev/null || echo "$equity")
+while true; do
+  move=$(( $(od -An -N1 -tu1 /dev/urandom) % 21 - 10 ))
+  equity=$((equity + move * 5))
+  [ "$equity" -gt "$peak" ] && peak=$equity
+  echo "$equity" > equity
+  echo "$peak" > peak
+  echo $(( (peak - equity) * 100 / peak )) > drawdown
+  sleep 1
+done

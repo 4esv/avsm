@@ -1,0 +1,25 @@
+# A parent over two of the other examples. It holds the four levers every
+# parent has and no other: it moves budget between its children, pauses
+# one, moves a threshold, and sees their numbers and records each night.
+# It never pulls a child's lever. A parent needs a number too; one will do.
+purpose: Put attention where the numbers say it is needed.
+metric: shell echo 1
+controller:
+  kind: model
+cadence: 1h
+children: [stripe-store, mail-inbox]
+permitted:
+  - name: budget
+    cap: 4/day
+    reversible: true
+    delegated: true
+  - name: pause
+    cap: 4/day
+    reversible: true
+    delegated: true
+  - name: resume
+    cap: 4/day
+    reversible: true
+  - name: threshold
+    cap: 4/day
+    reversible: true

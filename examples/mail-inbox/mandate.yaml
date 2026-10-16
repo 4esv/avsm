@@ -1,0 +1,15 @@
+# An inbox. Unread mail is counted over IMAP with the imap key
+# (user:password), and the one lever sends mail, so it asks first every
+# time: a send is never delegated here. Put your server and address in.
+# It can be a child of the portfolio example, or stand alone.
+purpose: Keep the inbox answered; never send without my say.
+metric: imap.unread mail.example.com
+controller:
+  kind: model
+cadence: 30m
+parent: portfolio
+permitted:
+  - name: reply
+    adapter: mail.send owner@example.com
+    cap: 10/day
+    reversible: false

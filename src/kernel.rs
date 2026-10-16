@@ -1085,10 +1085,17 @@ impl Kernel {
                 Err(e) => lines.push(format!("{name}: {action} did not run: {e}")),
             },
             Err(refusal) => {
-                let needs_human = refusal
+                // A paused venture is not asked about: an approval could
+                // not run until a human resumes it anyway.
+                let paused = refusal
                     .reasons
                     .iter()
-                    .any(|r| matches!(r, Reason::NeedsDecision { .. }));
+                    .any(|r| matches!(r, Reason::Paused { .. }));
+                let needs_human = !paused
+                    && refusal
+                        .reasons
+                        .iter()
+                        .any(|r| matches!(r, Reason::NeedsDecision { .. }));
                 let already = gate::open_asks(&entries).into_iter().any(|q| {
                     entries.iter().any(|e| {
                         e.seq == q

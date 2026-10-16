@@ -1,0 +1,3 @@
+#!/bin/sh
+# The temperature, in degrees. Stands in for a sensor.
+cat temperature 2>/dev/null || echo 24
