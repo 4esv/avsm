@@ -91,6 +91,21 @@ enum Command {
     /// The roles process; avsm start runs it for you
     #[command(hide = true)]
     Roles,
+    /// Run the ventures in a home of their own over simulated days
+    #[command(hide = true)]
+    Simulate {
+        /// How many days to simulate
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// How far the clock jumps each step, like 1h or 15m
+        #[arg(long, default_value = "1h")]
+        step: String,
+        /// Who answers the asks: all (approve every one) or none
+        #[arg(long, default_value = "all")]
+        approve: String,
+        /// Venture directories to take on first
+        ventures: Vec<PathBuf>,
+    },
 }
 
 fn done(result: Result<(), String>) -> ExitCode {
@@ -196,6 +211,30 @@ fn main() -> ExitCode {
         Command::Start => return done(avsm::kernel::start(&home)),
         Command::Warden => return done(avsm::kernel::warden_main(&home)),
         Command::Roles => return done(avsm::kernel::roles_main()),
+        Command::Simulate {
+            days,
+            step,
+            approve,
+            ventures,
+        } => {
+            let step = match humantime::parse_duration(&step) {
+                Ok(d) => d.as_secs() as i64,
+                Err(_) => return done(Err(format!("step is a duration like 1h, not {step:?}"))),
+            };
+            let human = match approve.as_str() {
+                "all" => avsm::simulate::Human::ApproveAll,
+                "none" => avsm::simulate::Human::Away,
+                other => return done(Err(format!("approve is all or none, not {other:?}"))),
+            };
+            let plan = avsm::simulate::Plan {
+                days,
+                step,
+                human,
+                start: None,
+                add: ventures,
+            };
+            return done(avsm::simulate::run(&home, &plan, &mut std::io::stdout()));
+        }
         Command::Add { dir } => {
             let dir = dir.canonicalize().unwrap_or(dir);
             vec!["add".to_string(), dir.to_string_lossy().into_owned()]

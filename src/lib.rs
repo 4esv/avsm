@@ -15,6 +15,7 @@ pub mod record;
 pub mod research;
 pub mod role;
 pub mod selfventure;
+pub mod simulate;
 pub mod tailscale;
 pub mod venture;
 pub mod warden;
