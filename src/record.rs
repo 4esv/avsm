@@ -84,12 +84,199 @@ impl fmt::Display for Kind {
     }
 }
 
+/// What a lever takes: the shape of a payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Takes {
+    Text,
+    Json,
+    Diff,
+    File,
+}
+
+impl Takes {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Takes::Text => "text",
+            Takes::Json => "json",
+            Takes::Diff => "diff",
+            Takes::File => "file",
+        }
+    }
+
+    /// Every shape, for messages.
+    pub const ALL: &'static str = "text, json, diff or file";
+}
+
+impl fmt::Display for Takes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Takes {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Takes, String> {
+        match s.trim() {
+            "text" => Ok(Takes::Text),
+            "json" => Ok(Takes::Json),
+            "diff" => Ok(Takes::Diff),
+            "file" => Ok(Takes::File),
+            other => Err(format!("takes is {}, not {other:?}", Takes::ALL)),
+        }
+    }
+}
+
+/// Content a lever will consume: produced by a model or a human, carried by
+/// a proposal, an ask, or an amended approval, and fed to the lever only
+/// once a proof allows it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Payload {
+    Text { text: String },
+    Json { json: serde_json::Value },
+    Diff { diff: String },
+    File { path: String },
+}
+
+impl Payload {
+    /// The most a payload may hold, in bytes of its text form.
+    pub const MAX: usize = 64 * 1024;
+
+    /// Read text as a payload of the given shape, checking it fits.
+    pub fn parse(takes: Takes, text: &str) -> Result<Payload, String> {
+        if text.len() > Payload::MAX {
+            return Err(format!(
+                "the payload is {} bytes; the most a payload may hold is {}",
+                text.len(),
+                Payload::MAX
+            ));
+        }
+        if text.trim().is_empty() {
+            return Err(format!("the payload is empty; this lever takes {takes}"));
+        }
+        Ok(match takes {
+            Takes::Text => Payload::Text {
+                text: text.to_string(),
+            },
+            Takes::Json => Payload::Json {
+                json: serde_json::from_str(text)
+                    .map_err(|e| format!("the payload is not JSON: {e}"))?,
+            },
+            Takes::Diff => {
+                let looks_like_diff = text.lines().any(|l| {
+                    l.starts_with("--- ") || l.starts_with("+++ ") || l.starts_with("@@ ")
+                });
+                if !looks_like_diff {
+                    return Err(
+                        "the payload is not a diff; a diff has ---, +++ and @@ lines".to_string(),
+                    );
+                }
+                Payload::Diff {
+                    diff: text.to_string(),
+                }
+            }
+            Takes::File => {
+                let path = text.trim();
+                if path.lines().count() != 1 {
+                    return Err("a file payload is one path on one line".to_string());
+                }
+                if path.starts_with('/') || path.split('/').any(|part| part == "..") {
+                    return Err(format!(
+                        "a file payload is a path inside the venture directory, not {path:?}"
+                    ));
+                }
+                Payload::File {
+                    path: path.to_string(),
+                }
+            }
+        })
+    }
+
+    /// Read a JSON value a model replied with as a payload of the given
+    /// shape: a string for text, diff and file; an object or array for json.
+    pub fn from_value(takes: Takes, value: &serde_json::Value) -> Result<Payload, String> {
+        match (takes, value) {
+            (Takes::Json, v) if v.is_object() || v.is_array() => {
+                Payload::parse(takes, &v.to_string())
+            }
+            (_, serde_json::Value::String(s)) => Payload::parse(takes, s),
+            (t, v) => Err(format!(
+                "this lever takes {t}; the reply gave {}",
+                match v {
+                    serde_json::Value::Null => "nothing",
+                    serde_json::Value::Bool(_) => "true or false",
+                    serde_json::Value::Number(_) => "a number",
+                    serde_json::Value::String(_) => "text",
+                    serde_json::Value::Array(_) => "a list",
+                    serde_json::Value::Object(_) => "a set of fields",
+                }
+            )),
+        }
+    }
+
+    /// The shape.
+    pub fn takes(&self) -> Takes {
+        match self {
+            Payload::Text { .. } => Takes::Text,
+            Payload::Json { .. } => Takes::Json,
+            Payload::Diff { .. } => Takes::Diff,
+            Payload::File { .. } => Takes::File,
+        }
+    }
+
+    /// The content as text: what a lever reads on its standard input.
+    pub fn text(&self) -> String {
+        match self {
+            Payload::Text { text } => text.clone(),
+            Payload::Json { json } => json.to_string(),
+            Payload::Diff { diff } => diff.clone(),
+            Payload::File { path } => path.clone(),
+        }
+    }
+
+    /// The shape of a payload for telling alike payloads apart: the kind,
+    /// and for json the top-level field names.
+    pub fn shape(&self) -> String {
+        match self {
+            Payload::Json {
+                json: serde_json::Value::Object(map),
+            } => {
+                let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                format!("json({})", keys.join(","))
+            }
+            other => other.takes().to_string(),
+        }
+    }
+
+    /// One short line: the kind and the start of the content.
+    pub fn summary(&self) -> String {
+        let text = self.text();
+        let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let lines = text.lines().count();
+        let mut head: String = first.chars().take(60).collect();
+        if first.chars().count() > 60 {
+            head.push('…');
+        }
+        if lines > 1 {
+            format!("{} {head:?} ({lines} lines)", self.takes())
+        } else {
+            format!("{} {head:?}", self.takes())
+        }
+    }
+}
+
 /// What a human decided.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "verdict", rename_all = "lowercase")]
 pub enum Verdict {
-    /// Yes to an ask.
-    Approve { ask: Seq },
+    /// Yes to an ask, with the payload as amended when the human changed it.
+    Approve {
+        ask: Seq,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<Payload>,
+    },
     /// No to an ask.
     Deny { ask: Seq, reason: String },
     /// Stop the venture until a human resumes it.
@@ -104,20 +291,32 @@ pub enum Verdict {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Record {
-    /// A reading of the venture's metric. `value` is None when the report failed.
+    /// A reading of the venture's metric, or any other fact about a topic.
+    /// `value` is None when the report failed or the fact is not a number.
+    /// A fact read from the open world names its source and how sure it
+    /// is; a summary cites the records it stands for.
     Report {
         claim: Claim,
         venture: String,
         metric: String,
         value: Option<f64>,
         note: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cites: Vec<Seq>,
     },
-    /// A model suggests an action by name.
+    /// A model, or a human by hand, suggests an action by name, with the
+    /// payload the lever would consume.
     Proposal {
         claim: Claim,
         venture: String,
         action: String,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<Payload>,
     },
     /// An action was taken, with the proof that allowed it and how it went.
     Action {
@@ -127,20 +326,28 @@ pub enum Record {
         proof: Proof,
         ok: bool,
         detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<Payload>,
     },
-    /// A question for the human, optionally about a specific action.
+    /// A question for the human, optionally about a specific action, with
+    /// the payload that action would consume.
     Ask {
         claim: Claim,
         venture: String,
         action: Option<String>,
         question: String,
         refusal: Option<Refusal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<Payload>,
     },
-    /// A human's verdict.
+    /// A human's verdict. `by` names the human when the record came in
+    /// over a path that knows who they are.
     Decision {
         claim: Claim,
         venture: String,
         verdict: Verdict,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
     },
     /// An irreversible action is about to run.
     Intent {
@@ -148,6 +355,8 @@ pub enum Record {
         venture: String,
         action: String,
         proof: Proof,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<Payload>,
     },
     /// How an intent went.
     Outcome {
@@ -207,13 +416,58 @@ impl Record {
         }
     }
 
+    /// The payload this record carries, if any: a proposal's, an ask's, an
+    /// amended approval's, or the one an action ran with.
+    pub fn payload(&self) -> Option<&Payload> {
+        match self {
+            Record::Proposal { payload, .. }
+            | Record::Ask { payload, .. }
+            | Record::Action { payload, .. }
+            | Record::Intent { payload, .. } => payload.as_ref(),
+            Record::Decision {
+                verdict: Verdict::Approve { payload, .. },
+                ..
+            } => payload.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The records this one cites, if it cites any.
+    pub fn cites(&self) -> &[Seq] {
+        match self {
+            Record::Report { cites, .. } => cites,
+            _ => &[],
+        }
+    }
+
+    /// A report with no extras: the common case.
+    pub fn report(
+        claim: Claim,
+        venture: &str,
+        metric: &str,
+        value: Option<f64>,
+        note: &str,
+    ) -> Record {
+        Record::Report {
+            claim,
+            venture: venture.to_string(),
+            metric: metric.to_string(),
+            value,
+            note: note.to_string(),
+            source: None,
+            confidence: None,
+            cites: vec![],
+        }
+    }
+
     /// The bytes that get hashed. Field order is the declaration order, so
     /// the same record always gives the same bytes.
     pub fn canonical(&self) -> String {
         serde_json::to_string(self).expect("a record always serializes")
     }
 
-    /// One line, no sequence number or time, for `tail` and friends.
+    /// One line, no sequence number or time, for `tail` and friends. A
+    /// multi-line note shows its first line.
     pub fn summary(&self) -> String {
         match self {
             Record::Report {
@@ -225,7 +479,7 @@ impl Record {
                 if note.is_empty() {
                     format!("{metric}={v}")
                 } else {
-                    format!("{metric}={v}  {note}")
+                    format!("{metric}={v}  {}", first_line(note))
                 }
             }
             Record::Report {
@@ -233,8 +487,16 @@ impl Record {
                 value: None,
                 note,
                 ..
-            } => format!("{metric}=?  {note}"),
-            Record::Proposal { action, reason, .. } => format!("{action}: {reason}"),
+            } => format!("{metric}=?  {}", first_line(note)),
+            Record::Proposal {
+                action,
+                reason,
+                payload,
+                ..
+            } => match payload {
+                Some(p) => format!("{action}: {reason}  [{}]", p.summary()),
+                None => format!("{action}: {reason}"),
+            },
             Record::Action {
                 action, ok, detail, ..
             } => format!(
@@ -249,25 +511,39 @@ impl Record {
             Record::Ask {
                 action: Some(a),
                 question,
+                payload,
                 ..
-            } => format!("{a}? {question}"),
+            } => match payload {
+                Some(p) => format!("{a}? {question}  [{}]", p.summary()),
+                None => format!("{a}? {question}"),
+            },
             Record::Ask {
                 action: None,
                 question,
                 ..
             } => question.clone(),
-            Record::Decision { verdict, .. } => match verdict {
-                Verdict::Approve { ask } => format!("approved #{ask}"),
-                Verdict::Deny { ask, reason } => format!("denied #{ask}: {reason}"),
-                Verdict::Pause => "paused".to_string(),
-                Verdict::Resume => "resumed".to_string(),
-                Verdict::Adopt { mandate, path } => {
-                    format!(
-                        "adopted mandate {} from {path}",
-                        &mandate[..12.min(mandate.len())]
-                    )
+            Record::Decision { verdict, by, .. } => {
+                let text = match verdict {
+                    Verdict::Approve { ask, payload: None } => format!("approved #{ask}"),
+                    Verdict::Approve {
+                        ask,
+                        payload: Some(p),
+                    } => format!("approved #{ask} with amended {}", p.summary()),
+                    Verdict::Deny { ask, reason } => format!("denied #{ask}: {reason}"),
+                    Verdict::Pause => "paused".to_string(),
+                    Verdict::Resume => "resumed".to_string(),
+                    Verdict::Adopt { mandate, path } => {
+                        format!(
+                            "adopted mandate {} from {path}",
+                            &mandate[..12.min(mandate.len())]
+                        )
+                    }
+                };
+                match by {
+                    Some(who) => format!("{text}  by {who}"),
+                    None => text,
                 }
-            },
+            }
             Record::Intent { action, .. } => format!("{action}: starting"),
             Record::Outcome {
                 intent, ok, detail, ..
@@ -281,6 +557,13 @@ impl Record {
                 }
             ),
         }
+    }
+}
+
+fn first_line(note: &str) -> String {
+    match note.split_once('\n') {
+        Some((first, _)) => format!("{first} …"),
+        None => note.to_string(),
     }
 }
 
@@ -399,13 +682,7 @@ mod tests {
     use super::*;
 
     fn report(v: f64) -> Record {
-        Record::Report {
-            claim: Claim::Measured,
-            venture: "counter".into(),
-            metric: "count".into(),
-            value: Some(v),
-            note: String::new(),
-        }
+        Record::report(Claim::Measured, "counter", "count", Some(v), "")
     }
 
     #[test]
@@ -431,5 +708,115 @@ mod tests {
         let mut bad = b;
         bad.record = report(3.0);
         assert!(verify_chain(&[a, bad]).is_err());
+    }
+
+    #[test]
+    fn records_from_0_1_read_back_byte_for_byte() {
+        // Text a 0.1.0 ledger stored: the new optional fields are absent,
+        // and must stay absent when the record is written again, or every
+        // old hash would break.
+        let old = [
+            r#"{"kind":"report","claim":"measured","venture":"counter","metric":"count","value":11.0,"note":""}"#,
+            r#"{"kind":"proposal","claim":"inferred","venture":"shop","action":"tidy","reason":"slow day"}"#,
+            r#"{"kind":"ask","claim":"inferred","venture":"shop","action":"wipe","question":"may I wipe?","refusal":null}"#,
+            r#"{"kind":"decision","claim":"declared","venture":"shop","verdict":{"verdict":"approve","ask":9}}"#,
+            r#"{"kind":"decision","claim":"declared","venture":"shop","verdict":{"verdict":"adopt","mandate":"abc","path":"/x"}}"#,
+            r#"{"kind":"action","claim":"measured","venture":"shop","action":"tidy","proof":{"venture":"shop","action":"tidy","steps":[]},"ok":true,"detail":""}"#,
+            r#"{"kind":"intent","claim":"measured","venture":"shop","action":"deploy","proof":{"venture":"shop","action":"deploy","steps":[]}}"#,
+            r#"{"kind":"outcome","claim":"measured","venture":"shop","intent":6,"ok":true,"detail":""}"#,
+        ];
+        for text in old {
+            let record: Record = serde_json::from_str(text).unwrap();
+            assert_eq!(record.canonical(), text);
+            assert!(record.payload().is_none());
+        }
+    }
+
+    #[test]
+    fn payloads_parse_by_shape_and_keep_their_bounds() {
+        let p = Payload::parse(Takes::Text, "hello\nworld").unwrap();
+        assert_eq!(p.takes(), Takes::Text);
+        assert_eq!(p.text(), "hello\nworld");
+        assert_eq!(p.summary(), "text \"hello\" (2 lines)");
+        assert_eq!(p.shape(), "text");
+
+        let p = Payload::parse(Takes::Json, r#"{"b": 1, "a": "x"}"#).unwrap();
+        assert_eq!(p.text(), r#"{"a":"x","b":1}"#, "json is canonical");
+        assert_eq!(p.shape(), "json(a,b)");
+        assert!(Payload::parse(Takes::Json, "not json")
+            .unwrap_err()
+            .contains("not JSON"));
+
+        let diff = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(
+            Payload::parse(Takes::Diff, diff).unwrap().takes(),
+            Takes::Diff
+        );
+        assert!(Payload::parse(Takes::Diff, "just words")
+            .unwrap_err()
+            .contains("not a diff"));
+
+        assert_eq!(
+            Payload::parse(Takes::File, "out/report.csv\n").unwrap(),
+            Payload::File {
+                path: "out/report.csv".into()
+            }
+        );
+        assert!(Payload::parse(Takes::File, "../etc/passwd").is_err());
+        assert!(Payload::parse(Takes::File, "/etc/passwd").is_err());
+
+        assert!(Payload::parse(Takes::Text, "  ")
+            .unwrap_err()
+            .contains("empty"));
+        let big = "x".repeat(Payload::MAX + 1);
+        assert!(Payload::parse(Takes::Text, &big)
+            .unwrap_err()
+            .contains("the most a payload may hold"));
+
+        let v = serde_json::json!({"to": "x"});
+        assert_eq!(
+            Payload::from_value(Takes::Json, &v).unwrap().shape(),
+            "json(to)"
+        );
+        assert!(Payload::from_value(Takes::Text, &v)
+            .unwrap_err()
+            .contains("takes text"));
+        assert_eq!(
+            Payload::from_value(Takes::Text, &serde_json::json!("hi")).unwrap(),
+            Payload::Text { text: "hi".into() }
+        );
+        assert_eq!("json".parse::<Takes>().unwrap(), Takes::Json);
+        assert!("blob".parse::<Takes>().is_err());
+    }
+
+    #[test]
+    fn summaries_show_payloads_and_identities() {
+        let p = Record::Proposal {
+            claim: Claim::Inferred,
+            venture: "shop".into(),
+            action: "announce".into(),
+            reason: "new stock".into(),
+            payload: Some(Payload::Text {
+                text: "Hello all".into(),
+            }),
+        };
+        assert_eq!(p.summary(), "announce: new stock  [text \"Hello all\"]");
+        let d = Record::Decision {
+            claim: Claim::Declared,
+            venture: "shop".into(),
+            verdict: Verdict::Approve {
+                ask: 4,
+                payload: Some(Payload::Text {
+                    text: "Hello".into(),
+                }),
+            },
+            by: Some("alice@github".into()),
+        };
+        assert_eq!(
+            d.summary(),
+            "approved #4 with amended text \"Hello\"  by alice@github"
+        );
+        let r = Record::report(Claim::Measured, "self", "digest", None, "two lines\nsecond");
+        assert_eq!(r.summary(), "digest=?  two lines …");
     }
 }

@@ -88,6 +88,7 @@ fn help_reads_plainly() {
     let help = String::from_utf8_lossy(&out.stdout).to_lowercase();
     for cmd in [
         "start", "add", "status", "tail", "asks", "approve", "deny", "pause", "resume", "why",
+        "propose",
     ] {
         assert!(
             help.contains(&format!("  {cmd} ")),
@@ -99,7 +100,9 @@ fn help_reads_plainly() {
     ] {
         assert!(!help.contains(word), "help uses jargon {word:?}:\n{help}");
     }
-    for cmd in ["add", "tail", "approve", "deny", "pause", "resume", "why"] {
+    for cmd in [
+        "add", "tail", "approve", "deny", "pause", "resume", "why", "propose",
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_avsm"))
             .args([cmd, "--help"])
             .output()
@@ -255,6 +258,7 @@ fn approve_and_deny_answer_open_asks() {
         action: Some(action.to_string()),
         question: format!("may I {action}?"),
         refusal: None,
+        payload: None,
     };
     let first = kernel.append(ask("deploy")).unwrap().seq;
     let second = kernel.append(ask("rollback")).unwrap().seq;
@@ -340,4 +344,115 @@ fn examples_counter_end_to_end() {
         std::fs::read_to_string(dir.join("count")).unwrap().trim(),
         "0"
     );
+}
+
+/// A human proposes by hand, reads the payload under the ask, and approves
+/// with an edit: what they saved is what runs.
+#[test]
+fn propose_asks_and_approve_edit_over_the_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = tmp.path().join("shop");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        "purpose: Sell more.\nmetric: orders\ncontroller: {kind: model}\ncadence: 1h\n\
+         permitted:\n\
+         - {name: announce, run: \"cat > announced\", cap: 3/day, reversible: true, takes: text}\n\
+         - {name: mail, run: \"cat > mailed\", cap: 3/day, reversible: false, takes: text}\n",
+    )
+    .unwrap();
+    let _daemon = start(&home);
+    let run = |args: &[&str]| avsm(&home, args);
+    let (ok, text) = run(&["add", dir.to_str().unwrap()]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("may announce  3/day  reversible, takes text and will ask first"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "may mail  3/day  irreversible, will ask first, takes text and will ask first"
+        ),
+        "{text}"
+    );
+
+    // A reversible payload lever, proposed by hand, runs at once.
+    let (ok, text) = run(&["propose", "shop", "announce", "Hello", "all"]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("declared  proposal  announce: proposed by hand  [text \"Hello all\"]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("measured  action    announce: done"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("announced")).unwrap(),
+        "Hello all"
+    );
+
+    // An irreversible one asks first, even from a human; the ask shows the payload.
+    let (ok, text) = run(&["propose", "shop", "mail", "Dear all,"]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("declared  ask       mail? may I mail with this?  [text \"Dear all,\"]"),
+        "{text}"
+    );
+    let ask = text
+        .lines()
+        .find(|l| l.contains("mail? may I mail"))
+        .unwrap()
+        .trim_start_matches('#')
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let (ok, text) = run(&["asks"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("mail? may I mail with this?"), "{text}");
+    assert!(text.contains("\n    Dear all,\n"), "{text}");
+
+    // approve --edit runs the editor on the payload and approves what it saved.
+    let editor = tmp.path().join("editor");
+    std::fs::write(&editor, "#!/bin/sh\nprintf 'Dear all, edited' > \"$1\"\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_avsm"))
+        .arg("--home")
+        .arg(&home)
+        .args(["approve", &ask, "--edit"])
+        .env("EDITOR", &editor)
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "approved #{ask} with amended text \"Dear all, edited\""
+        )),
+        "{text}"
+    );
+    let began = Instant::now();
+    loop {
+        if dir.join("mailed").exists() {
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(20), "mail never ran");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("mailed")).unwrap(),
+        "Dear all, edited"
+    );
+    let (ok, text) = run(&["tail", "3"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("intent    mail: starting"), "{text}");
+    let (ok, text) = run(&["asks"]);
+    assert!(ok);
+    assert_eq!(text, "no open asks\n");
+    let (ok, text) = run(&["propose", "shop", "announce"]);
+    assert!(!ok);
+    assert!(text.contains("announce takes text"), "{text}");
 }

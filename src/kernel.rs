@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::gate::{self, Adopted, Candidate, Reason, State, Step, SELF};
 use crate::ledger::Ledger;
 use crate::mandate::{Controller, Restart};
-use crate::record::{Claim, Entry, Record, Seq, Verdict};
+use crate::record::{Claim, Entry, Payload, Record, Seq, Verdict};
 use crate::role::{self, Context, InferRequest, ModelRole, Role};
 use crate::venture::{self, Venture};
 use crate::warden::{self, FromWarden, LocalWarden, ToWarden, Warden};
@@ -44,6 +44,9 @@ pub struct Kernel {
     handled: BTreeSet<Seq>,
     /// The local date each venture last had its nightly cycle.
     cycled: BTreeMap<String, NaiveDate>,
+    /// Who is giving the command being handled, when the path it came in
+    /// over knows: a Tailscale login. The socket knows nobody.
+    by: Option<String>,
 }
 
 /// What the kernel knows about a venture beyond the ledger.
@@ -131,6 +134,7 @@ impl Kernel {
             runtime: BTreeMap::new(),
             handled: BTreeSet::new(),
             cycled: BTreeMap::new(),
+            by: None,
         };
         kernel.reload()?;
         Ok(kernel)
@@ -160,6 +164,19 @@ impl Kernel {
 
     /// Run one command from the socket. The first argument is the command.
     pub fn handle(&mut self, args: &[String]) -> Result<String, String> {
+        self.handle_as(args, None)
+    }
+
+    /// Run one command given by a known human; their login goes on every
+    /// declared record the command writes.
+    pub fn handle_as(&mut self, args: &[String], by: Option<&str>) -> Result<String, String> {
+        self.by = by.map(str::to_string);
+        let result = self.dispatch(args);
+        self.by = None;
+        result
+    }
+
+    fn dispatch(&mut self, args: &[String]) -> Result<String, String> {
         let (cmd, rest) = args
             .split_first()
             .ok_or_else(|| "no command given".to_string())?;
@@ -173,12 +190,28 @@ impl Kernel {
                     .map_err(|_| format!("tail takes a count, not {n:?}"))?,
             ),
             ("asks", []) => self.asks(),
-            ("approve", [seq]) => self.approve(parse_seq(seq)?),
+            ("approve", [seq]) => self.approve(parse_seq(seq)?, None),
+            ("approve", [seq, "--payload", text]) => self.approve(parse_seq(seq)?, Some(text)),
+            ("payload", [seq]) => self.payload(parse_seq(seq)?),
             ("deny", [seq, reason @ ..]) => self.deny(parse_seq(seq)?, &reason.join(" ")),
             ("pause", [name]) => self.pause(name),
             ("resume", [name]) => self.resume(name),
             ("why", [seq]) => self.why(parse_seq(seq)?),
+            ("propose", [venture, lever]) => self.propose(venture, lever, None),
+            ("propose", [venture, lever, payload @ ..]) => {
+                self.propose(venture, lever, Some(&payload.join(" ")))
+            }
             _ => Err(format!("avsm does not understand: {}", args.join(" "))),
+        }
+    }
+
+    /// A declared decision by whoever is giving the command.
+    fn decision(&self, venture: &str, verdict: Verdict) -> Record {
+        Record::Decision {
+            claim: Claim::Declared,
+            venture: venture.to_string(),
+            verdict,
+            by: self.by.clone(),
         }
     }
 
@@ -189,14 +222,13 @@ impl Kernel {
             .map_err(|e| format!("cannot find {}: {e}", dir.display()))?;
         let name = venture::name_of(&dir)?;
         let (mandate, hash) = venture::read_mandate(&dir)?;
-        let entry = self.append(Record::Decision {
-            claim: Claim::Declared,
-            venture: name.clone(),
-            verdict: Verdict::Adopt {
+        let entry = self.append(self.decision(
+            &name,
+            Verdict::Adopt {
                 mandate: hash.clone(),
                 path: dir.to_string_lossy().into_owned(),
             },
-        })?;
+        ))?;
         let v = Venture {
             name: name.clone(),
             path: Some(dir.clone()),
@@ -219,7 +251,7 @@ impl Kernel {
         ));
         for p in &mandate.permitted {
             out.push_str(&format!(
-                "  may {}  {}  {}\n",
+                "  may {}  {}  {}{}\n",
                 p.name,
                 p.cap,
                 if p.reversible {
@@ -228,6 +260,11 @@ impl Kernel {
                     "irreversible, delegated"
                 } else {
                     "irreversible, will ask first"
+                },
+                match p.takes {
+                    Some(t) if p.delegated => format!(", takes {t}"),
+                    Some(t) => format!(", takes {t} and will ask first"),
+                    None => String::new(),
                 }
             ));
         }
@@ -269,18 +306,33 @@ impl Kernel {
         Ok(entries.iter().map(|e| e.line() + "\n").collect())
     }
 
-    /// The questions waiting for a human, one line each.
+    /// The questions waiting for a human, one line each, with the payload
+    /// the lever would consume under each that carries one.
     pub fn asks(&self) -> Result<String, String> {
         let entries = self.entries()?;
         let open = gate::open_asks(&entries);
         if open.is_empty() {
             return Ok("no open asks\n".to_string());
         }
-        Ok(entries
-            .iter()
-            .filter(|e| open.contains(&e.seq))
-            .map(|e| e.line() + "\n")
-            .collect())
+        let mut out = String::new();
+        for e in entries.iter().filter(|e| open.contains(&e.seq)) {
+            out.push_str(&e.line());
+            out.push('\n');
+            if let Some(p) = e.record.payload() {
+                out.push_str(&indent(&p.text(), 40));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The payload of an open ask: its shape on the first line, then the
+    /// content. For `approve --edit`.
+    pub fn payload(&self, seq: Seq) -> Result<String, String> {
+        let ask = self.open_ask(seq)?;
+        match ask.record.payload() {
+            Some(p) => Ok(format!("{}\n{}", p.takes(), p.text())),
+            None => Err(format!("#{seq} carries no payload to edit")),
+        }
     }
 
     fn open_ask(&self, seq: Seq) -> Result<Entry, String> {
@@ -292,14 +344,23 @@ impl Kernel {
         Ok(entry)
     }
 
-    /// Say yes to an ask. The next tick acts on it.
-    pub fn approve(&mut self, seq: Seq) -> Result<String, String> {
+    /// Say yes to an ask, with the payload as the human amended it when
+    /// they did. The next tick acts on it.
+    pub fn approve(&mut self, seq: Seq, amended: Option<&str>) -> Result<String, String> {
         let ask = self.open_ask(seq)?;
-        let entry = self.append(Record::Decision {
-            claim: Claim::Declared,
-            venture: ask.record.venture().to_string(),
-            verdict: Verdict::Approve { ask: seq },
-        })?;
+        let payload = match amended {
+            None => None,
+            Some(text) => {
+                let takes = ask
+                    .record
+                    .payload()
+                    .map(Payload::takes)
+                    .ok_or_else(|| format!("#{seq} carries no payload to amend"))?;
+                Some(Payload::parse(takes, text)?)
+            }
+        };
+        let entry = self
+            .append(self.decision(ask.record.venture(), Verdict::Approve { ask: seq, payload }))?;
         Ok(entry.line() + "\n")
     }
 
@@ -311,12 +372,51 @@ impl Kernel {
         } else {
             reason.trim().to_string()
         };
-        let entry = self.append(Record::Decision {
-            claim: Claim::Declared,
-            venture: ask.record.venture().to_string(),
-            verdict: Verdict::Deny { ask: seq, reason },
-        })?;
+        let entry =
+            self.append(self.decision(ask.record.venture(), Verdict::Deny { ask: seq, reason }))?;
         Ok(entry.line() + "\n")
+    }
+
+    /// File a proposal by hand. It is declared, and it still goes through
+    /// the gate right away: what the gate said comes back with the record.
+    pub fn propose(
+        &mut self,
+        name: &str,
+        lever: &str,
+        payload: Option<&str>,
+    ) -> Result<String, String> {
+        let v = self
+            .ventures
+            .get(name)
+            .ok_or_else(|| format!("no venture named {name}; see: avsm status"))?;
+        let perm = v
+            .mandate
+            .permitted(lever)
+            .ok_or_else(|| format!("{name} does not permit {lever}; see its mandate"))?;
+        let payload = match (perm.takes, payload) {
+            (None, None) => None,
+            (None, Some(_)) => return Err(format!("{lever} takes no payload")),
+            (Some(t), None) => {
+                return Err(format!("{lever} takes {t}; give it after the lever name"))
+            }
+            (Some(t), Some(text)) => Some(Payload::parse(t, text)?),
+        };
+        let entry = self.append(Record::Proposal {
+            claim: Claim::Declared,
+            venture: name.to_string(),
+            action: lever.to_string(),
+            reason: match &self.by {
+                Some(who) => format!("proposed by {who}"),
+                None => "proposed by hand".to_string(),
+            },
+            payload,
+        })?;
+        let mut out = entry.line() + "\n";
+        for line in self.act(name, lever, vec![entry.seq], Claim::Declared) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     fn known(&self, name: &str) -> Result<(), String> {
@@ -330,22 +430,14 @@ impl Kernel {
     /// Stop a venture until a human resumes it. The next tick stops its run.
     pub fn pause(&mut self, name: &str) -> Result<String, String> {
         self.known(name)?;
-        let entry = self.append(Record::Decision {
-            claim: Claim::Declared,
-            venture: name.to_string(),
-            verdict: Verdict::Pause,
-        })?;
+        let entry = self.append(self.decision(name, Verdict::Pause))?;
         Ok(entry.line() + "\n")
     }
 
     /// Let a paused venture run again.
     pub fn resume(&mut self, name: &str) -> Result<String, String> {
         self.known(name)?;
-        let entry = self.append(Record::Decision {
-            claim: Claim::Declared,
-            venture: name.to_string(),
-            verdict: Verdict::Resume,
-        })?;
+        let entry = self.append(self.decision(name, Verdict::Resume))?;
         Ok(entry.line() + "\n")
     }
 
@@ -485,13 +577,13 @@ impl Kernel {
             Some(m) => m,
             None => return,
         };
-        let entry = match self.append(Record::Report {
-            claim: Claim::Measured,
-            venture: name.to_string(),
-            metric: v.mandate.metric.clone(),
+        let entry = match self.append(Record::report(
+            Claim::Measured,
+            name,
+            &v.mandate.metric,
             value,
-            note,
-        }) {
+            &note,
+        )) {
             Ok(e) => e,
             Err(e) => {
                 log(&format!("{name}: cannot write report: {e}"));
@@ -562,13 +654,16 @@ impl Kernel {
     }
 
     /// Try to take an action: gate it, and if allowed have the warden do
-    /// it; if it needs a human, ask once.
-    fn act(&mut self, name: &str, action: &str, cites: Vec<Seq>, claim: Claim) {
+    /// it; if it needs a human, ask once. Returns what happened, one line
+    /// each, after logging it.
+    fn act(&mut self, name: &str, action: &str, cites: Vec<Seq>, claim: Claim) -> Vec<String> {
+        let mut lines = Vec::new();
         let entries = match self.entries() {
             Ok(e) => e,
             Err(e) => {
-                log(&format!("{name}: cannot read the ledger: {e}"));
-                return;
+                lines.push(format!("{name}: cannot read the ledger: {e}"));
+                log(&lines[0]);
+                return lines;
             }
         };
         let candidate = Candidate {
@@ -578,12 +673,8 @@ impl Kernel {
         };
         match gate::gate(&candidate, &entries, &self.adopted(), now()) {
             Ok(_) => match self.warden.execute(&candidate) {
-                Ok(written) => {
-                    for e in &written {
-                        log(&e.line());
-                    }
-                }
-                Err(e) => log(&format!("{name}: {action} did not run: {e}")),
+                Ok(written) => lines.extend(written.iter().map(Entry::line)),
+                Err(e) => lines.push(format!("{name}: {action} did not run: {e}")),
             },
             Err(refusal) => {
                 let needs_human = refusal
@@ -598,23 +689,40 @@ impl Kernel {
                     })
                 });
                 if needs_human && !already {
-                    let question = format!("may I {action}? it is irreversible");
+                    // The ask carries the payload the lever would consume,
+                    // from whichever cited record brought it.
+                    let payload = candidate
+                        .cites
+                        .iter()
+                        .filter_map(|s| entries.iter().find(|e| e.seq == *s))
+                        .find_map(|e| e.record.payload().cloned());
+                    let question = match &payload {
+                        Some(_) => format!("may I {action} with this?"),
+                        None => format!("may I {action}? it is irreversible"),
+                    };
                     match self.append(Record::Ask {
                         claim,
                         venture: name.to_string(),
                         action: Some(action.to_string()),
                         question,
                         refusal: Some(refusal),
+                        payload,
                     }) {
-                        Ok(e) => log(&e.line()),
-                        Err(e) => log(&format!("{name}: cannot write ask: {e}")),
+                        Ok(e) => lines.push(e.line()),
+                        Err(e) => lines.push(format!("{name}: cannot write ask: {e}")),
                     }
-                } else if !needs_human {
+                } else if needs_human {
+                    lines.push(format!("{name}: {action} is already asked; see: avsm asks"));
+                } else {
                     let why: Vec<String> = refusal.reasons.iter().map(|r| r.to_string()).collect();
-                    log(&format!("{name}: {action} refused: {}", why.join("; ")));
+                    lines.push(format!("{name}: {action} refused: {}", why.join("; ")));
                 }
             }
         }
+        for line in &lines {
+            log(line);
+        }
+        lines
     }
 
     /// Act on declared approvals not yet acted on.
@@ -641,7 +749,8 @@ impl Kernel {
                 Record::Decision {
                     claim: Claim::Declared,
                     venture,
-                    verdict: Verdict::Approve { ask },
+                    verdict: Verdict::Approve { ask, .. },
+                    ..
                 } if !acted.contains(&e.seq) && !self.handled.contains(&e.seq) => {
                     let action = entries
                         .iter()
@@ -752,22 +861,42 @@ impl Kernel {
         }
         for record in records {
             // A role may only propose or ask, and only for its own venture.
+            // A payload is kept only when the lever takes that shape.
             let record = match record {
-                Record::Proposal { action, reason, .. } => Record::Proposal {
-                    claim: Claim::Inferred,
-                    venture: name.to_string(),
+                Record::Proposal {
                     action,
                     reason,
-                },
+                    payload,
+                    ..
+                } => {
+                    let payload = fit_payload(&v.mandate, &action, payload, name);
+                    Record::Proposal {
+                        claim: Claim::Inferred,
+                        venture: name.to_string(),
+                        action,
+                        reason,
+                        payload,
+                    }
+                }
                 Record::Ask {
-                    action, question, ..
-                } => Record::Ask {
-                    claim: Claim::Inferred,
-                    venture: name.to_string(),
                     action,
                     question,
-                    refusal: None,
-                },
+                    payload,
+                    ..
+                } => {
+                    let payload = match &action {
+                        Some(a) => fit_payload(&v.mandate, a, payload, name),
+                        None => None,
+                    };
+                    Record::Ask {
+                        claim: Claim::Inferred,
+                        venture: name.to_string(),
+                        action,
+                        question,
+                        refusal: None,
+                        payload,
+                    }
+                }
                 other => {
                     log(&format!(
                         "{name}: role returned a {} record; only proposals and asks count",
@@ -806,6 +935,7 @@ impl Kernel {
             action: None,
             question: question.to_string(),
             refusal: None,
+            payload: None,
         }) {
             Ok(e) => log(&e.line()),
             Err(e) => log(&format!("{name}: cannot write ask: {e}")),
@@ -872,6 +1002,43 @@ fn spawn_run(home: &Path, name: &str, path: &Path) -> Result<Child, String> {
         .stderr(Stdio::from(err))
         .spawn()
         .map_err(|e| format!("cannot run {}: {e}", path.display()))
+}
+
+/// A payload as the lever takes it: dropped when the lever takes none,
+/// re-read into the lever's shape when the role gave another.
+fn fit_payload(
+    mandate: &crate::mandate::Mandate,
+    action: &str,
+    payload: Option<Payload>,
+    name: &str,
+) -> Option<Payload> {
+    let takes = mandate.permitted(action).and_then(|p| p.takes)?;
+    let payload = payload?;
+    if payload.takes() == takes {
+        return Some(payload);
+    }
+    match Payload::parse(takes, &payload.text()) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            log(&format!("{name}: {action}: dropped the payload: {e}"));
+            None
+        }
+    }
+}
+
+/// Text indented by four spaces, at most `max` lines.
+fn indent(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let lines: Vec<&str> = text.lines().collect();
+    for line in lines.iter().take(max) {
+        out.push_str("    ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    if lines.len() > max {
+        out.push_str(&format!("    ({} more lines)\n", lines.len() - max));
+    }
+    out
 }
 
 fn parse_seq(s: &str) -> Result<Seq, String> {

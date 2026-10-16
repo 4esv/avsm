@@ -11,7 +11,7 @@ use ascent::ascent;
 use serde::{Deserialize, Serialize};
 
 use crate::mandate::{Cap, Controller, Mandate};
-use crate::record::{Claim, Entry, Kind, Record, Seq, Verdict};
+use crate::record::{Claim, Entry, Kind, Record, Seq, Takes, Verdict};
 
 /// The action that always passes.
 pub const STOP: &str = crate::mandate::STOP;
@@ -71,6 +71,16 @@ pub enum Step {
         cap: Cap,
         reversible: bool,
         delegated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        takes: Option<Takes>,
+    },
+    /// The record whose payload the lever consumes: the amended approval
+    /// when a human changed it, else the ask, else the proposal.
+    Payload {
+        from: Seq,
+        claim: Claim,
+        kind: Takes,
+        summary: String,
     },
     /// A report the proof uses.
     Report {
@@ -106,17 +116,50 @@ pub enum Step {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Reason {
-    NoMandate { venture: String },
-    NotPermitted { action: String },
-    Forbidden { action: String },
-    Hardwired { action: String, why: String },
-    Paused { venture: String },
-    OverCap { used: u32, cap: Cap },
-    NeedsDecision { action: String },
-    NotJustified { action: String },
-    OnlyInferred { seqs: Vec<Seq> },
-    UnknownRecord { seq: Seq },
-    NeedsDeclaredResume { venture: String },
+    NoMandate {
+        venture: String,
+    },
+    NotPermitted {
+        action: String,
+    },
+    Forbidden {
+        action: String,
+    },
+    Hardwired {
+        action: String,
+        why: String,
+    },
+    Paused {
+        venture: String,
+    },
+    OverCap {
+        used: u32,
+        cap: Cap,
+    },
+    NeedsDecision {
+        action: String,
+    },
+    NotJustified {
+        action: String,
+    },
+    OnlyInferred {
+        seqs: Vec<Seq>,
+    },
+    UnknownRecord {
+        seq: Seq,
+    },
+    NeedsDeclaredResume {
+        venture: String,
+    },
+    NoPayload {
+        action: String,
+        takes: Takes,
+    },
+    WrongPayload {
+        action: String,
+        takes: Takes,
+        found: Takes,
+    },
 }
 
 /// A derivation that reaches the action.
@@ -125,6 +168,24 @@ pub struct Proof {
     pub venture: String,
     pub action: String,
     pub steps: Vec<Step>,
+}
+
+impl Proof {
+    /// The record the payload comes from, when the lever takes one.
+    pub fn payload_from(&self) -> Option<Seq> {
+        self.steps.iter().find_map(|s| match s {
+            Step::Payload { from, .. } => Some(*from),
+            _ => None,
+        })
+    }
+
+    /// The declared decision the proof rests on, if any.
+    pub fn decision(&self) -> Option<Seq> {
+        self.steps.iter().find_map(|s| match s {
+            Step::Decision { seq, .. } => Some(*seq),
+            _ => None,
+        })
+    }
 }
 
 /// A derivation that does not.
@@ -180,6 +241,8 @@ ascent! {
     relation mandate(Seq, String, String);
     // venture, action, cap count, reversible, delegated
     relation permitted(String, String, u32, bool, bool);
+    // venture, action: the lever consumes a payload
+    relation takes(String, String);
     // venture, action, times run inside the cap window
     relation used(String, String, u32);
     relation forbidden(String, String);
@@ -237,6 +300,18 @@ ascent! {
     relation needs_decision(String, String);
     needs_decision(v, a) <-- candidate(v, a), permitted(v, a, _, false, _), !irreversible_ok(v, a);
 
+    // Non-negotiable 9: content a model produced is inferred until a human
+    // approves it. A lever that takes a payload runs from a declared
+    // approval, from a proposal a human filed by hand, or when the mandate
+    // delegates the lever; never from a model's proposal alone.
+    relation declared_proposal(String, String, Seq);
+    declared_proposal(v, a, s) <-- proposed(v, a, s), trusted(s);
+    relation payload_ok(String, String);
+    payload_ok(v, a) <-- takes(v, a), permitted(v, a, _, _, true);
+    payload_ok(v, a) <-- takes(v, a), approved(v, a, _, _);
+    payload_ok(v, a) <-- takes(v, a), declared_proposal(v, a, _);
+    needs_decision(v, a) <-- candidate(v, a), takes(v, a), !payload_ok(v, a);
+
     // An ask stays open until a declared decision answers it.
     relation decided(Seq);
     decided(q) <-- decision(d, _, Dk::Approve, q), trusted(d);
@@ -289,7 +364,7 @@ pub fn gate(
             ledger.iter().any(|e| {
                 e.seq == m.seq
                     && matches!(&e.record,
-                        Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Adopt { mandate, .. } }
+                        Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Adopt { mandate, .. }, .. }
                         if *venture == m.venture && *mandate == m.hash)
             })
         })
@@ -316,6 +391,9 @@ pub fn gate(
                 })
                 .count() as u32;
             p.used.push((venture.clone(), perm.name.clone(), used));
+            if perm.takes.is_some() {
+                p.takes.push((venture.clone(), perm.name.clone()));
+            }
             if venture == SELF {
                 for (fragment, why) in HARDWIRED_RUN {
                     if perm.run.contains(fragment) {
@@ -377,7 +455,7 @@ fn load_ledger(p: &mut Rules, ledger: &[Entry]) {
             } => p.report.push((e.seq, venture, metric.clone(), Num(*val))),
             Record::Decision { verdict, .. } => {
                 let (dk, target) = match verdict {
-                    Verdict::Approve { ask } => (Dk::Approve, *ask),
+                    Verdict::Approve { ask, .. } => (Dk::Approve, *ask),
                     Verdict::Deny { ask, .. } => (Dk::Deny, *ask),
                     Verdict::Pause => (Dk::Pause, 0),
                     Verdict::Resume => (Dk::Resume, 0),
@@ -492,7 +570,7 @@ fn assemble(
         for &s in &candidate.cites {
             if let Some(e) = find(s) {
                 let declared_resume = matches!(&e.record,
-                    Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Resume }
+                    Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Resume, .. }
                     if venture == v);
                 if declared_resume {
                     steps.push(Step::Decision {
@@ -525,6 +603,7 @@ fn assemble(
                     cap: perm.cap,
                     reversible: perm.reversible,
                     delegated: perm.delegated,
+                    takes: perm.takes,
                 }),
                 None => reasons.push(Reason::NotPermitted { action: a.clone() }),
             }
@@ -597,6 +676,48 @@ fn assemble(
                 steps.push(occasion(e));
                 cited.insert(s);
             }
+        }
+    }
+
+    // The payload a lever consumes comes from the amended approval if the
+    // human changed it, else from the ask the approval answers, else from
+    // the proposal. A lever that takes one and gets none is refused.
+    if let Some(takes) = permitted.and_then(|perm| perm.takes) {
+        let with_payload = |seq: Seq| find(seq).filter(|e| e.record.payload().is_some());
+        let mut source = None;
+        for (_, _, d, q) in p.approved.iter().filter(|(x, y, _, _)| x == v && y == a) {
+            source = with_payload(*d).or_else(|| with_payload(*q));
+            if source.is_some() {
+                break;
+            }
+        }
+        if source.is_none() {
+            source = p
+                .proposed
+                .iter()
+                .filter(|(x, y, _)| x == v && y == a)
+                .find_map(|(_, _, s)| with_payload(*s));
+        }
+        match source.and_then(|e| e.record.payload().map(|pl| (e, pl))) {
+            Some((e, payload)) => {
+                steps.push(Step::Payload {
+                    from: e.seq,
+                    claim: e.record.claim(),
+                    kind: payload.takes(),
+                    summary: payload.summary(),
+                });
+                if payload.takes() != takes {
+                    reasons.push(Reason::WrongPayload {
+                        action: a.clone(),
+                        takes,
+                        found: payload.takes(),
+                    });
+                }
+            }
+            None => reasons.push(Reason::NoPayload {
+                action: a.clone(),
+                takes,
+            }),
         }
     }
 
@@ -687,20 +808,27 @@ impl fmt::Display for Step {
                 cap,
                 reversible,
                 delegated,
+                takes,
             } => write!(
                 f,
-                "permitted  {action}  {cap}  {}{}",
+                "permitted  {action}  {cap}  {}{}{}",
                 if *reversible {
                     "reversible"
                 } else {
                     "irreversible"
                 },
-                if !*reversible && *delegated {
-                    ", delegated"
-                } else {
-                    ""
+                if *delegated { ", delegated" } else { "" },
+                match takes {
+                    Some(t) => format!(", takes {t}"),
+                    None => String::new(),
                 }
             ),
+            Step::Payload {
+                from,
+                claim,
+                kind: _,
+                summary,
+            } => write!(f, "payload    #{from}  {claim}  {summary}"),
             Step::Report {
                 seq,
                 claim,
@@ -768,6 +896,14 @@ impl fmt::Display for Reason {
             Reason::NeedsDeclaredResume { venture } => {
                 write!(f, "resuming {venture} needs a declared decision")
             }
+            Reason::NoPayload { action, takes } => {
+                write!(f, "{action} takes {takes} and nothing cited carries one")
+            }
+            Reason::WrongPayload {
+                action,
+                takes,
+                found,
+            } => write!(f, "{action} takes {takes}, not {found}"),
         }
     }
 }
@@ -807,6 +943,11 @@ pub fn why(entry: &Entry) -> String {
         } => format!("{head}\n{r}"),
         Record::Ask { question, .. } => format!("{head}\n  asked: {question}\n"),
         Record::Report { claim, .. } => format!("{head}\n  {claim} by {}\n", by(*claim)),
+        Record::Proposal {
+            claim: Claim::Declared,
+            reason,
+            ..
+        } => format!("{head}\n  declared by a human: {reason}\n  the gate still decides\n"),
         Record::Proposal { reason, .. } => {
             format!("{head}\n  inferred by a model: {reason}\n  authorizes nothing on its own\n")
         }
@@ -827,7 +968,7 @@ fn by(claim: Claim) -> &'static str {
 mod tests {
     use super::*;
     use crate::mandate::{Permitted, Restart};
-    use crate::record::GENESIS;
+    use crate::record::{Payload, GENESIS};
     use std::time::Duration;
 
     const NOW: i64 = 1_700_000_000;
@@ -844,6 +985,7 @@ mod tests {
             },
             reversible,
             delegated,
+            takes: None,
         }
     }
 
@@ -873,13 +1015,7 @@ mod tests {
     }
 
     fn report(claim: Claim, value: f64) -> Record {
-        Record::Report {
-            claim,
-            venture: V.to_string(),
-            metric: "count".to_string(),
-            value: Some(value),
-            note: String::new(),
-        }
+        Record::report(claim, V, "count", Some(value), "")
     }
 
     fn proposal(claim: Claim, action: &str) -> Record {
@@ -888,6 +1024,17 @@ mod tests {
             venture: V.to_string(),
             action: action.to_string(),
             reason: "it seemed right".to_string(),
+            payload: None,
+        }
+    }
+
+    fn proposal_with(claim: Claim, action: &str, payload: Payload) -> Record {
+        Record::Proposal {
+            claim,
+            venture: V.to_string(),
+            action: action.to_string(),
+            reason: "it seemed right".to_string(),
+            payload: Some(payload),
         }
     }
 
@@ -898,6 +1045,18 @@ mod tests {
             action: Some(action.to_string()),
             question: format!("may I {action}?"),
             refusal: None,
+            payload: None,
+        }
+    }
+
+    fn ask_with(claim: Claim, action: &str, payload: Payload) -> Record {
+        Record::Ask {
+            claim,
+            venture: V.to_string(),
+            action: Some(action.to_string()),
+            question: format!("may I {action}?"),
+            refusal: None,
+            payload: Some(payload),
         }
     }
 
@@ -906,6 +1065,17 @@ mod tests {
             claim,
             venture: V.to_string(),
             verdict,
+            by: None,
+        }
+    }
+
+    fn approve(ask: Seq) -> Verdict {
+        Verdict::Approve { ask, payload: None }
+    }
+
+    fn text(t: &str) -> Payload {
+        Payload::Text {
+            text: t.to_string(),
         }
     }
 
@@ -921,6 +1091,7 @@ mod tests {
             },
             ok: true,
             detail: String::new(),
+            payload: None,
         }
     }
 
@@ -965,6 +1136,7 @@ mod tests {
                     mandate: hash.clone(),
                     path: format!("/ventures/{venture}"),
                 },
+                by: None,
             });
             self.adopted.push(Adopted {
                 seq,
@@ -1073,7 +1245,7 @@ mod tests {
             mandate(model(), vec![permit("deploy", 1, false, false)], &[]),
         );
         let q = fx.push(ask(Claim::Inferred, "deploy"));
-        let d = fx.push(decision(Claim::Inferred, Verdict::Approve { ask: q }));
+        let d = fx.push(decision(Claim::Inferred, approve(q)));
         let refusal = fx.gate(V, "deploy", &[q, d]).unwrap_err();
         assert!(refusal
             .reasons
@@ -1093,7 +1265,7 @@ mod tests {
             mandate(model(), vec![permit("deploy", 1, false, false)], &[]),
         );
         let q = fx.push(ask(Claim::Inferred, "deploy"));
-        let d = fx.push(decision(Claim::Declared, Verdict::Approve { ask: q }));
+        let d = fx.push(decision(Claim::Declared, approve(q)));
         let proof = fx.gate(V, "deploy", &[d]).expect("approved");
         assert!(proof
             .steps
@@ -1367,6 +1539,7 @@ mod tests {
                 venture: SELF.into(),
                 action: name.to_string(),
                 reason: "why not".into(),
+                payload: None,
             });
             let refusal = fx.gate(SELF, name, &[s]).unwrap_err();
             assert!(reasons(&refusal).contains(&why.to_string()), "{refusal}");
@@ -1381,6 +1554,7 @@ mod tests {
             venture: SELF.into(),
             action: "rotate".into(),
             reason: "why not".into(),
+            payload: None,
         });
         let refusal = fx.gate(SELF, "rotate", &[s]).unwrap_err();
         assert!(reasons(&refusal).contains(&"the self venture cannot touch keys".to_string()));
@@ -1414,6 +1588,7 @@ mod tests {
             proof,
             ok: true,
             detail: String::new(),
+            payload: None,
         });
         let text = why(&fx.entries[(a - 1) as usize]);
         assert!(text.starts_with(&format!("#{a}")), "{text}");
@@ -1435,6 +1610,7 @@ mod tests {
                     action: "deploy".into(),
                 }],
             }),
+            payload: None,
         });
         let text = why(&fx.entries[(q - 1) as usize]);
         assert!(text.contains("because    deploy is irreversible"), "{text}");
@@ -1499,5 +1675,175 @@ mod tests {
         let json = serde_json::to_string(&proof).unwrap();
         let back: Proof = serde_json::from_str(&json).unwrap();
         assert_eq!(back, proof);
+    }
+
+    fn takes(name: &str, takes: Takes, reversible: bool, delegated: bool) -> Permitted {
+        let mut p = permit(name, 3, reversible, delegated);
+        p.takes = Some(takes);
+        p
+    }
+
+    #[test]
+    fn payload_lever_is_refused_on_a_proposal_alone() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                model(),
+                vec![takes("announce", Takes::Text, true, false)],
+                &[],
+            ),
+        );
+        let s = fx.push(proposal_with(Claim::Inferred, "announce", text("Hello")));
+        let refusal = fx.gate(V, "announce", &[s]).unwrap_err();
+        assert!(
+            reasons(&refusal).contains(
+                &"announce is irreversible and no declared decision approves it".to_string()
+            ) || refusal
+                .reasons
+                .iter()
+                .any(|r| matches!(r, Reason::NeedsDecision { .. })),
+            "{refusal}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("payload    #2  inferred  text \"Hello\""),
+            "{refusal}"
+        );
+        // Without any payload at all the refusal says so too.
+        let s = fx.push(proposal(Claim::Inferred, "announce"));
+        let refusal = fx.gate(V, "announce", &[s]).unwrap_err();
+        assert!(reasons(&refusal)
+            .contains(&"announce takes text and nothing cited carries one".to_string()));
+    }
+
+    #[test]
+    fn payload_lever_runs_from_a_declared_approval_citing_the_ask() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                model(),
+                vec![takes("announce", Takes::Text, true, false)],
+                &[],
+            ),
+        );
+        let s = fx.push(proposal_with(Claim::Inferred, "announce", text("Hello")));
+        let q = fx.push(ask_with(Claim::Inferred, "announce", text("Hello")));
+        let d = fx.push(decision(Claim::Declared, approve(q)));
+        let proof = fx.gate(V, "announce", &[d]).expect("approved");
+        assert_eq!(proof.decision(), Some(d));
+        assert_eq!(proof.payload_from(), Some(q), "the ask carries the payload");
+        let text = proof.to_string();
+        assert!(
+            text.contains(&format!("decision   #{d}  declared  approved ask #{q}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("payload    #{q}  inferred  text \"Hello\"")),
+            "{text}"
+        );
+        // The proposal alone still does not pass.
+        assert!(fx.gate(V, "announce", &[s]).is_err());
+        // An inferred approval does not either.
+        let fake = fx.push(decision(Claim::Inferred, approve(q)));
+        assert!(fx.gate(V, "announce", &[fake]).is_err());
+    }
+
+    #[test]
+    fn an_amended_payload_on_the_approval_is_the_one_cited() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                model(),
+                vec![takes("announce", Takes::Text, true, false)],
+                &[],
+            ),
+        );
+        fx.push(proposal_with(Claim::Inferred, "announce", text("Hello")));
+        let q = fx.push(ask_with(Claim::Inferred, "announce", text("Hello")));
+        let d = fx.push(decision(
+            Claim::Declared,
+            Verdict::Approve {
+                ask: q,
+                payload: Some(text("Hello, amended")),
+            },
+        ));
+        let proof = fx.gate(V, "announce", &[d]).expect("approved");
+        assert_eq!(proof.payload_from(), Some(d));
+        assert!(
+            proof.to_string().contains(&format!(
+                "payload    #{d}  declared  text \"Hello, amended\""
+            )),
+            "{proof}"
+        );
+    }
+
+    #[test]
+    fn a_human_proposal_proves_and_a_wrong_shape_does_not() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                model(),
+                vec![takes("announce", Takes::Text, true, false)],
+                &[],
+            ),
+        );
+        let s = fx.push(proposal_with(Claim::Declared, "announce", text("Hello")));
+        let proof = fx.gate(V, "announce", &[s]).expect("a human filed it");
+        assert_eq!(proof.payload_from(), Some(s));
+        assert!(
+            proof
+                .to_string()
+                .contains(&format!("occasion   #{s}  declared  proposal")),
+            "{proof}"
+        );
+        // A declared proposal with the wrong shape of payload is refused.
+        let wrong = fx.push(proposal_with(
+            Claim::Declared,
+            "announce",
+            Payload::Json {
+                json: serde_json::json!({"to": "all"}),
+            },
+        ));
+        let refusal = fx.gate(V, "announce", &[wrong]).unwrap_err();
+        assert!(reasons(&refusal).contains(&"announce takes text, not json".to_string()));
+        // An irreversible lever still asks even when a human proposed it.
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(model(), vec![takes("send", Takes::Text, false, false)], &[]),
+        );
+        let s = fx.push(proposal_with(Claim::Declared, "send", text("Hello")));
+        let refusal = fx.gate(V, "send", &[s]).unwrap_err();
+        assert!(refusal
+            .reasons
+            .iter()
+            .any(|r| matches!(r, Reason::NeedsDecision { .. })));
+    }
+
+    #[test]
+    fn a_delegated_payload_lever_runs_on_a_proposal() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                model(),
+                vec![takes("announce", Takes::Text, true, true)],
+                &[],
+            ),
+        );
+        let s = fx.push(proposal_with(Claim::Inferred, "announce", text("Hello")));
+        let proof = fx.gate(V, "announce", &[s]).expect("delegated");
+        assert_eq!(proof.payload_from(), Some(s));
+        assert!(
+            proof
+                .to_string()
+                .contains("reversible, delegated, takes text"),
+            "{proof}"
+        );
     }
 }

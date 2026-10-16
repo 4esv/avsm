@@ -267,16 +267,10 @@ mod tests {
 
     use super::*;
     use crate::gate::{Proof, Refusal};
-    use crate::record::{Claim, Kind, Verdict};
+    use crate::record::{Claim, Kind, Payload, Verdict};
 
     fn report(value: f64) -> Record {
-        Record::Report {
-            claim: Claim::Measured,
-            venture: "counter".into(),
-            metric: "count".into(),
-            value: Some(value),
-            note: String::new(),
-        }
+        Record::report(Claim::Measured, "counter", "count", Some(value), "")
     }
 
     /// Short strings of any characters: quotes, backslashes, control
@@ -299,9 +293,26 @@ mod tests {
         ]
     }
 
+    /// Any payload: every shape, with json objects of short keys.
+    fn payload() -> impl Strategy<Value = Payload> {
+        prop_oneof![
+            text().prop_map(|text| Payload::Text { text }),
+            prop::collection::btree_map(text(), text(), 0..3).prop_map(|map| Payload::Json {
+                json: serde_json::Value::Object(
+                    map.into_iter()
+                        .map(|(k, v)| (k, serde_json::Value::String(v)))
+                        .collect()
+                ),
+            }),
+            text().prop_map(|diff| Payload::Diff { diff }),
+            text().prop_map(|path| Payload::File { path }),
+        ]
+    }
+
     fn verdict() -> impl Strategy<Value = Verdict> {
         prop_oneof![
-            any::<Seq>().prop_map(|ask| Verdict::Approve { ask }),
+            (any::<Seq>(), prop::option::of(payload()))
+                .prop_map(|(ask, payload)| Verdict::Approve { ask, payload }),
             (any::<Seq>(), text()).prop_map(|(ask, reason)| Verdict::Deny { ask, reason }),
             Just(Verdict::Pause),
             Just(Verdict::Resume),
@@ -326,65 +337,103 @@ mod tests {
         })
     }
 
-    /// Any record: all seven kinds, all three claims.
+    /// Any record: all seven kinds, all three claims, every optional field
+    /// present or absent.
     fn record() -> impl Strategy<Value = Record> {
         prop_oneof![
-            (claim(), text(), text(), prop::option::of(finite()), text()).prop_map(
-                |(claim, venture, metric, value, note)| Record::Report {
-                    claim,
-                    venture,
-                    metric,
-                    value,
-                    note,
-                }
-            ),
-            (claim(), text(), text(), text()).prop_map(|(claim, venture, action, reason)| {
-                Record::Proposal {
+            (
+                claim(),
+                text(),
+                text(),
+                prop::option::of(finite()),
+                text(),
+                prop::option::of(text()),
+                prop::option::of(finite()),
+                prop::collection::vec(any::<Seq>(), 0..3),
+            )
+                .prop_map(
+                    |(claim, venture, metric, value, note, source, confidence, cites)| {
+                        Record::Report {
+                            claim,
+                            venture,
+                            metric,
+                            value,
+                            note,
+                            source,
+                            confidence,
+                            cites,
+                        }
+                    }
+                ),
+            (claim(), text(), text(), text(), prop::option::of(payload())).prop_map(
+                |(claim, venture, action, reason, payload)| Record::Proposal {
                     claim,
                     venture,
                     action,
                     reason,
-                }
-            }),
-            (claim(), text(), text(), proof(), any::<bool>(), text()).prop_map(
-                |(claim, venture, action, proof, ok, detail)| Record::Action {
-                    claim,
-                    venture,
-                    action,
-                    proof,
-                    ok,
-                    detail,
+                    payload,
                 }
             ),
             (
                 claim(),
                 text(),
+                text(),
+                proof(),
+                any::<bool>(),
+                text(),
+                prop::option::of(payload())
+            )
+                .prop_map(|(claim, venture, action, proof, ok, detail, payload)| {
+                    Record::Action {
+                        claim,
+                        venture,
+                        action,
+                        proof,
+                        ok,
+                        detail,
+                        payload,
+                    }
+                }),
+            (
+                claim(),
+                text(),
                 prop::option::of(text()),
                 text(),
-                prop::option::of(refusal())
+                prop::option::of(refusal()),
+                prop::option::of(payload())
             )
-                .prop_map(|(claim, venture, action, question, refusal)| Record::Ask {
-                    claim,
-                    venture,
-                    action,
-                    question,
-                    refusal,
+                .prop_map(|(claim, venture, action, question, refusal, payload)| {
+                    Record::Ask {
+                        claim,
+                        venture,
+                        action,
+                        question,
+                        refusal,
+                        payload,
+                    }
                 }),
-            (claim(), text(), verdict()).prop_map(|(claim, venture, verdict)| {
-                Record::Decision {
+            (claim(), text(), verdict(), prop::option::of(text())).prop_map(
+                |(claim, venture, verdict, by)| Record::Decision {
                     claim,
                     venture,
                     verdict,
+                    by,
                 }
-            }),
-            (claim(), text(), text(), proof()).prop_map(|(claim, venture, action, proof)| {
-                Record::Intent {
+            ),
+            (
+                claim(),
+                text(),
+                text(),
+                proof(),
+                prop::option::of(payload())
+            )
+                .prop_map(|(claim, venture, action, proof, payload)| Record::Intent {
                     claim,
                     venture,
                     action,
                     proof,
-                }
-            }),
+                    payload,
+                }),
             (claim(), text(), any::<Seq>(), any::<bool>(), text()).prop_map(
                 |(claim, venture, intent, ok, detail)| Record::Outcome {
                     claim,
@@ -578,13 +627,7 @@ mod tests {
         let mut ledger = Ledger::open_in_memory().unwrap();
         ledger
             .append_at(
-                Record::Report {
-                    claim: Claim::Measured,
-                    venture: "counter".into(),
-                    metric: "count".into(),
-                    value: None,
-                    note: String::new(),
-                },
+                Record::report(Claim::Measured, "counter", "count", None, ""),
                 100,
             )
             .unwrap();

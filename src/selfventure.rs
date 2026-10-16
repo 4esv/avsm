@@ -62,6 +62,7 @@ pub fn adopt_record() -> Record {
             mandate: hash(),
             path: PATH.to_string(),
         },
+        by: None,
     }
 }
 
@@ -115,6 +116,7 @@ pub fn canary() -> Result<(), String> {
                 },
                 reversible: true,
                 delegated: true,
+                takes: None,
             })
             .collect(),
         forbidden: vec![],
@@ -130,6 +132,7 @@ pub fn canary() -> Result<(), String> {
             mandate: mandate_hash.clone(),
             path: PATH.to_string(),
         },
+        by: None,
     };
     let mut entries = vec![Entry::new(1, now - 100, GENESIS, adopt)];
     let mut push = |record: Record| -> Seq {
@@ -138,20 +141,20 @@ pub fn canary() -> Result<(), String> {
         entries.push(Entry::new(seq, now - 50, &prev, record));
         seq
     };
-    let measured = push(Record::Report {
-        claim: Claim::Measured,
-        venture: SELF.to_string(),
-        metric: "integrity".to_string(),
-        value: Some(1.0),
-        note: String::new(),
-    });
-    let inferred = push(Record::Report {
-        claim: Claim::Inferred,
-        venture: SELF.to_string(),
-        metric: "integrity".to_string(),
-        value: Some(1.0),
-        note: String::new(),
-    });
+    let measured = push(Record::report(
+        Claim::Measured,
+        SELF,
+        "integrity",
+        Some(1.0),
+        "",
+    ));
+    let inferred = push(Record::report(
+        Claim::Inferred,
+        SELF,
+        "integrity",
+        Some(1.0),
+        "",
+    ));
     let adopted = vec![Adopted {
         seq: 1,
         venture: SELF.to_string(),

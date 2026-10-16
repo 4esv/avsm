@@ -1,3 +1,4 @@
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -39,6 +40,9 @@ enum Command {
     Approve {
         /// The record number of the question
         number: String,
+        /// Open the content the lever would consume in your editor first; what you save is what runs
+        #[arg(long)]
+        edit: bool,
     },
     /// Say no to a question, by its record number, with a reason
     Deny {
@@ -62,6 +66,15 @@ enum Command {
         /// The record number
         number: String,
     },
+    /// Propose an action yourself; it still has to pass the gate
+    Propose {
+        /// The venture's name
+        venture: String,
+        /// The name of one of its permitted actions
+        lever: String,
+        /// What the action consumes, if it takes something; - reads it from standard input
+        payload: Vec<String>,
+    },
     /// The warden process; avsm start runs it for you
     #[command(hide = true)]
     Warden,
@@ -80,6 +93,83 @@ fn done(result: Result<(), String>) -> ExitCode {
     }
 }
 
+/// The payload given on the command line, or read from standard input
+/// when it is `-` or when nothing was given and input is not a terminal.
+fn payload_argument(words: Vec<String>) -> Result<Option<String>, String> {
+    let joined = words.join(" ");
+    let from_stdin = joined == "-" || (joined.is_empty() && !std::io::stdin().is_terminal());
+    if !from_stdin {
+        return Ok(if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        });
+    }
+    let mut text = String::new();
+    std::io::stdin()
+        .read_to_string(&mut text)
+        .map_err(|e| format!("cannot read the payload: {e}"))?;
+    Ok(if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    })
+}
+
+/// Fetch an ask's payload, let the human change it in their editor, and
+/// approve with what they saved.
+fn approve_edited(sock: &std::path::Path, number: &str) -> Result<(), String> {
+    let args = vec!["payload".to_string(), number.to_string()];
+    let answer = avsm::protocol::request(sock, &args)?;
+    if !answer.ok {
+        return Err(answer.text.trim_end().to_string());
+    }
+    let (kind, content) = answer
+        .text
+        .split_once('\n')
+        .ok_or_else(|| "avsm gave a bad answer".to_string())?;
+    let ext = match kind.trim() {
+        "json" => "json",
+        "diff" => "diff",
+        _ => "txt",
+    };
+    let path = std::env::temp_dir().join(format!(
+        "avsm-{}-{}.{ext}",
+        number.trim_start_matches('#'),
+        std::process::id()
+    ));
+    std::fs::write(&path, content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("editor")
+        .arg(&path)
+        .status()
+        .map_err(|e| format!("cannot run the editor ({editor}): {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&path);
+        return Err("the editor did not finish; nothing approved".to_string());
+    }
+    let edited = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&path);
+    let args = vec![
+        "approve".to_string(),
+        number.to_string(),
+        "--payload".to_string(),
+        edited,
+    ];
+    let answer = avsm::protocol::request(sock, &args)?;
+    print!("{}", answer.text);
+    if answer.ok {
+        Ok(())
+    } else {
+        Err("not approved".to_string())
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let home = cli.home.unwrap_or_else(avsm::kernel::default_home);
@@ -94,7 +184,27 @@ fn main() -> ExitCode {
         Command::Status => vec!["status".to_string()],
         Command::Tail { count } => vec!["tail".to_string(), count.to_string()],
         Command::Asks => vec!["asks".to_string()],
-        Command::Approve { number } => vec!["approve".to_string(), number],
+        Command::Approve {
+            number,
+            edit: false,
+        } => vec!["approve".to_string(), number],
+        Command::Approve { number, edit: true } => {
+            let sock = avsm::kernel::socket_path(&home);
+            return done(approve_edited(&sock, &number));
+        }
+        Command::Propose {
+            venture,
+            lever,
+            payload,
+        } => {
+            let mut v = vec!["propose".to_string(), venture, lever];
+            match payload_argument(payload) {
+                Ok(Some(text)) => v.push(text),
+                Ok(None) => {}
+                Err(e) => return done(Err(e)),
+            }
+            v
+        }
         Command::Deny { number, reason } => {
             let mut v = vec!["deny".to_string(), number];
             v.extend(reason);

@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::mandate::{Controller, Mandate};
-use crate::record::{Claim, Entry, Record};
+use crate::record::{Claim, Entry, Payload, Record};
 
 /// What a role is shown.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -86,7 +86,9 @@ pub fn prompt(ctx: &Context) -> InferRequest {
              in one of these forms:\n\
              {{\"choice\": \"nothing\"}}\n\
              {{\"choice\": \"action\", \"action\": \"<one of: {}>\", \"reason\": \"<one sentence>\"}}\n\
-             {{\"choice\": \"ask\", \"question\": \"<one sentence>\", \"action\": \"<permitted name, or omit>\"}}",
+             {{\"choice\": \"ask\", \"question\": \"<one sentence>\", \"action\": \"<permitted name, or omit>\"}}\n\
+             An action that takes a payload needs a \"payload\" field too: a string for text, \
+             diff or file; an object for json. A human reads the payload before it runs.",
             if names.is_empty() {
                 "none are permitted".to_string()
             } else {
@@ -105,7 +107,7 @@ pub fn prompt(ctx: &Context) -> InferRequest {
     }
     for p in &m.permitted {
         user.push_str(&format!(
-            "  {}: at most {}, {}\n",
+            "  {}: at most {}, {}{}\n",
             p.name,
             p.cap,
             if p.reversible {
@@ -114,6 +116,10 @@ pub fn prompt(ctx: &Context) -> InferRequest {
                 "irreversible, delegated to you"
             } else {
                 "irreversible, needs human approval"
+            },
+            match p.takes {
+                Some(t) => format!(", takes {t}"),
+                None => String::new(),
             }
         ));
     }
@@ -152,6 +158,8 @@ struct Reply {
     reason: Option<String>,
     #[serde(default)]
     question: Option<String>,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
 }
 
 /// Turn a backend's reply into inferred records. Garbled replies mean
@@ -160,18 +168,26 @@ pub fn parse_reply(ctx: &Context, reply: &str) -> Vec<Record> {
     let text = reply.trim();
     let permitted = |name: &str| ctx.mandate.permitted(name).is_some();
     let venture = ctx.venture.clone();
-    let proposal = |action: &str, reason: String| Record::Proposal {
+    // A payload is kept only in the shape the lever takes; a reply that
+    // gives another shape, or one for a lever that takes none, loses it.
+    let payload_for = |action: &str, value: Option<&serde_json::Value>| -> Option<Payload> {
+        let takes = ctx.mandate.permitted(action)?.takes?;
+        Payload::from_value(takes, value?).ok()
+    };
+    let proposal = |action: &str, reason: String, payload: Option<Payload>| Record::Proposal {
         claim: Claim::Inferred,
         venture: venture.clone(),
         action: action.to_string(),
         reason,
+        payload,
     };
-    let ask = |action: Option<String>, question: String| Record::Ask {
+    let ask = |action: Option<String>, question: String, payload: Option<Payload>| Record::Ask {
         claim: Claim::Inferred,
         venture: venture.clone(),
         action,
         question,
         refusal: None,
+        payload,
     };
     if let Some(json) = text
         .find('{')
@@ -184,16 +200,25 @@ pub fn parse_reply(ctx: &Context, reply: &str) -> Vec<Record> {
                         a,
                         r.reason
                             .unwrap_or_else(|| format!("chosen by {}", ctx.backend)),
+                        payload_for(a, r.payload.as_ref()),
                     )],
                     _ => vec![],
                 },
-                "ask" => vec![ask(
-                    r.action
+                "ask" => {
+                    let action = r
+                        .action
                         .filter(|a| permitted(a.trim()))
-                        .map(|a| a.trim().to_string()),
-                    r.question
-                        .unwrap_or_else(|| format!("{} asked for your attention", ctx.backend)),
-                )],
+                        .map(|a| a.trim().to_string());
+                    let payload = action
+                        .as_deref()
+                        .and_then(|a| payload_for(a, r.payload.as_ref()));
+                    vec![ask(
+                        action,
+                        r.question
+                            .unwrap_or_else(|| format!("{} asked for your attention", ctx.backend)),
+                        payload,
+                    )]
+                }
                 _ => vec![],
             };
         }
@@ -217,6 +242,7 @@ pub fn parse_reply(ctx: &Context, reply: &str) -> Vec<Record> {
             } else {
                 q.to_string()
             },
+            None,
         )];
     }
     let (name, reason) = match line.split_once(':') {
@@ -235,7 +261,7 @@ pub fn parse_reply(ctx: &Context, reply: &str) -> Vec<Record> {
         } else {
             reason
         };
-        return vec![proposal(&name, reason)];
+        return vec![proposal(&name, reason, None)];
     }
     vec![]
 }
@@ -274,6 +300,7 @@ mod tests {
             },
             reversible,
             delegated: false,
+            takes: None,
         };
         Context {
             venture: "shop".to_string(),
@@ -285,7 +312,14 @@ mod tests {
                 } else {
                     Controller::Model { backend: None }
                 },
-                permitted: vec![permit("discount", true), permit("refund", false)],
+                permitted: vec![
+                    permit("discount", true),
+                    permit("refund", false),
+                    Permitted {
+                        takes: Some(crate::record::Takes::Text),
+                        ..permit("announce", true)
+                    },
+                ],
                 forbidden: vec!["close".to_string()],
                 cadence: Duration::from_secs(60),
                 context_budget: 100,
@@ -295,13 +329,7 @@ mod tests {
                 1,
                 0,
                 GENESIS,
-                Record::Report {
-                    claim: Claim::Measured,
-                    venture: "shop".to_string(),
-                    metric: "orders".to_string(),
-                    value: Some(3.0),
-                    note: String::new(),
-                },
+                Record::report(Claim::Measured, "shop", "orders", Some(3.0), ""),
             )],
             state: "running".to_string(),
             now: 0,
@@ -356,6 +384,52 @@ mod tests {
     }
 
     #[test]
+    fn payloads_come_through_in_the_levers_shape() {
+        let c = ctx(false);
+        let p = prompt(&c);
+        assert!(
+            p.user
+                .contains("announce: at most 2/day, reversible, takes text"),
+            "{}",
+            p.user
+        );
+        assert!(p.system.contains("\"payload\""), "{}", p.system);
+        let r = parse_reply(
+            &c,
+            "{\"choice\":\"action\",\"action\":\"announce\",\"reason\":\"news\",\"payload\":\"Hello all\"}",
+        );
+        assert!(
+            matches!(&r[..], [Record::Proposal { action, payload: Some(Payload::Text { text }), .. }] if action == "announce" && text == "Hello all"),
+            "{r:?}"
+        );
+        // The wrong shape, or a lever that takes none, loses the payload.
+        let r = parse_reply(
+            &c,
+            "{\"choice\":\"action\",\"action\":\"announce\",\"payload\":{\"x\":1}}",
+        );
+        assert!(
+            matches!(&r[..], [Record::Proposal { payload: None, .. }]),
+            "{r:?}"
+        );
+        let r = parse_reply(
+            &c,
+            "{\"choice\":\"action\",\"action\":\"discount\",\"payload\":\"ten percent\"}",
+        );
+        assert!(
+            matches!(&r[..], [Record::Proposal { payload: None, .. }]),
+            "{r:?}"
+        );
+        let r = parse_reply(
+            &c,
+            "{\"choice\":\"ask\",\"action\":\"announce\",\"question\":\"send this?\",\"payload\":\"Hi\"}",
+        );
+        assert!(
+            matches!(&r[..], [Record::Ask { payload: Some(Payload::Text { text }), .. }] if text == "Hi"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
     fn labels_work_for_classifiers() {
         let c = ctx(true);
         assert!(parse_reply(&c, "nothing\n").is_empty());
@@ -386,13 +460,7 @@ mod tests {
                 i,
                 i as i64,
                 &prev,
-                Record::Report {
-                    claim: Claim::Measured,
-                    venture: "shop".to_string(),
-                    metric: "orders".to_string(),
-                    value: Some(i as f64),
-                    note: String::new(),
-                },
+                Record::report(Claim::Measured, "shop", "orders", Some(i as f64), ""),
             );
             prev = e.hash.clone();
             entries.push(e);

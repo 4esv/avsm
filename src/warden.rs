@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{self, Backend, Config};
 use crate::gate::{self, Candidate, RESUME, STOP};
 use crate::ledger::Ledger;
-use crate::record::{Claim, Entry, Record};
+use crate::record::{Claim, Entry, Payload, Record};
 use crate::role::InferRequest;
 use crate::venture;
 
@@ -70,6 +70,7 @@ impl Warden for LocalWarden {
                 proof,
                 ok: true,
                 detail: String::new(),
+                payload: None,
             })?);
             return Ok(written);
         }
@@ -81,8 +82,20 @@ impl Warden for LocalWarden {
             .permitted(&action)
             .ok_or_else(|| format!("{venture} does not permit {action}"))?;
         let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
+        // The payload comes from the record the proof names, never from
+        // the request: the gate chose the record, the warden only reads it.
+        let payload = match proof.payload_from() {
+            Some(seq) => entries
+                .iter()
+                .find(|e| e.seq == seq)
+                .and_then(|e| e.record.payload().cloned()),
+            None => None,
+        };
+        if perm.takes.is_some() && payload.is_none() {
+            return Err(format!("{action} takes a payload and the proof names none"));
+        }
         if perm.reversible {
-            let (ok, detail) = run_command(&dir, &perm.run, "", ACTION_TIMEOUT);
+            let (ok, detail) = run_lever(&dir, &perm.run, payload.as_ref(), ACTION_TIMEOUT);
             written.push(append(Record::Action {
                 claim: Claim::Measured,
                 venture,
@@ -90,6 +103,7 @@ impl Warden for LocalWarden {
                 proof,
                 ok,
                 detail,
+                payload,
             })?);
         } else {
             let intent = append(Record::Intent {
@@ -97,8 +111,9 @@ impl Warden for LocalWarden {
                 venture: venture.clone(),
                 action,
                 proof,
+                payload: payload.clone(),
             })?;
-            let (ok, detail) = run_command(&dir, &perm.run, "", ACTION_TIMEOUT);
+            let (ok, detail) = run_lever(&dir, &perm.run, payload.as_ref(), ACTION_TIMEOUT);
             let outcome = append(Record::Outcome {
                 claim: Claim::Measured,
                 venture,
@@ -284,6 +299,18 @@ impl Ran {
 /// Run a program in a directory with a clean environment, feeding it
 /// `stdin`, and wait up to `timeout`.
 pub fn run(dir: &Path, program: &str, args: &[&str], stdin: &str, timeout: Duration) -> Ran {
+    run_with(dir, program, args, &[], stdin, timeout)
+}
+
+/// Like `run`, with a few extra variables in the environment.
+pub fn run_with(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    stdin: &str,
+    timeout: Duration,
+) -> Ran {
     let mut child = match Command::new(program)
         .args(args)
         .current_dir(dir)
@@ -293,6 +320,7 @@ pub fn run(dir: &Path, program: &str, args: &[&str], stdin: &str, timeout: Durat
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
         )
         .env("HOME", dir)
+        .envs(env.iter().copied())
         .stdin(if stdin.is_empty() {
             Stdio::null()
         } else {
@@ -359,6 +387,24 @@ pub fn run_command(dir: &Path, command: &str, stdin: &str, timeout: Duration) ->
     (ran.ok, ran.detail(timeout))
 }
 
+/// Run a lever's command with its payload, if it takes one, on standard
+/// input: the text, the JSON, the diff, or the path of the file. The
+/// shape is in `AVSM_PAYLOAD` so a script can tell which it got.
+pub fn run_lever(
+    dir: &Path,
+    command: &str,
+    payload: Option<&Payload>,
+    timeout: Duration,
+) -> (bool, String) {
+    let (env, stdin): (Vec<(&str, String)>, String) = match payload {
+        Some(p) => (vec![("AVSM_PAYLOAD", p.takes().to_string())], p.text()),
+        None => (vec![], String::new()),
+    };
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let ran = run_with(dir, "sh", &["-c", command], &env, &stdin, timeout);
+    (ran.ok, ran.detail(timeout))
+}
+
 fn tail(s: &str) -> String {
     let s = s.replace('\n', "  ");
     if s.chars().count() <= 400 {
@@ -421,6 +467,30 @@ mod tests {
         let (ok, out) = run_command(tmp.path(), "env", "", Duration::from_secs(5));
         assert!(ok);
         assert!(!out.contains("AVSM"), "clean environment: {out}");
+    }
+
+    #[test]
+    fn a_lever_reads_its_payload_on_stdin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = Payload::Json {
+            json: serde_json::json!({"n": 1}),
+        };
+        let (ok, out) = run_lever(
+            tmp.path(),
+            "echo \"$AVSM_PAYLOAD: $(cat)\"",
+            Some(&payload),
+            Duration::from_secs(5),
+        );
+        assert!(ok);
+        assert_eq!(out, "json: {\"n\":1}");
+        let (ok, out) = run_lever(
+            tmp.path(),
+            "echo \"[$AVSM_PAYLOAD]\"",
+            None,
+            Duration::from_secs(5),
+        );
+        assert!(ok);
+        assert_eq!(out, "[]");
     }
 
     #[test]

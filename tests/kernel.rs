@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use avsm::gate::Candidate;
 use avsm::kernel::{Kernel, RolesProcess, WardenProcess};
-use avsm::record::{Claim, Kind, Record};
+use avsm::record::{Claim, Kind, Payload, Record};
 use avsm::role::{Context, InferRequest, Role};
 use avsm::warden::{LocalWarden, Warden};
 
@@ -58,6 +58,17 @@ fn proposal(venture: &str, action: &str) -> Record {
         venture: venture.into(),
         action: action.into(),
         reason: "the night is long".into(),
+        payload: None,
+    }
+}
+
+fn proposal_with(venture: &str, action: &str, text: &str) -> Record {
+    Record::Proposal {
+        claim: Claim::Inferred,
+        venture: venture.into(),
+        action: action.into(),
+        reason: "the night is long".into(),
+        payload: Some(Payload::Text { text: text.into() }),
     }
 }
 
@@ -93,6 +104,7 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
             action: None,
             question: "should we hire?".into(),
             refusal: None,
+            payload: None,
         },
     ]]);
     let mut k = kernel(&home, Box::new(FakeRole(replies)));
@@ -163,7 +175,7 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
     );
 
     // Approving the ask makes the next tick act: intent, then outcome.
-    k.approve(9).unwrap();
+    k.approve(9, None).unwrap();
     k.tick();
     let entries = k.entries().unwrap();
     let last = kinds(&entries);
@@ -592,5 +604,156 @@ fn self_reports_integrity_and_halts_everything_when_it_fails() {
             .lines()
             .count(),
         resets_before + 1
+    );
+}
+
+#[test]
+fn payload_levers_ask_first_run_with_what_the_human_approved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = venture(
+        tmp.path(),
+        "shop",
+        "purpose: Sell more.\nmetric: orders\ncontroller: {kind: model}\ncadence: 1h\n\
+         permitted:\n\
+         - {name: announce, run: \"cat > announced; echo sent $AVSM_PAYLOAD\", cap: 3/day, reversible: true, takes: text}\n\
+         - {name: label, run: \"cat > labelled\", cap: 3/day, reversible: true, takes: json, delegated: true}\n\
+         - {name: tidy, run: touch tidied, cap: 3/day, reversible: true}\n",
+    );
+    script(&dir, "report", "echo 5");
+    let replies = VecDeque::from(vec![vec![
+        proposal_with("shop", "announce", "Hello all"),
+        Record::Proposal {
+            claim: Claim::Inferred,
+            venture: "shop".into(),
+            action: "label".into(),
+            reason: "tag it".into(),
+            payload: Some(Payload::Json {
+                json: serde_json::json!({"tag": "new"}),
+            }),
+        },
+        proposal_with("shop", "tidy", "ignored: tidy takes nothing"),
+    ]]);
+    let mut k = kernel(&home, Box::new(FakeRole(replies)));
+    k.add(&dir).unwrap();
+    k.cycle("shop");
+    let got = kinds(&k.entries().unwrap());
+    // announce: a model's content waits for a human. label: delegated, so
+    // it ran with the JSON. tidy: the payload was dropped, the lever ran.
+    let expect = [
+        (Kind::Decision, "adopted"),
+        (
+            Kind::Proposal,
+            "announce: the night is long  [text \"Hello all\"]",
+        ),
+        (
+            Kind::Ask,
+            "announce? may I announce with this?  [text \"Hello all\"]",
+        ),
+        (
+            Kind::Proposal,
+            "label: tag it  [json \"{\\\"tag\\\":\\\"new\\\"}\"]",
+        ),
+        (Kind::Action, "label: done"),
+        (Kind::Proposal, "tidy: the night is long"),
+        (Kind::Action, "tidy: done"),
+    ];
+    assert_eq!(got.len(), expect.len(), "{got:?}");
+    for (g, e) in got.iter().zip(expect.iter()) {
+        assert_eq!(g.0, e.0, "{got:?}");
+        assert!(g.1.starts_with(e.1), "{g:?} vs {e:?}");
+    }
+    assert!(!dir.join("announced").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("labelled")).unwrap(),
+        "{\"tag\":\"new\"}"
+    );
+    let why = k.why(3).unwrap();
+    assert!(
+        why.contains("announce is irreversible and no declared decision approves it")
+            || why.contains("because"),
+        "{why}"
+    );
+    assert!(
+        why.contains("payload    #2  inferred  text \"Hello all\""),
+        "{why}"
+    );
+
+    // The asks list shows the payload under the ask.
+    let asks = k.asks().unwrap();
+    assert!(
+        asks.contains("announce? may I announce with this?"),
+        "{asks}"
+    );
+    assert!(asks.contains("\n    Hello all\n"), "{asks}");
+    assert_eq!(k.payload(3).unwrap(), "text\nHello all");
+
+    // Approve with an amended payload: the amended text is what runs, and
+    // the proof cites the decision for it.
+    let text = k.approve(3, Some("Hello all, amended")).unwrap();
+    assert!(
+        text.contains("approved #3 with amended text \"Hello all, amended\""),
+        "{text}"
+    );
+    k.tick();
+    let entries = k.entries().unwrap();
+    let action = entries
+        .iter()
+        .rev()
+        .find(|e| e.record.kind() == Kind::Action)
+        .unwrap();
+    assert!(
+        action
+            .record
+            .summary()
+            .starts_with("announce: done  sent text"),
+        "{}",
+        action.record.summary()
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("announced")).unwrap(),
+        "Hello all, amended"
+    );
+    assert_eq!(
+        action.record.payload(),
+        Some(&Payload::Text {
+            text: "Hello all, amended".into()
+        })
+    );
+    let why = k.why(action.seq).unwrap();
+    assert!(
+        why.contains("decision   #8  declared  approved ask #3"),
+        "{why}"
+    );
+    assert!(
+        why.contains("payload    #8  declared  text \"Hello all, amended\""),
+        "{why}"
+    );
+
+    // A human proposal by hand: declared, gated, and run at once.
+    let text = k.propose("shop", "announce", Some("From me")).unwrap();
+    assert!(
+        text.contains("declared  proposal  announce: proposed by hand  [text \"From me\"]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("measured  action    announce: done"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("announced")).unwrap(),
+        "From me"
+    );
+    let err = k.propose("shop", "announce", None).unwrap_err();
+    assert!(err.contains("announce takes text"), "{err}");
+    let err = k.propose("shop", "tidy", Some("x")).unwrap_err();
+    assert!(err.contains("tidy takes no payload"), "{err}");
+    let err = k.propose("shop", "label", Some("not json")).unwrap_err();
+    assert!(err.contains("not JSON"), "{err}");
+    let err = k.propose("shop", "wipe", None).unwrap_err();
+    assert!(err.contains("does not permit wipe"), "{err}");
+    assert_eq!(
+        k.ledger.verify().unwrap(),
+        k.entries().unwrap().len() as u64
     );
 }

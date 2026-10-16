@@ -10,6 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_yaml::{Mapping, Value};
 use sha2::{Digest, Sha256};
 
+pub use crate::record::Takes;
+
 /// A parsed mandate.yaml.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +82,11 @@ pub struct Permitted {
     /// Irreversible actions become asks unless the mandate delegates them.
     #[serde(default)]
     pub delegated: bool,
+    /// The payload the lever consumes, if it takes one: text, json, diff
+    /// or file. A lever that takes a payload runs a model's content only
+    /// after a human approves it, unless the mandate delegates the lever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takes: Option<Takes>,
 }
 
 /// At most `count` times per `per`.
@@ -194,7 +201,10 @@ const FIELDS: &[&str] = &[
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action"];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
-const ACTION_FIELDS: &[&str] = &["name", "run", "cap", "reversible", "delegated"];
+const ACTION_FIELDS: &[&str] = &["name", "run", "cap", "reversible", "delegated", "takes"];
+
+/// Names no permitted action may take: they are built in.
+pub const BUILT_IN: &[&str] = &[STOP, "resume", "delegate"];
 
 const KINDS: &str = "threshold, classifier or model";
 const NEEDS_PURPOSE: &str = "mandate needs a purpose: what the venture is for, in your own words";
@@ -252,6 +262,12 @@ impl Mandate {
                 return fail(format!(
                     "permitted action {:?} is listed twice; each action needs its own name",
                     p.name
+                ));
+            }
+            if BUILT_IN.contains(&p.name.as_str()) {
+                return fail(format!(
+                    "{} is built in; a permitted action cannot be named {:?}",
+                    p.name, p.name
                 ));
             }
             names.push(&p.name);
@@ -635,9 +651,23 @@ fn check_action(position: usize, item: &Value) -> Result<(), MandateError> {
         }
     }
     match map.get("delegated") {
-        None | Some(Value::Bool(_)) => Ok(()),
+        None | Some(Value::Bool(_)) => {}
+        Some(other) => {
+            return fail(format!(
+                "{who} delegated must be true or false, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match map.get("takes") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(t)) => t
+            .parse::<Takes>()
+            .map(|_| ())
+            .map_err(|_| MandateError(format!("{who} takes is {}, not {t:?}", Takes::ALL))),
         Some(other) => fail(format!(
-            "{who} delegated must be true or false, not {}",
+            "{who} takes is {}, not {}",
+            Takes::ALL,
             describe(other)
         )),
     }
@@ -1156,7 +1186,7 @@ forbidden: [rm]
         ));
         assert_eq!(
             msg,
-            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, cap, reversible, delegated"
+            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, cap, reversible, delegated, takes"
         );
     }
 
@@ -1259,6 +1289,36 @@ forbidden: [rm]
         );
         let m = Mandate::parse(&edit("delegated: false", "delegated: true")).unwrap();
         assert!(m.permitted("deploy").unwrap().delegated);
+    }
+
+    #[test]
+    fn permitted_takes_is_one_of_four_shapes() {
+        let m = Mandate::parse(&edit(
+            "    reversible: false\n",
+            "    reversible: false\n    takes: text\n",
+        ))
+        .unwrap();
+        assert_eq!(m.permitted("deploy").unwrap().takes, Some(Takes::Text));
+        assert_eq!(m.permitted("reset").unwrap().takes, None);
+        for (value, found) in [("blob", "\"blob\""), ("[text]", "a list")] {
+            let msg = fails(&edit(
+                "    reversible: false\n",
+                &format!("    reversible: false\n    takes: {value}\n"),
+            ));
+            assert_eq!(
+                msg,
+                format!(
+                    "permitted action \"deploy\" takes is text, json, diff or file, not {found}"
+                )
+            );
+        }
+        let msg = fails(&edit("  - name: deploy\n", "  - name: stop\n"));
+        assert_eq!(
+            msg,
+            "stop is built in; a permitted action cannot be named \"stop\""
+        );
+        let msg = fails(&edit("  - name: deploy\n", "  - name: delegate\n"));
+        assert!(msg.starts_with("delegate is built in"), "{msg}");
     }
 
     #[test]

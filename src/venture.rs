@@ -64,6 +64,7 @@ pub fn load_all(entries: &[Entry]) -> BTreeMap<String, Venture> {
             claim: Claim::Declared,
             venture,
             verdict: Verdict::Adopt { mandate, path },
+            ..
         } = &e.record
         {
             latest.insert(venture.clone(), (e.seq, mandate.clone(), path.clone()));
