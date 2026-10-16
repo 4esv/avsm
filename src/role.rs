@@ -117,7 +117,7 @@ pub fn prompt(ctx: &Context) -> InferRequest {
             } else {
                 "irreversible, needs human approval"
             },
-            match p.takes {
+            match p.takes() {
                 Some(t) => format!(", takes {t}"),
                 None => String::new(),
             }
@@ -171,7 +171,7 @@ pub fn parse_reply(ctx: &Context, reply: &str) -> Vec<Record> {
     // A payload is kept only in the shape the lever takes; a reply that
     // gives another shape, or one for a lever that takes none, loses it.
     let payload_for = |action: &str, value: Option<&serde_json::Value>| -> Option<Payload> {
-        let takes = ctx.mandate.permitted(action)?.takes?;
+        let takes = ctx.mandate.permitted(action)?.takes()?;
         Payload::from_value(takes, value?).ok()
     };
     let proposal = |action: &str, reason: String, payload: Option<Payload>| Record::Proposal {
@@ -293,7 +293,8 @@ mod tests {
     fn ctx(classifier: bool) -> Context {
         let permit = |name: &str, reversible: bool| Permitted {
             name: name.to_string(),
-            run: "./x".to_string(),
+            run: Some("./x".to_string()),
+            adapter: None,
             cap: Cap {
                 count: 2,
                 per: Cap::DAY,

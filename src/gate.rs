@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use ascent::ascent;
 use serde::{Deserialize, Serialize};
 
-use crate::mandate::{Cap, Controller, Mandate};
+use crate::mandate::{Cap, Controller, Mandate, Permitted};
 use crate::record::{Claim, Entry, Kind, Record, Seq, Takes, Verdict};
 
 /// The action that always passes.
@@ -391,12 +391,17 @@ pub fn gate(
                 })
                 .count() as u32;
             p.used.push((venture.clone(), perm.name.clone(), used));
-            if perm.takes.is_some() {
+            if perm.takes().is_some() {
                 p.takes.push((venture.clone(), perm.name.clone()));
             }
             if venture == SELF {
                 for (fragment, why) in HARDWIRED_RUN {
-                    if perm.run.contains(fragment) {
+                    let command = perm
+                        .run
+                        .as_deref()
+                        .or(perm.adapter.as_deref())
+                        .unwrap_or("");
+                    if command.contains(fragment) {
                         p.hardwired
                             .push((venture.clone(), perm.name.clone(), why.to_string()));
                     }
@@ -415,7 +420,7 @@ pub fn gate(
             if let Some(b) = above {
                 p.threshold.push((
                     venture.clone(),
-                    m.mandate.metric.clone(),
+                    m.mandate.metric_name().to_string(),
                     true,
                     Num(*b),
                     action.clone(),
@@ -424,7 +429,7 @@ pub fn gate(
             if let Some(b) = below {
                 p.threshold.push((
                     venture.clone(),
-                    m.mandate.metric.clone(),
+                    m.mandate.metric_name().to_string(),
                     false,
                     Num(*b),
                     action.clone(),
@@ -603,7 +608,7 @@ fn assemble(
                     cap: perm.cap,
                     reversible: perm.reversible,
                     delegated: perm.delegated,
-                    takes: perm.takes,
+                    takes: perm.takes(),
                 }),
                 None => reasons.push(Reason::NotPermitted { action: a.clone() }),
             }
@@ -682,7 +687,7 @@ fn assemble(
     // The payload a lever consumes comes from the amended approval if the
     // human changed it, else from the ask the approval answers, else from
     // the proposal. A lever that takes one and gets none is refused.
-    if let Some(takes) = permitted.and_then(|perm| perm.takes) {
+    if let Some(takes) = permitted.and_then(Permitted::takes) {
         let with_payload = |seq: Seq| find(seq).filter(|e| e.record.payload().is_some());
         let mut source = None;
         for (_, _, d, q) in p.approved.iter().filter(|(x, y, _, _)| x == v && y == a) {
@@ -967,7 +972,7 @@ fn by(claim: Claim) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mandate::{Permitted, Restart};
+    use crate::mandate::Restart;
     use crate::record::{Payload, GENESIS};
     use std::time::Duration;
 
@@ -978,7 +983,8 @@ mod tests {
     fn permit(name: &str, cap: u32, reversible: bool, delegated: bool) -> Permitted {
         Permitted {
             name: name.to_string(),
-            run: format!("./{name}"),
+            run: Some(format!("./{name}")),
+            adapter: None,
             cap: Cap {
                 count: cap,
                 per: Cap::DAY,
@@ -1547,7 +1553,7 @@ mod tests {
         // A differently named self action whose command touches keys is caught too.
         let mut fx = Fx::new();
         let mut perm = permit("rotate", 9, true, true);
-        perm.run = "cat ~/.avsm/keys".to_string();
+        perm.run = Some("cat ~/.avsm/keys".to_string());
         fx.adopt(SELF, mandate(model(), vec![perm], &[]));
         let s = fx.push(Record::Proposal {
             claim: Claim::Inferred,

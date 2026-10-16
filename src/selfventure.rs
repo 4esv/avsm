@@ -109,7 +109,8 @@ pub fn canary() -> Result<(), String> {
             .iter()
             .map(|(name, _)| Permitted {
                 name: name.to_string(),
-                run: "true".to_string(),
+                run: Some("true".to_string()),
+                adapter: None,
                 cap: Cap {
                     count: 9,
                     per: Cap::DAY,

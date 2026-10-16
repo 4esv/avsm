@@ -36,7 +36,8 @@ fn valid_fixture_parses_field_by_field() {
         permitted: vec![
             Permitted {
                 name: "reset".into(),
-                run: "./reset.sh".into(),
+                run: Some("./reset.sh".into()),
+                adapter: None,
                 cap: Cap {
                     count: 3,
                     per: Cap::DAY,
@@ -47,7 +48,8 @@ fn valid_fixture_parses_field_by_field() {
             },
             Permitted {
                 name: "deploy".into(),
-                run: "./deploy.sh".into(),
+                run: Some("./deploy.sh".into()),
+                adapter: None,
                 cap: Cap {
                     count: 1,
                     per: Cap::DAY,

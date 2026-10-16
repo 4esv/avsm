@@ -23,6 +23,75 @@ pub struct Config {
     /// Backends by name.
     #[serde(default)]
     pub backends: BTreeMap<String, Backend>,
+    /// Where the built-in adapters reach, and how mail goes out.
+    #[serde(default)]
+    pub adapters: Adapters,
+}
+
+/// Where the built-in adapters reach. The defaults are the real services;
+/// a test points them at stubs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Adapters {
+    #[serde(default = "stripe_endpoint")]
+    pub stripe: Endpoint,
+    #[serde(default = "github_endpoint")]
+    pub github: Endpoint,
+    #[serde(default)]
+    pub mail: Mail,
+}
+
+impl Default for Adapters {
+    fn default() -> Adapters {
+        Adapters {
+            stripe: stripe_endpoint(),
+            github: github_endpoint(),
+            mail: Mail::default(),
+        }
+    }
+}
+
+/// An address an adapter talks to.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Endpoint {
+    pub url: String,
+}
+
+fn stripe_endpoint() -> Endpoint {
+    Endpoint {
+        url: "https://api.stripe.com/v1".to_string(),
+    }
+}
+
+fn github_endpoint() -> Endpoint {
+    Endpoint {
+        url: "https://api.github.com".to_string(),
+    }
+}
+
+/// How mail.send hands a message on: a command that reads it on standard
+/// input, sendmail-style, and the address it comes from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mail {
+    #[serde(default = "sendmail")]
+    pub command: String,
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
+impl Default for Mail {
+    fn default() -> Mail {
+        Mail {
+            command: sendmail(),
+            from: None,
+        }
+    }
+}
+
+fn sendmail() -> String {
+    "sendmail -t -i".to_string()
 }
 
 fn default_nightly() -> String {
@@ -35,6 +104,7 @@ impl Default for Config {
             nightly: default_nightly(),
             default: None,
             backends: BTreeMap::new(),
+            adapters: Adapters::default(),
         }
     }
 }
@@ -92,6 +162,22 @@ impl Config {
     pub fn parse(text: &str) -> Result<Config, String> {
         let config: Config = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
         config.nightly_minutes()?;
+        for (name, url) in [
+            ("stripe", &config.adapters.stripe.url),
+            ("github", &config.adapters.github.url),
+        ] {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(format!(
+                    "adapters.{name}.url starts with http:// or https://, not {url:?}"
+                ));
+            }
+        }
+        if config.adapters.mail.command.trim().is_empty() {
+            return Err(
+                "adapters.mail.command is the command that sends a message, like sendmail -t -i"
+                    .to_string(),
+            );
+        }
         if let Some(d) = &config.default {
             if !config.backends.contains_key(d) {
                 return Err(format!(
@@ -222,6 +308,28 @@ mod tests {
             .backend(Some("zz"))
             .unwrap_err()
             .contains("no backend named zz"));
+    }
+
+    #[test]
+    fn adapters_have_real_defaults_and_can_point_at_stubs() {
+        let c = Config::default();
+        assert_eq!(c.adapters.stripe.url, "https://api.stripe.com/v1");
+        assert_eq!(c.adapters.github.url, "https://api.github.com");
+        assert_eq!(c.adapters.mail.command, "sendmail -t -i");
+        let c = Config::parse(
+            "adapters:\n  github: {url: http://127.0.0.1:9}\n  mail: {command: ./stub, from: me@x}\n",
+        )
+        .unwrap();
+        assert_eq!(c.adapters.github.url, "http://127.0.0.1:9");
+        assert_eq!(c.adapters.stripe.url, "https://api.stripe.com/v1");
+        assert_eq!(c.adapters.mail.command, "./stub");
+        assert_eq!(c.adapters.mail.from.as_deref(), Some("me@x"));
+        assert!(Config::parse("adapters:\n  stripe: {url: stripe.com}\n")
+            .unwrap_err()
+            .contains("http://"));
+        assert!(Config::parse("adapters:\n  mail: {command: \"\"}\n")
+            .unwrap_err()
+            .contains("sendmail"));
     }
 
     #[test]

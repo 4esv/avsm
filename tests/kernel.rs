@@ -262,6 +262,7 @@ fn run_is_restarted_per_policy_and_stopped_when_paused() {
         "purpose: Serve.\nmetric: up\ncontroller: {kind: model}\ncadence: 1h\nrestart: on-failure\n",
     );
     script(&dir, "run", "sleep 60");
+    script(&dir, "report", "echo 1");
     let mut k = kernel(&home, Box::new(FakeRole(VecDeque::new())));
     k.add(&dir).unwrap();
     k.tick();
@@ -295,6 +296,7 @@ fn run_is_restarted_per_policy_and_stopped_when_paused() {
         "purpose: Run once.\nmetric: up\ncontroller: {kind: model}\ncadence: 1h\nrestart: on-failure\n",
     );
     script(&dir2, "run", "exit 0");
+    script(&dir2, "report", "echo 1");
     k.add(&dir2).unwrap();
     k.tick();
     std::thread::sleep(Duration::from_millis(100));
@@ -436,6 +438,7 @@ fn warden_and_roles_run_as_separate_processes() {
         "purpose: Sell more.\nmetric: orders\ncontroller: {kind: classifier}\ncadence: 1h\n\
          permitted:\n- {name: tidy, run: touch tidied, cap: 3/day, reversible: true}\n",
     );
+    script(&dir, "report", "echo 5");
 
     // The test binary is not avsm, so point the children at the real one.
     let exe = Path::new(env!("CARGO_BIN_EXE_avsm"));

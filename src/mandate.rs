@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 
 pub use crate::record::Takes;
 
+use crate::adapter;
+
 /// A parsed mandate.yaml.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,13 +70,18 @@ pub enum Controller {
     },
 }
 
-/// An action the venture may take.
+/// An action the venture may take: a command of the venture's own, or a
+/// built-in adapter.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Permitted {
     pub name: String,
     /// The command that runs, in the venture directory.
-    pub run: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// The built-in action instead, like `github.issue owner/repo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
     /// How often it may run, like `3/day`.
     pub cap: Cap,
     /// Can it be undone?
@@ -201,7 +208,15 @@ const FIELDS: &[&str] = &[
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action"];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
-const ACTION_FIELDS: &[&str] = &["name", "run", "cap", "reversible", "delegated", "takes"];
+const ACTION_FIELDS: &[&str] = &[
+    "name",
+    "run",
+    "adapter",
+    "cap",
+    "reversible",
+    "delegated",
+    "takes",
+];
 
 /// Names no permitted action may take: they are built in.
 pub const BUILT_IN: &[&str] = &[STOP, "resume", "delegate"];
@@ -244,11 +259,16 @@ impl Mandate {
         if self.metric.trim().is_empty() {
             return fail(NEEDS_METRIC);
         }
-        if !is_word(&self.metric) {
-            return fail(format!(
-                "metric must be one word like count or latency_ms, not {:?}",
-                self.metric
-            ));
+        match adapter::Metric::parse(&self.metric) {
+            Ok(Some(_)) => {}
+            Ok(None) if is_word(self.metric.trim()) => {}
+            Ok(None) => {
+                return fail(format!(
+                    "metric must be one word like count or latency_ms, not {:?}",
+                    self.metric
+                ))
+            }
+            Err(e) => return fail(format!("metric: {e}")),
         }
         let mut names: Vec<&str> = Vec::new();
         for p in &self.permitted {
@@ -271,11 +291,49 @@ impl Mandate {
                 ));
             }
             names.push(&p.name);
-            if p.run.trim().is_empty() {
-                return fail(format!(
-                    "permitted action {:?} has an empty run; give it the command to run, like ./reset.sh",
-                    p.name
-                ));
+            match (&p.run, &p.adapter) {
+                (Some(run), None) if run.trim().is_empty() => {
+                    return fail(format!(
+                        "permitted action {:?} has an empty run; give it the command to run, like ./reset.sh",
+                        p.name
+                    ));
+                }
+                (Some(_), None) => {}
+                (None, Some(spec)) => {
+                    let lever = adapter::Lever::parse(spec)
+                        .map_err(|e| MandateError(format!("permitted action {:?}: {e}", p.name)))?;
+                    if let Some(t) = p.takes {
+                        if t != lever.takes() {
+                            return fail(format!(
+                                "permitted action {:?}: {} takes {}; leave takes out or say {}",
+                                p.name,
+                                lever.name(),
+                                lever.takes(),
+                                lever.takes()
+                            ));
+                        }
+                    }
+                    if p.reversible && !lever.reversible() {
+                        return fail(format!(
+                            "permitted action {:?}: {} cannot be undone; say reversible: false",
+                            p.name,
+                            lever.name()
+                        ));
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    return fail(format!(
+                        "permitted action {:?} has both run and adapter; choose one",
+                        p.name
+                    ))
+                }
+                (None, None) => {
+                    return fail(format!(
+                        "permitted action {:?} needs run (a command) or adapter (a built-in: {})",
+                        p.name,
+                        adapter::LEVERS.join(", ")
+                    ))
+                }
             }
             if p.cap.count == 0 {
                 return fail(format!(
@@ -382,6 +440,41 @@ impl Mandate {
     /// The permitted action with this name, if any.
     pub fn permitted(&self, name: &str) -> Option<&Permitted> {
         self.permitted.iter().find(|p| p.name == name)
+    }
+
+    /// The metric's name: the word before any adapter argument, as reports
+    /// carry it.
+    pub fn metric_name(&self) -> &str {
+        self.metric
+            .trim()
+            .split(char::is_whitespace)
+            .next()
+            .unwrap_or("")
+    }
+
+    /// The built-in metric, when the metric names one.
+    pub fn metric_adapter(&self) -> Option<adapter::Metric> {
+        adapter::Metric::parse(&self.metric).ok().flatten()
+    }
+}
+
+impl Permitted {
+    /// The shape of payload the lever consumes: as declared, or as the
+    /// built-in action takes it.
+    pub fn takes(&self) -> Option<Takes> {
+        self.takes.or_else(|| {
+            self.adapter
+                .as_deref()
+                .and_then(|a| adapter::Lever::parse(a).ok())
+                .map(|l| l.takes())
+        })
+    }
+
+    /// The built-in action, when the lever names one.
+    pub fn lever_adapter(&self) -> Option<adapter::Lever> {
+        self.adapter
+            .as_deref()
+            .and_then(|a| adapter::Lever::parse(a).ok())
     }
 }
 
@@ -605,19 +698,30 @@ fn check_action(position: usize, item: &Value) -> Result<(), MandateError> {
             ))
         }
     }
-    match map.get("run") {
-        None | Some(Value::Null) => {
+    match (map.get("run"), map.get("adapter")) {
+        (None | Some(Value::Null), None | Some(Value::Null)) => {
             return fail(format!(
-                "{who} needs run: the command to run, like ./reset.sh"
+                "{who} needs run: the command to run, like ./reset.sh; or adapter: a built-in action like github.issue owner/repo"
             ))
         }
-        Some(Value::String(_)) => {}
-        Some(other) => {
+        (Some(Value::String(_)), None | Some(Value::Null))
+        | (None | Some(Value::Null), Some(Value::String(_))) => {}
+        (Some(Value::String(_)), Some(Value::String(_))) => {
+            return fail(format!("{who} has both run and adapter; choose one"))
+        }
+        (Some(other), _) if !matches!(other, Value::String(_) | Value::Null) => {
             return fail(format!(
                 "{who} run must be the command to run, as text, not {}",
                 describe(other)
             ))
         }
+        (_, Some(other)) => {
+            return fail(format!(
+                "{who} adapter must be a built-in action, as text, not {}",
+                describe(other)
+            ))
+        }
+        _ => {}
     }
     match map.get("cap") {
         None | Some(Value::Null) => {
@@ -1186,7 +1290,7 @@ forbidden: [rm]
         ));
         assert_eq!(
             msg,
-            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, cap, reversible, delegated, takes"
+            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes"
         );
     }
 
@@ -1219,7 +1323,7 @@ forbidden: [rm]
         let msg = fails(&edit("    run: ./deploy.sh\n", ""));
         assert_eq!(
             msg,
-            "permitted action \"deploy\" needs run: the command to run, like ./reset.sh"
+            "permitted action \"deploy\" needs run: the command to run, like ./reset.sh; or adapter: a built-in action like github.issue owner/repo"
         );
         let msg = fails(&edit("run: ./deploy.sh", "run: \"  \""));
         assert_eq!(
@@ -1289,6 +1393,95 @@ forbidden: [rm]
         );
         let m = Mandate::parse(&edit("delegated: false", "delegated: true")).unwrap();
         assert!(m.permitted("deploy").unwrap().delegated);
+    }
+
+    #[test]
+    fn metric_may_name_an_adapter_with_its_argument() {
+        let m = Mandate::parse(&edit("metric: count", "metric: stripe.mrr")).unwrap();
+        assert_eq!(m.metric_name(), "stripe.mrr");
+        assert_eq!(m.metric_adapter(), Some(adapter::Metric::StripeMrr));
+        let m = Mandate::parse(&edit(
+            "metric: count",
+            "metric: github.open_issues 4esv/avsm",
+        ))
+        .unwrap();
+        assert_eq!(m.metric_name(), "github.open_issues");
+        assert!(m.metric_adapter().is_some());
+        let m = Mandate::parse(&edit(
+            "metric: count",
+            "metric: shell df --output=pcent / | tail -1",
+        ))
+        .unwrap();
+        assert_eq!(m.metric_name(), "shell");
+        let plain = Mandate::parse(VALID).unwrap();
+        assert_eq!(plain.metric_name(), "count");
+        assert_eq!(plain.metric_adapter(), None);
+        let msg = fails(&edit("metric: count", "metric: github.open_issues"));
+        assert_eq!(
+            msg,
+            "metric: github.open_issues needs a repository after it, like: metric: github.open_issues owner/repo"
+        );
+        let msg = fails(&edit("metric: count", "metric: http.status example.com"));
+        assert!(
+            msg.starts_with("metric: an address starts with http://"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn permitted_may_name_an_adapter_instead_of_a_command() {
+        let text = edit(
+            "    run: ./deploy.sh\n",
+            "    adapter: mail.send me@example.com\n",
+        );
+        let m = Mandate::parse(&text).unwrap();
+        let p = m.permitted("deploy").unwrap();
+        assert_eq!(p.run, None);
+        assert_eq!(p.takes(), Some(Takes::Text));
+        assert!(p.lever_adapter().is_some());
+        let msg = fails(&edit(
+            "    run: ./deploy.sh\n",
+            "    adapter: mail.send me@example.com\n    takes: json\n",
+        ));
+        assert_eq!(
+            msg,
+            "permitted action \"deploy\": mail.send takes text; leave takes out or say text"
+        );
+        let msg = fails(&edit(
+            "    run: ./deploy.sh\n    cap: 1/day\n    reversible: false\n",
+            "    adapter: mail.send me@example.com\n    cap: 1/day\n    reversible: true\n",
+        ));
+        assert_eq!(
+            msg,
+            "permitted action \"deploy\": mail.send cannot be undone; say reversible: false"
+        );
+        let msg = fails(&edit(
+            "    run: ./deploy.sh\n",
+            "    run: ./deploy.sh\n    adapter: mail.send me@example.com\n",
+        ));
+        assert_eq!(
+            msg,
+            "permitted action \"deploy\" has both run and adapter; choose one"
+        );
+        let msg = fails(&edit(
+            "    run: ./deploy.sh\n",
+            "    adapter: slack.post x\n",
+        ));
+        assert!(msg.contains("not a built-in action"), "{msg}");
+        let msg = fails(&edit("    run: ./deploy.sh\n", "    adapter: [x]\n"));
+        assert_eq!(
+            msg,
+            "permitted action \"deploy\" adapter must be a built-in action, as text, not a list"
+        );
+        // A mandate with nothing but adapters needs no files beside it.
+        let m = Mandate::parse(
+            "purpose: Watch the shop.\nmetric: stripe.mrr\ncontroller: {kind: model}\ncadence: 1h\n\
+             permitted:\n  - {name: nudge, adapter: mail.send me@example.com, cap: 1/day, reversible: false}\n",
+        )
+        .unwrap();
+        assert!(
+            m.metric_adapter().is_some() && m.permitted("nudge").unwrap().lever_adapter().is_some()
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::adapter::{self, Occasion};
 use crate::config::{self, Backend, Config};
 use crate::gate::{self, Candidate, RESUME, STOP};
 use crate::ledger::Ledger;
@@ -27,6 +28,9 @@ pub trait Warden {
     fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, String>;
     /// Send a prompt to a backend with its key and return the reply text.
     fn infer(&mut self, request: &InferRequest) -> Result<String, String>;
+    /// Measure a venture's metric through its adapter, with the key the
+    /// adapter is scoped to. The value, or None with a note saying why.
+    fn measure(&mut self, venture: &str) -> Result<(Option<f64>, String), String>;
 }
 
 /// The warden in this process.
@@ -91,11 +95,34 @@ impl Warden for LocalWarden {
                 .and_then(|e| e.record.payload().cloned()),
             None => None,
         };
-        if perm.takes.is_some() && payload.is_none() {
+        if perm.takes().is_some() && payload.is_none() {
             return Err(format!("{action} takes a payload and the proof names none"));
         }
+        let proof_text = proof.to_string();
+        let (for_venture, for_action) = (venture.clone(), action.clone());
+        let pull = |payload: Option<&Payload>| -> (bool, String) {
+            match (perm.lever_adapter(), &perm.run, payload) {
+                (Some(lever), _, Some(p)) => lever.run(
+                    &dir,
+                    lever
+                        .key_name()
+                        .and_then(|k| self.keys.get(k))
+                        .map(String::as_str),
+                    &self.config.adapters,
+                    p,
+                    &Occasion {
+                        venture: &for_venture,
+                        action: &for_action,
+                        proof: &proof_text,
+                    },
+                ),
+                (Some(lever), _, None) => (false, format!("{} needs a payload", lever.name())),
+                (None, Some(run), p) => run_lever(&dir, run, p, ACTION_TIMEOUT),
+                (None, None, _) => (false, format!("{for_action} has no command and no adapter")),
+            }
+        };
         if perm.reversible {
-            let (ok, detail) = run_lever(&dir, &perm.run, payload.as_ref(), ACTION_TIMEOUT);
+            let (ok, detail) = pull(payload.as_ref());
             written.push(append(Record::Action {
                 claim: Claim::Measured,
                 venture,
@@ -113,7 +140,7 @@ impl Warden for LocalWarden {
                 proof,
                 payload: payload.clone(),
             })?;
-            let (ok, detail) = run_lever(&dir, &perm.run, payload.as_ref(), ACTION_TIMEOUT);
+            let (ok, detail) = pull(payload.as_ref());
             let outcome = append(Record::Outcome {
                 claim: Claim::Measured,
                 venture,
@@ -149,14 +176,17 @@ impl Warden for LocalWarden {
                     body["output_config"] = serde_json::json!({ "effort": e });
                 }
                 let mut headers = vec![
-                    ("x-api-key", key.as_str()),
-                    ("anthropic-version", "2023-06-01"),
+                    ("x-api-key".to_string(), key.clone()),
+                    ("anthropic-version".to_string(), "2023-06-01".to_string()),
                 ];
                 if fallbacks_apply(model) {
                     body["fallbacks"] = serde_json::json!("default");
-                    headers.push(("anthropic-beta", "server-side-fallback-2026-07-01"));
+                    headers.push((
+                        "anthropic-beta".to_string(),
+                        "server-side-fallback-2026-07-01".to_string(),
+                    ));
                 }
-                let reply = post_json(url, &headers, &body)?;
+                let reply = adapter::post_json(url, &headers, &body)?;
                 if reply["stop_reason"].as_str() == Some("refusal") {
                     return Err(format!("backend {name} declined to answer"));
                 }
@@ -184,16 +214,14 @@ impl Warden for LocalWarden {
                     ],
                     "max_tokens": request.max_tokens,
                 });
-                let bearer;
                 let mut headers = Vec::new();
                 if let Some(k) = key {
                     let value = self.keys.get(k).ok_or_else(|| {
                         format!("backend {name} needs a key named {k} in the keys file")
                     })?;
-                    bearer = format!("Bearer {value}");
-                    headers.push(("authorization", bearer.as_str()));
+                    headers.push(("authorization".to_string(), format!("Bearer {value}")));
                 }
-                let reply = post_json(url, &headers, &body)?;
+                let reply = adapter::post_json(url, &headers, &body)?;
                 reply["choices"][0]["message"]["content"]
                     .as_str()
                     .map(str::to_string)
@@ -215,6 +243,24 @@ impl Warden for LocalWarden {
             }
         }
     }
+
+    fn measure(&mut self, venture: &str) -> Result<(Option<f64>, String), String> {
+        let entries = self.ledger.all().map_err(|e| e.to_string())?;
+        let ventures = venture::load_all(&entries);
+        let v = ventures
+            .get(venture)
+            .ok_or_else(|| format!("no venture named {venture}"))?;
+        let metric = v
+            .mandate
+            .metric_adapter()
+            .ok_or_else(|| format!("{venture} watches {}, not an adapter", v.mandate.metric))?;
+        let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
+        let key = metric
+            .key_name()
+            .and_then(|k| self.keys.get(k))
+            .map(String::as_str);
+        Ok(metric.measure(&dir, key, &self.config.adapters))
+    }
 }
 
 /// Models whose API takes `fallbacks: "default"`.
@@ -227,37 +273,6 @@ fn fallbacks_apply(model: &str) -> bool {
     ]
     .iter()
     .any(|p| model.starts_with(p))
-}
-
-fn post_json(
-    url: &str,
-    headers: &[(&str, &str)],
-    body: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(ACTION_TIMEOUT))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let mut req = agent.post(url);
-    for (k, v) in headers {
-        req = req.header(*k, *v);
-    }
-    let mut resp = req
-        .send_json(body)
-        .map_err(|e| format!("cannot reach {url}: {e}"))?;
-    let status = resp.status().as_u16();
-    let text = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("bad answer from {url}: {e}"))?;
-    if status >= 300 {
-        return Err(format!(
-            "{url} answered {status}: {}",
-            text.chars().take(400).collect::<String>()
-        ));
-    }
-    serde_json::from_str(&text).map_err(|e| format!("{url} did not answer JSON: {e}"))
 }
 
 /// What running something came to.
@@ -429,6 +444,7 @@ pub fn now() -> i64 {
 pub enum ToWarden {
     Execute(Candidate),
     Infer(InferRequest),
+    Measure(String),
 }
 
 /// What a warden process answers.
@@ -437,6 +453,7 @@ pub enum ToWarden {
 pub enum FromWarden {
     Done(Vec<Entry>),
     Text(String),
+    Measured(Option<f64>, String),
     Err(String),
 }
 

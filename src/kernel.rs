@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::gate::{self, Adopted, Candidate, Reason, State, Step, SELF};
 use crate::ledger::Ledger;
-use crate::mandate::{Controller, Restart};
+use crate::mandate::{Controller, Permitted, Restart};
 use crate::record::{Claim, Entry, Payload, Record, Seq, Verdict};
 use crate::role::{self, Context, InferRequest, ModelRole, Role};
 use crate::venture::{self, Venture};
@@ -103,6 +103,10 @@ impl Warden for NoWarden {
     }
 
     fn infer(&mut self, _request: &InferRequest) -> Result<String, String> {
+        Err("no warden process; start avsm with: avsm start".to_string())
+    }
+
+    fn measure(&mut self, _venture: &str) -> Result<(Option<f64>, String), String> {
         Err("no warden process; start avsm with: avsm start".to_string())
     }
 }
@@ -222,6 +226,14 @@ impl Kernel {
             .map_err(|e| format!("cannot find {}: {e}", dir.display()))?;
         let name = venture::name_of(&dir)?;
         let (mandate, hash) = venture::read_mandate(&dir)?;
+        if mandate.metric_adapter().is_none() && !dir.join("report").is_file() {
+            return Err(format!(
+                "{} watches {} but holds no report program to read it; add one, or name a built-in metric like {}",
+                dir.display(),
+                mandate.metric_name(),
+                crate::adapter::METRICS.join(", ")
+            ));
+        }
         let entry = self.append(self.decision(
             &name,
             Verdict::Adopt {
@@ -245,9 +257,14 @@ impl Kernel {
         let mut out = format!("added {name} from {}\n", dir.display());
         out.push_str(&format!("  {}\n", mandate.purpose.trim()));
         out.push_str(&format!(
-            "  watching {} every {}\n",
-            mandate.metric,
-            humantime::format_duration(mandate.cadence)
+            "  watching {} every {}{}\n",
+            mandate.metric_name(),
+            humantime::format_duration(mandate.cadence),
+            if mandate.metric_adapter().is_some() {
+                " through the warden"
+            } else {
+                ""
+            }
         ));
         for p in &mandate.permitted {
             out.push_str(&format!(
@@ -261,7 +278,7 @@ impl Kernel {
                 } else {
                     "irreversible, will ask first"
                 },
-                match p.takes {
+                match p.takes() {
                     Some(t) if p.delegated => format!(", takes {t}"),
                     Some(t) => format!(", takes {t} and will ask first"),
                     None => String::new(),
@@ -393,7 +410,7 @@ impl Kernel {
             .mandate
             .permitted(lever)
             .ok_or_else(|| format!("{name} does not permit {lever}; see its mandate"))?;
-        let payload = match (perm.takes, payload) {
+        let payload = match (perm.takes(), payload) {
             (None, None) => None,
             (None, Some(_)) => return Err(format!("{lever} takes no payload")),
             (Some(t), None) => {
@@ -580,7 +597,7 @@ impl Kernel {
         let entry = match self.append(Record::report(
             Claim::Measured,
             name,
-            &v.mandate.metric,
+            v.mandate.metric_name(),
             value,
             &note,
         )) {
@@ -625,11 +642,18 @@ impl Kernel {
         Ok(())
     }
 
-    /// Read a venture's metric: run its `report` and take the last line.
+    /// Read a venture's metric: through the warden when it names an
+    /// adapter, else by running its `report` and taking the last line.
     /// The built-in self venture measures itself.
     fn measure(&mut self, v: &Venture) -> Option<(Option<f64>, String)> {
         if v.name == SELF && v.path.is_none() {
             return Some(crate::selfventure::measure(&self.ledger));
+        }
+        if v.mandate.metric_adapter().is_some() {
+            return Some(match self.warden.measure(&v.name) {
+                Ok(measured) => measured,
+                Err(e) => (None, format!("cannot measure: {e}")),
+            });
         }
         let dir = v.path.clone()?;
         let report = v.report()?;
@@ -640,10 +664,9 @@ impl Kernel {
                 format!("report failed: {}", ran.detail(REPORT_TIMEOUT)),
             ));
         }
-        let last = ran.stdout.lines().rev().find(|l| !l.trim().is_empty());
-        match last.and_then(|s| s.trim().parse::<f64>().ok()) {
-            Some(n) if n.is_finite() => Some((Some(n), String::new())),
-            _ => Some((
+        match crate::adapter::number_from(&ran.stdout) {
+            Ok(n) => Some((Some(n), String::new())),
+            Err(_) => Some((
                 None,
                 format!(
                     "report did not print a number: {}",
@@ -1012,7 +1035,7 @@ fn fit_payload(
     payload: Option<Payload>,
     name: &str,
 ) -> Option<Payload> {
-    let takes = mandate.permitted(action).and_then(|p| p.takes)?;
+    let takes = mandate.permitted(action).and_then(Permitted::takes)?;
     let payload = payload?;
     if payload.takes() == takes {
         return Some(payload);
@@ -1223,7 +1246,7 @@ impl Warden for WardenProcess {
         match self.0.recv::<FromWarden>()? {
             FromWarden::Done(entries) => Ok(entries),
             FromWarden::Err(e) => Err(e),
-            FromWarden::Text(_) => Err("the warden answered the wrong question".to_string()),
+            _ => Err("the warden answered the wrong question".to_string()),
         }
     }
 
@@ -1232,7 +1255,16 @@ impl Warden for WardenProcess {
         match self.0.recv::<FromWarden>()? {
             FromWarden::Text(t) => Ok(t),
             FromWarden::Err(e) => Err(e),
-            FromWarden::Done(_) => Err("the warden answered the wrong question".to_string()),
+            _ => Err("the warden answered the wrong question".to_string()),
+        }
+    }
+
+    fn measure(&mut self, venture: &str) -> Result<(Option<f64>, String), String> {
+        self.0.send(&ToWarden::Measure(venture.to_string()))?;
+        match self.0.recv::<FromWarden>()? {
+            FromWarden::Measured(value, note) => Ok((value, note)),
+            FromWarden::Err(e) => Err(e),
+            _ => Err("the warden answered the wrong question".to_string()),
         }
     }
 }
@@ -1292,6 +1324,10 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
             },
             Ok(ToWarden::Infer(r)) => match warden.infer(&r) {
                 Ok(t) => FromWarden::Text(t),
+                Err(e) => FromWarden::Err(e),
+            },
+            Ok(ToWarden::Measure(v)) => match warden.measure(&v) {
+                Ok((value, note)) => FromWarden::Measured(value, note),
                 Err(e) => FromWarden::Err(e),
             },
             Err(e) => FromWarden::Err(format!("bad request: {e}")),

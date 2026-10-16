@@ -3,6 +3,7 @@
 //! A supervisor kernel where models only propose, code only proves, and
 //! every fact carries its provenance.
 
+pub mod adapter;
 pub mod config;
 pub mod gate;
 pub mod kernel;

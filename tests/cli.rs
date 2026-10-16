@@ -362,6 +362,8 @@ fn propose_asks_and_approve_edit_over_the_socket() {
          - {name: mail, run: \"cat > mailed\", cap: 3/day, reversible: false, takes: text}\n",
     )
     .unwrap();
+    std::fs::write(dir.join("report"), "#!/bin/sh\necho 3\n").unwrap();
+    std::fs::set_permissions(dir.join("report"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let _daemon = start(&home);
     let run = |args: &[&str]| avsm(&home, args);
     let (ok, text) = run(&["add", dir.to_str().unwrap()]);
