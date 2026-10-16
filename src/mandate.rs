@@ -45,6 +45,13 @@ pub struct Mandate {
     /// where Linux allows one. Script levers are not held to it.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "network")]
     pub network: Option<Vec<String>>,
+    /// The ventures this one allocates to. A parent sets their budgets and
+    /// thresholds and pauses them; it never runs their levers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<String>,
+    /// The venture that allocates to this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// `network:` as `none`, or a list of hosts.
@@ -132,6 +139,14 @@ pub struct Permitted {
     /// after a human approves it, unless the mandate delegates the lever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub takes: Option<Takes>,
+    /// What one run spends, in whatever units the human counts in. Spend
+    /// is held to the child's budget and to the shared quota.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cost: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// At most `count` times per `per`.
@@ -244,6 +259,8 @@ const FIELDS: &[&str] = &[
     "context_budget",
     "restart",
     "network",
+    "children",
+    "parent",
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action"];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
@@ -255,10 +272,103 @@ const ACTION_FIELDS: &[&str] = &[
     "reversible",
     "delegated",
     "takes",
+    "cost",
 ];
 
 /// Names no permitted action may take: they are built in.
-pub const BUILT_IN: &[&str] = &[STOP, "resume", "delegate"];
+pub const BUILT_IN: &[&str] = &[STOP, "delegate"];
+
+/// The levers a parent pulls on its children, by name alone, each taking
+/// text: `budget <child> <amount>`, `pause <child>`, `resume <child>`,
+/// `threshold <child> above|below <number>`.
+pub const PARENT_LEVERS: &[&str] = &["budget", "pause", "resume", "threshold"];
+
+/// A parent lever as pulled: which child, and what for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParentCall {
+    Budget {
+        child: String,
+        amount: u32,
+    },
+    Pause {
+        child: String,
+    },
+    Resume {
+        child: String,
+    },
+    Threshold {
+        child: String,
+        above: bool,
+        bound: f64,
+    },
+}
+
+impl ParentCall {
+    /// Read a parent lever's text payload.
+    pub fn parse(lever: &str, text: &str) -> Result<ParentCall, String> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let child = words
+            .first()
+            .filter(|w| is_word(w))
+            .ok_or_else(|| format!("{lever} names a child first, like: {lever} shop"))?
+            .to_string();
+        match (lever, &words[1..]) {
+            ("budget", [amount]) => Ok(ParentCall::Budget {
+                child,
+                amount: amount
+                    .parse()
+                    .map_err(|_| format!("budget takes a whole number, not {amount:?}"))?,
+            }),
+            ("budget", _) => Err("budget is written: budget <child> <amount>".to_string()),
+            ("pause", []) => Ok(ParentCall::Pause { child }),
+            ("pause", _) => Err("pause is written: pause <child>".to_string()),
+            ("resume", []) => Ok(ParentCall::Resume { child }),
+            ("resume", _) => Err("resume is written: resume <child>".to_string()),
+            ("threshold", [which, bound]) if matches!(*which, "above" | "below") => {
+                let bound: f64 = bound
+                    .parse()
+                    .ok()
+                    .filter(|b: &f64| b.is_finite())
+                    .ok_or_else(|| format!("threshold takes a number, not {bound:?}"))?;
+                Ok(ParentCall::Threshold {
+                    child,
+                    above: *which == "above",
+                    bound,
+                })
+            }
+            ("threshold", _) => {
+                Err("threshold is written: threshold <child> above|below <number>".to_string())
+            }
+            _ => Err(format!("{lever} is not a parent lever")),
+        }
+    }
+
+    pub fn child(&self) -> &str {
+        match self {
+            ParentCall::Budget { child, .. }
+            | ParentCall::Pause { child }
+            | ParentCall::Resume { child }
+            | ParentCall::Threshold { child, .. } => child,
+        }
+    }
+
+    /// One line, as an action's detail.
+    pub fn describe(&self) -> String {
+        match self {
+            ParentCall::Budget { child, amount } => format!("{child} may spend {amount} a day"),
+            ParentCall::Pause { child } => format!("{child} is paused"),
+            ParentCall::Resume { child } => format!("{child} may run again"),
+            ParentCall::Threshold {
+                child,
+                above,
+                bound,
+            } => format!(
+                "{child} acts {} {bound}",
+                if *above { "above" } else { "below" }
+            ),
+        }
+    }
+}
 
 /// The built-in lever that asks the research role a question. A mandate
 /// permits it by name alone, with no run and no adapter.
@@ -335,6 +445,32 @@ impl Mandate {
             }
             names.push(&p.name);
             match (&p.run, &p.adapter) {
+                (None, None) if PARENT_LEVERS.contains(&p.name.as_str()) => {
+                    if self.children.is_empty() {
+                        return fail(format!(
+                            "{} is a parent lever; list the ventures it applies to under children: first",
+                            p.name
+                        ));
+                    }
+                    if let Some(t) = p.takes {
+                        if t != Takes::Text {
+                            return fail(format!(
+                                "permitted action {:?} takes text, like: {} <child> ...; leave takes out",
+                                p.name, p.name
+                            ));
+                        }
+                    }
+                    if p.name == "resume" && p.delegated {
+                        return fail(
+                            "resume is declared-only: a human decides each time; remove delegated",
+                        );
+                    }
+                }
+                (Some(_), None) | (None, Some(_)) if p.name == "resume" => {
+                    return fail(
+                        "resume is built in; a permitted action cannot be named \"resume\"",
+                    )
+                }
                 (None, None) if p.name == RESEARCH => {
                     if let Some(t) = p.takes {
                         if t != Takes::Text {
@@ -391,7 +527,7 @@ impl Mandate {
                 }
                 (None, None) => {
                     return fail(format!(
-                        "permitted action {:?} needs run (a command) or adapter (a built-in: {}); only research needs neither",
+                        "permitted action {:?} needs run (a command) or adapter (a built-in: {}); only research and the parent levers need neither",
                         p.name,
                         adapter::LEVERS.join(", ")
                     ))
@@ -469,6 +605,27 @@ impl Mandate {
         if self.context_budget == 0 {
             return fail(format!("{BUDGET}, not 0"));
         }
+        for c in &self.children {
+            if !is_word(c) {
+                return fail(format!("children names ventures, one word each, not {c:?}"));
+            }
+            if c == "self" {
+                return fail("self cannot be a child; it belongs to no one".to_string());
+            }
+        }
+        if let Some(p) = &self.parent {
+            if !is_word(p) {
+                return fail(format!("parent names a venture, one word, not {p:?}"));
+            }
+            if p == "self" {
+                return fail("self cannot be a parent; it allocates nothing".to_string());
+            }
+            if self.children.contains(p) {
+                return fail(format!(
+                    "{p} cannot be both this venture's parent and its child"
+                ));
+            }
+        }
         if let Some(hosts) = &self.network {
             for h in hosts {
                 let ok = !h.is_empty()
@@ -518,6 +675,8 @@ impl Mandate {
             context_budget: default_context_budget(),
             restart: Restart::default(),
             network: None,
+            children: vec![],
+            parent: None,
         }
     }
 
@@ -553,12 +712,23 @@ impl Permitted {
                     .and_then(|a| adapter::Lever::parse(a).ok())
                     .map(|l| l.takes())
             })
-            .or_else(|| self.is_research().then_some(Takes::Text))
+            .or_else(|| (self.is_research() || self.is_parent_lever()).then_some(Takes::Text))
     }
 
     /// Is this the built-in research lever?
     pub fn is_research(&self) -> bool {
         self.name == RESEARCH && self.run.is_none() && self.adapter.is_none()
+    }
+
+    /// Is this one of the parent levers?
+    pub fn is_parent_lever(&self) -> bool {
+        PARENT_LEVERS.contains(&self.name.as_str()) && self.run.is_none() && self.adapter.is_none()
+    }
+
+    /// Does pulling it send something out into the world? Those count
+    /// toward the sends quota.
+    pub fn sends(&self) -> bool {
+        self.lever_adapter().is_some()
     }
 
     /// The built-in action, when the lever names one.
@@ -624,7 +794,33 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
     check_cadence(map.get("cadence"))?;
     check_context_budget(map.get("context_budget"))?;
     check_restart(map.get("restart"))?;
-    check_network(map.get("network"))
+    check_network(map.get("network"))?;
+    match map.get("children") {
+        None | Some(Value::Null) => {}
+        Some(Value::Sequence(items)) => {
+            for item in items {
+                if !matches!(item, Value::String(_)) {
+                    return fail(format!(
+                        "children names ventures, one word each, not {}",
+                        describe(item)
+                    ));
+                }
+            }
+        }
+        Some(other) => {
+            return fail(format!(
+                "children is a list of venture names, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match map.get("parent") {
+        None | Some(Value::Null) | Some(Value::String(_)) => Ok(()),
+        Some(other) => fail(format!(
+            "parent is the name of a venture, not {}",
+            describe(other)
+        )),
+    }
 }
 
 fn check_network(v: Option<&Value>) -> Result<(), MandateError> {
@@ -814,7 +1010,10 @@ fn check_action(position: usize, item: &Value) -> Result<(), MandateError> {
     }
     match (map.get("run"), map.get("adapter")) {
         (None | Some(Value::Null), None | Some(Value::Null))
-            if map.get("name").and_then(Value::as_str) == Some(RESEARCH) => {}
+            if map
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n == RESEARCH || PARENT_LEVERS.contains(&n)) => {}
         (None | Some(Value::Null), None | Some(Value::Null)) => {
             return fail(format!(
                 "{who} needs run: the command to run, like ./reset.sh; or adapter: a built-in action like github.issue owner/repo"
@@ -880,16 +1079,28 @@ fn check_action(position: usize, item: &Value) -> Result<(), MandateError> {
         }
     }
     match map.get("takes") {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(t)) => t
-            .parse::<Takes>()
-            .map(|_| ())
-            .map_err(|_| MandateError(format!("{who} takes is {}, not {t:?}", Takes::ALL))),
-        Some(other) => fail(format!(
-            "{who} takes is {}, not {}",
-            Takes::ALL,
-            describe(other)
-        )),
+        None | Some(Value::Null) => {}
+        Some(Value::String(t)) => {
+            t.parse::<Takes>()
+                .map_err(|_| MandateError(format!("{who} takes is {}, not {t:?}", Takes::ALL)))?;
+        }
+        Some(other) => {
+            return fail(format!(
+                "{who} takes is {}, not {}",
+                Takes::ALL,
+                describe(other)
+            ))
+        }
+    }
+    match map.get("cost") {
+        None => Ok(()),
+        Some(value) => match value.as_u64() {
+            Some(n) if n <= u64::from(u32::MAX) => Ok(()),
+            _ => fail(format!(
+                "{who} cost is a whole number of what one run spends, not {}",
+                describe(value)
+            )),
+        },
     }
 }
 
@@ -1172,7 +1383,7 @@ forbidden: [rm]
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, restart, network"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, restart, network, children, parent"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");
@@ -1406,7 +1617,7 @@ forbidden: [rm]
         ));
         assert_eq!(
             msg,
-            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes"
+            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes, cost"
         );
     }
 
@@ -1656,6 +1867,8 @@ forbidden: [rm]
         );
         let msg = fails(&edit("  - name: deploy\n", "  - name: delegate\n"));
         assert!(msg.starts_with("delegate is built in"), "{msg}");
+        let msg = fails(&edit("  - name: deploy\n", "  - name: resume\n"));
+        assert!(msg.starts_with("resume is built in"), "{msg}");
     }
 
     #[test]
@@ -1746,6 +1959,105 @@ forbidden: [rm]
         );
         let m = Mandate::parse(&edit("restart: on-failure", "restart: never")).unwrap();
         assert_eq!(m.restart, Restart::Never);
+    }
+
+    #[test]
+    fn parents_list_children_and_pull_parent_levers() {
+        let parent =
+            "purpose: Allocate.\nmetric: shell echo 1\ncontroller: {kind: model}\ncadence: 1h\n\
+                      children: [shop, farm]\n\
+                      permitted:\n\
+                      - {name: budget, cap: 9/day, reversible: true, delegated: true}\n\
+                      - {name: pause, cap: 9/day, reversible: true}\n\
+                      - {name: resume, cap: 9/day, reversible: true}\n\
+                      - {name: threshold, cap: 9/day, reversible: true}\n";
+        let m = Mandate::parse(parent).unwrap();
+        assert_eq!(m.children, vec!["shop", "farm"]);
+        for lever in PARENT_LEVERS {
+            let p = m.permitted(lever).unwrap();
+            assert!(p.is_parent_lever());
+            assert_eq!(p.takes(), Some(Takes::Text));
+        }
+        let child = Mandate::parse(&format!("{VALID}parent: portfolio\n")).unwrap();
+        assert_eq!(child.parent.as_deref(), Some("portfolio"));
+        let m =
+            Mandate::parse(&edit("    cap: 3/day\n", "    cap: 3/day\n    cost: 10\n")).unwrap();
+        assert_eq!(m.permitted("reset").unwrap().cost, 10);
+        assert!(serde_yaml::to_string(&m).unwrap().contains("cost: 10"));
+
+        let msg = fails(&parent.replace("children: [shop, farm]\n", ""));
+        assert!(
+            msg.starts_with("budget is a parent lever; list the ventures"),
+            "{msg}"
+        );
+        let msg = fails(&parent.replace(
+            "- {name: resume, cap: 9/day, reversible: true}",
+            "- {name: resume, cap: 9/day, reversible: true, delegated: true}",
+        ));
+        assert!(msg.starts_with("resume is declared-only"), "{msg}");
+        let msg = fails(&parent.replace("children: [shop, farm]", "children: [shop, self]"));
+        assert_eq!(msg, "self cannot be a child; it belongs to no one");
+        let msg = fails(&parent.replace("children: [shop, farm]", "children: [two words]"));
+        assert_eq!(
+            msg,
+            "children names ventures, one word each, not \"two words\""
+        );
+        let msg = fails(&parent.replace("children: [shop, farm]", "children: shop"));
+        assert_eq!(
+            msg,
+            "children is a list of venture names, not the text \"shop\""
+        );
+        let msg = fails(&format!("{VALID}parent: [a]\n"));
+        assert_eq!(msg, "parent is the name of a venture, not a list");
+        let msg = fails(&format!("{parent}parent: shop\n"));
+        assert_eq!(
+            msg,
+            "shop cannot be both this venture's parent and its child"
+        );
+        let msg = fails(&edit("    cap: 3/day\n", "    cap: 3/day\n    cost: -1\n"));
+        assert!(msg.contains("cost is a whole number"), "{msg}");
+
+        assert_eq!(
+            ParentCall::parse("budget", "shop 40").unwrap(),
+            ParentCall::Budget {
+                child: "shop".into(),
+                amount: 40
+            }
+        );
+        assert_eq!(
+            ParentCall::parse("pause", " shop ").unwrap(),
+            ParentCall::Pause {
+                child: "shop".into()
+            }
+        );
+        assert_eq!(
+            ParentCall::parse("resume", "shop").unwrap().describe(),
+            "shop may run again"
+        );
+        assert_eq!(
+            ParentCall::parse("threshold", "farm above 25.5").unwrap(),
+            ParentCall::Threshold {
+                child: "farm".into(),
+                above: true,
+                bound: 25.5
+            }
+        );
+        assert_eq!(
+            ParentCall::parse("budget", "shop").unwrap_err(),
+            "budget is written: budget <child> <amount>"
+        );
+        assert_eq!(
+            ParentCall::parse("budget", "shop lots").unwrap_err(),
+            "budget takes a whole number, not \"lots\""
+        );
+        assert_eq!(
+            ParentCall::parse("threshold", "farm over 3").unwrap_err(),
+            "threshold is written: threshold <child> above|below <number>"
+        );
+        assert_eq!(
+            ParentCall::parse("pause", "").unwrap_err(),
+            "pause names a child first, like: pause shop"
+        );
     }
 
     #[test]

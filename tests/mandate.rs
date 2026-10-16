@@ -45,6 +45,7 @@ fn valid_fixture_parses_field_by_field() {
                 reversible: true,
                 delegated: false,
                 takes: None,
+                cost: 0,
             },
             Permitted {
                 name: "deploy".into(),
@@ -57,6 +58,7 @@ fn valid_fixture_parses_field_by_field() {
                 reversible: false,
                 delegated: false,
                 takes: None,
+                cost: 0,
             },
         ],
         forbidden: vec!["rm".into()],
@@ -64,6 +66,8 @@ fn valid_fixture_parses_field_by_field() {
         context_budget: 4000,
         restart: Restart::OnFailure,
         network: None,
+        children: vec![],
+        parent: None,
     };
     assert_eq!(m.purpose, expected.purpose);
     assert_eq!(m.metric, expected.metric);

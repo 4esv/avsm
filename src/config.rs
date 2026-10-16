@@ -7,6 +7,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::mandate::Cap;
+
 pub const CONFIG_FILE: &str = "config.yaml";
 pub const KEYS_FILE: &str = "keys";
 
@@ -39,6 +41,26 @@ pub struct Config {
     /// The Tailscale logins allowed to give commands over the tailnet.
     #[serde(default)]
     pub remote_users: Vec<String>,
+    /// Limits shared by every venture: the kernel refuses what would pass
+    /// them before the gate sees it.
+    #[serde(default)]
+    pub quotas: Quotas,
+}
+
+/// Limits shared by every venture, each like `20/day`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Quotas {
+    /// Asks written, all ventures together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asks: Option<Cap>,
+    /// Cost of actions run, all ventures together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend: Option<Cap>,
+    /// Actions that send something out: mail, issues, comments, pull
+    /// requests, posts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sends: Option<Cap>,
 }
 
 fn default_port() -> u16 {
@@ -126,6 +148,7 @@ impl Default for Config {
             listen: None,
             port: default_port(),
             remote_users: vec![],
+            quotas: Quotas::default(),
         }
     }
 }
@@ -380,6 +403,17 @@ mod tests {
         assert!(Config::parse("adapters:\n  mail: {command: \"\"}\n")
             .unwrap_err()
             .contains("sendmail"));
+    }
+
+    #[test]
+    fn quotas_read_like_caps() {
+        let c = Config::parse("quotas: {asks: 20/day, spend: 100/day, sends: 5/hour}\n").unwrap();
+        assert_eq!(c.quotas.asks.unwrap().count, 20);
+        assert_eq!(c.quotas.spend.unwrap().per, Cap::DAY);
+        assert_eq!(c.quotas.sends.unwrap().per, Cap::HOUR);
+        assert_eq!(Config::default().quotas, Quotas::default());
+        assert!(Config::parse("quotas: {asks: many}\n").is_err());
+        assert!(Config::parse("quotas: {cost: 1/day}\n").is_err());
     }
 
     #[test]

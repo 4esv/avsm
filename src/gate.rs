@@ -10,8 +10,9 @@ use std::hash::{Hash, Hasher};
 use ascent::ascent;
 use serde::{Deserialize, Serialize};
 
-use crate::mandate::{Cap, Controller, Mandate, Permitted};
-use crate::record::{Claim, Entry, Kind, Record, Seq, Takes, Verdict};
+use crate::config::Quotas;
+use crate::mandate::{Cap, Controller, Mandate, ParentCall, Permitted};
+use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Takes, Verdict};
 
 /// The action that always passes.
 pub const STOP: &str = crate::mandate::STOP;
@@ -73,6 +74,8 @@ pub enum Step {
         delegated: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         takes: Option<Takes>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        cost: u32,
     },
     /// The record whose payload the lever consumes: the amended approval
     /// when a human changed it, else the ask, else the proposal.
@@ -89,12 +92,20 @@ pub enum Step {
         metric: String,
         value: f64,
     },
-    /// The threshold in the mandate that the report crosses.
+    /// The threshold the report crosses: the mandate's, or the one the
+    /// parent set with its `threshold` lever, cited as `from`.
     Threshold {
         metric: String,
         bound: f64,
         above: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<Seq>,
     },
+    /// The budget the parent set for this venture, and what is spent of
+    /// it today.
+    Budget { from: Seq, spent: u32, budget: u32 },
+    /// A shared quota that applies, and how much of it is used.
+    Quota { what: String, used: u32, cap: Cap },
     /// A declared decision the proof uses.
     Decision { seq: Seq, what: String },
     /// A record cited as the occasion for acting. It authorizes nothing.
@@ -160,6 +171,20 @@ pub enum Reason {
         takes: Takes,
         found: Takes,
     },
+    OverBudget {
+        spent: u32,
+        cost: u32,
+        budget: u32,
+    },
+    OverQuota {
+        what: String,
+        used: u32,
+        cap: Cap,
+    },
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A derivation that reaches the action.
@@ -247,8 +272,18 @@ ascent! {
     relation used(String, String, u32);
     relation forbidden(String, String);
     relation hardwired(String, String, String);
-    // venture, metric, above, bound, action
-    relation threshold(String, String, bool, Num, String);
+    // venture, metric, above, bound, action, the parent's action that set it
+    relation threshold(String, String, bool, Num, String, Option<Seq>);
+    // child, parent: both mandates say so
+    relation child_of(String, String);
+    // seq, parent, child: a parent pulled pause or resume
+    relation parent_pause(Seq, String, String);
+    relation parent_resume(Seq, String, String);
+    // a venture whose mandate permits the parent lever `resume`
+    relation parent_resume_lever(String);
+    // venture, action: refused by its parent's budget, or a shared quota
+    relation over_budget(String, String);
+    relation over_quota(String, String);
 
     // Non-negotiable 2: only measured and declared records can authorize.
     relation trusted(Seq);
@@ -260,8 +295,12 @@ ascent! {
     relation pause_at(String, Seq);
     pause_at(v, s) <-- decision(s, v, Dk::Pause, _), trusted(s);
     pause_at(v, s) <-- stopped(s, v);
+    // Non-negotiable 10: a parent allocates. Its pause and resume reach a
+    // child only when both mandates say they belong together.
+    pause_at(c, s) <-- parent_pause(s, p, c), child_of(c, p);
     relation resume_at(String, Seq);
     resume_at(v, s) <-- decision(s, v, Dk::Resume, _), trusted(s);
+    resume_at(c, s) <-- parent_resume(s, p, c), child_of(c, p);
     relation resumed_after(String, Seq);
     resumed_after(v, p) <-- pause_at(v, p), resume_at(v, r), if r > p;
     relation paused(String);
@@ -276,7 +315,7 @@ ascent! {
     relation crossed(String, String, Seq);
     crossed(v, a, s) <--
         candidate(v, a),
-        threshold(v, m, above, bound, a),
+        threshold(v, m, above, bound, a, _),
         report(s, v, m, val), cites(s), trusted(s), !stale(s),
         if (*above && val.0 > bound.0) || (!*above && val.0 < bound.0);
     relation approved(String, String, Seq, Seq);
@@ -311,6 +350,8 @@ ascent! {
     payload_ok(v, a) <-- takes(v, a), approved(v, a, _, _);
     payload_ok(v, a) <-- takes(v, a), declared_proposal(v, a, _);
     needs_decision(v, a) <-- candidate(v, a), takes(v, a), !payload_ok(v, a);
+    // A parent's resume is declared-only: a human decides each time.
+    needs_decision(v, a) <-- candidate(v, a), if a.as_str() == RESUME, parent_resume_lever(v), !approved(v, a, _, _);
 
     // An ask stays open until a declared decision answers it.
     relation decided(Seq);
@@ -324,14 +365,20 @@ ascent! {
     relation under_cap(String, String);
     under_cap(v, a) <-- permitted(v, a, cap, _, _), used(v, a, n), if n < cap;
 
+    // What goes through the mandate: everything but stop and the venture's
+    // own resume; a parent's resume lever is a lever like any other.
+    relation plain(String, String);
+    plain(v, a) <-- candidate(v, a), if a.as_str() != STOP && a.as_str() != RESUME;
+    plain(v, a) <-- candidate(v, a), if a.as_str() == RESUME, parent_resume_lever(v);
+
     // Non-negotiable 1: no action without a mandate and a proof.
     relation allowed(String, String);
     allowed(v, a) <-- candidate(v, a), if a.as_str() == STOP;
     allowed(v, a) <--
-        candidate(v, a), if a.as_str() == RESUME,
+        candidate(v, a), if a.as_str() == RESUME, !parent_resume_lever(v),
         decision(d, v, Dk::Resume, _), cites(d), trusted(d);
     allowed(v, a) <--
-        candidate(v, a), if a.as_str() != STOP && a.as_str() != RESUME,
+        plain(v, a),
         mandate(_, v, _),
         permitted(v, a, _, _, _),
         !forbidden(v, a),
@@ -339,15 +386,240 @@ ascent! {
         justified(v, a),
         !needs_decision(v, a),
         under_cap(v, a),
+        !over_budget(v, a),
+        !over_quota(v, a),
         !paused(v);
 }
 
+/// A threshold as it stands for a venture: the mandate's, or the one its
+/// parent set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Threshold {
+    pub above: bool,
+    pub bound: f64,
+    pub action: String,
+    /// The parent's action that set it, when a parent did.
+    pub from: Option<Seq>,
+}
+
+/// Does both mandates' word make `child` a child of `parent`?
+fn is_child_of(mandates: &[&Adopted], child: &str, parent: &str) -> bool {
+    mandates
+        .iter()
+        .any(|m| m.venture == parent && m.mandate.children.iter().any(|c| c == child))
+        && mandates
+            .iter()
+            .any(|m| m.venture == child && m.mandate.parent.as_deref() == Some(parent))
+}
+
+/// The parent levers pulled on `child` by its parent, oldest first:
+/// each successful action's sequence number and what it set.
+fn parent_calls(ledger: &[Entry], mandates: &[&Adopted], child: &str) -> Vec<(Seq, ParentCall)> {
+    let Some(parent) = mandates
+        .iter()
+        .find(|m| m.venture == child)
+        .and_then(|m| m.mandate.parent.clone())
+    else {
+        return vec![];
+    };
+    if !is_child_of(mandates, child, &parent) {
+        return vec![];
+    }
+    ledger
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Action {
+                venture,
+                action,
+                ok: true,
+                payload: Some(Payload::Text { text }),
+                ..
+            } if *venture == parent => ParentCall::parse(action, text)
+                .ok()
+                .filter(|c| c.child() == child)
+                .map(|c| (e.seq, c)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The threshold that applies to a venture now, if its controller is one.
+pub fn effective_threshold(
+    ledger: &[Entry],
+    mandates: &[Adopted],
+    venture: &str,
+) -> Option<Threshold> {
+    let refs: Vec<&Adopted> = mandates.iter().collect();
+    let m = refs.iter().find(|m| m.venture == venture)?;
+    let Controller::Threshold {
+        above,
+        below,
+        action,
+    } = &m.mandate.controller
+    else {
+        return None;
+    };
+    let mut t = match (above, below) {
+        (Some(b), _) => Threshold {
+            above: true,
+            bound: *b,
+            action: action.clone(),
+            from: None,
+        },
+        (_, Some(b)) => Threshold {
+            above: false,
+            bound: *b,
+            action: action.clone(),
+            from: None,
+        },
+        _ => return None,
+    };
+    for (seq, call) in parent_calls(ledger, &refs, venture) {
+        if let ParentCall::Threshold { above, bound, .. } = call {
+            t.above = above;
+            t.bound = bound;
+            t.from = Some(seq);
+        }
+    }
+    Some(t)
+}
+
+/// The budget a venture's parent set for it, and the action that set it.
+pub fn budget_of(ledger: &[Entry], mandates: &[&Adopted], venture: &str) -> Option<(Seq, u32)> {
+    parent_calls(ledger, mandates, venture)
+        .into_iter()
+        .filter_map(|(seq, call)| match call {
+            ParentCall::Budget { amount, .. } => Some((seq, amount)),
+            _ => None,
+        })
+        .next_back()
+}
+
+/// The cost of an action a venture took, by its mandate as adopted now.
+fn cost_of(mandates: &[&Adopted], venture: &str, action: &str) -> u32 {
+    mandates
+        .iter()
+        .find(|m| m.venture == venture)
+        .and_then(|m| m.mandate.permitted(action))
+        .map_or(0, |p| p.cost)
+}
+
+/// Actions and intents of `venture` (every venture when None) since
+/// `since`, as (venture, action).
+fn runs_since<'a>(
+    ledger: &'a [Entry],
+    venture: Option<&str>,
+    since: i64,
+) -> Vec<(&'a str, &'a str)> {
+    ledger
+        .iter()
+        .filter(|e| e.at > since)
+        .filter(|e| matches!(e.record.kind(), Kind::Action | Kind::Intent))
+        .filter(|e| venture.is_none_or(|v| e.record.venture() == v))
+        .filter_map(|e| e.record.action().map(|a| (e.record.venture(), a)))
+        .collect()
+}
+
+/// What a venture spent today.
+pub fn spent_today(ledger: &[Entry], mandates: &[&Adopted], venture: &str, now: i64) -> u32 {
+    runs_since(ledger, Some(venture), now - Cap::DAY.as_secs() as i64)
+        .into_iter()
+        .map(|(v, a)| cost_of(mandates, v, a))
+        .sum()
+}
+
+/// How the shared quotas bear on an action: the steps that show them, and
+/// the reasons when it would pass one. The kernel asks this before the
+/// gate; the gate asks it again.
+pub fn quota_check(
+    ledger: &[Entry],
+    mandates: &[Adopted],
+    quotas: &Quotas,
+    venture: &str,
+    action: &str,
+    now: i64,
+) -> (Vec<Step>, Vec<Reason>) {
+    let refs: Vec<&Adopted> = mandates.iter().collect();
+    let mut steps = Vec::new();
+    let mut reasons = Vec::new();
+    let Some(perm) = refs
+        .iter()
+        .find(|m| m.venture == venture)
+        .and_then(|m| m.mandate.permitted(action))
+    else {
+        return (steps, reasons);
+    };
+    if let (Some(cap), true) = (quotas.spend, perm.cost > 0) {
+        let used: u32 = runs_since(ledger, None, now - cap.per.as_secs() as i64)
+            .into_iter()
+            .map(|(v, a)| cost_of(&refs, v, a))
+            .sum();
+        steps.push(Step::Quota {
+            what: "spend".to_string(),
+            used,
+            cap,
+        });
+        if used + perm.cost > cap.count {
+            reasons.push(Reason::OverQuota {
+                what: "spend".to_string(),
+                used,
+                cap,
+            });
+        }
+    }
+    if let (Some(cap), true) = (quotas.sends, perm.sends()) {
+        let used = runs_since(ledger, None, now - cap.per.as_secs() as i64)
+            .into_iter()
+            .filter(|(v, a)| {
+                refs.iter()
+                    .find(|m| m.venture == *v)
+                    .and_then(|m| m.mandate.permitted(a))
+                    .is_some_and(Permitted::sends)
+            })
+            .count() as u32;
+        steps.push(Step::Quota {
+            what: "sends".to_string(),
+            used,
+            cap,
+        });
+        if used >= cap.count {
+            reasons.push(Reason::OverQuota {
+                what: "sends".to_string(),
+                used,
+                cap,
+            });
+        }
+    }
+    (steps, reasons)
+}
+
+/// How many asks were written inside the asks quota's window.
+pub fn asks_used(ledger: &[Entry], cap: Cap, now: i64) -> u32 {
+    ledger
+        .iter()
+        .filter(|e| e.at > now - cap.per.as_secs() as i64)
+        .filter(|e| e.record.kind() == Kind::Ask)
+        .count() as u32
+}
+
 /// Decide whether an action may happen, given the ledger so far and the
-/// adopted mandates. `now` is unix seconds, used for caps.
+/// adopted mandates, with no shared quotas. `now` is unix seconds, used
+/// for caps.
 pub fn gate(
     candidate: &Candidate,
     ledger: &[Entry],
     mandates: &[Adopted],
+    now: i64,
+) -> Result<Proof, Refusal> {
+    gate_with(candidate, ledger, mandates, &Quotas::default(), now)
+}
+
+/// Decide whether an action may happen, under the shared quotas too.
+pub fn gate_with(
+    candidate: &Candidate,
+    ledger: &[Entry],
+    mandates: &[Adopted],
+    quotas: &Quotas,
     now: i64,
 ) -> Result<Proof, Refusal> {
     let v = candidate.venture.as_str();
@@ -411,39 +683,93 @@ pub fn gate(
         for f in &m.mandate.forbidden {
             p.forbidden.push((venture.clone(), f.clone()));
         }
-        if let Controller::Threshold {
-            above,
-            below,
-            action,
-        } = &m.mandate.controller
-        {
-            if let Some(b) = above {
-                p.threshold.push((
-                    venture.clone(),
-                    m.mandate.metric_name().to_string(),
-                    true,
-                    Num(*b),
-                    action.clone(),
-                ));
-            }
-            if let Some(b) = below {
-                p.threshold.push((
-                    venture.clone(),
-                    m.mandate.metric_name().to_string(),
-                    false,
-                    Num(*b),
-                    action.clone(),
-                ));
-            }
+        if let Some(t) = effective_threshold(ledger, mandates, &venture) {
+            p.threshold.push((
+                venture.clone(),
+                m.mandate.metric_name().to_string(),
+                t.above,
+                Num(t.bound),
+                t.action,
+                t.from,
+            ));
         }
     }
     for (name, why) in HARDWIRED {
         p.hardwired
             .push((SELF.to_string(), name.to_string(), why.to_string()));
     }
+    load_family(&mut p, ledger, &adopted);
+    // The parent's budget and the shared quotas, as facts and as steps.
+    let mut extra_steps = Vec::new();
+    let mut extra_reasons = Vec::new();
+    let cost = adopted
+        .iter()
+        .find(|m| m.venture == v)
+        .and_then(|m| m.mandate.permitted(a))
+        .map_or(0, |perm| perm.cost);
+    if let Some((from, budget)) = budget_of(ledger, &adopted, v) {
+        let spent = spent_today(ledger, &adopted, v, now);
+        extra_steps.push(Step::Budget {
+            from,
+            spent,
+            budget,
+        });
+        if spent + cost > budget {
+            p.over_budget.push((v.to_string(), a.to_string()));
+            extra_reasons.push(Reason::OverBudget {
+                spent,
+                cost,
+                budget,
+            });
+        }
+    }
+    let (qsteps, qreasons) = quota_check(ledger, mandates, quotas, v, a, now);
+    if !qreasons.is_empty() {
+        p.over_quota.push((v.to_string(), a.to_string()));
+    }
+    extra_steps.extend(qsteps);
+    extra_reasons.extend(qreasons);
 
     p.run();
-    assemble(&p, candidate, ledger, &adopted)
+    assemble(&p, candidate, ledger, &adopted, extra_steps, extra_reasons)
+}
+
+/// Parents and children as facts: who belongs to whom, which parents may
+/// resume, and the pauses and resumes parents pulled.
+fn load_family(p: &mut Rules, ledger: &[Entry], adopted: &[&Adopted]) {
+    for m in adopted {
+        for c in &m.mandate.children {
+            if is_child_of(adopted, c, &m.venture) {
+                p.child_of.push((c.clone(), m.venture.clone()));
+            }
+        }
+        if m.mandate
+            .permitted(RESUME)
+            .is_some_and(Permitted::is_parent_lever)
+        {
+            p.parent_resume_lever.push((m.venture.clone(),));
+        }
+    }
+    for e in ledger {
+        if let Record::Action {
+            venture,
+            action,
+            ok: true,
+            payload: Some(Payload::Text { text }),
+            ..
+        } = &e.record
+        {
+            match ParentCall::parse(action, text) {
+                Ok(ParentCall::Pause { child }) => {
+                    p.parent_pause.push((e.seq, venture.clone(), child))
+                }
+                Ok(ParentCall::Resume { child }) => {
+                    p.parent_resume.push((e.seq, venture.clone(), child))
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Every ledger entry as facts.
@@ -499,12 +825,14 @@ impl fmt::Display for State {
     }
 }
 
-/// The state of a venture: paused after a declared pause or a stop action
-/// until a declared resume; asking while an ask has no declared decision;
-/// running otherwise.
-pub fn state(ledger: &[Entry], venture: &str) -> State {
+/// The state of a venture: paused after a declared pause, a stop action
+/// or its parent's pause, until a declared resume; asking while an ask has
+/// no declared decision; running otherwise.
+pub fn state(ledger: &[Entry], mandates: &[Adopted], venture: &str) -> State {
     let mut p = Rules::default();
     load_ledger(&mut p, ledger);
+    let adopted: Vec<&Adopted> = mandates.iter().collect();
+    load_family(&mut p, ledger, &adopted);
     p.run();
     if p.paused.iter().any(|(v,)| v == venture) {
         State::Paused
@@ -531,6 +859,8 @@ fn assemble(
     candidate: &Candidate,
     ledger: &[Entry],
     adopted: &[&Adopted],
+    extra_steps: Vec<Step>,
+    extra_reasons: Vec<Reason>,
 ) -> Result<Proof, Refusal> {
     let v = &candidate.venture;
     let a = &candidate.action;
@@ -567,7 +897,8 @@ fn assemble(
         }
     }
 
-    if a == RESUME {
+    let parent_resume = p.parent_resume_lever.iter().any(|(x,)| x == v);
+    if a == RESUME && !parent_resume {
         steps.push(Step::Axiom {
             text: "resuming needs a declared record".to_string(),
         });
@@ -613,6 +944,7 @@ fn assemble(
                     reversible: perm.reversible,
                     delegated: perm.delegated,
                     takes: perm.takes(),
+                    cost: perm.cost,
                 }),
                 None => reasons.push(Reason::NotPermitted { action: a.clone() }),
             }
@@ -647,15 +979,16 @@ fn assemble(
                     metric: metric.clone(),
                     value: *value,
                 });
-                if let Some((_, _, above, bound, _)) = p
+                if let Some((_, _, above, bound, _, from)) = p
                     .threshold
                     .iter()
-                    .find(|(x, m, _, _, act)| x == v && m == metric && act == a)
+                    .find(|(x, m, _, _, act, _)| x == v && m == metric && act == a)
                 {
                     steps.push(Step::Threshold {
                         metric: metric.clone(),
                         bound: bound.0,
                         above: *above,
+                        from: *from,
                     });
                 }
             }
@@ -769,6 +1102,8 @@ fn assemble(
             });
         }
     }
+    steps.extend(extra_steps);
+    reasons.extend(extra_reasons);
     if p.paused.iter().any(|(x,)| x == v) {
         reasons.push(Reason::Paused { venture: v.clone() });
     } else {
@@ -824,9 +1159,10 @@ impl fmt::Display for Step {
                 reversible,
                 delegated,
                 takes,
+                cost,
             } => write!(
                 f,
-                "permitted  {action}  {cap}  {}{}{}",
+                "permitted  {action}  {cap}  {}{}{}{}",
                 if *reversible {
                     "reversible"
                 } else {
@@ -836,6 +1172,11 @@ impl fmt::Display for Step {
                 match takes {
                     Some(t) => format!(", takes {t}"),
                     None => String::new(),
+                },
+                if *cost > 0 {
+                    format!(", costs {cost}")
+                } else {
+                    String::new()
                 }
             ),
             Step::Payload {
@@ -854,11 +1195,25 @@ impl fmt::Display for Step {
                 metric,
                 bound,
                 above,
+                from,
             } => write!(
                 f,
-                "threshold  {metric} {} {bound}",
-                if *above { "above" } else { "below" }
+                "threshold  {metric} {} {bound}{}",
+                if *above { "above" } else { "below" },
+                match from {
+                    Some(s) => format!("  set by the parent in #{s}"),
+                    None => String::new(),
+                }
             ),
+            Step::Budget {
+                from,
+                spent,
+                budget,
+            } => write!(
+                f,
+                "budget     {spent} of {budget} a day spent  set by the parent in #{from}"
+            ),
+            Step::Quota { what, used, cap } => write!(f, "quota      {what} {cap}, {used} used"),
             Step::Decision { seq, what } => write!(f, "decision   #{seq}  declared  {what}"),
             Step::Occasion {
                 seq,
@@ -919,6 +1274,17 @@ impl fmt::Display for Reason {
                 takes,
                 found,
             } => write!(f, "{action} takes {takes}, not {found}"),
+            Reason::OverBudget {
+                spent,
+                cost,
+                budget,
+            } => write!(
+                f,
+                "the parent's budget is {budget} a day, {spent} is spent and this costs {cost}"
+            ),
+            Reason::OverQuota { what, used, cap } => {
+                write!(f, "the {what} quota is {cap} and {used} are already used")
+            }
         }
     }
 }
@@ -1029,6 +1395,7 @@ mod tests {
             reversible,
             delegated,
             takes: None,
+            cost: 0,
         }
     }
 
@@ -1043,6 +1410,8 @@ mod tests {
             context_budget: 8000,
             restart: Restart::OnFailure,
             network: None,
+            children: vec![],
+            parent: None,
         }
     }
 
@@ -1667,9 +2036,9 @@ mod tests {
             V,
             mandate(model(), vec![permit("deploy", 1, false, false)], &[]),
         );
-        assert_eq!(state(&fx.entries, V), State::Running);
+        assert_eq!(state(&fx.entries, &fx.adopted, V), State::Running);
         let q = fx.push(ask(Claim::Inferred, "deploy"));
-        assert_eq!(state(&fx.entries, V), State::Asking);
+        assert_eq!(state(&fx.entries, &fx.adopted, V), State::Asking);
         assert_eq!(open_asks(&fx.entries), vec![q]);
         fx.push(decision(
             Claim::Inferred,
@@ -1691,16 +2060,16 @@ mod tests {
             },
         ));
         assert_eq!(open_asks(&fx.entries), Vec::<Seq>::new());
-        assert_eq!(state(&fx.entries, V), State::Running);
+        assert_eq!(state(&fx.entries, &fx.adopted, V), State::Running);
         fx.push(decision(Claim::Declared, Verdict::Pause));
         let q2 = fx.push(ask(Claim::Inferred, "deploy"));
         assert_eq!(
-            state(&fx.entries, V),
+            state(&fx.entries, &fx.adopted, V),
             State::Paused,
             "paused wins over asking"
         );
         assert_eq!(open_asks(&fx.entries), vec![q2]);
-        assert_eq!(state(&fx.entries, "other"), State::Running);
+        assert_eq!(state(&fx.entries, &fx.adopted, "other"), State::Running);
     }
 
     #[test]
@@ -1889,5 +2258,298 @@ mod tests {
                 .contains("reversible, delegated, takes text"),
             "{proof}"
         );
+    }
+
+    /// A parent with one child, both adopted and agreeing.
+    fn family(fx: &mut Fx, parent_levers: Vec<Permitted>, child: Mandate) -> (Seq, Seq) {
+        let mut pm = mandate(model(), parent_levers, &[]);
+        pm.children = vec![V.to_string()];
+        let p = fx.adopt("portfolio", pm);
+        let mut cm = child;
+        cm.parent = Some("portfolio".to_string());
+        let c = fx.adopt(V, cm);
+        (p, c)
+    }
+
+    fn parent_action(parent: &str, lever: &str, text: &str) -> Record {
+        Record::Action {
+            claim: Claim::Measured,
+            venture: parent.to_string(),
+            action: lever.to_string(),
+            proof: Proof {
+                venture: parent.to_string(),
+                action: lever.to_string(),
+                steps: vec![],
+            },
+            ok: true,
+            detail: String::new(),
+            payload: Some(self::text(text)),
+        }
+    }
+
+    fn parent_lever(name: &str, delegated: bool) -> Permitted {
+        let mut p = permit(name, 9, true, delegated);
+        p.run = None;
+        p
+    }
+
+    #[test]
+    fn a_child_paused_by_its_parent_cannot_act_until_resumed() {
+        let mut fx = Fx::new();
+        family(
+            &mut fx,
+            vec![parent_lever("pause", true), parent_lever("resume", false)],
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        let r = fx.push(report(Claim::Measured, 12.0));
+        assert!(fx.gate(V, "reset", &[r]).is_ok());
+        fx.push(parent_action("portfolio", "pause", V));
+        let r = fx.push(report(Claim::Measured, 12.0));
+        let refusal = fx.gate(V, "reset", &[r]).unwrap_err();
+        assert!(
+            refusal
+                .reasons
+                .contains(&Reason::Paused { venture: V.into() }),
+            "{refusal}"
+        );
+        assert_eq!(state(&fx.entries, &fx.adopted, V), State::Paused);
+        // A stranger's pause does nothing: it is not this child's parent.
+        let mut fx2 = Fx::new();
+        fx2.adopt(
+            V,
+            mandate(
+                above(10.0, "reset"),
+                vec![permit("reset", 3, true, false)],
+                &[],
+            ),
+        );
+        fx2.push(parent_action("stranger", "pause", V));
+        let r = fx2.push(report(Claim::Measured, 12.0));
+        assert!(fx2.gate(V, "reset", &[r]).is_ok());
+        // The parent's resume needs a declared decision; then the child acts again.
+        let s = fx.push(Record::Proposal {
+            claim: Claim::Inferred,
+            venture: "portfolio".into(),
+            action: "resume".into(),
+            reason: "it is fine now".into(),
+            payload: Some(text(V)),
+        });
+        let refusal = fx.gate("portfolio", "resume", &[s]).unwrap_err();
+        assert!(
+            refusal
+                .reasons
+                .iter()
+                .any(|r| matches!(r, Reason::NeedsDecision { .. })),
+            "{refusal}"
+        );
+        let q = fx.push(Record::Ask {
+            claim: Claim::Inferred,
+            venture: "portfolio".into(),
+            action: Some("resume".into()),
+            question: "resume?".into(),
+            refusal: None,
+            payload: Some(text(V)),
+        });
+        let d = fx.push(Record::Decision {
+            claim: Claim::Declared,
+            venture: "portfolio".into(),
+            verdict: approve(q),
+            by: None,
+        });
+        let proof = fx.gate("portfolio", "resume", &[d]).expect("declared");
+        assert!(proof.to_string().contains("decision"), "{proof}");
+        fx.push(parent_action("portfolio", "resume", V));
+        assert_eq!(state(&fx.entries, &fx.adopted, V), State::Running);
+        let r = fx.push(report(Claim::Measured, 12.0));
+        assert!(fx.gate(V, "reset", &[r]).is_ok());
+    }
+
+    #[test]
+    fn a_budget_set_by_the_parent_bounds_what_the_child_spends() {
+        let mut fx = Fx::new();
+        let mut spend = permit("spend", 9, true, true);
+        spend.cost = 10;
+        family(
+            &mut fx,
+            vec![parent_lever("budget", true)],
+            mandate(model(), vec![spend], &[]),
+        );
+        let s = fx.push(proposal(Claim::Inferred, "spend"));
+        assert!(fx.gate(V, "spend", &[s]).is_ok(), "no budget set: no bound");
+        let b = fx.push(parent_action("portfolio", "budget", &format!("{V} 15")));
+        let s = fx.push(proposal(Claim::Inferred, "spend"));
+        let proof = fx.gate(V, "spend", &[s]).expect("under budget");
+        assert!(
+            proof.to_string().contains(&format!(
+                "budget     0 of 15 a day spent  set by the parent in #{b}"
+            )),
+            "{proof}"
+        );
+        assert!(proof.to_string().contains("costs 10"), "{proof}");
+        fx.push(done("spend"));
+        let s = fx.push(proposal(Claim::Inferred, "spend"));
+        let refusal = fx.gate(V, "spend", &[s]).unwrap_err();
+        assert!(
+            reasons(&refusal).contains(
+                &"the parent's budget is 15 a day, 10 is spent and this costs 10".to_string()
+            ),
+            "{refusal}"
+        );
+        // A bigger budget lets it through again.
+        fx.push(parent_action("portfolio", "budget", &format!("{V} 30")));
+        let s = fx.push(proposal(Claim::Inferred, "spend"));
+        assert!(fx.gate(V, "spend", &[s]).is_ok());
+    }
+
+    #[test]
+    fn the_parent_may_move_the_childs_threshold() {
+        let mut fx = Fx::new();
+        family(
+            &mut fx,
+            vec![parent_lever("threshold", true)],
+            mandate(
+                above(30.0, "vent"),
+                vec![permit("vent", 9, true, false)],
+                &[],
+            ),
+        );
+        let r = fx.push(report(Claim::Measured, 27.0));
+        assert!(fx.gate(V, "vent", &[r]).is_err());
+        let t = fx.push(parent_action(
+            "portfolio",
+            "threshold",
+            &format!("{V} above 25"),
+        ));
+        assert_eq!(
+            effective_threshold(&fx.entries, &fx.adopted, V),
+            Some(Threshold {
+                above: true,
+                bound: 25.0,
+                action: "vent".into(),
+                from: Some(t)
+            })
+        );
+        let r = fx.push(report(Claim::Measured, 27.0));
+        let proof = fx.gate(V, "vent", &[r]).expect("over the parent's bound");
+        assert!(
+            proof.to_string().contains(&format!(
+                "threshold  count above 25  set by the parent in #{t}"
+            )),
+            "{proof}"
+        );
+    }
+
+    #[test]
+    fn shared_quotas_refuse_before_and_inside_the_gate() {
+        let mut fx = Fx::new();
+        let mut costly = permit("buy", 9, true, true);
+        costly.cost = 10;
+        let mut mail = permit("mail", 9, false, true);
+        mail.run = None;
+        mail.adapter = Some("mail.send me@example.com".to_string());
+        fx.adopt(V, mandate(model(), vec![costly, mail], &[]));
+        let quotas = Quotas {
+            asks: Some(Cap {
+                count: 2,
+                per: Cap::DAY,
+            }),
+            spend: Some(Cap {
+                count: 15,
+                per: Cap::DAY,
+            }),
+            sends: Some(Cap {
+                count: 1,
+                per: Cap::DAY,
+            }),
+        };
+        let s = fx.push(proposal(Claim::Inferred, "buy"));
+        let candidate = |action: &str, cites: Vec<Seq>| Candidate {
+            venture: V.into(),
+            action: action.into(),
+            cites,
+        };
+        let proof = gate_with(
+            &candidate("buy", vec![s]),
+            &fx.entries,
+            &fx.adopted,
+            &quotas,
+            NOW,
+        )
+        .unwrap();
+        assert!(
+            proof
+                .to_string()
+                .contains("quota      spend 15/day, 0 used"),
+            "{proof}"
+        );
+        fx.push(done("buy"));
+        let s = fx.push(proposal(Claim::Inferred, "buy"));
+        let refusal = gate_with(
+            &candidate("buy", vec![s]),
+            &fx.entries,
+            &fx.adopted,
+            &quotas,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(
+            reasons(&refusal)
+                .contains(&"the spend quota is 15/day and 10 are already used".to_string()),
+            "{refusal}"
+        );
+        let (steps, why) = quota_check(&fx.entries, &fx.adopted, &quotas, V, "buy", NOW);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(why.len(), 1);
+        // Sends: one mail is fine, the second is one too many.
+        let s = fx.push(proposal_with(Claim::Inferred, "mail", text("hi")));
+        assert!(gate_with(
+            &candidate("mail", vec![s]),
+            &fx.entries,
+            &fx.adopted,
+            &quotas,
+            NOW
+        )
+        .is_ok());
+        fx.push(Record::Intent {
+            claim: Claim::Measured,
+            venture: V.into(),
+            action: "mail".into(),
+            proof: Proof {
+                venture: V.into(),
+                action: "mail".into(),
+                steps: vec![],
+            },
+            payload: Some(text("hi")),
+        });
+        let s = fx.push(proposal_with(Claim::Inferred, "mail", text("again")));
+        let refusal = gate_with(
+            &candidate("mail", vec![s]),
+            &fx.entries,
+            &fx.adopted,
+            &quotas,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(
+            reasons(&refusal)
+                .contains(&"the sends quota is 1/day and 1 are already used".to_string()),
+            "{refusal}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("quota      sends 1/day, 1 used"),
+            "{refusal}"
+        );
+        // Asks are counted for the kernel.
+        fx.push(ask(Claim::Inferred, "mail"));
+        assert_eq!(asks_used(&fx.entries, quotas.asks.unwrap(), NOW), 1);
+        // Without quotas nothing of this applies.
+        let s = fx.push(proposal(Claim::Inferred, "buy"));
+        assert!(fx.gate(V, "buy", &[s]).is_ok());
     }
 }

@@ -118,6 +118,7 @@ pub fn canary() -> Result<(), String> {
                 reversible: true,
                 delegated: true,
                 takes: None,
+                cost: 0,
             })
             .collect(),
         forbidden: vec![],
@@ -125,6 +126,8 @@ pub fn canary() -> Result<(), String> {
         context_budget: 1000,
         restart: Restart::Never,
         network: None,
+        children: vec![],
+        parent: None,
     };
     let mandate_hash = Mandate::hash(&serde_yaml::to_string(&permissive).unwrap_or_default());
     let adopt = Record::Decision {

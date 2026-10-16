@@ -20,6 +20,22 @@ pub struct Context {
     pub now: i64,
     /// The backend to ask.
     pub backend: String,
+    /// For a parent: its children's metrics and records, never their raw
+    /// world input.
+    #[serde(default)]
+    pub children: Vec<ChildView>,
+}
+
+/// A child as its parent sees it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChildView {
+    pub name: String,
+    /// running, asking or paused.
+    pub state: String,
+    /// The latest report, as a line, or nothing yet.
+    pub metric: String,
+    /// Recent measured and declared records, as lines, oldest first.
+    pub lines: Vec<String>,
 }
 
 /// A prompt for a backend. The warden attaches the key and sends it.
@@ -118,10 +134,22 @@ pub fn prompt(ctx: &Context) -> InferRequest {
                 "irreversible, needs human approval"
             },
             match p.takes() {
+                Some(_) if p.is_parent_lever() => format!(", takes text: {}", parent_hint(&p.name)),
                 Some(t) => format!(", takes {t}"),
                 None => String::new(),
             }
         ));
+    }
+    if !ctx.children.is_empty() {
+        user.push_str("Children (you allocate, they act; you never pull their levers):\n");
+        for c in &ctx.children {
+            user.push_str(&format!("  {}: {}, {}\n", c.name, c.state, c.metric));
+            for line in &c.lines {
+                user.push_str("    ");
+                user.push_str(line);
+                user.push('\n');
+            }
+        }
     }
     if !m.forbidden.is_empty() {
         user.push_str(&format!("Forbidden: {}\n", m.forbidden.join(", ")));
@@ -145,6 +173,16 @@ pub fn prompt(ctx: &Context) -> InferRequest {
         system,
         user,
         max_tokens: 1024,
+    }
+}
+
+/// How a parent lever's payload is written.
+fn parent_hint(name: &str) -> &'static str {
+    match name {
+        "budget" => "<child> <amount a day>",
+        "pause" => "<child>",
+        "resume" => "<child>",
+        _ => "<child> above|below <number>",
     }
 }
 
@@ -302,6 +340,7 @@ mod tests {
             reversible,
             delegated: false,
             takes: None,
+            cost: 0,
         };
         Context {
             venture: "shop".to_string(),
@@ -326,6 +365,8 @@ mod tests {
                 context_budget: 100,
                 restart: Restart::OnFailure,
                 network: None,
+                children: vec![],
+                parent: None,
             },
             entries: vec![Entry::new(
                 1,
@@ -336,6 +377,7 @@ mod tests {
             state: "running".to_string(),
             now: 0,
             backend: "test".to_string(),
+            children: vec![],
         }
     }
 
@@ -427,6 +469,57 @@ mod tests {
         );
         assert!(
             matches!(&r[..], [Record::Ask { payload: Some(Payload::Text { text }), .. }] if text == "Hi"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_parent_sees_its_children() {
+        let mut c = ctx(false);
+        c.mandate.children = vec!["shop".to_string()];
+        c.mandate.permitted.push(Permitted {
+            name: "budget".to_string(),
+            run: None,
+            adapter: None,
+            cap: Cap {
+                count: 2,
+                per: Cap::DAY,
+            },
+            reversible: true,
+            delegated: true,
+            takes: None,
+            cost: 0,
+        });
+        c.children = vec![ChildView {
+            name: "shop".to_string(),
+            state: "running".to_string(),
+            metric: "orders=5  reported 3h ago".to_string(),
+            lines: vec!["#4     ...  shop  measured  action    tidy: done".to_string()],
+        }];
+        let p = prompt(&c);
+        assert!(
+            p.user
+                .contains("budget: at most 2/day, reversible, takes text: <child> <amount a day>"),
+            "{}",
+            p.user
+        );
+        assert!(
+            p.user.contains("Children (you allocate, they act"),
+            "{}",
+            p.user
+        );
+        assert!(
+            p.user
+                .contains("  shop: running, orders=5  reported 3h ago\n    #4 "),
+            "{}",
+            p.user
+        );
+        let r = parse_reply(
+            &c,
+            "{\"choice\":\"action\",\"action\":\"budget\",\"payload\":\"shop 40\"}",
+        );
+        assert!(
+            matches!(&r[..], [Record::Proposal { payload: Some(Payload::Text { text }), .. }] if text == "shop 40"),
             "{r:?}"
         );
     }

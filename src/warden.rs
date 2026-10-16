@@ -14,6 +14,7 @@ use crate::adapter::{self, Occasion};
 use crate::config::{self, Backend, Config};
 use crate::gate::{self, Candidate, RESUME, STOP};
 use crate::ledger::Ledger;
+use crate::mandate::ParentCall;
 use crate::record::{Claim, Entry, Payload, Record};
 use crate::research;
 use crate::role::InferRequest;
@@ -60,14 +61,19 @@ impl Warden for LocalWarden {
         let entries = self.ledger.all().map_err(|e| e.to_string())?;
         let ventures = venture::load_all(&entries);
         let adopted = venture::adopted(&ventures);
-        let proof = gate::gate(candidate, &entries, &adopted, now()).map_err(|r| r.to_string())?;
+        let proof = gate::gate_with(candidate, &entries, &adopted, &self.config.quotas, now())
+            .map_err(|r| r.to_string())?;
         let venture = candidate.venture.clone();
         let action = candidate.action.clone();
         let mut written = Vec::new();
         let mut append = |record: Record| -> Result<Entry, String> {
             self.ledger.append(record).map_err(|e| e.to_string())
         };
-        if action == STOP || action == RESUME {
+        let parent_lever = ventures
+            .get(&venture)
+            .and_then(|v| v.mandate.permitted(&action))
+            .is_some_and(crate::mandate::Permitted::is_parent_lever);
+        if (action == STOP || action == RESUME) && !parent_lever {
             written.push(append(Record::Action {
                 claim: Claim::Measured,
                 venture,
@@ -98,6 +104,33 @@ impl Warden for LocalWarden {
         };
         if perm.takes().is_some() && payload.is_none() {
             return Err(format!("{action} takes a payload and the proof names none"));
+        }
+        if perm.is_parent_lever() {
+            // Non-negotiable 10: a parent allocates. Pulling the lever is
+            // the record itself; the child's gate reads it from the ledger.
+            let text = payload.as_ref().map(Payload::text).unwrap_or_default();
+            let call = ParentCall::parse(&action, &text)?;
+            let child = ventures
+                .get(call.child())
+                .ok_or_else(|| format!("{} is not a venture", call.child()))?;
+            if !v.mandate.children.iter().any(|c| c == call.child())
+                || child.mandate.parent.as_deref() != Some(venture.as_str())
+            {
+                return Err(format!(
+                    "{} is not a child of {venture}: both mandates must say so",
+                    call.child()
+                ));
+            }
+            written.push(append(Record::Action {
+                claim: Claim::Measured,
+                venture,
+                action,
+                proof,
+                ok: true,
+                detail: call.describe(),
+                payload,
+            })?);
+            return Ok(written);
         }
         if perm.is_research() {
             let question = payload.as_ref().map(Payload::text).unwrap_or_default();

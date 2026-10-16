@@ -20,7 +20,7 @@ use crate::gate::{self, Adopted, Candidate, Reason, State, Step, SELF};
 use crate::ledger::Ledger;
 use crate::mandate::{Controller, Permitted, Restart};
 use crate::record::{Claim, Entry, Payload, Record, Seq, Verdict};
-use crate::role::{self, Context, InferRequest, ModelRole, Role};
+use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role};
 use crate::venture::{self, Venture};
 use crate::warden::{self, FromWarden, LocalWarden, ToWarden, Warden};
 
@@ -232,6 +232,7 @@ impl Kernel {
             .map_err(|e| format!("cannot find {}: {e}", dir.display()))?;
         let name = venture::name_of(&dir)?;
         let (mandate, hash) = venture::read_mandate(&dir)?;
+        self.check_family(&name, &mandate)?;
         if mandate.metric_adapter().is_none() && !dir.join("report").is_file() {
             return Err(format!(
                 "{} watches {} but holds no report program to read it; add one, or name a built-in metric like {}",
@@ -291,8 +292,133 @@ impl Kernel {
                 }
             ));
         }
+        if !mandate.children.is_empty() {
+            out.push_str(&format!("  parent of {}\n", mandate.children.join(", ")));
+        }
+        if let Some(p) = &mandate.parent {
+            out.push_str(&format!("  child of {p}\n"));
+        }
         out.push_str(&format!("  {}\n", entry.line()));
         Ok(out)
+    }
+
+    /// Refuse a mandate whose parent and children do not agree with the
+    /// mandates already adopted, or that would make a loop.
+    fn check_family(&self, name: &str, mandate: &crate::mandate::Mandate) -> Result<(), String> {
+        if mandate.children.iter().any(|c| c == name) {
+            return Err(format!("{name} cannot be its own child"));
+        }
+        if mandate.parent.as_deref() == Some(name) {
+            return Err(format!("{name} cannot be its own parent"));
+        }
+        let adopted: Vec<&Venture> = self
+            .ventures
+            .values()
+            .filter(|v| v.name != name && v.problem.is_none())
+            .collect();
+        if let Some(p) = &mandate.parent {
+            if let Some(parent) = adopted.iter().find(|v| v.name == *p) {
+                if !parent.mandate.children.iter().any(|c| c == name) {
+                    return Err(format!(
+                        "{name} names {p} as its parent, but {p} does not list {name} under children; add it there and run avsm add on {p} first"
+                    ));
+                }
+            }
+        }
+        for parent in adopted
+            .iter()
+            .filter(|v| v.mandate.children.iter().any(|c| c == name))
+        {
+            match mandate.parent.as_deref() {
+                Some(q) if q == parent.name => {}
+                Some(q) => {
+                    return Err(format!(
+                        "{} lists {name} under children, but {name} names {q} as its parent",
+                        parent.name
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "{} lists {name} under children, but {name} names no parent; set parent: {} in its mandate",
+                        parent.name, parent.name
+                    ))
+                }
+            }
+        }
+        for child in adopted
+            .iter()
+            .filter(|v| v.mandate.parent.as_deref() == Some(name))
+        {
+            if !mandate.children.contains(&child.name) {
+                return Err(format!(
+                    "{} names {name} as its parent, but {name} does not list {} under children; remove parent from {} first",
+                    child.name, child.name, child.name
+                ));
+            }
+        }
+        for c in &mandate.children {
+            if let Some(child) = adopted.iter().find(|v| v.name == *c) {
+                match child.mandate.parent.as_deref() {
+                    Some(q) if q == name => {}
+                    Some(q) => {
+                        return Err(format!(
+                            "{c} names {q} as its parent, not {name}; a venture has one parent"
+                        ))
+                    }
+                    None => {
+                        return Err(format!(
+                            "{c} does not name {name} as its parent; set parent: {name} in its mandate and run avsm add on it"
+                        ))
+                    }
+                }
+            }
+        }
+        // Edges from parent to child, as every mandate has them; a path
+        // from this venture back to itself is a loop.
+        let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut add_edges = |who: &str, m: &crate::mandate::Mandate| {
+            for c in &m.children {
+                edges.entry(who.to_string()).or_default().insert(c.clone());
+            }
+            if let Some(p) = &m.parent {
+                edges.entry(p.clone()).or_default().insert(who.to_string());
+            }
+        };
+        for v in &adopted {
+            add_edges(&v.name, &v.mandate);
+        }
+        add_edges(name, mandate);
+        let mut path = vec![name.to_string()];
+        let mut seen = BTreeSet::new();
+        fn walk(
+            at: &str,
+            edges: &BTreeMap<String, BTreeSet<String>>,
+            path: &mut Vec<String>,
+            seen: &mut BTreeSet<String>,
+        ) -> Option<Vec<String>> {
+            for next in edges.get(at).into_iter().flatten() {
+                if next == &path[0] {
+                    let mut found = path.clone();
+                    found.push(next.clone());
+                    return Some(found);
+                }
+                if seen.insert(next.clone()) {
+                    path.push(next.clone());
+                    if let Some(found) = walk(next, edges, path, seen) {
+                        return Some(found);
+                    }
+                    path.pop();
+                }
+            }
+            None
+        }
+        if let Some(found) = walk(name, &edges, &mut path, &mut seen) {
+            return Err(format!(
+                "that would make a loop: {}; a venture cannot be its own ancestor",
+                found.join(" -> ")
+            ));
+        }
+        Ok(())
     }
 
     /// One line per venture.
@@ -304,7 +430,7 @@ impl Kernel {
         let now = now();
         let mut out = String::new();
         for v in self.ventures.values() {
-            let state = gate::state(&entries, &v.name);
+            let state = gate::state(&entries, &self.adopted(), &v.name);
             let last = entries.iter().rev().find(|e| {
                 e.record.venture() == v.name && matches!(e.record, Record::Report { .. })
             });
@@ -488,7 +614,13 @@ impl Kernel {
                 action: action.clone(),
                 cites: vec![seq],
             };
-            let derivation = match gate::gate(&candidate, &entries, &self.adopted(), now()) {
+            let derivation = match gate::gate_with(
+                &candidate,
+                &entries,
+                &self.adopted(),
+                &self.config.quotas,
+                now(),
+            ) {
                 Ok(proof) => proof.to_string(),
                 Err(refusal) => refusal.to_string(),
             };
@@ -511,10 +643,11 @@ impl Kernel {
                 return;
             }
         };
-        let halted = gate::state(&entries, SELF) == State::Paused;
+        let adopted = self.adopted();
+        let halted = gate::state(&entries, &adopted, SELF) == State::Paused;
         let now = now();
         for name in &names {
-            let paused = halted || gate::state(&entries, name) == State::Paused;
+            let paused = halted || gate::state(&entries, &adopted, name) == State::Paused;
             self.supervise(name, paused);
             let due = self.runtime.entry(name.clone()).or_default().next_report <= now;
             if due && self.ventures[name].problem.is_none() {
@@ -644,18 +777,13 @@ impl Kernel {
         if halted {
             return;
         }
-        if let (
-            Controller::Threshold {
-                above,
-                below,
-                action,
-            },
-            Some(val),
-        ) = (&v.mandate.controller, value)
-        {
-            let crossed = above.is_some_and(|b| val > b) || below.is_some_and(|b| val < b);
+        let Some(val) = value else { return };
+        let Ok(entries) = self.entries() else { return };
+        // The bound is the mandate's, or the one the parent set.
+        if let Some(t) = gate::effective_threshold(&entries, &self.adopted(), name) {
+            let crossed = (t.above && val > t.bound) || (!t.above && val < t.bound);
             if crossed {
-                self.act(name, action, vec![entry.seq], Claim::Measured);
+                self.act(name, &t.action, vec![entry.seq], Claim::Measured);
             }
         }
     }
@@ -728,7 +856,31 @@ impl Kernel {
             action: action.to_string(),
             cites,
         };
-        match gate::gate(&candidate, &entries, &self.adopted(), now()) {
+        // The shared quotas come first: past one, the gate is not asked.
+        let (_, over) = gate::quota_check(
+            &entries,
+            &self.adopted(),
+            &self.config.quotas,
+            name,
+            action,
+            now(),
+        );
+        if !over.is_empty() {
+            let why: Vec<String> = over.iter().map(|r| r.to_string()).collect();
+            lines.push(format!(
+                "{name}: {action} refused before the gate: {}",
+                why.join("; ")
+            ));
+            log(&lines[0]);
+            return lines;
+        }
+        match gate::gate_with(
+            &candidate,
+            &entries,
+            &self.adopted(),
+            &self.config.quotas,
+            now(),
+        ) {
             Ok(_) => match self.warden.execute(&candidate) {
                 Ok(written) => lines.extend(written.iter().map(Entry::line)),
                 Err(e) => lines.push(format!("{name}: {action} did not run: {e}")),
@@ -745,7 +897,11 @@ impl Kernel {
                             && e.record.action() == Some(action)
                     })
                 });
-                if needs_human && !already {
+                if needs_human && !already && !self.may_ask(&entries) {
+                    lines.push(format!(
+                        "{name}: {action} needs a decision, but the asks quota is used up; not asking"
+                    ));
+                } else if needs_human && !already {
                     // The ask carries the payload the lever would consume,
                     // from whichever cited record brought it.
                     let payload = candidate
@@ -780,6 +936,14 @@ impl Kernel {
             log(line);
         }
         lines
+    }
+
+    /// Is there room under the asks quota for one more ask?
+    fn may_ask(&self, entries: &[Entry]) -> bool {
+        match self.config.quotas.asks {
+            Some(cap) => gate::asks_used(entries, cap, now()) < cap.count,
+            None => true,
+        }
     }
 
     /// Act on declared approvals not yet acted on.
@@ -894,13 +1058,54 @@ impl Kernel {
             .filter(|e| e.record.venture() == name)
             .cloned()
             .collect();
+        // A parent sees its children's metrics and records: what code
+        // measured and humans declared, never a model's or the world's
+        // raw input into them.
+        let children: Vec<ChildView> = v
+            .mandate
+            .children
+            .iter()
+            .filter_map(|c| {
+                let child = self.ventures.get(c)?;
+                if child.mandate.parent.as_deref() != Some(name) {
+                    return None;
+                }
+                let theirs: Vec<&Entry> = entries
+                    .iter()
+                    .filter(|e| e.record.venture() == *c && e.record.claim().authorizes())
+                    .collect();
+                let metric = theirs
+                    .iter()
+                    .rev()
+                    .find(|e| e.record.kind() == crate::record::Kind::Report)
+                    .map_or("no report yet".to_string(), |e| {
+                        format!("{}  reported {}", e.record.summary(), ago(now() - e.at))
+                    });
+                let lines: Vec<String> = theirs
+                    .iter()
+                    .rev()
+                    .take(12)
+                    .map(|e| e.line())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                Some(ChildView {
+                    name: c.clone(),
+                    state: gate::state(&entries, &self.adopted(), c).to_string(),
+                    metric,
+                    lines,
+                })
+            })
+            .collect();
         let ctx = Context {
             venture: name.to_string(),
             mandate: v.mandate.clone(),
             entries: role::trim_to_budget(&mine, v.mandate.context_budget),
-            state: gate::state(&entries, name).to_string(),
+            state: gate::state(&entries, &self.adopted(), name).to_string(),
             now: now(),
             backend,
+            children,
         };
         let records = {
             let Kernel { role, warden, .. } = self;
@@ -976,7 +1181,8 @@ impl Kernel {
         }
     }
 
-    /// Write an ask with this question unless one is already open.
+    /// Write an ask with this question unless one is already open, or the
+    /// asks quota is used up.
     fn ask_once(&mut self, name: &str, entries: &[Entry], question: &str) {
         let open = gate::open_asks(entries);
         let already = entries.iter().any(|e| {
@@ -984,6 +1190,12 @@ impl Kernel {
                 && matches!(&e.record, Record::Ask { question: q, .. } if q == question)
         });
         if already {
+            return;
+        }
+        if !self.may_ask(entries) {
+            log(&format!(
+                "{name}: the asks quota is used up; not asking: {question}"
+            ));
             return;
         }
         match self.append(Record::Ask {
