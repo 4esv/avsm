@@ -441,7 +441,8 @@ fn propose_asks_and_approve_edit_over_the_socket() {
     );
     let began = Instant::now();
     loop {
-        if dir.join("mailed").exists() {
+        // The file appears before its content does: wait for the content.
+        if std::fs::read_to_string(dir.join("mailed")).is_ok_and(|t| t == "Dear all, edited") {
             break;
         }
         assert!(began.elapsed() < Duration::from_secs(20), "mail never ran");

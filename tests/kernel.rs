@@ -409,7 +409,10 @@ fn backends_of_every_kind_answer_through_the_warden() {
     assert!(seen.contains("\"role\":\"system\""), "{seen}");
 
     let reply = warden.infer(&req("k")).unwrap();
-    assert_eq!(reply, "{\"choice\": \"ask\", \"question\": \"all well?\"}");
+    assert_eq!(
+        reply,
+        "{\"choice\": \"ask\", \"question\": \"all well?\"}\n"
+    );
     let prompt = std::fs::read_to_string(home.join("prompt.json")).unwrap();
     assert!(
         prompt.replace(' ', "").contains("\"user\":\"well?\""),
@@ -826,4 +829,36 @@ fn network_none_confines_the_run_where_namespaces_exist() {
             || status.contains("(network list holds adapters only; run is not held to it)"),
         "{status}"
     );
+}
+
+/// A command backend's reply comes back whole: every line, every byte,
+/// however long, up to the bound; past it, the warden refuses.
+#[test]
+fn a_command_backends_long_reply_comes_back_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let body: String = (0..60)
+        .map(|i| format!("line {i} of a long post\n"))
+        .collect();
+    std::fs::write(tmp.path().join("reply.txt"), &body).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "backends:\n  k: {{kind: command, run: \"cat > /dev/null; cat {}\"}}\n  big: {{kind: command, run: \"cat > /dev/null; head -c 300000 /dev/zero | tr '\\\\0' x\"}}\n",
+            tmp.path().join("reply.txt").display()
+        ),
+    )
+    .unwrap();
+    let mut warden = LocalWarden::open(&home).unwrap();
+    let req = |b: &str| InferRequest {
+        backend: b.into(),
+        system: "s".into(),
+        user: "u".into(),
+        max_tokens: 64,
+    };
+    assert!(body.len() > 1000);
+    assert_eq!(warden.infer(&req("k")).unwrap(), body);
+    let err = warden.infer(&req("big")).unwrap_err();
+    assert!(err.contains("replied with 300000 bytes"), "{err}");
 }

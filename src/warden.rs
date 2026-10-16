@@ -23,6 +23,8 @@ use crate::venture;
 
 /// How long an action or a report may run.
 pub const ACTION_TIMEOUT: Duration = Duration::from_secs(600);
+/// The most a backend's reply may hold, in bytes.
+pub const MAX_REPLY: usize = 256 * 1024;
 
 /// What the kernel asks of the warden.
 pub trait Warden {
@@ -370,12 +372,22 @@ impl Warden for LocalWarden {
                     "user": request.user,
                 }))
                 .map_err(|e| e.to_string())?;
-                let (ok, out) = run_command(&self.home, run, &stdin, ACTION_TIMEOUT);
-                if ok {
-                    Ok(out)
-                } else {
-                    Err(format!("backend {name} failed: {out}"))
+                // The reply is the whole of standard output, newlines and
+                // all, up to a bound; only a failure is cut to one line.
+                let ran = self::run(&self.home, "sh", &["-c", run], &stdin, ACTION_TIMEOUT);
+                if !ran.ok {
+                    return Err(format!(
+                        "backend {name} failed: {}",
+                        ran.detail(ACTION_TIMEOUT)
+                    ));
                 }
+                if ran.stdout.len() > MAX_REPLY {
+                    return Err(format!(
+                        "backend {name} replied with {} bytes; the most a reply may hold is {MAX_REPLY}",
+                        ran.stdout.len()
+                    ));
+                }
+                Ok(ran.stdout)
             }
         }
     }
