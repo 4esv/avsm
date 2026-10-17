@@ -6,6 +6,9 @@ use std::os::unix::fs::PermissionsExt;
 
 use avsm::simulate::{run, Human, Plan, BY, EDIT};
 
+/// A world that says when each simulated day begins.
+const WORLD: &str = "[ $((AVSM_NOW % 86400)) -eq 0 ] && echo \"day $AVSM_DAY begins\"; true";
+
 #[test]
 fn the_mixed_human_denies_every_third_ask_and_edits_what_runs() {
     std::env::set_var("TZ", "UTC");
@@ -41,6 +44,7 @@ fn the_mixed_human_denies_every_third_ask_and_edits_what_runs() {
         human: Human::Mixed,
         start: Some(1_767_225_600), // 2026-01-01T00:00:00Z
         add: vec![blog.clone()],
+        world: Some(WORLD.to_string()),
     };
     let mut out = Vec::new();
     run(&home, &plan, &mut out).unwrap();
@@ -60,9 +64,26 @@ fn the_mixed_human_denies_every_third_ask_and_edits_what_runs() {
     for p in &posts {
         assert_eq!(p, &format!("A title\nA body\n\n{EDIT}\n"), "{text}");
     }
+    // The world moved on simulated time, once a day at midnight.
+    assert!(text.contains("  world: day 0 begins\n"), "{text}");
+    assert!(text.contains("  world: day 2 begins\n"), "{text}");
+    assert_eq!(text.matches("  world: day ").count(), 3, "{text}");
     let k = avsm::kernel::Kernel::open(&home).unwrap();
     assert_eq!(
         k.ledger.verify().unwrap(),
         k.entries().unwrap().len() as u64
+    );
+    drop(k);
+
+    // A world that fails stops the simulation.
+    let broken = Plan {
+        start: None,
+        world: Some("echo flood >&2; exit 3".to_string()),
+        ..plan
+    };
+    let err = run(&home, &broken, &mut Vec::new()).unwrap_err();
+    assert!(
+        err.contains("the world failed") && err.contains("flood"),
+        "{err}"
     );
 }

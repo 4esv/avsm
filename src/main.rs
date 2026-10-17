@@ -104,6 +104,10 @@ enum Command {
         /// (deny every third, edit text payloads, approve the rest)
         #[arg(long, default_value = "all")]
         approve: String,
+        /// A command run before every step to move the world on; it gets
+        /// the simulated time in AVSM_NOW and the day in AVSM_DAY
+        #[arg(long)]
+        world: Option<String>,
         /// Venture directories to take on first
         ventures: Vec<PathBuf>,
     },
@@ -216,6 +220,7 @@ fn main() -> ExitCode {
             days,
             step,
             approve,
+            world,
             ventures,
         } => {
             let step = match humantime::parse_duration(&step) {
@@ -234,6 +239,7 @@ fn main() -> ExitCode {
                 human,
                 start: None,
                 add: ventures,
+                world,
             };
             return done(avsm::simulate::run(&home, &plan, &mut std::io::stdout()));
         }

@@ -47,6 +47,11 @@ pub struct Plan {
     pub start: Option<i64>,
     /// Venture directories to take on at the start, if not taken on yet.
     pub add: Vec<std::path::PathBuf>,
+    /// A command that moves the world on, run before every step with the
+    /// simulated time in `AVSM_NOW` (Unix seconds) and `AVSM_DAY` (from
+    /// 0). What it prints is shown as the world's; if it fails, the
+    /// simulation stops. The world is not avsm's: it leaves no record.
+    pub world: Option<String>,
 }
 
 /// Run the plan, writing what happens to `out`: every new record as a
@@ -119,6 +124,26 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
     );
     let mut answered = 0u64;
     while clock::now() < end {
+        if let Some(cmd) = &plan.world {
+            let ran = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .env("AVSM_NOW", clock::now().to_string())
+                .env("AVSM_DAY", ((clock::now() - start) / 86_400).to_string())
+                .output()
+                .map_err(|e| format!("cannot run the world ({cmd}): {e}"))?;
+            for line in String::from_utf8_lossy(&ran.stdout).lines() {
+                say(out, &format!("  world: {line}\n"));
+            }
+            if !ran.status.success() {
+                kernel.shutdown();
+                return Err(format!(
+                    "the world failed at {}: {}",
+                    clock::local().format("%Y-%m-%d %H:%M"),
+                    String::from_utf8_lossy(&ran.stderr).trim()
+                ));
+            }
+        }
         kernel.tick();
         if plan.human != Human::Away {
             let entries = kernel.entries()?;
