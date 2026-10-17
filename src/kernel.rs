@@ -1082,7 +1082,24 @@ impl Kernel {
                         }
                     }
                 }
-                Err(e) => lines.push(format!("{name}: {action} did not run: {e}")),
+                Err(e) => {
+                    lines.push(format!("{name}: {action} did not run: {e}"));
+                    // The gate said yes and nothing ran: the ledger says so.
+                    let first: String = e.lines().next().unwrap_or("").chars().take(200).collect();
+                    let failed = Record::Report {
+                        claim: Claim::Measured,
+                        venture: name.to_string(),
+                        metric: action.to_string(),
+                        value: None,
+                        note: format!("did not run: {first}"),
+                        source: None,
+                        confidence: None,
+                        cites: candidate.cites.clone(),
+                    };
+                    if let Err(e) = self.append(failed) {
+                        lines.push(format!("{name}: cannot write record: {e}"));
+                    }
+                }
             },
             Err(refusal) => {
                 // A paused venture is not asked about: an approval could

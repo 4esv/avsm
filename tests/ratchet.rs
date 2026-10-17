@@ -359,3 +359,58 @@ fn the_digest_says_what_the_night_did_and_is_written_as_a_record() {
     );
     assert_eq!(k.handle(&["digest".to_string()]).unwrap(), text);
 }
+
+#[test]
+fn an_approved_delegation_that_cannot_run_says_so_in_the_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path(), "nightly: never\ndefault: k\nbackends:\n  k: {kind: command, run: echo nothing}\nratchet: 5\n");
+    let role = Scripted {
+        replies: (1..=5).map(announce).collect(),
+        seen: Arc::new(Mutex::new(vec![])),
+    };
+    let mut k = Kernel::with(
+        &home,
+        Box::new(role),
+        Box::new(LocalWarden::open(&home).unwrap()),
+    )
+    .unwrap();
+    k.adopt_self().unwrap();
+    let dir = venture(tmp.path(), "shop", SHOP);
+    k.add(&dir).unwrap();
+    for _ in 1..=5 {
+        k.cycle("shop");
+        let ask = open_ask(&k, "announce").unwrap();
+        k.approve(ask, None).unwrap();
+        k.tick();
+    }
+    // The human edits the new mandate into something that is not YAML.
+    let ask = open_ask(&k, "delegate").expect("self proposed");
+    k.approve(ask, Some("purpose: Sell more.\nthis line is not yaml\n"))
+        .unwrap();
+    k.tick();
+    let entries = k.entries().unwrap();
+    let failed = entries
+        .iter()
+        .find(|e| {
+            e.record.kind() == Kind::Report
+                && e.record.claim() == Claim::Measured
+                && e.record
+                    .summary()
+                    .contains("delegate=?  did not run: the new mandate")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{}",
+                entries
+                    .iter()
+                    .map(|e| e.line())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+    assert_eq!(failed.record.venture(), "shop");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("mandate.yaml")).unwrap(),
+        SHOP
+    );
+}
