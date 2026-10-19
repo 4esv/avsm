@@ -401,6 +401,31 @@ pub struct Packet {
     /// The model's reason, if a model gave one. Always inferred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// On a capacity ask: what a forecast says the metric comes to under
+    /// each policy for the asks. Inferred, like every forecast: it informs
+    /// the human and authorizes nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<PolicyForecast>,
+}
+
+/// What a forecast found for one policy for the asks (all, none, mixed):
+/// the metric's p5, p50 and p95 at the horizon, and against the mandate's
+/// threshold, if it has one, whether it holds: `holds` when even p5 is on
+/// the right side, `fails` when even p95 is past it, `may fail` between.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolicyForecast {
+    pub policy: String,
+    pub metric: String,
+    pub days: u32,
+    pub seeds: u32,
+    #[serde(with = "finite")]
+    pub p5: f64,
+    #[serde(with = "finite")]
+    pub p50: f64,
+    #[serde(with = "finite")]
+    pub p95: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<String>,
 }
 
 /// A measured or declared record an ask rests on.
@@ -475,6 +500,19 @@ impl Packet {
             out.push_str(&format!("    {}: {forecast}", o.name));
             if let Some(c) = &o.cost {
                 out.push_str(&format!("; {c}"));
+            }
+            out.push('\n');
+        }
+        if !self.policies.is_empty() {
+            out.push_str("  forecast by policy (inferred):\n");
+        }
+        for f in &self.policies {
+            out.push_str(&format!(
+                "    {}: {} p5 {} p50 {} p95 {} at {}d x {} seeds",
+                f.policy, f.metric, f.p5, f.p50, f.p95, f.days, f.seeds
+            ));
+            if let Some(t) = &f.threshold {
+                out.push_str(&format!("; {t}"));
             }
             out.push('\n');
         }

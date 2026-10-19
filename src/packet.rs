@@ -6,7 +6,10 @@
 use crate::forecast::{Outcome, Policy};
 use crate::gate::{self, Adopted};
 use crate::index::{Index, EXPECTATION};
-use crate::record::{OptionForecast, Packet, PacketOption, Premise, Record, Seq, Signal};
+use crate::mandate::{Controller, Mandate};
+use crate::record::{
+    OptionForecast, Packet, PacketOption, PolicyForecast, Premise, Record, Seq, Signal,
+};
 
 /// How many days and seeds a per-option forecast looks.
 pub const DAYS: u32 = 7;
@@ -88,13 +91,80 @@ pub fn build(index: &Index, adopted: &[Adopted], now: i64, b: &Basis) -> Packet 
         premises,
         options,
         reason: b.reason.clone().filter(|r| !r.trim().is_empty()),
+        policies: vec![],
     }
+}
+
+/// What a forecast found for the venture's metric under each policy, in
+/// the order all, none, mixed, each against the mandate's threshold when
+/// its controller has one.
+pub fn policy_forecasts(
+    outcome: &Outcome,
+    venture: &str,
+    mandate: &Mandate,
+) -> Vec<PolicyForecast> {
+    let metric = mandate.metric_name();
+    let bound = match &mandate.controller {
+        Controller::Threshold { above: Some(b), .. } => Some((*b, true)),
+        Controller::Threshold { below: Some(b), .. } => Some((*b, false)),
+        _ => None,
+    };
+    Policy::EVERY
+        .iter()
+        .filter_map(|policy| {
+            let s = outcome
+                .summaries
+                .iter()
+                .find(|s| s.venture == venture && s.policy == *policy && s.variant.is_none())?;
+            let q = &s.metrics.iter().find(|m| m.name == metric)?.quantiles;
+            let threshold = bound.map(|(b, above)| {
+                let past = |x: f64| if above { x > b } else { x < b };
+                let side = if above { "above" } else { "below" };
+                let n = crate::record::round(b);
+                if past(q.p95) && past(q.p5) {
+                    format!("fails: {side} {n} even at p95")
+                } else if !past(q.p5) && !past(q.p95) {
+                    format!("holds: not {side} {n} even at p5")
+                } else {
+                    format!("may fail: {side} {n} in part of the seeds")
+                }
+            });
+            Some(PolicyForecast {
+                policy: policy.name().to_string(),
+                metric: metric.to_string(),
+                days: outcome.days,
+                seeds: outcome.seeds,
+                p5: crate::record::round(q.p5),
+                p50: crate::record::round(q.p50),
+                p95: crate::record::round(q.p95),
+                threshold,
+            })
+        })
+        .collect()
 }
 
 /// The packet of an ask the kernel wrote on its own: its premises are the
 /// readings that triggered it. `metric` is the venture's own.
 pub fn signal_packet(index: &Index, venture: &str, signal: &Signal, metric: &str) -> Packet {
-    let cites = readings(index, venture, signal, metric);
+    signal_packet_citing(index, venture, signal, metric, &[])
+}
+
+/// `signal_packet`, its premises also the measured and declared records
+/// among `extra`: what the kernel counted to raise it.
+pub fn signal_packet_citing(
+    index: &Index,
+    venture: &str,
+    signal: &Signal,
+    metric: &str,
+    extra: &[Seq],
+) -> Packet {
+    let mut cites = readings(index, venture, signal, metric);
+    cites.extend(
+        extra
+            .iter()
+            .filter(|s| !cites.contains(s))
+            .collect::<Vec<_>>(),
+    );
     build(
         index,
         &[],

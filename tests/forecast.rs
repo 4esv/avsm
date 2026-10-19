@@ -1128,3 +1128,247 @@ fn time_a_month_of_the_greenhouse() {
     println!("{}", outcome.render());
     println!("greenhouse: 30 days x 16 seeds x 3 policies in {secs:.2}s");
 }
+
+// ----- the binding limit (#39) -----
+
+fn capacity_asks(f: &Fixture) -> Vec<Entry> {
+    f.entries()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                &e.record,
+                Record::Ask {
+                    signal: Some(Signal::Capacity { .. }),
+                    ..
+                }
+            )
+        })
+        .collect()
+}
+
+fn question(e: &Entry) -> &str {
+    match &e.record {
+        Record::Ask { question, .. } => question,
+        _ => unreachable!(),
+    }
+}
+
+/// A tomato on a threshold, its water capped at 4 a day.
+const TOMATO: &str = "controller: {kind: threshold, below: 35, action: water}\ncadence: 2h\n\
+     permitted:\n- {name: water, run: echo ran >> invoked, cap: 4/day, reversible: true, delegated: true}\n";
+
+/// `days` days of moisture every 2h, `day(i)` the readings of day i,
+/// with the nightly check after each day.
+fn tomato_days(f: &mut Fixture, days: usize, day: impl Fn(usize) -> Vec<f64>) {
+    for d in 0..days {
+        f.history("tomato", &day(d), 2 * HOUR);
+        f.k.check_capacity("tomato");
+    }
+}
+
+/// Three low readings a day: water runs three times, one to spare.
+fn three_low(_: usize) -> Vec<f64> {
+    (0..12)
+        .map(|i| if i % 4 == 0 { 30.0 } else { 50.0 })
+        .collect()
+}
+
+#[test]
+fn a_cap_spent_two_days_running_with_the_metric_past_its_threshold_asks_once_naming_the_cap() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("tomato", "moisture", TOMATO);
+    // Dry all day, every day: water runs at each low reading until the cap
+    // is spent, and the metric is still below 35 after.
+    tomato_days(&mut f, 3, |_| vec![30.0; 12]);
+    let asks = capacity_asks(&f);
+    assert_eq!(asks.len(), 1, "{:#?}", f.entries());
+    let q = question(&asks[0]);
+    assert!(q.contains("water's cap 4/day"), "{q}");
+    assert!(q.contains("no margin"), "{q}");
+    assert!(q.contains("below 35"), "{q}");
+    let Record::Ask { claim, packet, .. } = &asks[0].record else {
+        unreachable!()
+    };
+    assert_eq!(*claim, Claim::Measured);
+    // The packet rests on the runs and the readings, never on a model.
+    let packet = packet.as_ref().unwrap();
+    assert!(packet.premises.len() > 1, "{packet:?}");
+    // Not again within the episode, however long the cap stays spent.
+    tomato_days(&mut f, 3, |_| vec![30.0; 12]);
+    assert_eq!(capacity_asks(&f).len(), 1);
+}
+
+#[test]
+fn a_capacity_ask_says_under_each_policy_whether_the_metric_holds_its_threshold() {
+    let _c = clock();
+    let mut f = fixture("forecast: {days: 3, seeds: 2}\n");
+    f.k.forecasts = true;
+    f.venture("tomato", "moisture", TOMATO);
+    tomato_days(&mut f, 3, |_| vec![30.0; 12]);
+    let asks = capacity_asks(&f);
+    assert_eq!(asks.len(), 1, "{:#?}", f.entries());
+    let Record::Ask {
+        packet: Some(p), ..
+    } = &asks[0].record
+    else {
+        unreachable!()
+    };
+    let names: Vec<&str> = p.policies.iter().map(|x| x.policy.as_str()).collect();
+    assert_eq!(names, ["all", "none", "mixed"], "{p:?}");
+    for x in &p.policies {
+        assert_eq!(x.metric, "moisture");
+        let t = x.threshold.as_deref().unwrap();
+        assert!(t.contains("below 35"), "{t}");
+    }
+    assert!(p.render().contains("forecast by policy (inferred):"));
+}
+
+#[test]
+fn a_cap_with_margin_left_gets_no_capacity_ask() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("tomato", "moisture", TOMATO);
+    tomato_days(&mut f, 4, three_low);
+    assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+    // One day spent is not two days running.
+    tomato_days(&mut f, 1, |_| vec![30.0; 12]);
+    tomato_days(&mut f, 1, three_low);
+    assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+}
+
+/// An inbox whose reply asks each time; nobody proposes anything.
+const INBOX: &str = "controller: {kind: model}\ncadence: 6h\nbetter: down\n\
+     permitted:\n- {name: reply, run: echo ran >> invoked, cap: 5/day, reversible: false, takes: text}\n";
+
+fn reply_ask(f: &mut Fixture) -> u64 {
+    f.k.append(Record::Ask {
+        claim: Claim::Inferred,
+        venture: "inbox".to_string(),
+        action: Some("reply".to_string()),
+        question: "reply to customer1?".to_string(),
+        refusal: None,
+        payload: Some(Payload::Text {
+            text: "customer1@example.com\nthanks".to_string(),
+        }),
+        signal: None,
+        cites: vec![],
+        packet: None,
+    })
+    .unwrap()
+    .seq
+}
+
+/// A refusal of reply for the asks quota, opened and closed with `count`.
+fn quota_refusal(f: &mut Fixture, count: u32) {
+    let refusal = |count: u32, closes: Option<u64>| Record::Refusal {
+        claim: Claim::Measured,
+        venture: "inbox".to_string(),
+        action: "reply".to_string(),
+        reason: "AsksQuotaSpent; NeedsDecision(reply)".to_string(),
+        detail: "the asks quota is used up, so no ask was written".to_string(),
+        count,
+        closes,
+    };
+    let open = f.k.append(refusal(1, None)).unwrap().seq;
+    f.k.append(refusal(count, Some(open))).unwrap();
+}
+
+/// Unread rising 3 a day, four reports a day, `each` run once a day.
+fn inbox_days(f: &mut Fixture, days: std::ops::Range<usize>, mut each: impl FnMut(&mut Fixture)) {
+    for d in days {
+        let base = 10.0 + 3.0 * d as f64;
+        f.history(
+            "inbox",
+            &[base, base + 1.0, base + 2.0, base + 2.0],
+            6 * HOUR,
+        );
+        each(f);
+    }
+}
+
+#[test]
+fn a_better_down_metric_rising_while_its_asks_are_denied_asks_naming_the_denials() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("inbox", "unread", INBOX);
+    inbox_days(&mut f, 0..8, |f| {
+        let a = reply_ask(f);
+        f.k.deny(a, "not now").unwrap();
+    });
+    let m = f.k.ventures["inbox"].mandate.clone();
+    assert!(
+        forecast::capacity(&f.k.index().unwrap(), "inbox", &m).is_none(),
+        "the rate check alone sees no gap"
+    );
+    f.k.check_capacity("inbox");
+    let asks = capacity_asks(&f);
+    assert_eq!(asks.len(), 1, "{:#?}", f.entries());
+    let q = question(&asks[0]);
+    assert!(q.contains("unread rose"), "{q}");
+    assert!(q.contains("reply ran 0 of 35"), "{q}");
+    assert!(q.contains("7 of 7 asks denied"), "{q}");
+    let Record::Ask { packet, .. } = &asks[0].record else {
+        unreachable!()
+    };
+    // The denials are premises: declared records a human can check.
+    let premises = &packet.as_ref().unwrap().premises;
+    assert!(
+        premises.iter().any(|p| p.claim == Claim::Declared),
+        "{premises:?}"
+    );
+}
+
+#[test]
+fn a_better_down_metric_rising_while_the_asks_quota_refuses_asks_naming_the_quota() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("inbox", "unread", INBOX);
+    inbox_days(&mut f, 0..8, |f| quota_refusal(f, 3));
+    f.k.check_capacity("inbox");
+    let asks = capacity_asks(&f);
+    assert_eq!(asks.len(), 1, "{:#?}", f.entries());
+    let q = question(&asks[0]);
+    assert!(
+        q.contains("refused 21 times: the asks quota was spent"),
+        "{q}"
+    );
+    assert!(!q.contains("denied"), "{q}");
+}
+
+#[test]
+fn a_rising_metric_whose_controller_proposes_nothing_names_the_controller_and_asks_once() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("inbox", "unread", INBOX);
+    inbox_days(&mut f, 0..8, |_| {});
+    f.k.check_capacity("inbox");
+    let asks = capacity_asks(&f);
+    assert_eq!(asks.len(), 1, "{:#?}", f.entries());
+    let q = question(&asks[0]);
+    assert!(q.contains("the controller proposed it 0 times"), "{q}");
+    // Answered, and still rising: the episode is not over, no new ask.
+    for q in f.k.open_asks().unwrap() {
+        f.k.deny(q, "seen").unwrap();
+    }
+    inbox_days(&mut f, 8..12, |f| {
+        f.k.check_capacity("inbox");
+    });
+    assert_eq!(capacity_asks(&f).len(), 1);
+}
+
+#[test]
+fn a_metric_not_worse_every_day_gets_no_held_back_ask() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("inbox", "unread", INBOX);
+    // Up one day, down the next.
+    for d in 0..8 {
+        let base = if d % 2 == 0 { 10.0 } else { 14.0 };
+        f.history("inbox", &[base; 4], 6 * HOUR);
+        let a = reply_ask(&mut f);
+        f.k.deny(a, "not now").unwrap();
+    }
+    f.k.check_capacity("inbox");
+    assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+}

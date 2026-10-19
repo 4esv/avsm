@@ -350,6 +350,20 @@ impl Kernel {
     /// Write an ask carrying a signal: measured, past the asks quota, and
     /// only when none is open for this venture and subject.
     pub(super) fn signal(&mut self, venture: &str, question: String, signal: Signal) {
+        self.signal_citing(venture, question, signal, &[], vec![]);
+    }
+
+    /// `signal`, its packet's premises also the measured and declared
+    /// records among `cites`, and its packet carrying `policies`, what a
+    /// forecast says under each policy for the asks.
+    pub(super) fn signal_citing(
+        &mut self,
+        venture: &str,
+        question: String,
+        signal: Signal,
+        cites: &[crate::record::Seq],
+        policies: Vec<crate::record::PolicyForecast>,
+    ) {
         let key = subject(&signal);
         let already = {
             let Ok(index) = self.index() else { return };
@@ -363,7 +377,9 @@ impl Kernel {
         if already {
             return;
         }
-        let packet = self.signal_packet(venture, &signal);
+        let packet = self
+            .signal_packet_citing(venture, &signal, cites)
+            .map(|p| crate::record::Packet { policies, ..p });
         match self.append(Record::Ask {
             cites: vec![],
             claim: Claim::Measured,

@@ -563,7 +563,10 @@ impl Kernel {
                 .quotas
                 .asks
                 .map(|c| f64::from(c.count) * 86_400.0 / c.per.as_secs().max(1) as f64);
+            let now = now();
             crate::forecast::capacity_with(&index, name, &v.mandate, asks)
+                .or_else(|| crate::forecast::cap_spent(&index, name, &v.mandate, now))
+                .or_else(|| crate::forecast::held_back(&index, name, &v.mandate, now))
         };
         let Some(gap) = gap else {
             if let Some(clean) = self.short.get_mut(name) {
@@ -580,7 +583,8 @@ impl Kernel {
         }
         self.short.insert(name.to_string(), 0);
         let before = self.ledger_last();
-        self.signal(
+        let policies = self.policy_forecasts(&v);
+        self.signal_citing(
             name,
             format!("{}; the target is out of reach", gap.describe()),
             Signal::Capacity {
@@ -588,6 +592,8 @@ impl Kernel {
                 drift: gap.drift,
                 most: gap.most,
             },
+            &gap.cites,
+            policies,
         );
         let index = self.index().ok()?;
         let found = index
@@ -2061,8 +2067,75 @@ impl Kernel {
         ))
     }
 
+    /// What a packet-sized forecast says the venture's metric comes to
+    /// under each policy for the asks, all, none and mixed, for a capacity
+    /// ask. One per reading of the metric: it goes in the packet cache, so
+    /// the lever asks of the same reading reuse it, and a cached one of
+    /// the same reading that has every policy is reused here. Empty when
+    /// forecasts are off or it fails.
+    fn policy_forecasts(&self, v: &Venture) -> Vec<crate::record::PolicyForecast> {
+        let (true, Some(settings)) = (self.forecasts, self.config.automatic_forecast()) else {
+            return vec![];
+        };
+        let reading = self.index().ok().and_then(|i| {
+            i.series(&v.name, v.mandate.metric_name())
+                .last()
+                .map(|(s, _)| *s)
+        });
+        let every = |o: &crate::forecast::Outcome| {
+            crate::forecast::Policy::EVERY
+                .iter()
+                .all(|p| o.summaries.iter().any(|s| s.policy == *p))
+        };
+        let cached = reading.and_then(|r| {
+            self.packet_forecasts
+                .borrow()
+                .get(&v.name)
+                .filter(|(at, o)| *at == r && every(o))
+                .map(|(_, o)| o.clone())
+        });
+        let outcome = match cached {
+            Some(o) => o,
+            None => {
+                let mut opts = crate::forecast::Options::new(vec![v.name.clone()], settings);
+                opts.days = packet::DAYS;
+                opts.seeds = packet::SEEDS;
+                opts.policies = crate::forecast::Policy::EVERY.to_vec();
+                let ran = self
+                    .index()
+                    .and_then(|i| crate::forecast::run_in(&i, &self.ledger, &self.home, &opts));
+                match ran {
+                    Ok(o) => {
+                        if let Some(r) = reading {
+                            self.packet_forecasts
+                                .borrow_mut()
+                                .insert(v.name.clone(), (r, o.clone()));
+                        }
+                        o
+                    }
+                    Err(e) => {
+                        log(&format!("{}: no forecast by policy: {e}", v.name));
+                        return vec![];
+                    }
+                }
+            }
+        };
+        packet::policy_forecasts(&outcome, &v.name, &v.mandate)
+    }
+
     /// The packet of an ask the kernel raises on its own.
     pub(crate) fn signal_packet(&self, venture: &str, signal: &Signal) -> Option<Packet> {
+        self.signal_packet_citing(venture, signal, &[])
+    }
+
+    /// `signal_packet`, its premises also the measured and declared
+    /// records among `cites`.
+    pub(crate) fn signal_packet_citing(
+        &self,
+        venture: &str,
+        signal: &Signal,
+        cites: &[Seq],
+    ) -> Option<Packet> {
         let metric = self
             .ventures
             .get(venture)?
@@ -2070,7 +2143,9 @@ impl Kernel {
             .metric_name()
             .to_string();
         let index = self.index().ok()?;
-        Some(packet::signal_packet(&index, venture, signal, &metric))
+        Some(packet::signal_packet_citing(
+            &index, venture, signal, &metric, cites,
+        ))
     }
 
     /// Run a payload lever's check on the payload an ask would carry. When

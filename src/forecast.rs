@@ -1288,6 +1288,12 @@ pub struct Gap {
     /// What holds the levers back, in words: their caps, or how often the
     /// controller acts.
     pub limit: String,
+    /// The measured and declared records the gap was read from, beyond the
+    /// metric's latest reading: the readings, runs, denials and refusals.
+    pub cites: Vec<Seq>,
+    /// The whole finding in words, when it is not a rate against a rate:
+    /// a cap spent with no margin, or what held the levers back.
+    pub said: Option<String>,
 }
 
 /// A number as short as it goes, to two places.
@@ -1303,6 +1309,9 @@ fn num(x: f64) -> String {
 impl Gap {
     /// `unread grows 20/day; reply can remove at most 5/day: the cap`.
     pub fn describe(&self) -> String {
+        if let Some(said) = &self.said {
+            return said.clone();
+        }
         let (moves, back) = match self.toward {
             Direction::Down => ("grows", "remove"),
             Direction::Up => ("falls", "add"),
@@ -1418,6 +1427,301 @@ pub fn capacity_with(
         levers,
         toward,
         limit: limits.into_iter().collect::<Vec<_>>().join("; "),
+        cites: vec![],
+        said: None,
+    })
+}
+
+/// How many cap windows running a lever's cap must be spent, with the
+/// metric still past its threshold, before the cap is called the limit.
+pub const SPENT_WINDOWS: i64 = 2;
+/// The days a metric must worsen, each worse than the one before, before
+/// what held its levers back is named.
+pub const HELD_DAYS: i64 = 7;
+/// The most records a gap cites.
+const MAX_CITES: usize = 8;
+/// What the asks quota refusing a lever is called in a refusal's reason.
+const ASKS_SPENT: &str = "AsksQuotaSpent";
+const DAY_SECS: i64 = 86_400;
+
+/// The cap binds: a threshold controller's lever was spent to its cap in
+/// each of the last `SPENT_WINDOWS` cap windows, and in each the metric
+/// was still read past the threshold. Zero margin, measured; nothing here
+/// foresees what the world does next.
+pub fn cap_spent(index: &Index, venture: &str, mandate: &Mandate, now: i64) -> Option<Gap> {
+    let Controller::Threshold {
+        above,
+        below,
+        action,
+        ..
+    } = &mandate.controller
+    else {
+        return None;
+    };
+    let p = mandate.permitted(action)?;
+    let (bound, side) = match (above, below) {
+        (Some(b), _) => (*b, "above"),
+        (None, Some(b)) => (*b, "below"),
+        (None, None) => return None,
+    };
+    let past = |x: f64| {
+        if side == "above" {
+            x > bound
+        } else {
+            x < bound
+        }
+    };
+    let metric = mandate.metric_name();
+    let per = p.cap.per.as_secs().max(1) as i64;
+    let series = index.series(venture, metric);
+    let at = |s: Seq| index.get(s).map_or(i64::MIN, |e| e.at);
+    let mut cites = Vec::new();
+    let mut latest = None;
+    for k in 0..SPENT_WINDOWS {
+        let (from, to) = (now - (k + 1) * per, now - k * per);
+        let used = index.used(venture, action, from) - index.used(venture, action, to);
+        if used < p.cap.count {
+            return None;
+        }
+        let lo = series.partition_point(|(s, _)| at(*s) <= from);
+        let hi = series.partition_point(|(s, _)| at(*s) <= to);
+        let (seq, x) = *series[lo..hi].iter().rev().find(|(_, x)| past(*x))?;
+        latest.get_or_insert(x);
+        cites.push(seq);
+    }
+    // The runs that spent the last window, newest first, after the readings.
+    let room = MAX_CITES.saturating_sub(cites.len());
+    cites.extend(
+        index
+            .of(venture)
+            .rev()
+            .take_while(|e| e.at > now - per)
+            .filter(|e| {
+                e.record.kind() == record::Kind::Intent && e.record.action() == Some(action)
+            })
+            .map(|e| e.seq)
+            .take(room),
+    );
+    let cap = f64::from(p.cap.count) * 86_400.0 / per as f64;
+    let base = Baseline::from_index(index, venture, mandate);
+    let effect = effect_of(&base, p).map_or(0.0, f64::abs);
+    let windows = if p.cap.per == crate::mandate::Cap::DAY {
+        format!("{SPENT_WINDOWS} days")
+    } else {
+        format!(
+            "{SPENT_WINDOWS} windows of {}",
+            humantime::format_duration(p.cap.per)
+        )
+    };
+    Some(Gap {
+        metric: metric.to_string(),
+        drift: 0.0,
+        most: effect * cap,
+        levers: vec![action.clone()],
+        toward: target(mandate)?,
+        limit: "the cap".to_string(),
+        cites,
+        said: Some(format!(
+            "{action}'s cap {} was spent in each of the last {windows} with {metric} still {side} {} (latest {}): no margin; the cap is the limit",
+            p.cap,
+            num(bound),
+            num(latest?)
+        )),
+    })
+}
+
+/// What a lever's records over a span show held it back.
+#[derive(Default)]
+struct Held {
+    asks: BTreeSet<Seq>,
+    denied: Vec<Seq>,
+    quota: u32,
+    refusals: Vec<Seq>,
+    proposed: u32,
+}
+
+/// What held the levers back: the metric worse each of the last
+/// `HELD_DAYS` days than the day before (daily means of its trusted,
+/// plausible readings), and for each lever that could move it back, what
+/// the records of those days show stopped it: its cap spent, its asks
+/// denied, the asks quota refusing it, or else a controller that proposed
+/// it too seldom, each with its count.
+pub fn held_back(index: &Index, venture: &str, mandate: &Mandate, now: i64) -> Option<Gap> {
+    let toward = target(mandate)?;
+    let worse = |a: f64, b: f64| {
+        if toward == Direction::Down {
+            b > a
+        } else {
+            b < a
+        }
+    };
+    let metric = mandate.metric_name();
+    let span = HELD_DAYS * DAY_SECS;
+    let start = now - span;
+    let series = index.series(venture, metric);
+    let at = |s: Seq| index.get(s).map_or(i64::MIN, |e| e.at);
+    let lo = series.partition_point(|(s, _)| at(*s) <= start);
+    let mut days = vec![(0.0, 0u32); HELD_DAYS as usize];
+    for (s, x) in &series[lo..] {
+        let d = ((at(*s) - start - 1) / DAY_SECS).clamp(0, HELD_DAYS - 1) as usize;
+        days[d].0 += x;
+        days[d].1 += 1;
+    }
+    if days.iter().any(|(_, n)| *n == 0) {
+        return None;
+    }
+    let means: Vec<f64> = days.iter().map(|(t, n)| t / f64::from(*n)).collect();
+    let (first, last) = (means[0], means[means.len() - 1]);
+    if !worse(first, last) || means.windows(2).any(|w| worse(w[1], w[0])) {
+        return None;
+    }
+    // A threshold is the target: on its right side, nothing is held back.
+    match &mandate.controller {
+        Controller::Threshold { above: Some(b), .. } if last <= *b => return None,
+        Controller::Threshold {
+            above: None,
+            below: Some(b),
+            ..
+        } if last >= *b => return None,
+        _ => {}
+    }
+    let base = Baseline::from_index(index, venture, mandate);
+    let want = if toward == Direction::Down { -1.0 } else { 1.0 };
+    let levers: Vec<&crate::mandate::Permitted> = mandate
+        .permitted
+        .iter()
+        .filter(|p| !(p.is_research() || p.is_forecast() || p.is_parent_lever()))
+        // A lever known to move the metric the wrong way holds nothing back.
+        .filter(|p| effect_of(&base, p).is_none_or(|e| e * want > 0.0))
+        .collect();
+    if levers.is_empty() {
+        return None;
+    }
+    let window: Vec<&Entry> = {
+        let mut w: Vec<&Entry> = index
+            .of(venture)
+            .rev()
+            .take_while(|e| e.at > start)
+            .collect();
+        w.reverse();
+        w
+    };
+    // A refusal is opened with count 1 and closed with its whole count.
+    let closed: BTreeMap<Seq, u32> = window
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Refusal {
+                closes: Some(open),
+                count,
+                ..
+            } => Some((*open, *count)),
+            _ => None,
+        })
+        .collect();
+    let mut held: BTreeMap<&str, Held> = BTreeMap::new();
+    for e in &window {
+        match &e.record {
+            Record::Ask {
+                action: Some(a),
+                signal: None,
+                ..
+            } => {
+                held.entry(a.as_str()).or_default().asks.insert(e.seq);
+            }
+            Record::Decision {
+                verdict: crate::record::Verdict::Deny { ask, .. },
+                ..
+            } => {
+                let lever = index.get(*ask).and_then(|a| match &a.record {
+                    Record::Ask {
+                        action: Some(a),
+                        signal: None,
+                        ..
+                    } => Some(a.as_str()),
+                    _ => None,
+                });
+                if let Some(h) = lever.and_then(|l| held.get_mut(l)) {
+                    if h.asks.contains(ask) {
+                        h.denied.push(e.seq);
+                    }
+                }
+            }
+            Record::Refusal {
+                action,
+                reason,
+                closes: None,
+                ..
+            } if reason.split("; ").any(|r| r == ASKS_SPENT) => {
+                let h = held.entry(action.as_str()).or_default();
+                h.quota += closed.get(&e.seq).copied().unwrap_or(1);
+                h.refusals.push(e.seq);
+            }
+            Record::Proposal { action, .. } => {
+                held.entry(action.as_str()).or_default().proposed += 1;
+            }
+            _ => {}
+        }
+    }
+    let mut parts = Vec::new();
+    let mut limits = BTreeSet::new();
+    let mut cites = Vec::new();
+    let mut most = 0.0;
+    let none = Held::default();
+    for p in &levers {
+        let h = held.get(p.name.as_str()).unwrap_or(&none);
+        let per = p.cap.per.as_secs().max(1) as i64;
+        let room = (f64::from(p.cap.count) * span as f64 / per as f64).floor() as u32;
+        let ran = index.used(venture, &p.name, start);
+        most += effect_of(&base, p).map_or(0.0, f64::abs) * f64::from(p.cap.count) * 86_400.0
+            / per as f64;
+        let mut why = Vec::new();
+        if ran >= room {
+            why.push("the cap".to_string());
+            limits.insert("the cap");
+        }
+        if !h.denied.is_empty() {
+            why.push(format!(
+                "{} of {} asks denied",
+                h.denied.len(),
+                h.asks.len()
+            ));
+            limits.insert("denied asks");
+            cites.extend(h.denied.iter().rev().take(MAX_CITES / 2));
+        }
+        if h.quota > 0 {
+            why.push(format!(
+                "refused {} times: the asks quota was spent",
+                h.quota
+            ));
+            limits.insert("the asks quota");
+            cites.extend(h.refusals.iter().rev().take(MAX_CITES / 2));
+        }
+        if why.is_empty() {
+            why.push(format!("the controller proposed it {} times", h.proposed));
+            limits.insert("the controller");
+        }
+        parts.push(format!(
+            "{} ran {ran} of {room}: {}",
+            p.name,
+            why.join(", ")
+        ));
+    }
+    cites.truncate(MAX_CITES);
+    let moved = if last > first { "rose" } else { "fell" };
+    Some(Gap {
+        metric: metric.to_string(),
+        drift: (last - first) / (HELD_DAYS - 1) as f64,
+        most,
+        levers: levers.iter().map(|p| p.name.clone()).collect(),
+        toward,
+        limit: limits.into_iter().collect::<Vec<_>>().join("; "),
+        cites,
+        said: Some(format!(
+            "{metric} {moved} from {} to {} over {HELD_DAYS} days, worse each day; {}",
+            num(first),
+            num(last),
+            parts.join("; ")
+        )),
     })
 }
 
