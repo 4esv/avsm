@@ -110,10 +110,27 @@ impl Ledger {
     /// Set the connection up and make sure the table and triggers exist.
     fn prepare(conn: Connection) -> Result<Ledger, LedgerError> {
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        // An in-memory database has no file to journal; it stays in "memory"
-        // mode, and SQLite reports that instead of failing.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(SCHEMA)?;
+        // NOTE: turning a new file to WAL takes an exclusive lock, and
+        // SQLite answers busy at once there instead of calling the busy
+        // handler. avsmd's kernel and warden open a new ledger at the same
+        // moment, so the loser waits here, as long as an append would.
+        let began = std::time::Instant::now();
+        loop {
+            // An in-memory database has no file to journal; it stays in
+            // "memory" mode, and SQLite reports that instead of failing.
+            let set = conn
+                .pragma_update(None, "journal_mode", "WAL")
+                .and_then(|_| conn.execute_batch(SCHEMA));
+            match set {
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy
+                        && began.elapsed() < BUSY_TIMEOUT =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                set => break set?,
+            }
+        }
         Ok(Ledger { conn })
     }
 
@@ -900,6 +917,37 @@ mod tests {
         }
         let ledger = Ledger::open(&path).unwrap();
         assert_eq!(ledger.verify().unwrap(), 100);
+    }
+
+    /// avsmd's start: the kernel and the warden open a ledger that is not
+    /// there yet at the same moment, and the kernel appends at once. The
+    /// open that loses the race waits; it does not fail.
+    #[test]
+    fn two_connections_open_a_new_ledger_at_the_same_time() {
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..200 {
+            let path = dir.path().join(format!("ledger{round}.db"));
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let openers: Vec<_> = (0..2)
+                .map(|w| {
+                    let path = path.clone();
+                    let gate = std::sync::Arc::clone(&gate);
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        let mut ledger = Ledger::open(&path)
+                            .unwrap_or_else(|e| panic!("round {round}: open: {e}"));
+                        if w == 0 {
+                            ledger
+                                .append_at(report(1.0), 1)
+                                .unwrap_or_else(|e| panic!("round {round}: append: {e}"));
+                        }
+                    })
+                })
+                .collect();
+            for opener in openers {
+                opener.join().unwrap();
+            }
+        }
     }
 
     #[test]
