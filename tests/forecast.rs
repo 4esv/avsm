@@ -720,17 +720,94 @@ fn a_simulation_forecasts_at_add_as_its_config_says() {
         forecasts,
         ["all", "none", "mixed"].map(|p| (p.to_string(), 10, 4, vec![adopt]))
     );
-    // Off with seeds 0, and off with no forecast key at all.
-    for config in [
-        "nightly: never\nforecast: {days: 10, seeds: 0}\n",
-        "nightly: never\n",
-    ] {
-        let entries = simulate_garden(config);
-        assert!(
-            !entries.iter().any(|e| e.record.kind() == Kind::Forecast),
-            "{config}"
-        );
+    // Off only with seeds 0.
+    let entries = simulate_garden("nightly: never\nforecast: {days: 10, seeds: 0}\n");
+    assert!(!entries.iter().any(|e| e.record.kind() == Kind::Forecast));
+}
+
+#[test]
+fn with_no_forecast_key_a_simulation_forecasts_with_the_defaults() {
+    let _c = clock();
+    let none = avsm::config::Config::parse("nightly: never\n").unwrap();
+    assert_eq!(
+        none.automatic_forecast(),
+        Some(config::Forecast {
+            days: 30,
+            seeds: 16
+        })
+    );
+    let off = avsm::config::Config::parse("forecast: {seeds: 0}\n").unwrap();
+    assert_eq!(off.automatic_forecast(), None);
+    let entries = simulate_garden("nightly: never\n");
+    let forecasts: Vec<(String, u32, u32)> = entries
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Forecast {
+                policy,
+                horizon,
+                seeds,
+                ..
+            } => Some((policy.clone(), *horizon, *seeds)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        forecasts,
+        ["all", "none", "mixed"].map(|p| (p.to_string(), 30, 16))
+    );
+}
+
+#[test]
+fn a_capacity_gap_that_comes_and_goes_asks_once_a_quiet_week_closes_it() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture(
+        "inbox",
+        "unread",
+        "controller: {kind: threshold, above: 900, action: reply}\ncadence: 1h\n\
+         permitted:\n- {name: reply, run: echo ran >> invoked, cap: 5/day, reversible: true, delegated: true, expects: down 1 within 1}\n",
+    );
+    // The mean drift a day is (x_n - 100) / n: 7 on odd days, past the 5
+    // replies can remove, and 3 on even days, within it.
+    let asks = |f: &Fixture| {
+        f.entries()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.record,
+                    Record::Ask {
+                        signal: Some(Signal::Capacity { .. }),
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    // Each night: the report, the nightly check, and a human who answers
+    // every ask at once, so no open ask holds a repeat back.
+    let night = |f: &mut Fixture, n: i64, per_day: i64| {
+        f.history("inbox", &[(100 + per_day * n) as f64], DAY);
+        f.now += HOUR / 2;
+        avsm::clock::set(f.now);
+        f.k.tick();
+        for q in f.k.open_asks().unwrap() {
+            f.k.deny(q, "seen").unwrap();
+        }
+        f.now -= HOUR / 2;
+    };
+    f.history("inbox", &[100.0], DAY);
+    for n in 1..=14 {
+        night(&mut f, n, if n % 2 == 1 { 7 } else { 3 });
     }
+    assert_eq!(asks(&f), 1, "a gap that flips daily asks once");
+    // Seven clean nights in a row close the episode, and the next gap
+    // asks again.
+    for n in 15..=21 {
+        night(&mut f, n, 3);
+    }
+    assert_eq!(asks(&f), 1);
+    night(&mut f, 22, 7);
+    assert_eq!(asks(&f), 2, "a new episode after a quiet week asks");
 }
 
 #[test]

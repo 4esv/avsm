@@ -54,10 +54,9 @@ pub struct Config {
     /// payload, self proposes delegating it. 0 turns the ratchet off.
     #[serde(default = "default_ratchet")]
     pub ratchet: u32,
-    /// How far and how wide forecasts look. Present with seeds above 0,
-    /// the daemon and a simulation forecast at add and before a ratchet
-    /// ask; absent or with seeds 0, they do not. `avsm forecast` and the
-    /// `forecast` lever use it, or the defaults when it is absent.
+    /// How far and how wide forecasts look; 30 days and 16 seeds when left
+    /// out. The daemon and a simulation forecast at add, before a ratchet
+    /// ask and in a decision packet unless seeds is 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forecast: Option<Forecast>,
     /// Off when absent. When set, a canary ask goes out after every this
@@ -74,10 +73,11 @@ impl Config {
         self.forecast.unwrap_or_default()
     }
 
-    /// The settings of the forecasts at add and before a ratchet ask:
-    /// None when config.yaml leaves them out or says seeds 0.
+    /// The settings of the forecasts at add, before a ratchet ask and in
+    /// a decision packet: the defaults when config.yaml leaves them out,
+    /// and None only when it says seeds 0.
     pub fn automatic_forecast(&self) -> Option<Forecast> {
-        self.forecast.filter(|f| f.seeds > 0)
+        Some(self.forecast_settings()).filter(|f| f.seeds > 0)
     }
 }
 

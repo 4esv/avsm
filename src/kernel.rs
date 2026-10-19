@@ -50,6 +50,9 @@ pub const REPORT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// A `run` alive this long has its backoff forgiven.
 const STEADY: Duration = Duration::from_secs(600);
+/// A capacity episode closes after this many clean nightly checks in a
+/// row: a week.
+pub const QUIET_CHECKS: u32 = 7;
 
 /// The kernel's working state.
 pub struct Kernel {
@@ -86,9 +89,10 @@ pub struct Kernel {
     /// `forecast:` says. The daemon sets it; a simulation and a forecast's
     /// own branches never do, so a forecast never forecasts.
     pub forecasts: bool,
-    /// Ventures whose metric is in a capacity episode: it drifts from the
-    /// target faster than the levers can bring it back. Asked once each.
-    short: BTreeSet<String>,
+    /// Ventures whose metric is in a capacity episode, it drifting from
+    /// the target faster than the levers can bring it back, each with the
+    /// clean checks in a row since. Asked once an episode.
+    short: BTreeMap<String, u32>,
     /// The local date each venture's capacity was last checked nightly.
     capacity_checked: BTreeMap<String, NaiveDate>,
     /// A forecast branch ticks only the ventures it forecasts: the rest,
@@ -220,7 +224,7 @@ impl Kernel {
             judged: BTreeMap::new(),
             sim: None,
             forecasts: false,
-            short: BTreeSet::new(),
+            short: BTreeMap::new(),
             capacity_checked: BTreeMap::new(),
             scope: None,
         };
@@ -474,8 +478,9 @@ impl Kernel {
     /// Check, in code, that the permitted levers can keep the venture's
     /// metric from drifting off the target: its drift a day against the
     /// most the levers can move it a day. When they cannot, ask once per
-    /// episode, before any saturation; the episode ends at a check that
-    /// finds them able. Returns the ask written, if one was.
+    /// episode, before any saturation; the episode ends only after
+    /// `QUIET_CHECKS` checks in a row find them able, so a gap that comes
+    /// and goes asks once. Returns the ask written, if one was.
     pub fn check_capacity(&mut self, name: &str) -> Option<Entry> {
         let v = self.ventures.get(name)?.clone();
         let gap = {
@@ -483,12 +488,19 @@ impl Kernel {
             crate::forecast::capacity(&index, name, &v.mandate)
         };
         let Some(gap) = gap else {
-            self.short.remove(name);
+            if let Some(clean) = self.short.get_mut(name) {
+                *clean += 1;
+                if *clean >= QUIET_CHECKS {
+                    self.short.remove(name);
+                }
+            }
             return None;
         };
-        if !self.short.insert(name.to_string()) {
+        if let Some(clean) = self.short.get_mut(name) {
+            *clean = 0;
             return None;
         }
+        self.short.insert(name.to_string(), 0);
         let before = self.ledger_last();
         self.signal(
             name,

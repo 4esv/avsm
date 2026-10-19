@@ -67,20 +67,20 @@ if venture == "trader":
 if venture == "inbox":
     d_in = os.path.join(W, "inbox")
     inbox = sorted(os.listdir(d_in)) if os.path.isdir(d_in) else []
-    if day % 3 == 0:
-        out({"choice": "action", "action": "research", "reason": "read the mail", "payload": "What is in the inbox?"})
     # What a reasonable model sees: who each mail is from. Customers get a
-    # reply; anyone else is archived (delegated, reversible). One choice a
-    # night: archive on odd days when there is something to archive.
+    # reply each; anyone else is archived (delegated, reversible), each in
+    # a choice of its own, up to five a night: customers first, and every
+    # third night a look at the mail if there is room.
     customers, others = [], []
     for f in inbox:
         with open(os.path.join(d_in, f)) as fh: m = json.load(fh)
         (customers if re.fullmatch(r"customer\d+@example\.com", m["from"]) else others).append(m)
-    if others and (day % 2 or not customers):
-        out({"choice": "action", "action": "archive", "reason": f"mail {others[0]['id']} is not from a customer", "payload": f"mail {others[0]['id']}"})
-    if customers:
-        m = customers[0]
-        out({"choice": "action", "action": "reply", "reason": f"answer mail {m['id']}", "payload": f"{m['from']}\n\nThanks, it ships this week. (re mail {m['id']})"})
+    choices = [{"choice": "action", "action": "reply", "reason": f"answer mail {m['id']}", "payload": f"{m['from']}\n\nThanks, it ships this week. (re mail {m['id']})"} for m in customers]
+    choices += [{"choice": "action", "action": "archive", "reason": f"mail {m['id']} is not from a customer", "payload": f"mail {m['id']}"} for m in others]
+    if day % 3 == 0:
+        choices.append({"choice": "action", "action": "research", "reason": "read the mail", "payload": "What is in the inbox?"})
+    if choices:
+        out({"choices": choices[:5]})
     out({"choice": "nothing"})
 if venture == "garden":
     if day % 10 == 0:
