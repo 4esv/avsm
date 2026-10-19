@@ -1345,8 +1345,7 @@ pub fn capacity(index: &Index, venture: &str, mandate: &Mandate) -> Option<Gap> 
     // direction makes a debatable ask, and a debatable ask is noise.
     let toward = target(mandate)?;
     let want = if toward == Direction::Down { -1.0 } else { 1.0 };
-    let per_day = 86_400.0 / base.period as f64;
-    let drift = base.drift.iter().sum::<f64>() / base.drift.len() as f64 * per_day;
+    let drift = base.drift_per_day();
     if drift * want >= 0.0 {
         return None;
     }

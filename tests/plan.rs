@@ -459,10 +459,9 @@ fn a_branch_has_the_chosen_the_top_three_alternatives_and_propensities() {
 fn the_same_seed_gives_the_same_branch_record() {
     use avsm::mandate::Worse;
     use avsm::plan::{self, Lever, Problem};
-    use avsm::world::Baseline;
+    use avsm::world::{Baseline, Drift};
     use std::collections::BTreeMap;
-    let world = Baseline {
-        drift: vec![0.5, -0.3, 0.2, -0.4, 0.1, 0.3],
+    let mut world = Baseline {
         effects: BTreeMap::from([
             ("boost".to_string(), vec![4.0, 6.0, 5.0, 3.0]),
             ("tidy".to_string(), vec![1.0, 9.0, 2.0, 8.0]),
@@ -471,6 +470,7 @@ fn the_same_seed_gives_the_same_branch_record() {
         period: 3600,
         ..Baseline::default()
     };
+    world.set_drift(Drift::every(3600, &[0.5, -0.3, 0.2, -0.4, 0.1, 0.3]));
     let lever = |name: &str| Lever {
         name: name.to_string(),
         reversible: true,

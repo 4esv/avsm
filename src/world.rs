@@ -148,17 +148,51 @@ pub fn model_name(mandate: &Mandate) -> &'static str {
 
 // ----- the baseline -----
 
+/// One step of the metric between two reports with no lever run between
+/// them: when it began, how long it took, and how far it moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Drift {
+    pub at: i64,
+    pub gap: i64,
+    pub change: f64,
+}
+
+impl Drift {
+    /// Steps of these changes, one `period` each, back to back from 0.
+    pub fn every(period: i64, changes: &[f64]) -> Vec<Drift> {
+        changes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Drift {
+                at: i as i64 * period,
+                gap: period,
+                change: *c,
+            })
+            .collect()
+    }
+}
+
 /// The built-in world model. State is the metric value and the peak it
-/// has reached: `{"value", "peak"}`, or a bare number. Each step of time
-/// resamples a drift, the change between two reports with no lever run
-/// between them. An action adds a resampled effect of that lever: the
-/// change from the last report before a run to the report at its
-/// `expects` horizon, net of the drift the metric would have made over
-/// those reports anyway, so drift is counted once, per step, at any
-/// horizon. Drawdown guards are computed along the rolled path, from the
-/// peak so far to the value now.
+/// has reached: `{"value", "peak"}`, or a bare number.
+///
+/// Time moves the metric by its drift, learnt per second of elapsed time:
+/// a step of `dt` adds the mean rate integrated over `dt`, and one
+/// resampled residual scaled by √dt, as a random walk spreads. When the
+/// history spans a day or more and every hour of the day has at least
+/// `MIN_SAMPLES` steps, the mean rate is the one for each hour of the day
+/// (UTC), and the value reverts, with a time constant of a day, to the
+/// mean level of its hour of the day: a daily cycle comes back round
+/// instead of compounding, and its spread stays bounded. A mandate's
+/// `range:` bounds the value.
+///
+/// An action adds a resampled effect of that lever: the change from the
+/// last report before a run to the report at its `expects` horizon, net
+/// of the drift over that time, so drift is counted once at any horizon.
+/// Drawdown guards are computed along the rolled path, from the peak so
+/// far to the value now.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Baseline {
+    /// The change of each drift step, report to report.
     pub drift: Vec<f64>,
     /// Per lever: what a run moved the metric, net of drift.
     pub effects: BTreeMap<String, Vec<f64>>,
@@ -168,34 +202,78 @@ pub struct Baseline {
     pub peak: Option<f64>,
     /// The names of the drawdown guards over the metric.
     pub drawdowns: Vec<String>,
-    /// Seconds between reports, typically: one drift per period.
+    /// Seconds between reports, typically.
     pub period: i64,
+    /// The mandate's `range:`, low and high.
+    pub range: Option<[f64; 2]>,
+    /// Derived by `set_drift`: the mean drift a second, overall.
+    pub rate: f64,
+    /// Derived by `set_drift`: the mean drift a second for each hour of
+    /// the day, when the history holds enough of every hour.
+    pub by_hour: Option<[f64; 24]>,
+    /// Derived by `set_drift`: each step's departure from the mean, a
+    /// √second.
+    pub noise: Vec<f64>,
+    /// Derived by `set_levels`: the mean value at each hour of the day,
+    /// which the value reverts to, when the history holds enough of
+    /// every hour.
+    pub levels: Option<[f64; 24]>,
 }
+
+const HOUR: i64 = 3_600;
+const DAY: i64 = 86_400;
 
 impl Baseline {
     /// Learn the drift and the effects from the ledger.
     pub fn from_index(index: &Index, venture: &str, mandate: &Mandate) -> Baseline {
         let metric = mandate.metric_name();
         let series = index.series(venture, metric);
+        let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
         let mut runs: Vec<Seq> = mandate
             .permitted
             .iter()
             .flat_map(|p| index.intents_of(venture, &p.name).iter().copied())
             .collect();
         runs.sort_unstable();
-        let drift: Vec<f64> = series
+        let steps: Vec<Drift> = series
             .windows(2)
             .filter(|w| {
                 let i = runs.partition_point(|s| *s <= w[0].0);
                 runs.get(i).is_none_or(|s| *s >= w[1].0)
             })
-            .map(|w| w[1].1 - w[0].1)
+            .map(|w| Drift {
+                at: at(w[0].0),
+                gap: at(w[1].0) - at(w[0].0),
+                change: w[1].1 - w[0].1,
+            })
             .collect();
-        let drift_mean = if drift.is_empty() {
-            0.0
-        } else {
-            drift.iter().sum::<f64>() / drift.len() as f64
+        let mut gaps: Vec<i64> = series
+            .windows(2)
+            .map(|w| at(w[1].0) - at(w[0].0))
+            .filter(|g| *g > 0)
+            .collect();
+        gaps.sort_unstable();
+        let period = gaps
+            .get(gaps.len() / 2)
+            .copied()
+            .unwrap_or(mandate.cadence.as_secs() as i64)
+            .max(1);
+        let mut b = Baseline {
+            last: series.last().map(|(_, v)| *v),
+            peak: index.peak(venture, metric),
+            drawdowns: mandate
+                .guards
+                .iter()
+                .filter(|g| g.drawdown.is_some())
+                .map(|g| g.name.clone())
+                .collect(),
+            period,
+            range: mandate.range,
+            ..Baseline::default()
         };
+        b.set_drift(steps);
+        let points: Vec<(i64, f64)> = series.iter().map(|(s, v)| (at(*s), *v)).collect();
+        b.set_levels(&points);
         // Measured `expectation` reports say what a run did; where one
         // exists it stands for that run.
         let mut said: BTreeMap<Seq, f64> = BTreeMap::new();
@@ -210,73 +288,150 @@ impl Baseline {
                 }
             }
         }
-        let mut effects = BTreeMap::new();
         for p in &mandate.permitted {
             let within = p.expects.map_or(1, |e| e.within.max(1)) as usize;
-            // What the metric would have moved over the horizon anyway.
-            let carried = drift_mean * within as f64;
             let mut samples = Vec::new();
             for &intent in index.intents_of(venture, &p.name) {
                 let Some((outcome, true)) = index.settled(intent) else {
                     continue;
                 };
-                if let Some(x) = said.get(&intent) {
-                    samples.push(*x - carried);
-                    continue;
-                }
-                let b = series.partition_point(|(s, _)| *s < intent);
+                let i = series.partition_point(|(s, _)| *s < intent);
                 let a = series.partition_point(|(s, _)| *s <= outcome);
-                if let (Some(base), Some(then)) = (
-                    b.checked_sub(1).and_then(|i| series.get(i)),
-                    series.get(a + within - 1),
-                ) {
-                    samples.push(then.1 - base.1 - carried);
+                let base = i.checked_sub(1).and_then(|i| series.get(i));
+                let then = series.get(a + within - 1);
+                // What the metric would have moved over the horizon anyway.
+                let carried = match (base, then) {
+                    (Some(b0), Some(t)) => b.integrate(at(b0.0), at(t.0) - at(b0.0)),
+                    _ => b.integrate(at(intent), period * within as i64),
+                };
+                match (said.get(&intent), base, then) {
+                    (Some(x), _, _) => samples.push(*x - carried),
+                    (None, Some(b0), Some(t)) => samples.push(t.1 - b0.1 - carried),
+                    _ => {}
                 }
             }
             if !samples.is_empty() {
-                effects.insert(p.name.clone(), samples);
+                b.effects.insert(p.name.clone(), samples);
             }
         }
-        let mut gaps: Vec<i64> = series
-            .windows(2)
-            .filter_map(|w| Some(index.get(w[1].0)?.at - index.get(w[0].0)?.at))
-            .filter(|g| *g > 0)
-            .collect();
-        gaps.sort_unstable();
-        let period = gaps
-            .get(gaps.len() / 2)
-            .copied()
-            .unwrap_or(mandate.cadence.as_secs() as i64)
-            .max(1);
-        let drawdowns = mandate
-            .guards
+        b
+    }
+
+    /// Learn the drift from these steps: the mean rate, by hour of the day
+    /// where the history allows, and the residuals. With fewer than
+    /// `MIN_SAMPLES` steps the mean is taken as none: persistence plus
+    /// the spread of what there is.
+    pub fn set_drift(&mut self, steps: Vec<Drift>) {
+        let steps: Vec<Drift> = steps.into_iter().filter(|d| d.gap > 0).collect();
+        self.drift = steps.iter().map(|d| d.change).collect();
+        let total: i64 = steps.iter().map(|d| d.gap).sum();
+        let mean = if total > 0 {
+            steps.iter().map(|d| d.change).sum::<f64>() / total as f64
+        } else {
+            0.0
+        };
+        let first = steps.iter().map(|d| d.at).min().unwrap_or(0);
+        let last = steps.iter().map(|d| d.at + d.gap).max().unwrap_or(0);
+        let mut by_hour = None;
+        if last - first >= DAY {
+            let mut change = [0.0; 24];
+            let mut time = [0i64; 24];
+            let mut count = [0usize; 24];
+            for d in &steps {
+                let h = hour_of(d.at);
+                change[h] += d.change;
+                time[h] += d.gap;
+                count[h] += 1;
+            }
+            if count.iter().all(|n| *n >= MIN_SAMPLES) {
+                by_hour = Some(std::array::from_fn(|h| change[h] / time[h] as f64));
+            }
+        }
+        self.by_hour = by_hour;
+        self.rate = if steps.len() >= MIN_SAMPLES {
+            mean
+        } else {
+            0.0
+        };
+        self.noise = steps
             .iter()
-            .filter(|g| g.drawdown.is_some())
-            .map(|g| g.name.clone())
+            .map(|d| {
+                let r = by_hour.map_or(mean, |b| b[hour_of(d.at)]);
+                (d.change - r * d.gap as f64) / (d.gap as f64).sqrt()
+            })
             .collect();
-        Baseline {
-            drift,
-            effects,
-            last: series.last().map(|(_, v)| *v),
-            peak: index.peak(venture, metric),
-            drawdowns,
-            period,
+    }
+
+    /// Learn the mean value at each hour of the day from these readings,
+    /// when they span a day and hold at least `MIN_SAMPLES` of every hour.
+    pub fn set_levels(&mut self, points: &[(i64, f64)]) {
+        self.levels = None;
+        let (Some(first), Some(last)) = (
+            points.iter().map(|p| p.0).min(),
+            points.iter().map(|p| p.0).max(),
+        ) else {
+            return;
+        };
+        if last - first < DAY {
+            return;
+        }
+        let mut sum = [0.0; 24];
+        let mut count = [0usize; 24];
+        for (t, v) in points {
+            sum[hour_of(*t)] += v;
+            count[hour_of(*t)] += 1;
+        }
+        if count.iter().all(|n| *n >= MIN_SAMPLES) {
+            self.levels = Some(std::array::from_fn(|h| sum[h] / count[h] as f64));
         }
     }
 
-    /// One draw from `samples`, or with fewer than `MIN_SAMPLES`, from
-    /// the drift's spread about nothing: persistence.
-    fn draw(&self, samples: &[f64], rng: &mut u64) -> f64 {
-        if samples.len() >= MIN_SAMPLES {
-            return samples[(splitmix64(rng) % samples.len() as u64) as usize];
-        }
-        if self.drift.is_empty() {
+    /// The level at time `t`: between the hours' levels, each taken at
+    /// the middle of its hour.
+    fn level(&self, levels: &[f64; 24], t: i64) -> f64 {
+        let s = (t - HOUR / 2).rem_euclid(DAY);
+        let h = (s / HOUR) as usize;
+        let f = (s % HOUR) as f64 / HOUR as f64;
+        levels[h] + (levels[(h + 1) % 24] - levels[h]) * f
+    }
+
+    /// The mean drift over `dt` seconds from `t0`.
+    pub fn integrate(&self, t0: i64, dt: i64) -> f64 {
+        if dt <= 0 {
             return 0.0;
         }
-        let mean = self.drift.iter().sum::<f64>() / self.drift.len() as f64;
-        let i = (splitmix64(rng) % self.drift.len() as u64) as usize;
-        self.drift[i] - mean
+        let Some(b) = self.by_hour else {
+            return self.rate * dt as f64;
+        };
+        let day: f64 = b.iter().map(|r| r * HOUR as f64).sum();
+        let mut sum = (dt / DAY) as f64 * day;
+        let mut t = t0 + (dt / DAY) * DAY;
+        let end = t0 + dt;
+        while t < end {
+            let next = ((t.div_euclid(HOUR)) + 1) * HOUR;
+            let upto = next.min(end);
+            sum += b[hour_of(t)] * (upto - t) as f64;
+            t = upto;
+        }
+        sum
     }
+
+    /// The mean drift a day, from the hours of the day where known.
+    pub fn drift_per_day(&self) -> f64 {
+        self.integrate(0, DAY)
+    }
+
+    fn bound(&self, x: f64) -> f64 {
+        match self.range {
+            Some([lo, hi]) => x.clamp(lo, hi),
+            None => x,
+        }
+    }
+}
+
+/// The hour of the day, UTC, of a time in unix seconds.
+fn hour_of(t: i64) -> usize {
+    (t.rem_euclid(DAY) / HOUR) as usize
 }
 
 impl WorldModel for Baseline {
@@ -304,25 +459,30 @@ impl WorldModel for Baseline {
             .unwrap_or(x)
             .max(x);
         let mut rng = mix(seed, now as u64);
-        let steps = if dt <= 0 {
-            0
-        } else {
-            ((dt as f64 / self.period as f64).round() as i64).max(1)
-        };
-        for _ in 0..steps.min(10_000) {
-            x += self.draw(&self.drift, &mut rng);
+        if dt > 0 {
+            // A scaled sample, not a sum of resampled steps: one draw
+            // whatever dt is, exact for steps of any length, and the mean
+            // and spread of the sum of independent steps covering dt.
+            x += self.integrate(now, dt);
+            if !self.noise.is_empty() {
+                let i = (splitmix64(&mut rng) % self.noise.len() as u64) as usize;
+                x += self.noise[i] * (dt as f64).sqrt();
+            }
+            // A cyclic metric reverts to its level for the hour.
+            if let Some(levels) = &self.levels {
+                let to = self.level(levels, now + dt);
+                x = to + (x - to) * (-(dt as f64) / DAY as f64).exp();
+            }
+            x = self.bound(x);
             peak = peak.max(x);
         }
         if let Some(a) = action {
             let samples = self.effects.get(&a.name).map_or(&[][..], Vec::as_slice);
-            x += if samples.len() >= MIN_SAMPLES {
-                self.draw(samples, &mut rng)
-            } else if steps == 0 {
-                // No effect known, and no time passing to spread over.
-                0.0
-            } else {
-                self.draw(&[], &mut rng)
-            };
+            // Fewer than MIN_SAMPLES runs: no effect known, persistence.
+            if samples.len() >= MIN_SAMPLES {
+                x += samples[(splitmix64(&mut rng) % samples.len() as u64) as usize];
+            }
+            x = self.bound(x);
             peak = peak.max(x);
         }
         // A drawdown as the kernel reads one: percent below the peak.
@@ -497,6 +657,163 @@ mod tests {
     use crate::gate::Proof;
     use crate::record::{Entry, GENESIS};
 
+    /// examples/greenhouse/report's curve: 18 at 02:00 UTC, 34 at 14:00,
+    /// to one decimal.
+    fn greenhouse_at(now: i64) -> f64 {
+        let m = (now % 86_400) / 60;
+        let mut d = (m - 840).abs();
+        if d > 720 {
+            d = 1440 - d;
+        }
+        let t = 18.0 + 16.0 * (720 - d) as f64 / 720.0;
+        (t * 10.0).round() / 10.0
+    }
+
+    const MIDNIGHT: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
+
+    /// `days` of greenhouse reports a minute apart, from midnight.
+    fn greenhouse(days: i64, range: &str) -> (Index, Mandate) {
+        let m = Mandate::parse(&format!(
+            "purpose: p\ncontroller: {{kind: model}}\nmetric: temperature\ncadence: 1m\n{range}"
+        ))
+        .unwrap();
+        let mut entries: Vec<Entry> = Vec::new();
+        for i in 0..days * 1440 {
+            let at = MIDNIGHT + i * 60;
+            let prev = entries
+                .last()
+                .map_or(GENESIS.to_string(), |e| e.hash.clone());
+            let r = Record::report(
+                Claim::Measured,
+                V,
+                "temperature",
+                Some(greenhouse_at(at)),
+                "",
+            );
+            entries.push(Entry::new(entries.len() as Seq + 1, at, &prev, r));
+        }
+        (Index::from_entries(&entries), m)
+    }
+
+    /// Roll every member from the end of the history, `dt` a step, to
+    /// `days` on; the quantiles of where they end.
+    fn roll(b: &Baseline, from: i64, days: i64, dt: i64, members: u64) -> Quantiles {
+        let mut ends = Vec::new();
+        for i in 0..members {
+            let mut state = Value::Null;
+            let mut t = from;
+            let mut x = f64::NAN;
+            for s in 0..days * 86_400 / dt {
+                let next = b
+                    .step(&state, None, member_seed(9, i) ^ s as u64, t, dt)
+                    .unwrap();
+                x = next.metric;
+                state = next.state;
+                t += dt;
+            }
+            ends.push(x);
+        }
+        quantiles(&ends).unwrap()
+    }
+
+    #[test]
+    fn the_greenhouse_forecast_stays_in_its_band_for_thirty_days() {
+        let (index, m) = greenhouse(2, "");
+        let b = Baseline::from_index(&index, V, &m);
+        assert!(b.by_hour.is_some() && b.levels.is_some(), "a daily cycle");
+        let from = MIDNIGHT + 2 * 86_400 - 60;
+        let q = roll(&b, from, 30, 3600, 50);
+        // The curve runs 18 to 34; a margin of 2 either side.
+        for v in q.values() {
+            assert!((16.0..=36.0).contains(&v), "{q:?}");
+        }
+        // At 23:59 the curve reads 20.7.
+        assert!((q.p50 - greenhouse_at(from)).abs() < 1.5, "{q:?}");
+    }
+
+    #[test]
+    fn under_a_day_of_history_the_drift_is_not_by_hour() {
+        let (index, m) = greenhouse(1, "");
+        let b = Baseline::from_index(&index, V, &m);
+        assert!(b.by_hour.is_none() && b.levels.is_none());
+    }
+
+    #[test]
+    fn a_step_moves_by_the_drift_of_the_time_it_covers() {
+        // A steady 2 an hour, learnt from hourly reports.
+        let mut b = Baseline {
+            last: Some(10.0),
+            period: 3600,
+            ..Baseline::default()
+        };
+        b.set_drift(Drift::every(3600, &[2.0; 6]));
+        let ten = b.step(&Value::Null, None, 1, 0, 10 * 3600).unwrap();
+        assert!((ten.metric - 30.0).abs() < 1e-9, "{}", ten.metric);
+        // Learnt from reports a minute apart, the same rate.
+        let mut fine = b.clone();
+        fine.set_drift(Drift::every(60, &[2.0 / 60.0; 600]));
+        let hour = fine.step(&Value::Null, None, 1, 0, 3600).unwrap();
+        assert!((hour.metric - 12.0).abs() < 1e-9, "{}", hour.metric);
+        // Reports of mixed gaps give the rate a second, not a step.
+        let mut mixed = b.clone();
+        let mut steps = Drift::every(60, &[2.0 / 60.0; 60]);
+        steps.extend(Drift::every(3600, &[2.0; 3]).into_iter().map(|d| Drift {
+            at: d.at + 3600,
+            ..d
+        }));
+        mixed.set_drift(steps);
+        let day = mixed.step(&Value::Null, None, 1, 0, 86_400).unwrap();
+        assert!((day.metric - 58.0).abs() < 1e-9, "{}", day.metric);
+        // The greenhouse: twelve hours on from 02:00 is the afternoon peak.
+        let (index, m) = greenhouse(2, "");
+        let g = Baseline::from_index(&index, V, &m);
+        let at2 = MIDNIGHT + 2 * 86_400 + 2 * 3600;
+        let members: Vec<f64> = (0..50)
+            .map(|i| {
+                g.step(&Value::from(18.0), None, member_seed(3, i), at2, 12 * 3600)
+                    .unwrap()
+                    .metric
+            })
+            .collect();
+        let q = quantiles(&members).unwrap();
+        assert!((q.p50 - 34.0).abs() < 1.5, "{q:?}");
+    }
+
+    #[test]
+    fn the_range_bounds_every_step() {
+        let (_, m) = greenhouse(1, "range: [10, 40]\n");
+        let (index, _) = greenhouse(1, "");
+        assert_eq!(
+            Baseline::from_index(&index, V, &m).range,
+            Some([10.0, 40.0])
+        );
+        let mut b = Baseline {
+            last: Some(90.0),
+            period: 3600,
+            range: Some([0.0, 100.0]),
+            ..Baseline::default()
+        };
+        b.set_drift(Drift::every(3600, &[1.0, 3.0, 2.0, 2.5, 1.5, 2.0]));
+        let ends: Vec<f64> = (0..50)
+            .map(|i| {
+                b.step(&Value::Null, None, member_seed(5, i), 0, 86_400)
+                    .unwrap()
+                    .metric
+            })
+            .collect();
+        let q = quantiles(&ends).unwrap();
+        assert_eq!(q.p95, 100.0, "{q:?}");
+        assert!(ends.iter().all(|x| (0.0..=100.0).contains(x)), "{ends:?}");
+        // A lever's effect is bounded too.
+        b.effects.insert("boost".to_string(), vec![50.0; 3]);
+        let boost = Action {
+            name: "boost".to_string(),
+            payload: None,
+        };
+        let after = b.step(&Value::Null, Some(&boost), 1, 0, 0).unwrap();
+        assert_eq!(after.metric, 100.0);
+    }
+
     const V: &str = "shop";
 
     fn mandate() -> Mandate {
@@ -528,7 +845,10 @@ mod tests {
             self.push(Record::report(Claim::Measured, V, "count", Some(x), ""))
         }
 
+        /// A run at the time of the last report: intent and outcome take
+        /// no time of their own.
         fn run(&mut self, lever: &str) {
+            self.at -= 3600;
             let i = self.push(Record::Intent {
                 claim: Claim::Measured,
                 venture: V.to_string(),
@@ -541,6 +861,7 @@ mod tests {
                 payload: None,
                 key: None,
             });
+            self.at -= 3600;
             self.push(Record::Outcome {
                 claim: Claim::Measured,
                 venture: V.to_string(),
@@ -731,14 +1052,10 @@ mod tests {
         let b = Baseline::from_index(&Index::default(), V, &m);
         assert_eq!(b.drawdowns, vec!["dd".to_string()]);
         // 100, up 20, down 19: the path peaks at 120 and ends at 101.
-        let up = Baseline {
-            drift: vec![20.0; 3],
-            ..b.clone()
-        };
-        let down = Baseline {
-            drift: vec![-19.0; 3],
-            ..b.clone()
-        };
+        let mut up = b.clone();
+        up.set_drift(Drift::every(3600, &[20.0; 3]));
+        let mut down = b.clone();
+        down.set_drift(Drift::every(3600, &[-19.0; 3]));
         let first = up.step(&Value::from(100.0), None, 1, 0, 3600).unwrap();
         assert_eq!(first.metric, 120.0);
         assert_eq!(first.guards["dd"], 0.0);
