@@ -578,6 +578,8 @@ pub fn run_with(
         (out, err)
     });
     let began = Instant::now();
+    // PERF: most children exit within milliseconds; poll fast, then back off.
+    let mut wait = Duration::from_millis(1);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -586,7 +588,10 @@ pub fn run_with(
                 let _ = child.wait();
                 break None;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(Duration::from_millis(20));
+            }
             Err(_) => break None,
         }
     };

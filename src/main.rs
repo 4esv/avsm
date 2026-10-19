@@ -108,6 +108,10 @@ enum Command {
         /// the simulated time in AVSM_NOW and the day in AVSM_DAY
         #[arg(long)]
         world: Option<String>,
+        /// Unix seconds to start at on an empty ledger, so two runs see
+        /// the same world
+        #[arg(long)]
+        start: Option<i64>,
         /// Venture directories to take on first
         ventures: Vec<PathBuf>,
     },
@@ -221,6 +225,7 @@ fn main() -> ExitCode {
             step,
             approve,
             world,
+            start,
             ventures,
         } => {
             let step = match humantime::parse_duration(&step) {
@@ -237,7 +242,7 @@ fn main() -> ExitCode {
                 days,
                 step,
                 human,
-                start: None,
+                start,
                 add: ventures,
                 world,
             };
