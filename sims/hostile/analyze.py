@@ -120,7 +120,8 @@ for s, a, r in outcomes:
 # --- implausible readings ------------------------------------------------------
 def implausible_kind(why):
     for k, pat in [("missing", "missing"), ("NaN", "NaN"), ("out of range", "out of range"),
-                   ("max_step", "max_step"), ("flapping", "flapping"), ("not a number", "not a number")]:
+                   ("max_step", "max_step"), ("flapping", "flapping"), ("not a number", "not a number"),
+                   ("stuck", "stuck: ")]:
         if pat in why:
             return "flapping" if "flapping" in why else k
     return "other"

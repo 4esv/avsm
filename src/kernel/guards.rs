@@ -91,9 +91,12 @@ pub fn implausible(
     }
     let s = max_step?;
     // Exact repeats are the stuck signature, where the metric varies. A
-    // metric that never varies is not stuck.
+    // metric that never varies is not stuck, and neither is a reading at
+    // a declared bound of its range: dry soil reads its floor.
     let varies = median_step(before) > 0.0;
+    let bound = |x: f64| range.is_some_and(|[lo, hi]| x == lo || x == hi);
     if varies
+        && !bound(x)
         && recent.len() >= STUCK
         && recent[recent.len() - STUCK..].iter().all(|r| *r == Some(x))
     {
@@ -120,7 +123,7 @@ pub fn implausible(
                     }
                 }
             }
-            let repeats = run.windows(2).any(|w| w[0] == w[1]);
+            let repeats = run.windows(2).any(|w| w[0] == w[1] && !bound(w[0]));
             let lo = run.iter().copied().fold(f64::INFINITY, f64::min);
             let hi = run.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             if run.len() == AGREE && hi - lo <= s && !(varies && repeats) {
@@ -188,12 +191,63 @@ fn recent(index: &Index, venture: &str, metric: &str, n: usize) -> Vec<Option<f6
     out
 }
 
-/// The latest `n` plausible readings of a metric, oldest first.
-pub fn plausible_before(index: &Index, venture: &str, metric: &str, n: usize) -> Vec<f64> {
-    let mut out: Vec<f64> = reports(index, venture, metric)
-        .filter_map(plausible)
-        .take(n)
-        .collect();
+/// Does this record approve, by a declared decision, an ask about an
+/// implausible reading of this metric? Only a human says a doubted
+/// reading is real.
+fn vouches(index: &Index, e: &Entry, venture: &str, metric: &str) -> bool {
+    let Record::Decision {
+        claim: Claim::Declared,
+        verdict: crate::record::Verdict::Approve { ask, .. },
+        ..
+    } = &e.record
+    else {
+        return false;
+    };
+    index.get(*ask).is_some_and(|q| {
+        matches!(&q.record, Record::Ask {
+            venture: v,
+            signal: Some(Signal::Implausible { metric: m, .. }),
+            ..
+        } if v == venture && m == metric)
+    })
+}
+
+/// The latest `n` readings a step is measured from, oldest first: the
+/// plausible ones, back to a declared approval of an implausible ask about
+/// the metric, where the latest reading before that approval is the
+/// anchor, plausible or not.
+fn anchored_before(index: &Index, venture: &str, metric: &str, n: usize) -> Vec<f64> {
+    let mut out: Vec<f64> = Vec::new();
+    let mut vouched = false;
+    for e in index.of(venture).rev() {
+        if out.len() >= n {
+            break;
+        }
+        if !vouched && vouches(index, e, venture, metric) {
+            vouched = true;
+            continue;
+        }
+        let Record::Report {
+            metric: m,
+            claim,
+            value,
+            ..
+        } = &e.record
+        else {
+            continue;
+        };
+        if m != metric || !claim.authorizes() {
+            continue;
+        }
+        if vouched {
+            if let Some(x) = value.filter(|x| x.is_finite()) {
+                out.push(x);
+                break;
+            }
+        } else if let Some(x) = plausible(e) {
+            out.push(x);
+        }
+    }
     out.reverse();
     out
 }
@@ -290,7 +344,7 @@ impl Kernel {
         let Ok(index) = self.index() else {
             return (None, false);
         };
-        let before = plausible_before(&index, venture, metric, HISTORY);
+        let before = anchored_before(&index, venture, metric, HISTORY);
         let recent = recent(&index, venture, metric, STUCK.max(AGREE - 1));
         let why = implausible(value, &before, &recent, range, max_step);
         let fresh = reports(&index, venture, metric)

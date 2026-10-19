@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use avsm::gate::{self, Adopted, Candidate, Reason, State};
 use avsm::kernel::Kernel;
 use avsm::mandate::Mandate;
-use avsm::record::{Claim, Entry, Kind, Record, Signal, Verdict, GENESIS};
+use avsm::record::{Claim, Entry, Kind, Record, Seq, Signal, Verdict, GENESIS};
 use avsm::role::{self, Context, InferRequest, Role};
 use avsm::warden::LocalWarden;
 
@@ -556,6 +556,15 @@ fn hold_needs_three_crossed_reports_in_a_row() {
 
 /// Feed reports; return the kernel and its directory.
 fn plausibility(controller: &str, values: &[&str]) -> (Kernel, PathBuf, tempfile::TempDir) {
+    plausibility_in("[0, 1000]", controller, values)
+}
+
+/// The same, with this range.
+fn plausibility_in(
+    range: &str,
+    controller: &str,
+    values: &[&str],
+) -> (Kernel, PathBuf, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let dir = venture(
@@ -563,7 +572,7 @@ fn plausibility(controller: &str, values: &[&str]) -> (Kernel, PathBuf, tempfile
         "counter",
         &format!(
             "purpose: Keep it low.\nmetric: count\ncontroller: {controller}\ncadence: 1h\n\
-             range: [0, 1000]\nmax_step: 50\n\
+             range: {range}\nmax_step: 50\n\
              permitted:\n- {{name: reset, run: echo reset >> resets, cap: 99/day, reversible: true}}\n"
         ),
     );
@@ -833,6 +842,88 @@ fn a_sensor_stuck_at_its_last_value_is_stuck_from_the_fourth() {
         "{f:?}"
     );
     assert_eq!(implausible_asks(&k, "count"), 1, "one ask an episode");
+}
+
+#[test]
+fn a_reading_at_its_range_floor_is_never_stuck_and_can_act() {
+    let water = "{kind: threshold, below: 20, action: reset}";
+    // Within max_step all the way down: 0 repeated is dry soil, not stuck.
+    let values = ["30", "32", "31", "33", "30", "10", "0", "0", "0", "0", "0"];
+    let (k, _dir, _tmp) = plausibility_in("[0, 100]", water, &values);
+    let f = flags(&k, "counter", "count");
+    assert!(f.iter().all(Option::is_none), "{f:?}");
+    assert!(count(&k, Kind::Intent, "reset") > 0);
+    // After a jump, 0, 0, 0 at the floor agree and re-anchor on the third.
+    let values = ["60", "62", "61", "63", "60", "0", "0", "0", "0", "0"];
+    let (k, _dir, _tmp) = plausibility_in("[0, 100]", water, &values);
+    let f = flags(&k, "counter", "count");
+    assert!(f[5..7].iter().all(Option::is_some), "{f:?}");
+    assert!(f[7..].iter().all(Option::is_none), "{f:?}");
+    assert_eq!(count(&k, Kind::Intent, "reset"), 3, "the floor acts");
+}
+
+/// A metric stuck mid-range at 60: flagged from the fourth repeat.
+fn stuck_at_60() -> (Kernel, PathBuf, tempfile::TempDir, Seq) {
+    let none = "{kind: threshold, above: 900, action: reset}";
+    let values = ["60", "62", "61", "63", "60", "60", "60", "60", "60"];
+    let (k, dir, tmp) = plausibility_in("[0, 100]", none, &values);
+    let f = flags(&k, "counter", "count");
+    assert!(f[7..].iter().all(Option::is_some), "{f:?}");
+    let ask = signals(&k, |s| matches!(s, Signal::Implausible { .. }))[0].seq;
+    (k, dir, tmp, ask)
+}
+
+#[test]
+fn a_declared_approval_re_anchors_a_stuck_reading_and_a_denial_does_not() {
+    let (mut k, dir, _tmp, ask) = stuck_at_60();
+    report(&mut k, &dir, "counter", "60");
+    assert!(
+        flags(&k, "counter", "count").last().unwrap().is_some(),
+        "code never re-anchors"
+    );
+    k.approve(ask, None).unwrap();
+    for _ in 0..5 {
+        report(&mut k, &dir, "counter", "60");
+    }
+    let f = flags(&k, "counter", "count");
+    assert!(f[f.len() - 5..].iter().all(Option::is_none), "{f:?}");
+
+    let (mut k, dir, _tmp, ask) = stuck_at_60();
+    k.deny(ask, "not real").unwrap();
+    for _ in 0..3 {
+        report(&mut k, &dir, "counter", "60");
+    }
+    let f = flags(&k, "counter", "count");
+    assert!(
+        f[f.len() - 3..].iter().all(Option::is_some),
+        "denied: {f:?}"
+    );
+}
+
+#[test]
+fn a_measured_or_inferred_approval_never_re_anchors() {
+    for claim in [Claim::Measured, Claim::Inferred] {
+        let (mut k, dir, tmp, ask) = stuck_at_60();
+        let mut ledger =
+            avsm::ledger::Ledger::open(&tmp.path().join("home").join("ledger.db")).unwrap();
+        ledger
+            .append(Record::Decision {
+                claim,
+                venture: "counter".into(),
+                verdict: Verdict::Approve { ask, payload: None },
+                by: None,
+            })
+            .unwrap();
+        drop(ledger);
+        for _ in 0..3 {
+            report(&mut k, &dir, "counter", "60");
+        }
+        let f = flags(&k, "counter", "count");
+        assert!(
+            f[f.len() - 3..].iter().all(Option::is_some),
+            "{claim:?}: {f:?}"
+        );
+    }
 }
 
 #[test]
