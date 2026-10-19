@@ -25,6 +25,16 @@ pub struct Pulled {
     pub budget: Option<(Seq, u32)>,
 }
 
+/// A venture's latest declared adoption: the record, the hash of the
+/// mandate, its directory and, from 2.0, the text as adopted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Adoption {
+    pub seq: Seq,
+    pub hash: String,
+    pub path: String,
+    pub text: Option<String>,
+}
+
 /// The ledger as read so far, and what follows from it.
 #[derive(Default)]
 pub struct Index {
@@ -66,8 +76,10 @@ pub struct Index {
     digests_at: Vec<i64>,
     /// Refusals written and not yet closed.
     refusals_open: BTreeSet<Seq>,
-    /// The latest declared adoption per venture: seq, mandate hash, path.
-    adoptions: BTreeMap<String, (Seq, String, String)>,
+    /// The latest declared adoption per venture.
+    adoptions: BTreeMap<String, Adoption>,
+    /// Every declared adoption per venture, oldest first: its mandate versions.
+    versions: HashMap<String, Vec<Seq>>,
 }
 
 impl Index {
@@ -190,9 +202,21 @@ impl Index {
                             }
                         }
                     }
-                    Verdict::Adopt { mandate, path } if *claim == Claim::Declared => {
-                        self.adoptions
-                            .insert(venture, (seq, mandate.clone(), path.clone()));
+                    Verdict::Adopt {
+                        mandate,
+                        path,
+                        text,
+                    } if *claim == Claim::Declared => {
+                        self.versions.entry(venture.clone()).or_default().push(seq);
+                        self.adoptions.insert(
+                            venture,
+                            Adoption {
+                                seq,
+                                hash: mandate.clone(),
+                                path: path.clone(),
+                                text: text.clone(),
+                            },
+                        );
                     }
                     _ => {}
                 }
@@ -383,9 +407,16 @@ impl Index {
         &self.digests_at
     }
 
-    /// The latest declared adoption of each venture: seq, hash, path.
-    pub fn adoptions(&self) -> &BTreeMap<String, (Seq, String, String)> {
+    /// The latest declared adoption of each venture.
+    pub fn adoptions(&self) -> &BTreeMap<String, Adoption> {
         &self.adoptions
+    }
+
+    /// Which mandate version a declared adoption is: how many adoptions of
+    /// that venture came up to and including it, counting from 1.
+    pub fn mandate_version(&self, venture: &str, adopted: Seq) -> Option<usize> {
+        let seqs = self.versions.get(venture)?;
+        seqs.binary_search(&adopted).ok().map(|i| i + 1)
     }
 }
 

@@ -178,6 +178,11 @@ fn five_approvals_yield_one_proposal_and_adopting_it_ends_the_asks() {
     );
     assert_eq!(adopted.record.claim(), Claim::Declared);
     let text = std::fs::read_to_string(dir.join("mandate.yaml")).unwrap();
+    assert!(
+        matches!(&adopted.record, Record::Decision { verdict: avsm::record::Verdict::Adopt { text: Some(t), .. }, .. } if *t == text),
+        "a delegate adoption stores the mandate it adopted: {}",
+        adopted.line()
+    );
     assert!(text.starts_with("# The shop.\n"), "comments kept: {text}");
     assert!(
         text.contains("    takes: text\n    delegated: true\n"),
@@ -204,6 +209,21 @@ fn five_approvals_yield_one_proposal_and_adopting_it_ends_the_asks() {
     assert_eq!(
         std::fs::read_to_string(dir.join("announced")).unwrap(),
         "Hello 1Hello 2Hello 3Hello 4Hello 5Hello 6"
+    );
+    // The first announce rested on the first mandate; the delegated one on
+    // the second, the one the delegate action adopted.
+    let announces: Vec<_> = k
+        .entries()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.record.kind() == Kind::Action && e.record.action() == Some("announce"))
+        .collect();
+    let first = k.why(announces.first().unwrap().seq).unwrap();
+    assert!(first.contains("shop mandate v1 (#"), "{first}");
+    let last = k.why(announces.last().unwrap().seq).unwrap();
+    assert!(
+        last.contains(&format!("shop mandate v2 (#{}, ", adopted.seq)),
+        "{last}"
     );
     k.tick();
     assert_eq!(

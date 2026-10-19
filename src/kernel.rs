@@ -263,7 +263,7 @@ impl Kernel {
             .canonicalize()
             .map_err(|e| format!("cannot find {}: {e}", dir.display()))?;
         let name = venture::name_of(&dir)?;
-        let (mandate, hash) = venture::read_mandate(&dir)?;
+        let (mandate, hash, text) = venture::read_mandate(&dir)?;
         self.check_family(&name, &mandate)?;
         if mandate.metric_adapter().is_none() && !dir.join("report").is_file() {
             return Err(format!(
@@ -278,6 +278,7 @@ impl Kernel {
             Verdict::Adopt {
                 mandate: hash.clone(),
                 path: dir.to_string_lossy().into_owned(),
+                text: Some(text),
             },
         ))?;
         let v = Venture {
@@ -287,6 +288,7 @@ impl Kernel {
             hash,
             adopted: entry.seq,
             problem: None,
+            note: None,
         };
         self.ventures.insert(name.clone(), v);
         // A fresh mandate means a fresh run and a report right away.
@@ -474,6 +476,9 @@ impl Kernel {
                     None => "no report yet".to_string(),
                 },
             };
+            if let Some(note) = &v.note {
+                detail.push_str(&format!("  [{note}]"));
+            }
             if let Some(note) = self.runtime.get(&v.name).and_then(|rt| rt.note.as_deref()) {
                 detail.push_str(&format!("  ({note})"));
             }
@@ -1916,7 +1921,35 @@ fn why_in(
         };
         return Ok(format!("{}\n{derivation}", entry.line()));
     }
-    Ok(gate::why(entry))
+    let mut text = gate::why(entry);
+    // The mandate version an action, intent or outcome rests on.
+    let proof = match &entry.record {
+        Record::Action { proof, .. } | Record::Intent { proof, .. } => Some(proof),
+        Record::Outcome { intent, .. } => index.get(*intent).and_then(|e| match &e.record {
+            Record::Intent { proof, .. } => Some(proof),
+            _ => None,
+        }),
+        _ => None,
+    };
+    if let Some(line) = proof.and_then(|p| mandate_version_line(index, p)) {
+        text.push_str(&format!("  authorized by {line}\n"));
+    }
+    Ok(text)
+}
+
+/// `<venture> mandate vN (#<adopt seq>, <short hash>)` for the mandate a
+/// proof rests on, counting that venture's adoptions from 1.
+fn mandate_version_line(index: &Index, proof: &gate::Proof) -> Option<String> {
+    let (seq, hash) = proof.steps.iter().find_map(|s| match s {
+        gate::Step::Mandate { seq, hash } => Some((*seq, hash)),
+        _ => None,
+    })?;
+    let venture = index.get(seq)?.record.venture();
+    let n = index.mandate_version(venture, seq)?;
+    Some(format!(
+        "{venture} mandate v{n} (#{seq}, {})",
+        &hash[..12.min(hash.len())]
+    ))
 }
 
 /// The current facts about a venture (when `what` names one) or a topic,

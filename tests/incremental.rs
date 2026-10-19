@@ -327,6 +327,7 @@ fn record(op: &Op, n: u64) -> Record {
                     "changed".to_string()
                 },
                 path: format!("/ventures/{venture}"),
+                text: None,
             },
             venture,
             by: None,
@@ -467,6 +468,7 @@ fn build(case: &Case) -> (Ledger, Index, Vec<Adopted>, i64) {
                     verdict: Verdict::Adopt {
                         mandate: hash.clone(),
                         path: format!("/ventures/{v}"),
+                        text: None,
                     },
                     by: None,
                 },

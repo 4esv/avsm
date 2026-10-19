@@ -2072,6 +2072,7 @@ mod tests {
                 verdict: Verdict::Adopt {
                     mandate: hash.clone(),
                     path: format!("/ventures/{venture}"),
+                    text: None,
                 },
                 by: None,
             });

@@ -285,8 +285,15 @@ pub enum Verdict {
     Pause,
     /// Let a paused venture run again.
     Resume,
-    /// Take on a mandate; `mandate` is the hash of its text, `path` its directory.
-    Adopt { mandate: String, path: String },
+    /// Take on a mandate; `mandate` is the hash of its text, `path` its
+    /// directory, `text` the whole mandate as adopted. A 1.0 adoption has
+    /// no text; it is absent from the record, so old hashes still hold.
+    Adopt {
+        mandate: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
 }
 
 /// One ledger record. Every variant carries its claim and its venture.
@@ -554,7 +561,7 @@ impl Record {
                     Verdict::Deny { ask, reason } => format!("denied #{ask}: {reason}"),
                     Verdict::Pause => "paused".to_string(),
                     Verdict::Resume => "resumed".to_string(),
-                    Verdict::Adopt { mandate, path } => {
+                    Verdict::Adopt { mandate, path, .. } => {
                         format!(
                             "adopted mandate {} from {path}",
                             &mandate[..12.min(mandate.len())]
@@ -766,6 +773,33 @@ mod tests {
             assert_eq!(record.canonical(), text);
             assert!(record.payload().is_none());
         }
+    }
+
+    #[test]
+    fn an_adoption_with_text_round_trips_and_one_without_hashes_as_before() {
+        let with = Record::Decision {
+            claim: Claim::Declared,
+            venture: "shop".into(),
+            verdict: Verdict::Adopt {
+                mandate: "abc".into(),
+                path: "/x".into(),
+                text: Some("purpose: p\n".into()),
+            },
+            by: None,
+        };
+        let back: Record = serde_json::from_str(&with.canonical()).unwrap();
+        assert_eq!(back, with);
+        let without = r#"{"kind":"decision","claim":"declared","venture":"shop","verdict":{"verdict":"adopt","mandate":"abc","path":"/x"}}"#;
+        let record: Record = serde_json::from_str(without).unwrap();
+        assert!(matches!(
+            &record,
+            Record::Decision {
+                verdict: Verdict::Adopt { text: None, .. },
+                ..
+            }
+        ));
+        assert_eq!(record.canonical(), without);
+        assert_ne!(record.canonical(), with.canonical());
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::gate::Adopted;
+use crate::index::Adoption;
 use crate::mandate::Mandate;
 use crate::record::{Claim, Entry, Record, Seq, Verdict};
 
@@ -21,10 +22,15 @@ pub struct Venture {
     pub hash: String,
     /// The declared record that adopted the mandate.
     pub adopted: Seq,
-    /// Set when the mandate on disk no longer matches the adopted one, or
-    /// cannot be read; the text says what is wrong. The gate then permits
-    /// nothing for this venture until `avsm add` runs again.
+    /// Set when no mandate can be had for the venture: a 1.0 adoption whose
+    /// file no longer reads or has changed, or text that does not match its
+    /// hash. The gate then permits nothing for this venture until
+    /// `avsm add` runs again.
     pub problem: Option<String>,
+    /// Set when the file on disk no longer matches the adopted text, or
+    /// cannot be read. The adopted text keeps running; it takes
+    /// `avsm add` to adopt what is on disk.
+    pub note: Option<String>,
 }
 
 impl Venture {
@@ -44,55 +50,89 @@ impl Venture {
     }
 }
 
-/// Read and hash a venture directory's mandate.
-pub fn read_mandate(dir: &Path) -> Result<(Mandate, String), String> {
+/// Read and hash a venture directory's mandate: the mandate, the hash of
+/// its text and the text.
+pub fn read_mandate(dir: &Path) -> Result<(Mandate, String, String), String> {
     let path = dir.join(MANDATE_FILE);
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mandate = Mandate::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok((mandate, Mandate::hash(&text)))
+    let hash = Mandate::hash(&text);
+    Ok((mandate, hash, text))
 }
 
 /// Every venture the ledger says was adopted, from the latest declared
-/// Adopt record of each, with its mandate read from disk now. A mandate
-/// that changed or cannot be read leaves the venture listed with a
-/// problem, and the gate permits it nothing.
+/// Adopt record of each. The mandate in force is the text that record
+/// holds; a 1.0 record has none, and its mandate is read from disk now,
+/// and a change there leaves the venture listed with a problem.
 pub fn load_all(entries: &[Entry]) -> BTreeMap<String, Venture> {
-    let mut latest: BTreeMap<String, (Seq, String, String)> = BTreeMap::new();
+    let mut latest: BTreeMap<String, Adoption> = BTreeMap::new();
     for e in entries {
         if let Record::Decision {
             claim: Claim::Declared,
             venture,
-            verdict: Verdict::Adopt { mandate, path },
+            verdict:
+                Verdict::Adopt {
+                    mandate,
+                    path,
+                    text,
+                },
             ..
         } = &e.record
         {
-            latest.insert(venture.clone(), (e.seq, mandate.clone(), path.clone()));
+            latest.insert(
+                venture.clone(),
+                Adoption {
+                    seq: e.seq,
+                    hash: mandate.clone(),
+                    path: path.clone(),
+                    text: text.clone(),
+                },
+            );
         }
     }
     from_adoptions(&latest)
 }
 
 /// Every venture from the latest declared adoption of each: name, then
-/// the adopting record, the mandate's hash and its directory.
-pub fn from_adoptions(
-    latest: &BTreeMap<String, (Seq, String, String)>,
-) -> BTreeMap<String, Venture> {
+/// the adopting record, the mandate's hash, its directory and its text.
+pub fn from_adoptions(latest: &BTreeMap<String, Adoption>) -> BTreeMap<String, Venture> {
     let mut ventures = BTreeMap::new();
-    for (name, (seq, hash, path)) in latest {
-        let (name, seq, hash) = (name.clone(), *seq, hash.clone());
+    for (name, a) in latest {
+        let (name, seq, hash, path) = (name.clone(), a.seq, a.hash.clone(), &a.path);
         if name == crate::gate::SELF {
             ventures.insert(name, crate::selfventure::venture(seq, &hash));
             continue;
         }
         let dir = PathBuf::from(path);
-        let (mandate, problem) = match read_mandate(&dir) {
-            Ok((m, h)) if h == hash => (m, None),
-            Ok((m, _)) => (
-                m,
-                Some("mandate changed on disk; run avsm add again".to_string()),
-            ),
-            Err(e) => (Mandate::empty(), Some(e)),
+        let changed = "mandate changed on disk; run avsm add again".to_string();
+        let on_disk = read_mandate(&dir);
+        let (mandate, problem, note) = match (&a.text, on_disk) {
+            // 2.0: the adopted text runs; the disk is only compared.
+            (Some(text), disk) => {
+                let note = match disk {
+                    Ok((_, h, _)) if h == hash => None,
+                    Ok(_) => Some(changed),
+                    Err(e) => Some(e),
+                };
+                match Mandate::parse(text) {
+                    Ok(m) if Mandate::hash(text) == hash => (m, None, note),
+                    Ok(_) => (
+                        Mandate::empty(),
+                        Some("the adopted text does not match its hash".to_string()),
+                        note,
+                    ),
+                    Err(e) => (
+                        Mandate::empty(),
+                        Some(format!("the adopted text does not parse: {e}")),
+                        note,
+                    ),
+                }
+            }
+            // 1.0: no text in the ledger; the disk is all there is.
+            (None, Ok((m, h, _))) if h == hash => (m, None, None),
+            (None, Ok((m, _, _))) => (m, Some(changed), None),
+            (None, Err(e)) => (Mandate::empty(), Some(e), None),
         };
         ventures.insert(
             name.clone(),
@@ -103,6 +143,7 @@ pub fn from_adoptions(
                 hash,
                 adopted: seq,
                 problem,
+                note,
             },
         );
     }

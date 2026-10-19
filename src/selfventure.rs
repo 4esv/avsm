@@ -50,6 +50,7 @@ pub fn venture(adopted: Seq, recorded_hash: &str) -> Venture {
         hash: hash(),
         adopted,
         problem,
+        note: None,
     }
 }
 
@@ -61,6 +62,7 @@ pub fn adopt_record() -> Record {
         verdict: Verdict::Adopt {
             mandate: hash(),
             path: PATH.to_string(),
+            text: Some(MANDATE.to_string()),
         },
         by: None,
     }
@@ -137,6 +139,7 @@ pub fn canary() -> Result<(), String> {
         verdict: Verdict::Adopt {
             mandate: mandate_hash.clone(),
             path: PATH.to_string(),
+            text: None,
         },
         by: None,
     };

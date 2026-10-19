@@ -139,6 +139,7 @@ impl Warden for LocalWarden {
                 verdict: Verdict::Adopt {
                     mandate: hash,
                     path: dir.to_string_lossy().into_owned(),
+                    text: Some(text),
                 },
                 by,
             })?);

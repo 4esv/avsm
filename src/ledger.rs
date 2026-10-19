@@ -313,7 +313,13 @@ mod tests {
             (any::<Seq>(), text()).prop_map(|(ask, reason)| Verdict::Deny { ask, reason }),
             Just(Verdict::Pause),
             Just(Verdict::Resume),
-            (text(), text()).prop_map(|(mandate, path)| Verdict::Adopt { mandate, path }),
+            (text(), text(), proptest::option::of(text())).prop_map(|(mandate, path, text)| {
+                Verdict::Adopt {
+                    mandate,
+                    path,
+                    text,
+                }
+            }),
         ]
     }
 
