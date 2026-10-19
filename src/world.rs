@@ -224,7 +224,10 @@ const HOUR: i64 = 3_600;
 const DAY: i64 = 86_400;
 
 /// The drift steps of a venture's metric: each change from one plausible
-/// report to the next with no lever run between, before `upto` when given.
+/// report to the next that no lever run is still judged over, before
+/// `upto` when given. A run is judged over the reports up to its
+/// `expects within`-th after it (the one after it with no `expects`), so
+/// a lever that keeps moving the metric over its horizon is not drift.
 ///
 /// Each step is worked out once per index and kept (`DriftMemo`): a step
 /// between two reports already in the index never changes, since a run
@@ -238,24 +241,20 @@ pub fn drift_steps(
     let metric = mandate.metric_name();
     let series = index.series(venture, metric);
     let end = upto.map_or(series.len(), |u| series.partition_point(|(s, _)| *s < u));
-    let mut levers: Vec<&str> = mandate.permitted.iter().map(|p| p.name.as_str()).collect();
-    levers.sort_unstable();
-    levers.dedup();
-    let key = (venture.to_string(), metric.to_string(), levers.join("\n"));
+    let levers = horizons(mandate);
+    let names: Vec<String> = levers.iter().map(|(l, w)| format!("{l} {w}")).collect();
+    let key = (venture.to_string(), metric.to_string(), names.join("\n"));
     let mut memos = index.drift_memo().lock().unwrap_or_else(|e| e.into_inner());
     // The memo lives with the index, whose series only ever grow.
     let memo = memos.entry(key).or_default();
     let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
     let want = end.saturating_sub(1);
     for i in memo.windows..want {
-        let (w0, w1) = (series[i].0, series[i + 1].0);
-        // No run of a permitted lever between the two reports.
-        let quiet = levers.iter().all(|l| {
-            let runs = index.intents_of(venture, l);
-            let j = runs.partition_point(|s| *s <= w0);
-            runs.get(j).is_none_or(|s| *s >= w1)
-        });
+        let quiet = levers
+            .iter()
+            .all(|(l, w)| !judged_over(series, i, index.intents_of(venture, l), *w));
         if quiet {
+            let (w0, w1) = (series[i].0, series[i + 1].0);
             memo.steps.push((
                 i,
                 Drift {
@@ -269,6 +268,34 @@ pub fn drift_steps(
     }
     let n = memo.steps.partition_point(|(i, _)| *i < want);
     memo.steps[..n].iter().map(|(_, d)| *d).collect()
+}
+
+/// Each permitted lever and how many reports after a run it is judged
+/// over: its `expects within`, else 1.
+fn horizons(mandate: &Mandate) -> Vec<(&str, usize)> {
+    let mut levers: Vec<(&str, usize)> = mandate
+        .permitted
+        .iter()
+        .map(|p| {
+            let w = p.expects.as_ref().map_or(1, |e| e.within.max(1) as usize);
+            (p.name.as_str(), w)
+        })
+        .collect();
+    // A mandate names each lever once; sorted, the memo's key is stable.
+    levers.sort_unstable();
+    levers
+}
+
+/// Whether the step from report `i` to `i + 1` of `series` falls within
+/// `within` reports after the latest of these `runs` before its end.
+fn judged_over(series: &[(Seq, f64)], i: usize, runs: &[Seq], within: usize) -> bool {
+    let end = series[i + 1].0;
+    let Some(&run) = runs[..runs.partition_point(|s| *s < end)].last() else {
+        return false;
+    };
+    // The reports after the run, up to and including the step's end.
+    let after = i + 2 - series.partition_point(|(s, _)| *s <= run);
+    after <= within
 }
 
 /// The drift steps worked out so far for one venture, metric and set of
@@ -311,19 +338,17 @@ pub fn drift_steps_whole(
     let end = upto.map_or(series.len(), |u| series.partition_point(|(s, _)| *s < u));
     let series = &series[..end];
     let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
-    let mut runs: Vec<Seq> = mandate
-        .permitted
-        .iter()
-        .flat_map(|p| index.intents_of(venture, &p.name).iter().copied())
-        .collect();
-    runs.sort_unstable();
+    let levers = horizons(mandate);
+    let whole = index.series(venture, mandate.metric_name());
     series
         .windows(2)
-        .filter(|w| {
-            let i = runs.partition_point(|s| *s <= w[0].0);
-            runs.get(i).is_none_or(|s| *s >= w[1].0)
+        .enumerate()
+        .filter(|(i, _)| {
+            levers
+                .iter()
+                .all(|(l, w)| !judged_over(whole, *i, index.intents_of(venture, l), *w))
         })
-        .map(|w| Drift {
+        .map(|(_, w)| Drift {
             at: at(w[0].0),
             gap: at(w[1].0) - at(w[0].0),
             change: w[1].1 - w[0].1,
@@ -1180,7 +1205,14 @@ mod tests {
                  - {name: other, run: ./other, cap: 9/day, reversible: true}\n",
             )
             .unwrap();
-            let mandates = [mandate(), both];
+            let horizon = Mandate::parse(
+                "purpose: p\nmetric: count\ncontroller: {kind: model}\ncadence: 1h\n\
+                 permitted:\n- {name: boost, run: ./boost, cap: 9/day, reversible: true, \
+                 expects: up within 3}\n\
+                 - {name: other, run: ./other, cap: 9/day, reversible: true}\n",
+            )
+            .unwrap();
+            let mandates = [mandate(), both, horizon];
             let mut l = Ledger { entries: vec![], at: 1_800_000_000 };
             let mut index = Index::default();
             let mut x = 0.0;
@@ -1293,6 +1325,43 @@ mod tests {
         let x = b.last.unwrap();
         let moved = p50_after(&b, x, 3 * b.period) - x;
         assert!((moved - 11.0).abs() < 1e-9, "three steps after: {moved:+}");
+    }
+
+    #[test]
+    fn a_lever_still_moving_the_metric_within_its_horizon_is_not_drift() {
+        // Each run moves it 5 more on every one of the three reports it
+        // is judged over: 7, 7, 7, where drift alone is 2.
+        let m = Mandate::parse(
+            "purpose: p\nmetric: count\ncontroller: {kind: model}\ncadence: 1h\n\
+             permitted:\n- {name: boost, run: ./boost, cap: 9/day, reversible: true, \
+             expects: up within 3}\n",
+        )
+        .unwrap();
+        let mut l = Ledger {
+            entries: vec![],
+            at: 1_800_000_000,
+        };
+        let mut x = 100.0;
+        for _ in 0..5 {
+            for _ in 0..4 {
+                x += 2.0;
+                l.report(x);
+            }
+            l.run("boost");
+            for _ in 0..3 {
+                x += 7.0;
+                l.report(x);
+            }
+        }
+        let index = Index::from_entries(&l.entries);
+        let steps = drift_steps(&index, V, &m, None);
+        assert!(steps.iter().all(|d| d.change == 2.0), "{steps:?}");
+        assert_eq!(steps, drift_steps_whole(&index, V, &m, None));
+        // Without expects only the step across the run is the lever's.
+        let bare = mandate();
+        assert!(drift_steps(&index, V, &bare, None)
+            .iter()
+            .any(|d| d.change == 7.0));
     }
 
     #[test]
