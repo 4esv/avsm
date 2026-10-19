@@ -512,6 +512,19 @@ impl Kernel {
     /// they did. The next tick acts on it.
     pub fn approve(&mut self, seq: Seq, amended: Option<&str>) -> Result<String, String> {
         let ask = self.open_ask(seq)?;
+        let lever_takes = ask.record.action().and_then(|a| {
+            self.ventures
+                .get(ask.record.venture())
+                .and_then(|v| v.mandate.permitted(a))
+                .and_then(|p| p.takes().map(|t| (p.name.clone(), t)))
+        });
+        // A lever that takes a payload cannot run on an approval that has
+        // none: refuse now, record nothing.
+        if let (None, None, Some((name, _))) = (amended, ask.record.payload(), &lever_takes) {
+            return Err(format!(
+                "#{seq}: {name} takes a payload and the ask carries none; approve with --payload"
+            ));
+        }
         let payload = match amended {
             None => None,
             Some(text) => {
@@ -519,6 +532,7 @@ impl Kernel {
                     .record
                     .payload()
                     .map(Payload::takes)
+                    .or(lever_takes.map(|(_, t)| t))
                     .ok_or_else(|| format!("#{seq} carries no payload to amend"))?;
                 let parsed = Payload::parse(takes, text)?;
                 if ask.record.action() == Some(DELEGATE) {
