@@ -3,6 +3,7 @@
 //! acts on declared decisions, and runs the nightly cycle through a role.
 //! It never holds a key: execution and backend calls go through the warden.
 
+use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
@@ -16,7 +17,8 @@ use chrono::{Local, NaiveDate, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::gate::{self, Adopted, Candidate, Reason, State, Step, DELEGATE, SELF};
+use crate::gate::{self, Adopted, Candidate, Reason, State, DELEGATE, SELF};
+use crate::index::Index;
 use crate::ledger::Ledger;
 use crate::mandate::{self, Cap, Controller, Permitted, Restart};
 use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Verdict};
@@ -35,6 +37,9 @@ const STEADY: Duration = Duration::from_secs(600);
 pub struct Kernel {
     pub home: PathBuf,
     pub ledger: Ledger,
+    /// The ledger as read so far and what the gate needs from it, brought
+    /// up to date before each use with only the records appended since.
+    index: RefCell<Index>,
     pub ventures: BTreeMap<String, Venture>,
     pub config: Config,
     role: Box<dyn Role + Send>,
@@ -139,6 +144,7 @@ impl Kernel {
         let mut kernel = Kernel {
             home: home.to_path_buf(),
             ledger,
+            index: RefCell::new(Index::default()),
             ventures: BTreeMap::new(),
             config,
             role,
@@ -156,14 +162,29 @@ impl Kernel {
 
     /// Rebuild the ventures from the latest declared Adopt record of each.
     fn reload(&mut self) -> Result<(), String> {
-        let entries = self.entries()?;
-        self.ventures = venture::load_all(&entries);
+        let ventures = venture::from_adoptions(self.index()?.adoptions());
+        self.ventures = ventures;
         Ok(())
     }
 
-    /// Every entry, oldest first.
+    /// Every entry, oldest first, read afresh from the ledger.
     pub fn entries(&self) -> Result<Vec<Entry>, String> {
         self.ledger.all().map_err(|e| e.to_string())
+    }
+
+    /// The index, brought up to date with the ledger: only what was
+    /// appended since it last looked is read. Drop it before appending.
+    pub fn index(&self) -> Result<Ref<'_, Index>, String> {
+        self.index
+            .borrow_mut()
+            .refresh(&self.ledger)
+            .map_err(|e| e.to_string())?;
+        Ok(self.index.borrow())
+    }
+
+    /// Asks with no declared decision yet, oldest first.
+    pub fn open_asks(&self) -> Result<Vec<Seq>, String> {
+        Ok(self.index()?.open_asks())
     }
 
     /// The mandates the gate may use: adopted and unchanged.
@@ -432,14 +453,15 @@ impl Kernel {
         if self.ventures.is_empty() {
             return Ok("no ventures; add one with: avsm add <directory>\n".to_string());
         }
-        let entries = self.entries()?;
+        let index = self.index()?;
         let now = now();
         let mut out = String::new();
         for v in self.ventures.values() {
-            let state = gate::state(&entries, &self.adopted(), &v.name);
-            let last = entries.iter().rev().find(|e| {
-                e.record.venture() == v.name && matches!(e.record, Record::Report { .. })
-            });
+            let state = gate::state_in(&index, &self.adopted(), &v.name);
+            let last = index
+                .of(&v.name)
+                .rev()
+                .find(|e| matches!(e.record, Record::Report { .. }));
             let mut detail = match &v.problem {
                 Some(p) => p.clone(),
                 None => match last {
@@ -467,13 +489,13 @@ impl Kernel {
     /// The questions waiting for a human, one line each, with the payload
     /// the lever would consume under each that carries one.
     pub fn asks(&self) -> Result<String, String> {
-        let entries = self.entries()?;
-        let open = gate::open_asks(&entries);
+        let index = self.index()?;
+        let open = index.open_asks();
         if open.is_empty() {
             return Ok("no open asks\n".to_string());
         }
         let mut out = String::new();
-        for e in entries.iter().filter(|e| open.contains(&e.seq)) {
+        for e in open.iter().filter_map(|q| index.get(*q)) {
             out.push_str(&e.line());
             out.push('\n');
             if let Some(p) = e.record.payload() {
@@ -495,8 +517,7 @@ impl Kernel {
 
     fn open_ask(&self, seq: Seq) -> Result<Entry, String> {
         let entry = self.entry(seq)?;
-        let entries = self.entries()?;
-        if !gate::open_asks(&entries).contains(&seq) {
+        if !self.index()?.is_open(seq) {
             return Err(format!("#{seq} is not an open ask\n{}", entry.line()));
         }
         Ok(entry)
@@ -609,16 +630,16 @@ impl Kernel {
     /// The proof behind a record. A proposal is gated afresh, so the text
     /// says what would happen if it were acted on now.
     pub fn why(&self, seq: Seq) -> Result<String, String> {
-        let entries = self.entries()?;
-        why_in(&entries, &self.adopted(), &self.config.quotas, seq)
+        let index = self.index()?;
+        why_in(&index, &self.adopted(), &self.config.quotas, seq)
     }
 
     /// What is held true now about a venture, or about a topic across
     /// ventures: each current fact with its age, claim and leaves.
     pub fn know(&self, what: &str) -> Result<String, String> {
-        let entries = self.entries()?;
+        let index = self.index()?;
         let ventures: BTreeSet<String> = self.ventures.keys().cloned().collect();
-        Ok(know_in(&entries, &ventures, what))
+        Ok(know_in(&index, &ventures, what))
     }
 
     // ----- the loop -----
@@ -628,18 +649,25 @@ impl Kernel {
     /// Problems are logged and never stop the pass.
     pub fn tick(&mut self) {
         let names: Vec<String> = self.ventures.keys().cloned().collect();
-        let entries = match self.entries() {
-            Ok(e) => e,
-            Err(e) => {
-                log(&format!("cannot read the ledger: {e}"));
-                return;
-            }
-        };
         let adopted = self.adopted();
-        let halted = gate::state(&entries, &adopted, SELF) == State::Paused;
+        // Every state as the ledger stood when the pass began.
+        let (halted, paused) = {
+            let index = match self.index() {
+                Ok(i) => i,
+                Err(e) => {
+                    log(&format!("cannot read the ledger: {e}"));
+                    return;
+                }
+            };
+            let halted = gate::state_in(&index, &adopted, SELF) == State::Paused;
+            let paused: Vec<bool> = names
+                .iter()
+                .map(|name| halted || gate::state_in(&index, &adopted, name) == State::Paused)
+                .collect();
+            (halted, paused)
+        };
         let now = now();
-        for name in &names {
-            let paused = halted || gate::state(&entries, &adopted, name) == State::Paused;
+        for (name, paused) in names.iter().zip(paused) {
             self.supervise(name, paused);
             let due = self.runtime.entry(name.clone()).or_default().next_report <= now;
             if due && self.ventures[name].problem.is_none() {
@@ -673,8 +701,6 @@ impl Kernel {
         if n == 0 {
             return;
         }
-        let Ok(entries) = self.entries() else { return };
-        let open = gate::open_asks(&entries);
         let ventures: Vec<Venture> = self
             .ventures
             .values()
@@ -682,11 +708,15 @@ impl Kernel {
             .cloned()
             .collect();
         for v in ventures {
-            let asked_already = entries.iter().any(|e| {
-                open.contains(&e.seq)
-                    && e.record.venture() == v.name
-                    && e.record.action() == Some(DELEGATE)
-            });
+            let asked_already = {
+                let Ok(index) = self.index() else { return };
+                let asked = index.open_of(&v.name).any(|q| {
+                    index
+                        .get(q)
+                        .is_some_and(|e| e.record.action() == Some(DELEGATE))
+                });
+                asked
+            };
             if asked_already {
                 continue;
             }
@@ -696,44 +726,11 @@ impl Kernel {
                 if !asks_each_time || (perm.is_parent_lever() && perm.name == "resume") {
                     continue;
                 }
-                // The last word on delegating this lever: an approval or
-                // denial of an earlier delegate ask naming it.
-                let since = entries
-                    .iter()
-                    .rev()
-                    .find(|e| {
-                        matches!(&e.record, Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Approve { ask, .. } | Verdict::Deny { ask, .. }, .. }
-                            if *venture == v.name && delegate_ask_names(&entries, *ask, &perm.name))
-                    })
-                    .map_or(0, |e| e.seq);
-                let approvals: Vec<(Seq, String)> = entries
-                    .iter()
-                    .filter(|e| e.seq > since)
-                    .filter_map(|e| match &e.record {
-                        Record::Decision {
-                            claim: Claim::Declared,
-                            venture,
-                            verdict: Verdict::Approve { ask, payload },
-                            ..
-                        } if *venture == v.name => {
-                            let asked = entries.iter().find(|a| a.seq == *ask)?;
-                            if asked.record.action() != Some(perm.name.as_str()) {
-                                return None;
-                            }
-                            let shape = payload
-                                .as_ref()
-                                .or(asked.record.payload())
-                                .map_or("none".to_string(), Payload::shape);
-                            Some((e.seq, shape))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let mut by_shape: BTreeMap<&str, Vec<Seq>> = BTreeMap::new();
-                for (seq, shape) in &approvals {
-                    by_shape.entry(shape.as_str()).or_default().push(*seq);
-                }
-                let Some((shape, seqs)) = by_shape.iter().find(|(_, s)| s.len() >= n) else {
+                let found = {
+                    let Ok(index) = self.index() else { return };
+                    ripe(&index, &v.name, &perm.name, n)
+                };
+                let Some((shape, seqs)) = found else {
                     continue;
                 };
                 let Some(dir) = v.path.as_ref() else { continue };
@@ -756,7 +753,7 @@ impl Kernel {
                     "{} was approved {} times with {} ({}); delegating it ends the asks",
                     perm.name,
                     seqs.len(),
-                    if *shape == "none" {
+                    if shape == "none" {
                         "no payload".to_string()
                     } else {
                         format!("a {shape} payload")
@@ -797,32 +794,30 @@ impl Kernel {
         if self.digested == Some(today) {
             return false;
         }
-        let Ok(entries) = self.entries() else {
+        let Ok(index) = self.index() else {
             return false;
         };
-        !entries.iter().any(|e| {
-            matches!(&e.record, Record::Report { venture, metric, .. } if venture == SELF && metric == "digest")
-                && Local
-                    .timestamp_opt(e.at, 0)
-                    .single()
-                    .is_some_and(|t| t.date_naive() == today)
-        })
+        !written_on(index.digests_at(), today)
     }
 
     /// What happened since the last digest, or over the last day: one
     /// line per venture with its metric and how it moved, the actions,
     /// the asks, the cost; and self's asks and incidents a week.
     pub fn digest(&self) -> Result<String, String> {
-        let entries = self.entries()?;
-        Ok(digest_text(&entries, &self.ventures, now()))
+        let index = self.index()?;
+        Ok(digest_text(&index, &self.ventures, now()))
     }
 
     /// Write the digest as a record of self, with self's weekly counts.
     pub fn record_digest(&mut self) -> Result<Entry, String> {
-        let entries = self.entries()?;
         let now = now();
-        let text = digest_text(&entries, &self.ventures, now);
-        let (asks, incidents) = weekly(&entries, now);
+        let (text, (asks, incidents)) = {
+            let index = self.index()?;
+            (
+                digest_text(&index, &self.ventures, now),
+                weekly(index.entries(), now),
+            )
+        };
         self.digested = Some(crate::clock::local().date_naive());
         let entry = self.append(Record::report(Claim::Measured, SELF, "digest", None, &text))?;
         self.append(Record::report(
@@ -956,9 +951,12 @@ impl Kernel {
             return;
         }
         let Some(val) = value else { return };
-        let Ok(entries) = self.entries() else { return };
         // The bound is the mandate's, or the one the parent set.
-        if let Some(t) = gate::effective_threshold(&entries, &self.adopted(), name) {
+        let threshold = match self.index() {
+            Ok(index) => gate::effective_threshold_in(&index, &self.adopted(), name),
+            Err(_) => return,
+        };
+        if let Some(t) = threshold {
             let crossed = (t.above && val > t.bound) || (!t.above && val < t.bound);
             if crossed {
                 self.act(name, &t.action, vec![entry.seq], Claim::Measured);
@@ -1021,44 +1019,66 @@ impl Kernel {
     /// each, after logging it.
     fn act(&mut self, name: &str, action: &str, cites: Vec<Seq>, claim: Claim) -> Vec<String> {
         let mut lines = Vec::new();
-        let entries = match self.entries() {
-            Ok(e) => e,
-            Err(e) => {
-                lines.push(format!("{name}: cannot read the ledger: {e}"));
-                log(&lines[0]);
-                return lines;
-            }
-        };
         let candidate = Candidate {
             venture: name.to_string(),
             action: action.to_string(),
             cites,
         };
-        // The shared quotas come first: past one, the gate is not asked.
-        let (_, over) = gate::quota_check(
-            &entries,
-            &self.adopted(),
-            &self.config.quotas,
-            name,
-            action,
-            now(),
-        );
-        if !over.is_empty() {
-            let why: Vec<String> = over.iter().map(|r| r.to_string()).collect();
-            lines.push(format!(
-                "{name}: {action} refused before the gate: {}",
-                why.join("; ")
-            ));
-            log(&lines[0]);
-            return lines;
-        }
-        match gate::gate_with(
-            &candidate,
-            &entries,
-            &self.adopted(),
-            &self.config.quotas,
-            now(),
-        ) {
+        let adopted = self.adopted();
+        // What the gate says, and what an ask would carry, as the ledger
+        // stands now.
+        let judged = {
+            let index = match self.index() {
+                Ok(i) => i,
+                Err(e) => {
+                    lines.push(format!("{name}: cannot read the ledger: {e}"));
+                    log(&lines[0]);
+                    return lines;
+                }
+            };
+            // The shared quotas come first: past one, the gate is not asked.
+            let (_, over) =
+                gate::quota_check_in(&index, &adopted, &self.config.quotas, name, action, now());
+            if !over.is_empty() {
+                let why: Vec<String> = over.iter().map(|r| r.to_string()).collect();
+                lines.push(format!(
+                    "{name}: {action} refused before the gate: {}",
+                    why.join("; ")
+                ));
+                log(&lines[0]);
+                return lines;
+            }
+            match gate::gate_in(&index, &candidate, &adopted, &self.config.quotas, now()) {
+                Ok(proof) => Ok(proof),
+                Err(refusal) => {
+                    let already = index.open_of(name).any(|q| {
+                        index
+                            .get(q)
+                            .is_some_and(|e| e.record.action() == Some(action))
+                    });
+                    let may_ask = self.may_ask(&index);
+                    let cited: Vec<&Entry> = candidate
+                        .cites
+                        .iter()
+                        .filter_map(|s| index.get(*s))
+                        .collect();
+                    // The ask carries the payload the lever would consume,
+                    // from whichever cited record brought it.
+                    let payload = cited.iter().find_map(|e| e.record.payload().cloned());
+                    // The question carries the proposal's reason, so the
+                    // human sees why without a drill.
+                    let reason = cited
+                        .iter()
+                        .find_map(|e| match &e.record {
+                            Record::Proposal { reason, .. } => Some(format!("  {reason}")),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    Err((refusal, already, may_ask, payload, reason))
+                }
+            }
+        };
+        match judged {
             Ok(_) => match self.warden.execute(&candidate) {
                 Ok(written) => {
                     lines.extend(written.iter().map(Entry::line));
@@ -1101,7 +1121,7 @@ impl Kernel {
                     }
                 }
             },
-            Err(refusal) => {
+            Err((refusal, already, may_ask, payload, reason)) => {
                 // A paused venture is not asked about: an approval could
                 // not run until a human resumes it anyway.
                 let paused = refusal
@@ -1113,36 +1133,11 @@ impl Kernel {
                         .reasons
                         .iter()
                         .any(|r| matches!(r, Reason::NeedsDecision { .. }));
-                let already = gate::open_asks(&entries).into_iter().any(|q| {
-                    entries.iter().any(|e| {
-                        e.seq == q
-                            && e.record.venture() == name
-                            && e.record.action() == Some(action)
-                    })
-                });
-                if needs_human && !already && !self.may_ask(&entries) {
+                if needs_human && !already && !may_ask {
                     lines.push(format!(
                         "{name}: {action} needs a decision, but the asks quota is used up; not asking"
                     ));
                 } else if needs_human && !already {
-                    // The ask carries the payload the lever would consume,
-                    // from whichever cited record brought it.
-                    let payload = candidate
-                        .cites
-                        .iter()
-                        .filter_map(|s| entries.iter().find(|e| e.seq == *s))
-                        .find_map(|e| e.record.payload().cloned());
-                    // The question carries the proposal's reason, so the
-                    // human sees why without a drill.
-                    let reason = candidate
-                        .cites
-                        .iter()
-                        .filter_map(|s| entries.iter().find(|e| e.seq == *s))
-                        .find_map(|e| match &e.record {
-                            Record::Proposal { reason, .. } => Some(format!("  {reason}")),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
                     let question = match &payload {
                         Some(_) => format!("may I {action} with this?{reason}"),
                         None => format!("may I {action}? it is irreversible{reason}"),
@@ -1173,49 +1168,33 @@ impl Kernel {
     }
 
     /// Is there room under the asks quota for one more ask?
-    fn may_ask(&self, entries: &[Entry]) -> bool {
+    fn may_ask(&self, index: &Index) -> bool {
         match self.config.quotas.asks {
-            Some(cap) => gate::asks_used(entries, cap, now()) < cap.count,
+            Some(cap) => gate::asks_used_in(index, cap, now()) < cap.count,
             None => true,
         }
     }
 
     /// Act on declared approvals not yet acted on.
     fn act_on_decisions(&mut self) {
-        let entries = match self.entries() {
-            Ok(e) => e,
-            Err(_) => return,
+        let pending: Vec<(Seq, String, String)> = {
+            let Ok(index) = self.index() else { return };
+            index
+                .unacted()
+                .filter(|d| !self.handled.contains(d))
+                .filter_map(|d| match &index.get(d)?.record {
+                    Record::Decision {
+                        venture,
+                        verdict: Verdict::Approve { ask, .. },
+                        ..
+                    } => {
+                        let action = index.get(*ask)?.record.action()?.to_string();
+                        Some((d, venture.clone(), action))
+                    }
+                    _ => None,
+                })
+                .collect()
         };
-        let acted: BTreeSet<Seq> = entries
-            .iter()
-            .filter_map(|e| match &e.record {
-                Record::Action { proof, .. } | Record::Intent { proof, .. } => Some(proof),
-                _ => None,
-            })
-            .flat_map(|p| p.steps.iter())
-            .filter_map(|s| match s {
-                Step::Decision { seq, .. } => Some(*seq),
-                _ => None,
-            })
-            .collect();
-        let pending: Vec<(Seq, String, String)> = entries
-            .iter()
-            .filter_map(|e| match &e.record {
-                Record::Decision {
-                    claim: Claim::Declared,
-                    venture,
-                    verdict: Verdict::Approve { ask, .. },
-                    ..
-                } if !acted.contains(&e.seq) && !self.handled.contains(&e.seq) => {
-                    let action = entries
-                        .iter()
-                        .find(|a| a.seq == *ask)
-                        .and_then(|a| a.record.action().map(str::to_string))?;
-                    Some((e.seq, venture.clone(), action))
-                }
-                _ => None,
-            })
-            .collect();
         for (seq, venture, action) in pending {
             self.handled.insert(seq);
             self.act(&venture, &action, vec![seq], Claim::Declared);
@@ -1243,17 +1222,10 @@ impl Kernel {
             return false;
         }
         // After a restart, an inferred record from today means it ran.
-        let Ok(entries) = self.entries() else {
+        let Ok(index) = self.index() else {
             return false;
         };
-        !entries.iter().any(|e| {
-            e.record.venture() == name
-                && e.record.claim() == Claim::Inferred
-                && Local
-                    .timestamp_opt(e.at, 0)
-                    .single()
-                    .is_some_and(|t| t.date_naive() == today)
-        })
+        !written_on(index.inferred_at(name), today)
     }
 
     /// Run the nightly cycle for a venture now: show the role the mandate
@@ -1269,8 +1241,8 @@ impl Kernel {
             Controller::Classifier { backend } | Controller::Model { backend } => backend.clone(),
             Controller::Threshold { .. } => return,
         };
-        let entries = match self.entries() {
-            Ok(e) => e,
+        let index = match self.index() {
+            Ok(i) => i,
             Err(e) => {
                 log(&format!("{name}: cannot read the ledger: {e}"));
                 return;
@@ -1279,19 +1251,12 @@ impl Kernel {
         let backend = match self.config.backend(wanted.as_deref()) {
             Ok((b, _)) => b,
             Err(e) => {
-                self.ask_once(
-                    name,
-                    &entries,
-                    &format!("{name} cannot run its nightly cycle: {e}"),
-                );
+                drop(index);
+                self.ask_once(name, &format!("{name} cannot run its nightly cycle: {e}"));
                 return;
             }
         };
-        let mine: Vec<Entry> = entries
-            .iter()
-            .filter(|e| e.record.venture() == name)
-            .cloned()
-            .collect();
+        let mine: Vec<Entry> = index.of(name).cloned().collect();
         // Context by budget: the mandate, the latest summary, the records
         // it does not stand for, and the open asks. Past the venture's
         // bound, the older records go to the role to be summarized first;
@@ -1312,15 +1277,14 @@ impl Kernel {
             .cloned()
             .into_iter()
             .collect();
-        let open = gate::open_asks(&entries);
         let asks: Vec<Entry> = mine
             .iter()
-            .filter(|e| open.contains(&e.seq))
+            .filter(|e| index.is_open(e.seq))
             .cloned()
             .collect();
         let uncovered: Vec<Entry> = mine
             .iter()
-            .filter(|e| e.seq > covered && !is_summary(e) && !open.contains(&e.seq))
+            .filter(|e| e.seq > covered && !is_summary(e) && !index.is_open(e.seq))
             .cloned()
             .collect();
         let bound = v.mandate.summarize_after as usize;
@@ -1351,9 +1315,9 @@ impl Kernel {
                 if child.mandate.parent.as_deref() != Some(name) {
                     return None;
                 }
-                let theirs: Vec<&Entry> = entries
-                    .iter()
-                    .filter(|e| e.record.venture() == *c && e.record.claim().authorizes())
+                let theirs: Vec<&Entry> = index
+                    .of(c)
+                    .filter(|e| e.record.claim().authorizes())
                     .collect();
                 let metric = theirs
                     .iter()
@@ -1373,7 +1337,7 @@ impl Kernel {
                     .collect();
                 Some(ChildView {
                     name: c.clone(),
-                    state: gate::state(&entries, &self.adopted(), c).to_string(),
+                    state: gate::state_in(&index, &self.adopted(), c).to_string(),
                     metric,
                     lines,
                 })
@@ -1383,7 +1347,7 @@ impl Kernel {
             venture: name.to_string(),
             mandate: v.mandate.clone(),
             entries: role::trim_to_chars(&recent, limit),
-            state: gate::state(&entries, &self.adopted(), name).to_string(),
+            state: gate::state_in(&index, &self.adopted(), name).to_string(),
             now: now(),
             backend,
             children,
@@ -1394,19 +1358,23 @@ impl Kernel {
         let adopted = self.adopted();
         let ventures: BTreeSet<String> = self.ventures.keys().cloned().collect();
         let quotas = self.config.quotas.clone();
+        drop(index);
         let records = {
             let Kernel {
                 role,
                 warden,
                 ledger,
+                index,
                 ..
             } = self;
             // A drill reads the ledger as it stood when the cycle began,
-            // and is itself a record.
+            // and is itself a record: the index is not brought up to date
+            // until the cycle is over.
             let mut drill = |what: &str, arg: &str| -> Result<String, String> {
+                let index = index.borrow();
                 let text = match what {
-                    "know" => know_in(&entries, &ventures, arg),
-                    "why" => why_in(&entries, &adopted, &quotas, parse_seq(arg)?)?,
+                    "know" => know_in(&index, &ventures, arg),
+                    "why" => why_in(&index, &adopted, &quotas, parse_seq(arg)?)?,
                     _ => return Err(format!("a drill is know or why, not {what}")),
                 };
                 let note = format!("{arg}: {} lines shown", text.lines().count());
@@ -1548,16 +1516,20 @@ impl Kernel {
 
     /// Write an ask with this question unless one is already open, or the
     /// asks quota is used up.
-    fn ask_once(&mut self, name: &str, entries: &[Entry], question: &str) {
-        let open = gate::open_asks(entries);
-        let already = entries.iter().any(|e| {
-            open.contains(&e.seq)
-                && matches!(&e.record, Record::Ask { question: q, .. } if q == question)
-        });
+    fn ask_once(&mut self, name: &str, question: &str) {
+        let (already, may_ask) = {
+            let Ok(index) = self.index() else { return };
+            let already = index.open_asks().into_iter().any(|q| {
+                index.get(q).is_some_and(
+                    |e| matches!(&e.record, Record::Ask { question: q, .. } if q == question),
+                )
+            });
+            (already, self.may_ask(&index))
+        };
         if already {
             return;
         }
-        if !self.may_ask(entries) {
+        if !may_ask {
             log(&format!(
                 "{name}: the asks quota is used up; not asking: {question}"
             ));
@@ -1685,13 +1657,67 @@ fn spawn_run(home: &Path, name: &str, path: &Path, confine: bool) -> Result<Chil
 }
 
 /// Does this ask, a delegate ask, name the lever? The question says so.
-fn delegate_ask_names(entries: &[Entry], ask: Seq, lever: &str) -> bool {
-    entries.iter().any(|e| {
-        e.seq == ask
-            && e.record.action() == Some(DELEGATE)
+fn delegate_ask_names(index: &Index, ask: Seq, lever: &str) -> bool {
+    index.get(ask).is_some_and(|e| {
+        e.record.action() == Some(DELEGATE)
             && matches!(&e.record, Record::Proposal { reason, .. } | Record::Ask { question: reason, .. }
                 if reason.starts_with(&format!("{lever} was approved")) || reason.contains(&format!(" {lever} was approved")))
     })
+}
+
+/// The approvals of a lever since the last word on delegating it, when
+/// `n` of them share a shape of payload: the shape and the approvals.
+fn ripe(index: &Index, venture: &str, lever: &str, n: usize) -> Option<(String, Vec<Seq>)> {
+    let answers = index.answers(venture);
+    // The last word on delegating this lever: an approval or denial of
+    // an earlier delegate ask naming it.
+    let since = answers
+        .iter()
+        .rev()
+        .copied()
+        .find(|d| {
+            index.get(*d).is_some_and(|e| {
+                matches!(&e.record, Record::Decision { verdict: Verdict::Approve { ask, .. } | Verdict::Deny { ask, .. }, .. }
+                    if delegate_ask_names(index, *ask, lever))
+            })
+        })
+        .unwrap_or(0);
+    let mut by_shape: BTreeMap<String, Vec<Seq>> = BTreeMap::new();
+    for d in answers.iter().filter(|d| **d > since) {
+        let Some(Record::Decision {
+            verdict: Verdict::Approve { ask, payload },
+            ..
+        }) = index.get(*d).map(|e| &e.record)
+        else {
+            continue;
+        };
+        let Some(asked) = index.get(*ask) else {
+            continue;
+        };
+        if asked.record.action() != Some(lever) {
+            continue;
+        }
+        let shape = payload
+            .as_ref()
+            .or(asked.record.payload())
+            .map_or("none".to_string(), Payload::shape);
+        by_shape.entry(shape).or_default().push(*d);
+    }
+    by_shape.into_iter().find(|(_, s)| s.len() >= n)
+}
+
+/// Was anything in this time-ordered list written on this local date?
+/// Only times within a few days of now can fall on today.
+fn written_on(times: &[i64], today: NaiveDate) -> bool {
+    let since = now() - 3 * Cap::DAY.as_secs() as i64;
+    times[times.partition_point(|t| *t < since)..]
+        .iter()
+        .any(|t| {
+            Local
+                .timestamp_opt(*t, 0)
+                .single()
+                .is_some_and(|t| t.date_naive() == today)
+        })
 }
 
 /// Asks this week, and incidents this week: failed actions and outcomes,
@@ -1720,7 +1746,8 @@ fn weekly(entries: &[Entry], now: i64) -> (u32, u32) {
 
 /// The digest text: since the last digest when there is one this week,
 /// else the last day.
-fn digest_text(entries: &[Entry], ventures: &BTreeMap<String, Venture>, now: i64) -> String {
+fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) -> String {
+    let entries = index.entries();
     let day = Cap::DAY.as_secs() as i64;
     // Since the last digest record when there is one this week, by its
     // place in the ledger; else the last day, by time.
@@ -1819,7 +1846,7 @@ fn digest_text(entries: &[Entry], ventures: &BTreeMap<String, Venture>, now: i64
             ));
         }
     }
-    let open = gate::open_asks(entries).len();
+    let open = index.open_asks().len();
     out.push_str(&format!(
         "open asks: {open}{}
 ",
@@ -1830,15 +1857,12 @@ fn digest_text(entries: &[Entry], ventures: &BTreeMap<String, Venture>, now: i64
 
 /// The proof behind a record, from a snapshot of the ledger.
 fn why_in(
-    entries: &[Entry],
+    index: &Index,
     adopted: &[Adopted],
     quotas: &crate::config::Quotas,
     seq: Seq,
 ) -> Result<String, String> {
-    let entry = entries
-        .iter()
-        .find(|e| e.seq == seq)
-        .ok_or_else(|| format!("no record #{seq}"))?;
+    let entry = index.get(seq).ok_or_else(|| format!("no record #{seq}"))?;
     if let Record::Proposal {
         venture, action, ..
     } = &entry.record
@@ -1848,7 +1872,7 @@ fn why_in(
             action: action.clone(),
             cites: vec![seq],
         };
-        let derivation = match gate::gate_with(&candidate, entries, adopted, quotas, now()) {
+        let derivation = match gate::gate_in(index, &candidate, adopted, quotas, now()) {
             Ok(proof) => proof.to_string(),
             Err(refusal) => refusal.to_string(),
         };
@@ -1860,13 +1884,13 @@ fn why_in(
 /// The current facts about a venture (when `what` names one) or a topic,
 /// from a snapshot of the ledger: number, age, claim, the fact, and what
 /// it rests on.
-fn know_in(entries: &[Entry], ventures: &BTreeSet<String>, what: &str) -> String {
+fn know_in(index: &Index, ventures: &BTreeSet<String>, what: &str) -> String {
     let by_venture = ventures.contains(what) || what == SELF;
-    let current = gate::current_facts(entries);
+    let current = gate::current_facts(index.entries());
     let picked: Vec<&Entry> = current
         .iter()
         .filter(|(_, v, t)| if by_venture { v == what } else { t == what })
-        .filter_map(|(s, _, _)| entries.iter().find(|e| e.seq == *s))
+        .filter_map(|(s, _, _)| index.get(*s))
         .collect();
     if picked.is_empty() {
         return format!(

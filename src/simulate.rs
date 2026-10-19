@@ -10,7 +10,6 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::clock;
-use crate::gate;
 use crate::kernel::{default_home, socket_path, Kernel};
 use crate::protocol;
 use crate::record::Seq;
@@ -146,8 +145,7 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
         }
         kernel.tick();
         if plan.human != Human::Away {
-            let entries = kernel.entries()?;
-            for q in gate::open_asks(&entries) {
+            for q in kernel.open_asks()? {
                 let args = answer(&kernel, plan.human, q, answered);
                 answered += 1;
                 if let Err(e) = kernel.handle_as(&args, Some(BY)) {

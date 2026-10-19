@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::{self, Occasion};
 use crate::config::{self, Backend, Config};
 use crate::gate::{self, Candidate, DELEGATE, RESUME, STOP};
+use crate::index::Index;
 use crate::ledger::Ledger;
 use crate::mandate::{Mandate, ParentCall};
 use crate::record::Verdict;
@@ -42,6 +43,8 @@ pub trait Warden {
 pub struct LocalWarden {
     home: PathBuf,
     ledger: Ledger,
+    /// The ledger as read so far; each request reads only what is new.
+    index: Index,
     config: Config,
     keys: BTreeMap<String, String>,
 }
@@ -53,6 +56,7 @@ impl LocalWarden {
         Ok(LocalWarden {
             home: home.to_path_buf(),
             ledger,
+            index: Index::default(),
             config: Config::load(home)?,
             keys: config::load_keys(home)?,
         })
@@ -61,10 +65,13 @@ impl LocalWarden {
 
 impl Warden for LocalWarden {
     fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, String> {
-        let entries = self.ledger.all().map_err(|e| e.to_string())?;
-        let ventures = venture::load_all(&entries);
+        self.index
+            .refresh(&self.ledger)
+            .map_err(|e| e.to_string())?;
+        let index = &self.index;
+        let ventures = venture::from_adoptions(index.adoptions());
         let adopted = venture::adopted(&ventures);
-        let proof = gate::gate_with(candidate, &entries, &adopted, &self.config.quotas, now())
+        let proof = gate::gate_in(index, candidate, &adopted, &self.config.quotas, now())
             .map_err(|r| r.to_string())?;
         let venture = candidate.venture.clone();
         let action = candidate.action.clone();
@@ -89,13 +96,13 @@ impl Warden for LocalWarden {
                 .ok_or_else(|| format!("{venture} has no mandate file to rewrite"))?;
             let text = proof
                 .payload_from()
-                .and_then(|seq| entries.iter().find(|e| e.seq == seq))
+                .and_then(|seq| index.get(seq))
                 .and_then(|e| e.record.payload().map(Payload::text))
                 .ok_or("the proof names no mandate text")?;
             let mandate = Mandate::parse(&text).map_err(|e| format!("the new mandate: {e}"))?;
             let by = proof
                 .decision()
-                .and_then(|seq| entries.iter().find(|e| e.seq == seq))
+                .and_then(|seq| index.get(seq))
                 .and_then(|e| match &e.record {
                     Record::Decision { by, .. } => by.clone(),
                     _ => None,
@@ -160,10 +167,7 @@ impl Warden for LocalWarden {
         // The payload comes from the record the proof names, never from
         // the request: the gate chose the record, the warden only reads it.
         let payload = match proof.payload_from() {
-            Some(seq) => entries
-                .iter()
-                .find(|e| e.seq == seq)
-                .and_then(|e| e.record.payload().cloned()),
+            Some(seq) => index.get(seq).and_then(|e| e.record.payload().cloned()),
             None => None,
         };
         if perm.takes().is_some() && payload.is_none() {
@@ -393,18 +397,20 @@ impl Warden for LocalWarden {
     }
 
     fn measure(&mut self, venture: &str) -> Result<(Option<f64>, String), String> {
-        let entries = self.ledger.all().map_err(|e| e.to_string())?;
-        self.measure_in(&entries, venture)
+        self.index
+            .refresh(&self.ledger)
+            .map_err(|e| e.to_string())?;
+        let ventures = venture::from_adoptions(self.index.adoptions());
+        self.measure_in(&ventures, venture)
     }
 }
 
 impl LocalWarden {
     fn measure_in(
         &self,
-        entries: &[Entry],
+        ventures: &BTreeMap<String, venture::Venture>,
         venture: &str,
     ) -> Result<(Option<f64>, String), String> {
-        let ventures = venture::load_all(entries);
         let v = ventures
             .get(venture)
             .ok_or_else(|| format!("no venture named {venture}"))?;

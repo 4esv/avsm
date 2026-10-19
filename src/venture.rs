@@ -70,13 +70,22 @@ pub fn load_all(entries: &[Entry]) -> BTreeMap<String, Venture> {
             latest.insert(venture.clone(), (e.seq, mandate.clone(), path.clone()));
         }
     }
+    from_adoptions(&latest)
+}
+
+/// Every venture from the latest declared adoption of each: name, then
+/// the adopting record, the mandate's hash and its directory.
+pub fn from_adoptions(
+    latest: &BTreeMap<String, (Seq, String, String)>,
+) -> BTreeMap<String, Venture> {
     let mut ventures = BTreeMap::new();
     for (name, (seq, hash, path)) in latest {
+        let (name, seq, hash) = (name.clone(), *seq, hash.clone());
         if name == crate::gate::SELF {
             ventures.insert(name, crate::selfventure::venture(seq, &hash));
             continue;
         }
-        let dir = PathBuf::from(&path);
+        let dir = PathBuf::from(path);
         let (mandate, problem) = match read_mandate(&dir) {
             Ok((m, h)) if h == hash => (m, None),
             Ok((m, _)) => (

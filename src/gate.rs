@@ -3,14 +3,16 @@
 //! permissions are rules. The proof, or the failed attempt at one, is the
 //! derivation `why` prints.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::time::Duration;
 
 use ascent::ascent;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Quotas;
+use crate::index::{Index, Pulled};
 use crate::mandate::{Cap, Controller, Mandate, ParentCall, Permitted};
 use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Takes, Verdict};
 
@@ -406,44 +408,55 @@ ascent! {
         !paused(v);
 }
 
-ascent! {
-    /// What the ledger holds true now. Every report is a fact about a
-    /// topic. A measured fact is superseded by a later measured fact on
-    /// the same topic; any fact is superseded by a later one that cites
-    /// it. The rest is current.
-    struct Facts;
-
-    // seq, venture, topic, measured or declared
-    relation fact(Seq, String, String, bool);
-    relation cites(Seq, Seq);
-    relation superseded(Seq);
-    superseded(o) <-- fact(o, v, t, true), fact(n, v, t, true), if n > o;
-    superseded(o) <-- fact(o, v, t, _), fact(n, v, t, _), cites(n, o), if n > o;
-    relation current(Seq, String, String);
-    current(s, v, t) <-- fact(s, v, t, _), !superseded(s);
-}
-
-/// The current facts: (seq, venture, topic), oldest first.
+/// The current facts: (seq, venture, topic), oldest first. Every report is
+/// a fact about a topic. A measured or declared fact is superseded by a
+/// later measured or declared fact on the same topic; any fact is
+/// superseded by a later one on the same topic that cites it. The rest is
+/// current.
 pub fn current_facts(ledger: &[Entry]) -> Vec<(Seq, String, String)> {
-    let mut f = Facts::default();
+    let mut facts: HashMap<Seq, (&str, &str, bool)> = HashMap::new();
+    let mut latest: HashMap<(&str, &str), Seq> = HashMap::new();
     for e in ledger {
         if let Record::Report {
             claim,
+            venture,
+            metric,
+            ..
+        } = &e.record
+        {
+            facts.insert(e.seq, (venture, metric, claim.authorizes()));
+            if claim.authorizes() {
+                let l = latest.entry((venture, metric)).or_insert(e.seq);
+                *l = (*l).max(e.seq);
+            }
+        }
+    }
+    let mut superseded: HashSet<Seq> = HashSet::new();
+    for e in ledger {
+        if let Record::Report {
             venture,
             metric,
             cites,
             ..
         } = &e.record
         {
-            f.fact
-                .push((e.seq, venture.clone(), metric.clone(), claim.authorizes()));
             for c in cites {
-                f.cites.push((e.seq, *c));
+                let same = facts
+                    .get(c)
+                    .is_some_and(|(v, t, _)| v == venture && t == metric);
+                if *c < e.seq && same {
+                    superseded.insert(*c);
+                }
             }
         }
     }
-    f.run();
-    let mut out: Vec<(Seq, String, String)> = f.current.into_iter().collect();
+    let mut out = Vec::new();
+    for (&s, &(v, t, trusted)) in &facts {
+        let later = trusted && latest.get(&(v, t)).is_some_and(|l| *l > s);
+        if !later && !superseded.contains(&s) {
+            out.push((s, v.to_string(), t.to_string()));
+        }
+    }
     out.sort_unstable();
     out
 }
@@ -469,45 +482,27 @@ fn is_child_of(mandates: &[&Adopted], child: &str, parent: &str) -> bool {
             .any(|m| m.venture == child && m.mandate.parent.as_deref() == Some(parent))
 }
 
-/// The parent levers pulled on `child` by its parent, oldest first:
-/// each successful action's sequence number and what it set.
-fn parent_calls(ledger: &[Entry], mandates: &[&Adopted], child: &str) -> Vec<(Seq, ParentCall)> {
-    let Some(parent) = mandates
+/// The levers `child`'s parent pulled on it, the latest of each, when both
+/// mandates say they belong together.
+fn pulled_by_parent<'a>(
+    index: &'a Index,
+    mandates: &[&Adopted],
+    child: &str,
+) -> Option<&'a Pulled> {
+    let parent = mandates
         .iter()
         .find(|m| m.venture == child)
-        .and_then(|m| m.mandate.parent.clone())
-    else {
-        return vec![];
-    };
+        .and_then(|m| m.mandate.parent.clone())?;
     if !is_child_of(mandates, child, &parent) {
-        return vec![];
+        return None;
     }
-    ledger
-        .iter()
-        .filter_map(|e| match &e.record {
-            Record::Action {
-                venture,
-                action,
-                ok: true,
-                payload: Some(Payload::Text { text }),
-                ..
-            } if *venture == parent => ParentCall::parse(action, text)
-                .ok()
-                .filter(|c| c.child() == child)
-                .map(|c| (e.seq, c)),
-            _ => None,
-        })
-        .collect()
+    index.pulled(child, &parent)
 }
 
-/// The threshold that applies to a venture now, if its controller is one.
-pub fn effective_threshold(
-    ledger: &[Entry],
-    mandates: &[Adopted],
-    venture: &str,
-) -> Option<Threshold> {
-    let refs: Vec<&Adopted> = mandates.iter().collect();
-    let m = refs.iter().find(|m| m.venture == venture)?;
+/// The threshold a venture's controller starts from, before its parent
+/// moves it.
+fn mandate_threshold(mandates: &[&Adopted], venture: &str) -> Option<Threshold> {
+    let m = mandates.iter().find(|m| m.venture == venture)?;
     let Controller::Threshold {
         above,
         below,
@@ -516,40 +511,58 @@ pub fn effective_threshold(
     else {
         return None;
     };
-    let mut t = match (above, below) {
-        (Some(b), _) => Threshold {
+    match (above, below) {
+        (Some(b), _) => Some(Threshold {
             above: true,
             bound: *b,
             action: action.clone(),
             from: None,
-        },
-        (_, Some(b)) => Threshold {
+        }),
+        (_, Some(b)) => Some(Threshold {
             above: false,
             bound: *b,
             action: action.clone(),
             from: None,
-        },
-        _ => return None,
-    };
-    for (seq, call) in parent_calls(ledger, &refs, venture) {
-        if let ParentCall::Threshold { above, bound, .. } = call {
-            t.above = above;
-            t.bound = bound;
-            t.from = Some(seq);
-        }
+        }),
+        _ => None,
+    }
+}
+
+/// The threshold that applies to a venture now, if its controller is one.
+pub fn effective_threshold(
+    ledger: &[Entry],
+    mandates: &[Adopted],
+    venture: &str,
+) -> Option<Threshold> {
+    effective_threshold_in(&Index::from_entries(ledger), mandates, venture)
+}
+
+/// The threshold that applies to a venture now, from the index.
+pub fn effective_threshold_in(
+    index: &Index,
+    mandates: &[Adopted],
+    venture: &str,
+) -> Option<Threshold> {
+    let refs: Vec<&Adopted> = mandates.iter().collect();
+    let mut t = mandate_threshold(&refs, venture)?;
+    if let Some((seq, above, bound)) =
+        pulled_by_parent(index, &refs, venture).and_then(|p| p.threshold)
+    {
+        t.above = above;
+        t.bound = bound;
+        t.from = Some(seq);
     }
     Some(t)
 }
 
 /// The budget a venture's parent set for it, and the action that set it.
 pub fn budget_of(ledger: &[Entry], mandates: &[&Adopted], venture: &str) -> Option<(Seq, u32)> {
-    parent_calls(ledger, mandates, venture)
-        .into_iter()
-        .filter_map(|(seq, call)| match call {
-            ParentCall::Budget { amount, .. } => Some((seq, amount)),
-            _ => None,
-        })
-        .next_back()
+    budget_of_in(&Index::from_entries(ledger), mandates, venture)
+}
+
+/// The budget a venture's parent set for it, from the index.
+pub fn budget_of_in(index: &Index, mandates: &[&Adopted], venture: &str) -> Option<(Seq, u32)> {
+    pulled_by_parent(index, mandates, venture).and_then(|p| p.budget)
 }
 
 /// The cost of an action a venture took, by its mandate as adopted now.
@@ -561,27 +574,17 @@ fn cost_of(mandates: &[&Adopted], venture: &str, action: &str) -> u32 {
         .map_or(0, |p| p.cost)
 }
 
-/// Actions and intents of `venture` (every venture when None) since
-/// `since`, as (venture, action).
-fn runs_since<'a>(
-    ledger: &'a [Entry],
-    venture: Option<&str>,
-    since: i64,
-) -> Vec<(&'a str, &'a str)> {
-    ledger
-        .iter()
-        .filter(|e| e.at > since)
-        .filter(|e| matches!(e.record.kind(), Kind::Action | Kind::Intent))
-        .filter(|e| venture.is_none_or(|v| e.record.venture() == v))
-        .filter_map(|e| e.record.action().map(|a| (e.record.venture(), a)))
-        .collect()
-}
-
 /// What a venture spent today.
 pub fn spent_today(ledger: &[Entry], mandates: &[&Adopted], venture: &str, now: i64) -> u32 {
-    runs_since(ledger, Some(venture), now - Cap::DAY.as_secs() as i64)
-        .into_iter()
-        .map(|(v, a)| cost_of(mandates, v, a))
+    spent_today_in(&Index::from_entries(ledger), mandates, venture, now)
+}
+
+/// What a venture spent today, from the index.
+pub fn spent_today_in(index: &Index, mandates: &[&Adopted], venture: &str, now: i64) -> u32 {
+    index
+        .runs_of_after(venture, now - Cap::DAY.as_secs() as i64)
+        .iter()
+        .map(|(_, a)| cost_of(mandates, venture, a))
         .sum()
 }
 
@@ -596,7 +599,46 @@ pub fn quota_check(
     action: &str,
     now: i64,
 ) -> (Vec<Step>, Vec<Reason>) {
+    quota_check_in(
+        &Index::from_entries(ledger),
+        mandates,
+        quotas,
+        venture,
+        action,
+        now,
+    )
+}
+
+/// How the shared quotas bear on an action, from the index.
+pub fn quota_check_in(
+    index: &Index,
+    mandates: &[Adopted],
+    quotas: &Quotas,
+    venture: &str,
+    action: &str,
+    now: i64,
+) -> (Vec<Step>, Vec<Reason>) {
     let refs: Vec<&Adopted> = mandates.iter().collect();
+    let runs = |per: Duration| {
+        index
+            .runs_after(now - per.as_secs() as i64)
+            .iter()
+            .map(|(_, v, a)| (v.as_str(), a.as_str()))
+    };
+    quota_steps(&refs, quotas, venture, action, runs)
+}
+
+/// The quota steps and reasons, over the runs inside each quota's window.
+fn quota_steps<'a, I>(
+    refs: &[&Adopted],
+    quotas: &Quotas,
+    venture: &str,
+    action: &str,
+    runs: impl Fn(Duration) -> I,
+) -> (Vec<Step>, Vec<Reason>)
+where
+    I: Iterator<Item = (&'a str, &'a str)>,
+{
     let mut steps = Vec::new();
     let mut reasons = Vec::new();
     let Some(perm) = refs
@@ -607,10 +649,7 @@ pub fn quota_check(
         return (steps, reasons);
     };
     if let (Some(cap), true) = (quotas.spend, perm.cost > 0) {
-        let used: u32 = runs_since(ledger, None, now - cap.per.as_secs() as i64)
-            .into_iter()
-            .map(|(v, a)| cost_of(&refs, v, a))
-            .sum();
+        let used: u32 = runs(cap.per).map(|(v, a)| cost_of(refs, v, a)).sum();
         steps.push(Step::Quota {
             what: "spend".to_string(),
             used,
@@ -625,8 +664,7 @@ pub fn quota_check(
         }
     }
     if let (Some(cap), true) = (quotas.sends, perm.sends()) {
-        let used = runs_since(ledger, None, now - cap.per.as_secs() as i64)
-            .into_iter()
+        let used = runs(cap.per)
             .filter(|(v, a)| {
                 refs.iter()
                     .find(|m| m.venture == *v)
@@ -652,11 +690,13 @@ pub fn quota_check(
 
 /// How many asks were written inside the asks quota's window.
 pub fn asks_used(ledger: &[Entry], cap: Cap, now: i64) -> u32 {
-    ledger
-        .iter()
-        .filter(|e| e.at > now - cap.per.as_secs() as i64)
-        .filter(|e| e.record.kind() == Kind::Ask)
-        .count() as u32
+    asks_used_in(&Index::from_entries(ledger), cap, now)
+}
+
+/// How many asks were written inside the asks quota's window, from the
+/// index.
+pub fn asks_used_in(index: &Index, cap: Cap, now: i64) -> u32 {
+    index.asks_after(now - cap.per.as_secs() as i64)
 }
 
 /// Decide whether an action may happen, given the ledger so far and the
@@ -679,26 +719,105 @@ pub fn gate_with(
     quotas: &Quotas,
     now: i64,
 ) -> Result<Proof, Refusal> {
+    gate_in(
+        &Index::from_entries(ledger),
+        candidate,
+        mandates,
+        quotas,
+        now,
+    )
+}
+
+/// Decide whether an action may happen, from the index. The rules see the
+/// records the candidate can rest on and no others: what it cites, the
+/// asks the cited decisions answer, the latest trusted report of each
+/// cited metric, and what pauses or resumes the venture. The rest of the
+/// ledger cannot change what they derive for this candidate.
+pub fn gate_in(
+    index: &Index,
+    candidate: &Candidate,
+    mandates: &[Adopted],
+    quotas: &Quotas,
+    now: i64,
+) -> Result<Proof, Refusal> {
     let v = candidate.venture.as_str();
     let a = candidate.action.as_str();
     let mut p = Rules::default();
     p.candidate.push((v.to_string(), a.to_string()));
     p.cites = candidate.cites.iter().map(|s| (*s,)).collect();
-    load_ledger(&mut p, ledger);
+    let mut seqs = BTreeSet::new();
+    for &s in &candidate.cites {
+        let Some(e) = index.get(s) else { continue };
+        seqs.insert(s);
+        match &e.record {
+            Record::Decision {
+                verdict: Verdict::Approve { ask, .. } | Verdict::Deny { ask, .. },
+                ..
+            } => {
+                seqs.insert(*ask);
+            }
+            Record::Report {
+                venture,
+                metric,
+                value: Some(_),
+                ..
+            } => seqs.extend(index.latest_report(venture, metric)),
+            _ => {}
+        }
+    }
+    seqs.extend(index.pause_sources(v));
+    for s in seqs {
+        if let Some(e) = index.get(s) {
+            load_entry(&mut p, e);
+            load_call(&mut p, e);
+        }
+    }
 
     // Only mandates the ledger shows adopted by a declared decision count.
     let adopted: Vec<&Adopted> = mandates
         .iter()
-        .filter(|m| {
-            ledger.iter().any(|e| {
-                e.seq == m.seq
-                    && matches!(&e.record,
-                        Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Adopt { mandate, .. }, .. }
-                        if *venture == m.venture && *mandate == m.hash)
-            })
-        })
+        .filter(|m| index.get(m.seq).is_some_and(|e| adopts(e, m)))
         .collect();
-    for m in &adopted {
+    load_mandates(
+        &mut p,
+        &adopted,
+        now,
+        |venture, action, since| index.used(venture, action, since),
+        |venture| effective_threshold_in(index, mandates, venture),
+    );
+    load_family_mandates(&mut p, &adopted);
+    let budget = budget_of_in(index, &adopted, v);
+    let spent = || spent_today_in(index, &adopted, v, now);
+    let quota = quota_check_in(index, mandates, quotas, v, a, now);
+    let (extra_steps, extra_reasons) = limits(&mut p, v, a, &adopted, budget, spent, quota);
+    p.run();
+    assemble(
+        &p,
+        candidate,
+        &|s| index.get(s),
+        &adopted,
+        extra_steps,
+        extra_reasons,
+    )
+}
+
+/// Is this entry the declared decision that adopted this mandate?
+fn adopts(e: &Entry, m: &Adopted) -> bool {
+    matches!(&e.record,
+        Record::Decision { claim: Claim::Declared, venture, verdict: Verdict::Adopt { mandate, .. }, .. }
+        if *venture == m.venture && *mandate == m.hash)
+}
+
+/// The adopted mandates as facts: what each permits and forbids, how much
+/// of each cap is used, the thresholds, and what self may never do.
+fn load_mandates(
+    p: &mut Rules,
+    adopted: &[&Adopted],
+    now: i64,
+    used: impl Fn(&str, &str, i64) -> u32,
+    threshold: impl Fn(&str) -> Option<Threshold>,
+) {
+    for m in adopted {
         let venture = m.venture.clone();
         p.mandate.push((m.seq, venture.clone(), m.hash.clone()));
         for perm in &m.mandate.permitted {
@@ -710,16 +829,8 @@ pub fn gate_with(
                 perm.delegated,
             ));
             let window = perm.cap.per.as_secs() as i64;
-            let used = ledger
-                .iter()
-                .filter(|e| {
-                    e.record.venture() == venture
-                        && e.record.action() == Some(perm.name.as_str())
-                        && matches!(e.record.kind(), Kind::Action | Kind::Intent)
-                        && e.at > now - window
-                })
-                .count() as u32;
-            p.used.push((venture.clone(), perm.name.clone(), used));
+            let n = used(&venture, &perm.name, now - window);
+            p.used.push((venture.clone(), perm.name.clone(), n));
             if perm.takes().is_some() {
                 p.takes.push((venture.clone(), perm.name.clone()));
             }
@@ -740,7 +851,7 @@ pub fn gate_with(
         for f in &m.mandate.forbidden {
             p.forbidden.push((venture.clone(), f.clone()));
         }
-        if let Some(t) = effective_threshold(ledger, mandates, &venture) {
+        if let Some(t) = threshold(&venture) {
             p.threshold.push((
                 venture.clone(),
                 m.mandate.metric_name().to_string(),
@@ -755,8 +866,18 @@ pub fn gate_with(
         p.hardwired
             .push((SELF.to_string(), name.to_string(), why.to_string()));
     }
-    load_family(&mut p, ledger, &adopted);
-    // The parent's budget and the shared quotas, as facts and as steps.
+}
+
+/// The parent's budget and the shared quotas, as facts and as steps.
+fn limits(
+    p: &mut Rules,
+    v: &str,
+    a: &str,
+    adopted: &[&Adopted],
+    budget: Option<(Seq, u32)>,
+    spent: impl Fn() -> u32,
+    (qsteps, qreasons): (Vec<Step>, Vec<Reason>),
+) -> (Vec<Step>, Vec<Reason>) {
     let mut extra_steps = Vec::new();
     let mut extra_reasons = Vec::new();
     let cost = adopted
@@ -764,8 +885,8 @@ pub fn gate_with(
         .find(|m| m.venture == v)
         .and_then(|m| m.mandate.permitted(a))
         .map_or(0, |perm| perm.cost);
-    if let Some((from, budget)) = budget_of(ledger, &adopted, v) {
-        let spent = spent_today(ledger, &adopted, v, now);
+    if let Some((from, budget)) = budget {
+        let spent = spent();
         extra_steps.push(Step::Budget {
             from,
             spent,
@@ -780,20 +901,17 @@ pub fn gate_with(
             });
         }
     }
-    let (qsteps, qreasons) = quota_check(ledger, mandates, quotas, v, a, now);
     if !qreasons.is_empty() {
         p.over_quota.push((v.to_string(), a.to_string()));
     }
     extra_steps.extend(qsteps);
     extra_reasons.extend(qreasons);
-
-    p.run();
-    assemble(&p, candidate, ledger, &adopted, extra_steps, extra_reasons)
+    (extra_steps, extra_reasons)
 }
 
-/// Parents and children as facts: who belongs to whom, which parents may
-/// resume, and the pauses and resumes parents pulled.
-fn load_family(p: &mut Rules, ledger: &[Entry], adopted: &[&Adopted]) {
+/// Parents and children as facts: who belongs to whom, and which parents
+/// may resume.
+fn load_family_mandates(p: &mut Rules, adopted: &[&Adopted]) {
     for m in adopted {
         for c in &m.mandate.children {
             if is_child_of(adopted, c, &m.venture) {
@@ -807,63 +925,61 @@ fn load_family(p: &mut Rules, ledger: &[Entry], adopted: &[&Adopted]) {
             p.parent_resume_lever.push((m.venture.clone(),));
         }
     }
-    for e in ledger {
-        if let Record::Action {
-            venture,
-            action,
-            ok: true,
-            payload: Some(Payload::Text { text }),
-            ..
-        } = &e.record
-        {
-            match ParentCall::parse(action, text) {
-                Ok(ParentCall::Pause { child }) => {
-                    p.parent_pause.push((e.seq, venture.clone(), child))
-                }
-                Ok(ParentCall::Resume { child }) => {
-                    p.parent_resume.push((e.seq, venture.clone(), child))
-                }
-                _ => {}
+}
+
+/// A pause or resume a parent pulled, as a fact.
+fn load_call(p: &mut Rules, e: &Entry) {
+    if let Record::Action {
+        venture,
+        action,
+        ok: true,
+        payload: Some(Payload::Text { text }),
+        ..
+    } = &e.record
+    {
+        match ParentCall::parse(action, text) {
+            Ok(ParentCall::Pause { child }) => p.parent_pause.push((e.seq, venture.clone(), child)),
+            Ok(ParentCall::Resume { child }) => {
+                p.parent_resume.push((e.seq, venture.clone(), child))
             }
+            _ => {}
         }
     }
 }
 
-/// Every ledger entry as facts.
-fn load_ledger(p: &mut Rules, ledger: &[Entry]) {
-    for e in ledger {
-        let r = &e.record;
-        let venture = r.venture().to_string();
-        p.record.push((e.seq, venture.clone(), r.claim(), r.kind()));
-        match r {
-            Record::Report {
-                metric,
-                value: Some(val),
-                ..
-            } => p.report.push((e.seq, venture, metric.clone(), Num(*val))),
-            Record::Decision { verdict, .. } => {
-                let (dk, target) = match verdict {
-                    Verdict::Approve { ask, .. } => (Dk::Approve, *ask),
-                    Verdict::Deny { ask, .. } => (Dk::Deny, *ask),
-                    Verdict::Pause => (Dk::Pause, 0),
-                    Verdict::Resume => (Dk::Resume, 0),
-                    Verdict::Adopt { .. } => (Dk::Adopt, 0),
-                };
-                p.decision.push((e.seq, venture, dk, target));
-            }
-            Record::Ask { action, claim, .. } => {
-                p.asked.push((e.seq, venture.clone()));
-                if *claim == Claim::Measured {
-                    p.code_ask.push((e.seq,));
-                }
-                if let Some(act) = action {
-                    p.ask.push((e.seq, venture, act.clone()));
-                }
-            }
-            Record::Proposal { action, .. } => p.proposal.push((e.seq, venture, action.clone())),
-            Record::Action { action, .. } if action == STOP => p.stopped.push((e.seq, venture)),
-            _ => {}
+/// One ledger entry as facts.
+fn load_entry(p: &mut Rules, e: &Entry) {
+    let r = &e.record;
+    let venture = r.venture().to_string();
+    p.record.push((e.seq, venture.clone(), r.claim(), r.kind()));
+    match r {
+        Record::Report {
+            metric,
+            value: Some(val),
+            ..
+        } => p.report.push((e.seq, venture, metric.clone(), Num(*val))),
+        Record::Decision { verdict, .. } => {
+            let (dk, target) = match verdict {
+                Verdict::Approve { ask, .. } => (Dk::Approve, *ask),
+                Verdict::Deny { ask, .. } => (Dk::Deny, *ask),
+                Verdict::Pause => (Dk::Pause, 0),
+                Verdict::Resume => (Dk::Resume, 0),
+                Verdict::Adopt { .. } => (Dk::Adopt, 0),
+            };
+            p.decision.push((e.seq, venture, dk, target));
         }
+        Record::Ask { action, claim, .. } => {
+            p.asked.push((e.seq, venture.clone()));
+            if *claim == Claim::Measured {
+                p.code_ask.push((e.seq,));
+            }
+            if let Some(act) = action {
+                p.ask.push((e.seq, venture, act.clone()));
+            }
+        }
+        Record::Proposal { action, .. } => p.proposal.push((e.seq, venture, action.clone())),
+        Record::Action { action, .. } if action == STOP => p.stopped.push((e.seq, venture)),
+        _ => {}
     }
 }
 
@@ -889,14 +1005,25 @@ impl fmt::Display for State {
 /// or its parent's pause, until a declared resume; asking while an ask has
 /// no declared decision; running otherwise.
 pub fn state(ledger: &[Entry], mandates: &[Adopted], venture: &str) -> State {
+    state_in(&Index::from_entries(ledger), mandates, venture)
+}
+
+/// The state of a venture, from the index. The rules see what pauses and
+/// resumes it, the latest of each source, and decide whether it is paused.
+pub fn state_in(index: &Index, mandates: &[Adopted], venture: &str) -> State {
     let mut p = Rules::default();
-    load_ledger(&mut p, ledger);
+    for s in index.pause_sources(venture) {
+        if let Some(e) = index.get(s) {
+            load_entry(&mut p, e);
+            load_call(&mut p, e);
+        }
+    }
     let adopted: Vec<&Adopted> = mandates.iter().collect();
-    load_family(&mut p, ledger, &adopted);
+    load_family_mandates(&mut p, &adopted);
     p.run();
     if p.paused.iter().any(|(v,)| v == venture) {
         State::Paused
-    } else if p.open_ask.iter().any(|(_, v)| v == venture) {
+    } else if index.open_of(venture).next().is_some() {
         State::Asking
     } else {
         State::Running
@@ -905,19 +1032,14 @@ pub fn state(ledger: &[Entry], mandates: &[Adopted], venture: &str) -> State {
 
 /// Asks with no declared decision yet, oldest first.
 pub fn open_asks(ledger: &[Entry]) -> Vec<Seq> {
-    let mut p = Rules::default();
-    load_ledger(&mut p, ledger);
-    p.run();
-    let mut open: Vec<Seq> = p.open_ask.iter().map(|(q, _)| *q).collect();
-    open.sort_unstable();
-    open
+    Index::from_entries(ledger).open_asks()
 }
 
 /// Turn the derived facts into a proof or a refusal that reads top to bottom.
-fn assemble(
+fn assemble<'a>(
     p: &Rules,
     candidate: &Candidate,
-    ledger: &[Entry],
+    find: &dyn Fn(Seq) -> Option<&'a Entry>,
     adopted: &[&Adopted],
     extra_steps: Vec<Step>,
     extra_reasons: Vec<Reason>,
@@ -927,7 +1049,6 @@ fn assemble(
     let allowed = p.allowed.iter().any(|(x, y)| x == v && y == a);
     let mut steps = Vec::new();
     let mut reasons = Vec::new();
-    let find = |seq: Seq| ledger.iter().find(|e| e.seq == seq);
     let occasion = |e: &Entry| Step::Occasion {
         seq: e.seq,
         claim: e.record.claim(),
@@ -1493,6 +1614,271 @@ fn by(claim: Claim) -> &'static str {
         Claim::Measured => "code",
         Claim::Declared => "a human",
         Claim::Inferred => "a model",
+    }
+}
+
+/// The gate as first written: every call loads every record of the ledger
+/// into the rules and derives from all of them. Slow on a long ledger and
+/// plainly right, it is the oracle the gate above is tested against.
+pub mod reference {
+    use super::*;
+
+    ascent! {
+        /// What the ledger holds true now. Every report is a fact about a
+        /// topic. A measured fact is superseded by a later measured fact on
+        /// the same topic; any fact is superseded by a later one that cites
+        /// it. The rest is current.
+        struct Facts;
+
+        // seq, venture, topic, measured or declared
+        relation fact(Seq, String, String, bool);
+        relation cites(Seq, Seq);
+        relation superseded(Seq);
+        superseded(o) <-- fact(o, v, t, true), fact(n, v, t, true), if n > o;
+        superseded(o) <-- fact(o, v, t, _), fact(n, v, t, _), cites(n, o), if n > o;
+        relation current(Seq, String, String);
+        current(s, v, t) <-- fact(s, v, t, _), !superseded(s);
+    }
+
+    /// The current facts: (seq, venture, topic), oldest first.
+    pub fn current_facts(ledger: &[Entry]) -> Vec<(Seq, String, String)> {
+        let mut f = Facts::default();
+        for e in ledger {
+            if let Record::Report {
+                claim,
+                venture,
+                metric,
+                cites,
+                ..
+            } = &e.record
+            {
+                f.fact
+                    .push((e.seq, venture.clone(), metric.clone(), claim.authorizes()));
+                for c in cites {
+                    f.cites.push((e.seq, *c));
+                }
+            }
+        }
+        f.run();
+        let mut out: Vec<(Seq, String, String)> = f.current.into_iter().collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// The parent levers pulled on `child` by its parent, oldest first:
+    /// each successful action's sequence number and what it set.
+    fn parent_calls(
+        ledger: &[Entry],
+        mandates: &[&Adopted],
+        child: &str,
+    ) -> Vec<(Seq, ParentCall)> {
+        let Some(parent) = mandates
+            .iter()
+            .find(|m| m.venture == child)
+            .and_then(|m| m.mandate.parent.clone())
+        else {
+            return vec![];
+        };
+        if !is_child_of(mandates, child, &parent) {
+            return vec![];
+        }
+        ledger
+            .iter()
+            .filter_map(|e| match &e.record {
+                Record::Action {
+                    venture,
+                    action,
+                    ok: true,
+                    payload: Some(Payload::Text { text }),
+                    ..
+                } if *venture == parent => ParentCall::parse(action, text)
+                    .ok()
+                    .filter(|c| c.child() == child)
+                    .map(|c| (e.seq, c)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The threshold that applies to a venture now, if its controller is one.
+    pub fn effective_threshold(
+        ledger: &[Entry],
+        mandates: &[Adopted],
+        venture: &str,
+    ) -> Option<Threshold> {
+        let refs: Vec<&Adopted> = mandates.iter().collect();
+        let mut t = mandate_threshold(&refs, venture)?;
+        for (seq, call) in parent_calls(ledger, &refs, venture) {
+            if let ParentCall::Threshold { above, bound, .. } = call {
+                t.above = above;
+                t.bound = bound;
+                t.from = Some(seq);
+            }
+        }
+        Some(t)
+    }
+
+    /// The budget a venture's parent set for it, and the action that set it.
+    pub fn budget_of(ledger: &[Entry], mandates: &[&Adopted], venture: &str) -> Option<(Seq, u32)> {
+        parent_calls(ledger, mandates, venture)
+            .into_iter()
+            .filter_map(|(seq, call)| match call {
+                ParentCall::Budget { amount, .. } => Some((seq, amount)),
+                _ => None,
+            })
+            .next_back()
+    }
+
+    /// Actions and intents of `venture` (every venture when None) since
+    /// `since`, as (venture, action).
+    fn runs_since<'a>(
+        ledger: &'a [Entry],
+        venture: Option<&str>,
+        since: i64,
+    ) -> Vec<(&'a str, &'a str)> {
+        ledger
+            .iter()
+            .filter(|e| e.at > since)
+            .filter(|e| matches!(e.record.kind(), Kind::Action | Kind::Intent))
+            .filter(|e| venture.is_none_or(|v| e.record.venture() == v))
+            .filter_map(|e| e.record.action().map(|a| (e.record.venture(), a)))
+            .collect()
+    }
+
+    /// What a venture spent today.
+    pub fn spent_today(ledger: &[Entry], mandates: &[&Adopted], venture: &str, now: i64) -> u32 {
+        runs_since(ledger, Some(venture), now - Cap::DAY.as_secs() as i64)
+            .into_iter()
+            .map(|(v, a)| cost_of(mandates, v, a))
+            .sum()
+    }
+
+    /// How the shared quotas bear on an action.
+    pub fn quota_check(
+        ledger: &[Entry],
+        mandates: &[Adopted],
+        quotas: &Quotas,
+        venture: &str,
+        action: &str,
+        now: i64,
+    ) -> (Vec<Step>, Vec<Reason>) {
+        let refs: Vec<&Adopted> = mandates.iter().collect();
+        let runs = |per: Duration| runs_since(ledger, None, now - per.as_secs() as i64).into_iter();
+        quota_steps(&refs, quotas, venture, action, runs)
+    }
+
+    /// How many asks were written inside the asks quota's window.
+    pub fn asks_used(ledger: &[Entry], cap: Cap, now: i64) -> u32 {
+        ledger
+            .iter()
+            .filter(|e| e.at > now - cap.per.as_secs() as i64)
+            .filter(|e| e.record.kind() == Kind::Ask)
+            .count() as u32
+    }
+
+    /// Decide whether an action may happen, with no shared quotas.
+    pub fn gate(
+        candidate: &Candidate,
+        ledger: &[Entry],
+        mandates: &[Adopted],
+        now: i64,
+    ) -> Result<Proof, Refusal> {
+        gate_with(candidate, ledger, mandates, &Quotas::default(), now)
+    }
+
+    /// Decide whether an action may happen, under the shared quotas too.
+    pub fn gate_with(
+        candidate: &Candidate,
+        ledger: &[Entry],
+        mandates: &[Adopted],
+        quotas: &Quotas,
+        now: i64,
+    ) -> Result<Proof, Refusal> {
+        let v = candidate.venture.as_str();
+        let a = candidate.action.as_str();
+        let mut p = Rules::default();
+        p.candidate.push((v.to_string(), a.to_string()));
+        p.cites = candidate.cites.iter().map(|s| (*s,)).collect();
+        load_ledger(&mut p, ledger);
+
+        // Only mandates the ledger shows adopted by a declared decision count.
+        let adopted: Vec<&Adopted> = mandates
+            .iter()
+            .filter(|m| ledger.iter().any(|e| e.seq == m.seq && adopts(e, m)))
+            .collect();
+        load_mandates(
+            &mut p,
+            &adopted,
+            now,
+            |venture, action, since| {
+                ledger
+                    .iter()
+                    .filter(|e| {
+                        e.record.venture() == venture
+                            && e.record.action() == Some(action)
+                            && matches!(e.record.kind(), Kind::Action | Kind::Intent)
+                            && e.at > since
+                    })
+                    .count() as u32
+            },
+            |venture| effective_threshold(ledger, mandates, venture),
+        );
+        load_family(&mut p, ledger, &adopted);
+        let budget = budget_of(ledger, &adopted, v);
+        let spent = || spent_today(ledger, &adopted, v, now);
+        let quota = quota_check(ledger, mandates, quotas, v, a, now);
+        let (extra_steps, extra_reasons) = limits(&mut p, v, a, &adopted, budget, spent, quota);
+        p.run();
+        assemble(
+            &p,
+            candidate,
+            &|s| ledger.iter().find(|e| e.seq == s),
+            &adopted,
+            extra_steps,
+            extra_reasons,
+        )
+    }
+
+    /// Parents and children as facts, and every pause and resume a parent
+    /// pulled.
+    fn load_family(p: &mut Rules, ledger: &[Entry], adopted: &[&Adopted]) {
+        load_family_mandates(p, adopted);
+        for e in ledger {
+            load_call(p, e);
+        }
+    }
+
+    /// Every ledger entry as facts.
+    fn load_ledger(p: &mut Rules, ledger: &[Entry]) {
+        for e in ledger {
+            load_entry(p, e);
+        }
+    }
+
+    /// The state of a venture.
+    pub fn state(ledger: &[Entry], mandates: &[Adopted], venture: &str) -> State {
+        let mut p = Rules::default();
+        load_ledger(&mut p, ledger);
+        let adopted: Vec<&Adopted> = mandates.iter().collect();
+        load_family(&mut p, ledger, &adopted);
+        p.run();
+        if p.paused.iter().any(|(v,)| v == venture) {
+            State::Paused
+        } else if p.open_ask.iter().any(|(_, v)| v == venture) {
+            State::Asking
+        } else {
+            State::Running
+        }
+    }
+
+    /// Asks with no declared decision yet, oldest first.
+    pub fn open_asks(ledger: &[Entry]) -> Vec<Seq> {
+        let mut p = Rules::default();
+        load_ledger(&mut p, ledger);
+        p.run();
+        let mut open: Vec<Seq> = p.open_ask.iter().map(|(q, _)| *q).collect();
+        open.sort_unstable();
+        open
     }
 }
 
