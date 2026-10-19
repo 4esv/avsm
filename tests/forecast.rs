@@ -292,6 +292,25 @@ fn a_forecast_is_deterministic_under_its_seeds() {
 }
 
 #[test]
+fn a_forecast_from_the_kernels_index_is_the_forecast_from_the_ledger() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("garden", "level", GARDEN);
+    f.history(
+        "garden",
+        &[100.0, 98.0, 99.0, 96.0, 97.0, 94.0, 95.0, 92.0],
+        HOUR,
+    );
+    let opts = f.opts(&["garden"], 2, 4);
+    let read = forecast::run(&f.k.ledger, &f.k.home, &opts).unwrap();
+    let seeded = {
+        let index = f.k.index().unwrap();
+        forecast::run_in(&index, &f.k.ledger, &f.k.home, &opts).unwrap()
+    };
+    assert_eq!(read.records(&[]), seeded.records(&[]));
+}
+
+#[test]
 fn a_forecast_that_hits_a_guard_asks_with_the_envelope() {
     let _c = clock();
     let mut f = fixture("");

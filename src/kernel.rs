@@ -230,14 +230,29 @@ impl Kernel {
         role: Box<dyn Role + Send>,
         warden: Box<dyn Warden + Send>,
     ) -> Result<Kernel, String> {
+        Kernel::with_index(home, role, warden, None)
+    }
+
+    /// `with`, its index started from a copy of `seed` when that is an
+    /// index of a prefix of the ledger in `home`.
+    fn with_index(
+        home: &Path,
+        role: Box<dyn Role + Send>,
+        warden: Box<dyn Warden + Send>,
+        seed: Option<&Index>,
+    ) -> Result<Kernel, String> {
         std::fs::create_dir_all(home)
             .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
         let ledger = Ledger::open(&home.join("ledger.db")).map_err(|e| e.to_string())?;
         let config = Config::load(home)?;
+        let index = match seed {
+            Some(seed) => seed.seed_for(&ledger).map_err(|e| e.to_string())?,
+            None => Index::default(),
+        };
         let mut kernel = Kernel {
             home: home.to_path_buf(),
             ledger,
-            index: RefCell::new(Index::default()),
+            index: RefCell::new(index),
             ventures: BTreeMap::new(),
             config,
             role,
@@ -264,14 +279,17 @@ impl Kernel {
 
     /// A forecast branch's kernel: a keyless warden that sends every lever
     /// run to the simulation, the given scripted role, and a ledger copy
-    /// that is deleted after. Only a forecast builds one.
+    /// that is deleted after. Only a forecast builds one. `head` is the
+    /// index of the ledger the copy was made from: the kernel and the
+    /// warden start from it and read only what the branch appends.
     pub(crate) fn forecasting(
         home: &Path,
         sim: Arc<crate::simulate::Simulation>,
         role: Box<dyn Role + Send>,
+        head: &Index,
     ) -> Result<Kernel, String> {
-        let warden = LocalWarden::keyless(home, sim.clone())?;
-        let mut kernel = Kernel::with(home, role, Box::new(warden))?;
+        let warden = LocalWarden::keyless(home, sim.clone(), head)?;
+        let mut kernel = Kernel::with_index(home, role, Box::new(warden), Some(head))?;
         kernel.ledger.throwaway().map_err(|e| e.to_string())?;
         kernel.sim = Some(sim);
         Ok(kernel)
@@ -502,7 +520,10 @@ impl Kernel {
         opts: &crate::forecast::Options,
         cites: &[Seq],
     ) -> Result<(crate::forecast::Outcome, Vec<Entry>), String> {
-        let outcome = crate::forecast::run(&self.ledger, &self.home, opts)?;
+        let outcome = {
+            let index = self.index()?;
+            crate::forecast::run_in(&index, &self.ledger, &self.home, opts)?
+        };
         let mut written = Vec::new();
         let mut seqs: BTreeMap<String, Vec<Seq>> = BTreeMap::new();
         for record in outcome.records(cites) {
@@ -1963,13 +1984,16 @@ impl Kernel {
                 });
                 let ran = match cached {
                     Some(o) => Ok(o),
-                    None => crate::forecast::run(&self.ledger, &self.home, &opts).inspect(|o| {
-                        if let Some(r) = reading {
-                            self.packet_forecasts
-                                .borrow_mut()
-                                .insert(venture.to_string(), (r, o.clone()));
-                        }
-                    }),
+                    None => self
+                        .index()
+                        .and_then(|i| crate::forecast::run_in(&i, &self.ledger, &self.home, &opts))
+                        .inspect(|o| {
+                            if let Some(r) = reading {
+                                self.packet_forecasts
+                                    .borrow_mut()
+                                    .insert(venture.to_string(), (r, o.clone()));
+                            }
+                        }),
                 };
                 match ran {
                     Ok(outcome) => {

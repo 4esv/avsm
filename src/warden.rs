@@ -130,13 +130,20 @@ impl LocalWarden {
 
     /// The warden of a forecast branch: it never reads the keys file, and
     /// every lever run goes to the simulation.
-    pub(crate) fn keyless(home: &Path, sim: Arc<Simulation>) -> Result<LocalWarden, String> {
+    /// Its index starts from a copy of `head` when that is an index of a
+    /// prefix of the branch's ledger.
+    pub(crate) fn keyless(
+        home: &Path,
+        sim: Arc<Simulation>,
+        head: &Index,
+    ) -> Result<LocalWarden, String> {
         let ledger = Ledger::open(&home.join("ledger.db")).map_err(|e| e.to_string())?;
         ledger.throwaway().map_err(|e| e.to_string())?;
+        let index = head.seed_for(&ledger).map_err(|e| e.to_string())?;
         Ok(LocalWarden {
             home: home.to_path_buf(),
             ledger,
-            index: Index::default(),
+            index,
             config: Config::load(home)?,
             keys: BTreeMap::new(),
             sim: Some(sim),

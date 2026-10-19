@@ -52,7 +52,7 @@ pub struct Adoption {
 }
 
 /// The ledger as read so far, and what follows from it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Index {
     entries: Vec<Entry>,
     /// Set when an entry's number is not one more than the last one's, as
@@ -140,6 +140,20 @@ impl Index {
             index.apply(e.clone());
         }
         index
+    }
+
+    /// A copy of this index to start a reader of `ledger` from, when it
+    /// is an index of a prefix of that ledger: its last entry is the
+    /// ledger's entry of that number, hash and all. Else an empty index,
+    /// which reads the ledger whole.
+    pub fn seed_for(&self, ledger: &Ledger) -> Result<Index, LedgerError> {
+        let Some(last) = self.entries.last() else {
+            return Ok(Index::default());
+        };
+        Ok(match ledger.get(last.seq)? {
+            Some(e) if e.hash == last.hash && !self.scattered => self.clone(),
+            _ => Index::default(),
+        })
     }
 
     /// Add what was appended to the ledger since the index last looked.
@@ -840,4 +854,50 @@ fn by_time<T>(list: &mut Vec<T>, item: T, at: impl Fn(&T) -> i64) {
 /// The part of a time-ordered list after `since`.
 fn after<T>(list: &[T], since: i64, at: impl Fn(&T) -> i64) -> &[T] {
     &list[list.partition_point(|x| at(x) <= since)..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(value: f64) -> Record {
+        Record::report(Claim::Measured, "garden", "level", Some(value), "")
+    }
+
+    fn ledger(values: &[f64]) -> Ledger {
+        let mut l = Ledger::open_in_memory().unwrap();
+        for v in values {
+            l.append(report(*v)).unwrap();
+        }
+        l
+    }
+
+    #[test]
+    fn a_seed_of_a_prefix_reads_on_to_the_whole_ledger() {
+        let mut l = ledger(&[1.0, 2.0, 3.0]);
+        let head = Index::from_entries(&l.all().unwrap());
+        l.append(report(4.0)).unwrap();
+        let mut seeded = head.seed_for(&l).unwrap();
+        assert_eq!(seeded.last(), 3, "a seed of a prefix is kept");
+        seeded.refresh(&l).unwrap();
+        assert_eq!(
+            seeded.entries(),
+            Index::from_entries(&l.all().unwrap()).entries()
+        );
+        assert_eq!(seeded.series("garden", "level").len(), 4);
+    }
+
+    #[test]
+    fn a_seed_of_another_ledger_is_dropped() {
+        let other = Index::from_entries(&ledger(&[1.0, 2.0, 9.0]).all().unwrap());
+        let l = ledger(&[1.0, 2.0, 3.0]);
+        let seeded = other.seed_for(&l).unwrap();
+        assert_eq!(seeded.last(), 0, "an index of another ledger is not a seed");
+        let longer = Index::from_entries(&ledger(&[1.0, 2.0, 3.0, 4.0]).all().unwrap());
+        assert_eq!(
+            longer.seed_for(&l).unwrap().last(),
+            0,
+            "nor one past its head"
+        );
+    }
 }

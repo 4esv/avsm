@@ -572,6 +572,9 @@ struct Branch {
 /// What every branch shares.
 struct Shared<'a> {
     head: PathBuf,
+    /// The index of the head: each branch's kernel and warden start
+    /// from a copy of it instead of reading the head again.
+    index: &'a Index,
     config: Option<String>,
     start: i64,
     end: i64,
@@ -607,14 +610,25 @@ struct Trace {
 /// Run a forecast against the ledger at its head. Nothing is written to
 /// `source`; the caller writes the records the outcome gives.
 pub fn run(source: &Ledger, home: &Path, opts: &Options) -> Result<Outcome, String> {
+    let entries = source.all().map_err(|e| e.to_string())?;
+    run_in(&Index::from_entries(&entries), source, home, opts)
+}
+
+/// Run a forecast as `run` does, given the index of `source` up to its
+/// head (the caller's), so that neither this nor any branch reads the
+/// whole ledger again: each branch starts from a copy of it.
+pub fn run_in(
+    index: &Index,
+    source: &Ledger,
+    home: &Path,
+    opts: &Options,
+) -> Result<Outcome, String> {
     // The depth guard: whatever path reaches here from inside a branch,
     // a branch never forecasts, so a forecast never recurses.
     if DEPTH.with(std::cell::Cell::get) > 0 {
         return Err("a forecast branch never forecasts".to_string());
     }
     opts.check()?;
-    let entries = source.all().map_err(|e| e.to_string())?;
-    let index = Index::from_entries(&entries);
     let ventures = venture::from_adoptions(index.adoptions());
     let names: Vec<String> = if opts.ventures.is_empty() {
         ventures
@@ -717,7 +731,7 @@ pub fn run(source: &Ledger, home: &Path, opts: &Options) -> Result<Outcome, Stri
         .min()
         .unwrap_or(STEP_FLOOR)
         .max(STEP_FLOOR);
-    let start = clock::now().max(entries.last().map_or(i64::MIN, |e| e.at)) + step;
+    let start = clock::now().max(index.entries().last().map_or(i64::MIN, |e| e.at)) + step;
     let end = start + i64::from(opts.days) * 86_400;
     let scratch = Scratch::new(opts.scratch.as_deref())?;
     let head = scratch.0.join("head.db");
@@ -726,6 +740,7 @@ pub fn run(source: &Ledger, home: &Path, opts: &Options) -> Result<Outcome, Stri
         .map_err(|e| format!("cannot fork the ledger: {e}"))?;
     let shared = Shared {
         head,
+        index,
         config: std::fs::read_to_string(home.join(config::CONFIG_FILE)).ok(),
         start,
         end,
@@ -796,7 +811,7 @@ fn run_branch(home: &Path, b: &Branch, shared: &Shared) -> Result<BTreeMap<Strin
         seed: b.seed,
         ventures: shared.names.iter().cloned().collect(),
     };
-    let mut k = Kernel::forecasting(home, sim, Box::new(role))?;
+    let mut k = Kernel::forecasting(home, sim, Box::new(role), shared.index)?;
     k.scope = Some(shared.names.iter().cloned().collect());
     for (name, text) in &shared.variants[b.variant].mandates {
         k.adopt_text(name, text, BY)?;
@@ -1479,8 +1494,12 @@ mod tests {
         std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
         let open = crate::warden::LocalWarden::open(tmp.path()).unwrap();
         assert_eq!(open.keys_held(), 1, "the real warden reads the keys file");
-        let w = crate::warden::LocalWarden::keyless(tmp.path(), Arc::new(Simulation::branch(1)))
-            .unwrap();
+        let w = crate::warden::LocalWarden::keyless(
+            tmp.path(),
+            Arc::new(Simulation::branch(1)),
+            &Index::default(),
+        )
+        .unwrap();
         assert_eq!(w.keys_held(), 0);
     }
 
