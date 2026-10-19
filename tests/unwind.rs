@@ -309,6 +309,51 @@ fn a_tripped_guard_runs_its_unwind_once_with_a_proof_from_the_reading_and_the_ma
 }
 
 #[test]
+fn an_unwind_is_never_held_waiting_on_the_last_run() {
+    let _c = clock();
+    let tmp = tempfile::tempdir().unwrap();
+    // The trade lever expects equity up within 5 reports: a run's
+    // expectation outlasts the next trip of the guard.
+    let mandate = fund("9/day", "ask", "    expects: up within 5\n", "");
+    let dir = venture(tmp.path(), &mandate);
+    let mut k = kernel(&tmp.path().join("home"));
+    k.add(&dir).unwrap();
+    report(&mut k, &dir, "100");
+    report(&mut k, &dir, "120");
+    report(&mut k, &dir, "101"); // trips: the unwind runs
+    assert_eq!(trades(&dir).len(), 1, "{}", lines(&k));
+    report(&mut k, &dir, "118"); // back inside
+    report(&mut k, &dir, "100"); // past again, 2 of 5 readings since the run
+    assert_eq!(
+        trades(&dir).len(),
+        2,
+        "a tripped guard's unwind is not held by a waiting expectation: {}",
+        lines(&k)
+    );
+    // Any other run of the lever then is held: the last run's
+    // expectation waits.
+    let candidate = Candidate {
+        venture: "fund".into(),
+        action: "trade".into(),
+        cites: vec![],
+    };
+    let refusal = gate::gate(
+        &candidate,
+        &k.entries().unwrap(),
+        &k.adopted(),
+        avsmd::clock::now(),
+    )
+    .unwrap_err();
+    assert!(
+        refusal
+            .reasons
+            .iter()
+            .any(|r| matches!(r, Reason::Waiting { action, .. } if action == "trade")),
+        "{refusal}"
+    );
+}
+
+#[test]
 fn only_the_declared_payload_passes_the_guard() {
     let _c = clock();
     let tmp = tempfile::tempdir().unwrap();

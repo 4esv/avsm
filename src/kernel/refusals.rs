@@ -77,6 +77,7 @@ fn reason_key(r: &Reason) -> String {
         Reason::OverBudget { cost, budget, .. } => format!("OverBudget({budget},{cost})"),
         Reason::OverQuota { what, cap, .. } => format!("OverQuota({what},{cap})"),
         Reason::Pending { intent } => format!("Pending({intent})"),
+        Reason::Waiting { action, .. } => format!("Waiting({action})"),
         Reason::NotAChild { venture, child } => format!("NotAChild({venture},{child})"),
         Reason::BelowFloor { child, floor, .. } => format!("BelowFloor({child},{floor})"),
         Reason::Priority { child, spared, .. } => format!("Priority({child},{spared})"),

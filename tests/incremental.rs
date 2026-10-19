@@ -74,7 +74,7 @@ controller: {kind: threshold, below: 5, action: reset}
 cadence: 1h
 parent: parent
 permitted:
-  - {name: reset, run: ./reset, cap: 2/hour, reversible: true}
+  - {name: reset, run: ./reset, cap: 2/hour, reversible: true, expects: up within 2}
 "
         }
         _ => {
@@ -787,6 +787,13 @@ proptest! {
                 reference::restored(&entries, v, a),
                 "restored {} {}", v, a
             );
+            for within in [1, 2] {
+                prop_assert_eq!(
+                    index.waiting(v, a, "count", within),
+                    reference::waiting(&entries, v, a, "count", within),
+                    "waiting {} {} within {}", v, a, within
+                );
+            }
         }
         prop_assert_eq!(index.open_asks(), reference::open_asks(&entries));
         prop_assert_eq!(gate::open_asks(&entries), reference::open_asks(&entries));

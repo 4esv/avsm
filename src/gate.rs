@@ -219,6 +219,15 @@ pub enum Reason {
     Pending {
         intent: Seq,
     },
+    /// The lever's latest ok run, `intent`, expects something of the
+    /// metric that is not judged yet: fewer readings than its `within`
+    /// have come since. Running it again before then is acting twice on
+    /// one error (windup). A declared approval of this run, or the
+    /// lever's run as a tripped guard's unwind, is not held.
+    Waiting {
+        action: String,
+        intent: Seq,
+    },
     /// A parent lever names a venture that is not this parent's child.
     NotAChild {
         venture: String,
@@ -944,6 +953,8 @@ pub fn gate_in(
         .filter(|m| index.get(m.seq).is_some_and(|e| adopts(e, m)))
         .collect();
     let pending = index.pending_of(v, a);
+    let waiting =
+        expects_of(&adopted, v, a).and_then(|(metric, within)| index.waiting(v, a, metric, within));
     load_mandates(
         &mut p,
         &adopted,
@@ -976,10 +987,17 @@ pub fn gate_in(
         candidate,
         &|s| index.get(s),
         &adopted,
-        pending,
+        (pending, waiting),
         extra_steps,
         extra_reasons,
     )
+}
+
+/// The metric and `within` of what an adopted mandate's lever expects.
+fn expects_of<'a>(adopted: &[&'a Adopted], v: &str, a: &str) -> Option<(&'a str, u32)> {
+    let m = adopted.iter().find(|m| m.venture == v)?;
+    let within = m.mandate.permitted(a)?.expects.as_ref()?.within;
+    Some((m.mandate.metric_name(), within))
 }
 
 /// Is this entry the declared decision that adopted this mandate?
@@ -1367,7 +1385,7 @@ fn assemble<'a>(
     candidate: &Candidate,
     find: &dyn Fn(Seq) -> Option<&'a Entry>,
     adopted: &[&Adopted],
-    pending: Option<Seq>,
+    (pending, waiting): (Option<Seq>, Option<Seq>),
     extra_steps: Vec<Step>,
     extra_reasons: Vec<Reason>,
 ) -> Result<Proof, Refusal> {
@@ -1694,6 +1712,17 @@ fn assemble<'a>(
         reasons.push(Reason::NeedsDecision {
             action: a.clone(),
             suspended: p.suspended.iter().any(|(x, y)| x == v && y == a),
+        });
+    }
+    // A run whose expectation is still waiting holds the lever: the
+    // metric has not had the time the mandate gives it to answer. A
+    // tripped guard's unwind is never held back by it, and a declared
+    // approval of this run loosens it: a human may act twice.
+    let approved = p.approved.iter().any(|(x, y, _, _)| x == v && y == a);
+    if let Some(intent) = waiting.filter(|_| !unwinding && !approved) {
+        reasons.push(Reason::Waiting {
+            action: a.clone(),
+            intent,
         });
     }
     if let Some(perm) = permitted {
@@ -2084,6 +2113,10 @@ impl fmt::Display for Reason {
                 f,
                 "intent #{intent} has no outcome; until it is known whether it happened, it does not run again"
             ),
+            Reason::Waiting { action, intent } => write!(
+                f,
+                "{action} ran at intent #{intent} and what it expects is not judged yet; it does not run again until it is"
+            ),
             Reason::NotAChild { venture, child } => write!(
                 f,
                 "{child} is not a child of {venture}: both mandates must say so"
@@ -2451,6 +2484,50 @@ pub mod reference {
             .min()
     }
 
+    /// The latest ok run of this lever whose expectation is still
+    /// waiting: a plausible trusted reading of the metric before its
+    /// intent, and fewer than `within` trusted readings of it, plausible
+    /// or not, after its ok outcome.
+    pub fn waiting(
+        ledger: &[Entry],
+        venture: &str,
+        action: &str,
+        metric: &str,
+        within: u32,
+    ) -> Option<Seq> {
+        let reading = |e: &Entry, plausible_only: bool| {
+            matches!(&e.record, Record::Report {
+                venture: v, metric: m, claim, value, implausible, ..
+            } if v == venture && m == metric && claim.authorizes()
+                && ((value.is_some() && implausible.is_none())
+                    || (!plausible_only && implausible.is_some())))
+        };
+        // The latest ok outcome of each intent of the lever.
+        let ok = |intent: Seq| {
+            ledger
+                .iter()
+                .filter(|o| {
+                    matches!(&o.record, Record::Outcome { claim, venture: v, intent: i, ok: true, .. }
+                        if claim.authorizes() && v == venture && *i == intent && intent < o.seq)
+                })
+                .map(|o| o.seq)
+                .max()
+        };
+        let (intent, outcome) = ledger
+            .iter()
+            .filter(|e| matches!(&e.record, Record::Intent { venture: v, action: a, .. } if v == venture && a == action))
+            .filter_map(|e| ok(e.seq).map(|o| (e.seq, o)))
+            .max()?;
+        if !ledger.iter().any(|e| e.seq < intent && reading(e, true)) {
+            return None;
+        }
+        let since = ledger
+            .iter()
+            .filter(|e| e.seq > outcome && reading(e, false))
+            .count();
+        (since < within as usize).then_some(intent)
+    }
+
     /// The parent levers pulled on `child` by its parent, oldest first:
     /// each successful action's, or done intent's, sequence number and
     /// what it set.
@@ -2665,7 +2742,11 @@ pub mod reference {
             candidate,
             &|s| ledger.iter().find(|e| e.seq == s),
             &adopted,
-            pending(ledger, v, a),
+            (
+                pending(ledger, v, a),
+                expects_of(&adopted, v, a)
+                    .and_then(|(metric, within)| waiting(ledger, v, a, metric, within)),
+            ),
             extra_steps,
             extra_reasons,
         )

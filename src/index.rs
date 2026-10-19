@@ -736,6 +736,36 @@ impl Index {
         (latest, relapsed)
     }
 
+    /// The latest ok run of this lever whose expectation is still waiting:
+    /// it has a plausible reading of the metric from before its intent to
+    /// judge it against, and fewer than `within` trusted readings of the
+    /// metric since its outcome, plausible or not. A run with nothing to
+    /// compare with is never waited on, and the window closes with the
+    /// readings that come, whether or not the sensor is believed, so no
+    /// sensor holds a lever for ever.
+    pub fn waiting(&self, venture: &str, action: &str, metric: &str, within: u32) -> Option<Seq> {
+        let intent = self
+            .intents_of(venture, action)
+            .iter()
+            .copied()
+            .filter(|i| self.settled(*i).is_some_and(|(_, ok)| ok))
+            .max()?;
+        let (outcome, _) = self.settled(intent)?;
+        let series = self.series(venture, metric);
+        if series.first().is_none_or(|(s, _)| *s >= intent) {
+            return None;
+        }
+        let plausible = series.len() - series.partition_point(|(s, _)| *s <= outcome);
+        let doubted = self
+            .doubted
+            .get(venture)
+            .and_then(|m| m.get(metric))
+            .map_or(0, |list| {
+                list.len() - list.partition_point(|s| *s <= outcome)
+            });
+        ((plausible + doubted) < within as usize).then_some(intent)
+    }
+
     /// Is this measured ineffective ask or relapse void? It is when the
     /// miss it says came only from readings flagged stuck, the ones it
     /// cites, and a plausible reading of their metric since is new

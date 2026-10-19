@@ -1148,3 +1148,141 @@ fn a_relapse_seen_only_on_a_stuck_sensor_ends_when_it_reads_again() {
     assert_eq!(f.intents(), 3, "runs again on a confirmed reading");
     assert_eq!(declared(&f), decisions, "without a declared approval");
 }
+
+// ----- no run again while the last one's expectation waits -----
+
+/// A boost that may run every hour and expects the count up 5 within two
+/// reports.
+fn eager() -> Fixture {
+    fixture_in(
+        "controller: {kind: threshold, below: 5, action: boost}\ncadence: 1h\n",
+        "{name: boost, run: echo boost >> boosts, cap: 99/day, reversible: true, \
+         delegated: true, expects: up 5 within 2}",
+    )
+}
+
+/// Refusal records of the lever for waiting on its last run.
+fn waiting_refusals(f: &Fixture) -> Vec<String> {
+    f.entries()
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Refusal { action, reason, .. }
+                if action == "boost" && reason.contains("Waiting(boost)") =>
+            {
+                Some(reason.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The gate's word, from the index and from the reference, which agree.
+fn gate_now(f: &Fixture, cites: Vec<Seq>) -> Result<avsmd::gate::Proof, avsmd::gate::Refusal> {
+    let candidate = avsmd::gate::Candidate {
+        venture: "raiser".into(),
+        action: "boost".into(),
+        cites,
+    };
+    let adopted = f.k.adopted();
+    let got = avsmd::gate::gate_in(
+        &f.k.index().unwrap(),
+        &candidate,
+        &adopted,
+        &Default::default(),
+        f.now,
+    );
+    let want = avsmd::gate::reference::gate(&candidate, &f.entries(), &adopted, f.now);
+    assert_eq!(got, want, "the index and the reference agree");
+    got
+}
+
+/// The intents of the lever, oldest first.
+fn intent_seqs(f: &Fixture) -> Vec<Seq> {
+    f.entries()
+        .iter()
+        .filter(|e| e.record.kind() == Kind::Intent)
+        .map(|e| e.seq)
+        .collect()
+}
+
+#[test]
+fn a_second_run_waits_until_the_first_is_judged() {
+    let _c = clock();
+    let mut f = eager();
+    f.report(3.0); // crosses: boost runs
+    let first = intent_seqs(&f);
+    assert_eq!(first.len(), 1);
+    f.report(4.0); // still below, one report of two since: refused, waiting
+    assert_eq!(
+        f.intents(),
+        1,
+        "not run again on one error: {:#?}",
+        f.entries()
+    );
+    assert_eq!(waiting_refusals(&f).len(), 1, "a refusal record says why");
+    match gate_now(&f, vec![]) {
+        Err(r) => assert!(
+            r.reasons.contains(&avsmd::gate::Reason::Waiting {
+                action: "boost".into(),
+                intent: first[0],
+            }),
+            "{r}"
+        ),
+        Ok(p) => panic!("allowed while waiting: {p}"),
+    }
+    assert!(f.lever_asks().is_empty(), "waiting asks nobody");
+    f.report(4.0); // the second report: judged (the wrong size), runs again
+    assert_eq!(f.intents(), 2, "{:#?}", f.entries());
+}
+
+#[test]
+fn a_failed_run_is_not_waited_on() {
+    let _c = clock();
+    let mut f = fixture_in(
+        "controller: {kind: threshold, below: 5, action: boost}\ncadence: 1h\n",
+        "{name: boost, run: exit 1, cap: 99/day, reversible: true, \
+         delegated: true, expects: up 5 within 2}",
+    );
+    f.report(3.0);
+    f.report(3.0);
+    assert_eq!(f.intents(), 2, "a failed run tells nothing to wait for");
+    assert!(waiting_refusals(&f).is_empty());
+}
+
+#[test]
+fn a_declared_approval_of_this_run_overrides_the_wait() {
+    let _c = clock();
+    let mut f = eager();
+    f.report(3.0);
+    f.report(4.0);
+    assert_eq!(waiting_refusals(&f).len(), 1);
+    // A human asked about this run and said yes: a declared decision may
+    // loosen what code holds.
+    let ask =
+        f.k.append(Record::Ask {
+            claim: Claim::Inferred,
+            venture: "raiser".into(),
+            action: Some("boost".into()),
+            question: "boost again now?".into(),
+            refusal: None,
+            payload: None,
+            signal: None,
+            cites: vec![],
+            packet: None,
+        })
+        .unwrap()
+        .seq;
+    let approval =
+        f.k.append(Record::Decision {
+            claim: Claim::Declared,
+            venture: "raiser".into(),
+            verdict: Verdict::Approve { ask, payload: None },
+            by: None,
+        })
+        .unwrap()
+        .seq;
+    let proof = gate_now(&f, vec![approval]).expect("approved: allowed");
+    assert_eq!(proof.decision(), Some(approval));
+    // Not cited, the approval loosens nothing.
+    assert!(gate_now(&f, vec![]).is_err());
+}
