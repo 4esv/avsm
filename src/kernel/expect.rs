@@ -12,10 +12,15 @@
 //! a restored lever that misses again is suspended again, by a measured
 //! relapse report with no ask unless the metric was measured somewhere new
 //! since the last ask; a suspended lever that is refused asks again only
-//! then too. Tightening is measured; loosening is declared.
+//! then too. Tightening is measured; loosening is declared, with one
+//! exception: a miss seen only on readings stuck at the value from before
+//! the run holds the lever only while the metric stays frozen. Its ask
+//! cites those readings, and the first plausible reading since that is
+//! away from the frozen value voids it: the lever runs again on its own
+//! premises, with no human. A frozen sensor never gives one.
 
 use crate::expect::{self, Judgement};
-use crate::index::{Index, EXPECTATION, SUSPENSION};
+use crate::index::{EXPECTATION, SUSPENSION};
 use crate::record::{Claim, Record, Seq, Signal};
 use crate::world;
 
@@ -30,31 +35,12 @@ pub(super) enum Run {
     Failed,
     /// The metric did not move as expected; the words say how.
     Ineffective(String),
+    /// No effect seen, from this reading flagged stuck at the value from
+    /// before the run alone: a miss that holds only while the metric
+    /// stays frozen.
+    Frozen(String, Seq),
     /// A reading the step spans is implausible: neither a hit nor a miss.
     Unjudged,
-}
-
-/// New measured evidence about a suspended lever since its last
-/// ineffective ask: a plausible reading of the metric after the ask that
-/// is further from the frozen value (the last plausible reading at the
-/// ask) than the metric's noise then. Returns the two values, or None.
-/// With no ask, anything is new.
-pub(super) fn evidence(
-    index: &Index,
-    venture: &str,
-    metric: &str,
-    since: Option<Seq>,
-) -> Option<(f64, f64)> {
-    let since = since?;
-    let series = index.series(venture, metric);
-    let i = series.partition_point(|(s, _)| *s <= since);
-    let frozen = series[..i].last()?.1;
-    let values: Vec<f64> = series[..i].iter().map(|(_, x)| *x).collect();
-    let noise = expect::noise(&values);
-    series[i..]
-        .iter()
-        .find(|(_, x)| (x - frozen).abs() > noise)
-        .map(|(_, x)| (frozen, *x))
 }
 
 impl Kernel {
@@ -72,6 +58,7 @@ impl Kernel {
             let mut memo: Vec<(Seq, Run)> = Vec::new();
             let mut records: Vec<Record> = Vec::new();
             let mut ask: Option<(String, Option<Seq>)> = None;
+            let mut cites: Vec<Seq> = Vec::new();
             {
                 let Ok(index) = self.index() else { return };
                 let floor = index.last_suspension(venture, &perm.name).unwrap_or(0);
@@ -106,27 +93,30 @@ impl Kernel {
                                     implausible,
                                     ..
                                 } if *m == metric && claim.authorizes() => {
-                                    Some((*x, implausible.as_deref()))
+                                    Some((e.seq, *x, implausible.as_deref()))
                                 }
                                 _ => None,
                             })
-                            .take_while(|(_, flag)| flag.is_some())
-                            .find(|(x, flag)| {
+                            .take_while(|(_, _, flag)| flag.is_some())
+                            .find(|(_, x, flag)| {
                                 *x == frozen && flag.is_some_and(|f| f.starts_with("stuck"))
                             })
-                            .map(|(x, _)| x)
+                            .map(|(seq, x, _)| (seq, x))
                     });
                     let result = if !ok {
                         Run::Failed
-                    } else if let Some(x) = stuck {
-                        Run::Ineffective(format!(
-                            "no effect seen: {metric} stuck at {x} after {} ran; {} expects {}",
-                            perm.name,
-                            perm.name,
-                            perm.expects
-                                .as_ref()
-                                .map_or_else(String::new, |e| e.to_string()),
-                        ))
+                    } else if let Some((seen, x)) = stuck {
+                        Run::Frozen(
+                            format!(
+                                "no effect seen: {metric} stuck at {x} after {} ran; {} expects {}",
+                                perm.name,
+                                perm.name,
+                                perm.expects
+                                    .as_ref()
+                                    .map_or_else(String::new, |e| e.to_string()),
+                            ),
+                            seen,
+                        )
                     } else if let Some(expects) = &perm.expects {
                         let series = index.series(venture, &metric);
                         let b = series.partition_point(|(s, _)| *s < intent);
@@ -208,7 +198,7 @@ impl Kernel {
                 let mut misses: Vec<&Run> = Vec::new();
                 for r in seen.iter().rev() {
                     match r {
-                        Run::Ineffective(_) => misses.push(r),
+                        Run::Ineffective(_) | Run::Frozen(..) => misses.push(r),
                         Run::Failed if perm.revoke_after.is_some() => misses.push(r),
                         Run::Unjudged => continue,
                         _ => break,
@@ -219,12 +209,25 @@ impl Kernel {
                     && !index.suspended(venture, &perm.name)
                 {
                     let why = match misses[0] {
-                        Run::Ineffective(why) if misses.len() == 1 => why.clone(),
-                        Run::Ineffective(why) => {
+                        Run::Ineffective(why) | Run::Frozen(why, _) if misses.len() == 1 => {
+                            why.clone()
+                        }
+                        Run::Ineffective(why) | Run::Frozen(why, _) => {
                             format!("{} misses in a row; the last: {why}", misses.len())
                         }
                         _ => format!("{} runs in a row failed", misses.len()),
                     };
+                    // Misses seen only on stuck readings are cited: they
+                    // hold the lever only while the metric stays frozen.
+                    let seen: Vec<Seq> = misses
+                        .iter()
+                        .map(|r| match r {
+                            Run::Frozen(_, s) => Some(*s),
+                            _ => None,
+                        })
+                        .collect::<Option<_>>()
+                        .unwrap_or_default();
+                    cites = seen;
                     // The first miss of an episode asks. A restored lever
                     // that misses again asks only on new evidence since
                     // the last ask; otherwise it relapses, measured and
@@ -235,7 +238,7 @@ impl Kernel {
                         .filter(|q| *q > adopted);
                     ask = Some(match last {
                         None => (why, None),
-                        Some(q) => match evidence(&index, venture, &metric, Some(q)) {
+                        Some(q) => match index.evidence(venture, &metric, Some(q)) {
                             Some((was, now)) => (
                                 format!("{why}; {metric} read {was} at ask #{q} and {now} since"),
                                 None,
@@ -252,7 +255,7 @@ impl Kernel {
                 }
             }
             match ask {
-                Some((why, None)) => self.ask_ineffective(venture, &perm.name, why),
+                Some((why, None)) => self.ask_ineffective(venture, &perm.name, why, cites),
                 Some((why, Some(q))) => {
                     let record = Record::Report {
                         claim: Claim::Measured,
@@ -265,7 +268,7 @@ impl Kernel {
                         ),
                         source: None,
                         confidence: None,
-                        cites: vec![q],
+                        cites: [vec![q], cites].concat(),
                         implausible: None,
                         facts: None,
                     };
@@ -279,8 +282,15 @@ impl Kernel {
         }
     }
 
-    /// Write the measured ask that suspends `lever`: one an episode.
-    pub(super) fn ask_ineffective(&mut self, venture: &str, lever: &str, why: String) {
+    /// Write the measured ask that suspends `lever`: one an episode. It
+    /// cites the stuck readings that alone saw a miss, if that is all.
+    pub(super) fn ask_ineffective(
+        &mut self,
+        venture: &str,
+        lever: &str,
+        why: String,
+        cites: Vec<Seq>,
+    ) {
         let question = format!(
             "{lever} is ineffective, so it is refused and asks no more: {why}; approve to delegate it again"
         );
@@ -290,7 +300,7 @@ impl Kernel {
         };
         let packet = self.signal_packet(venture, &signal);
         match self.append(Record::Ask {
-            cites: vec![],
+            cites,
             claim: Claim::Measured,
             venture: venture.to_string(),
             action: None,
@@ -318,7 +328,7 @@ impl Kernel {
             if last.is_some_and(|q| index.is_open(q)) {
                 return;
             }
-            evidence(&index, venture, &metric, last).map(|(was, now)| {
+            index.evidence(venture, &metric, last).map(|(was, now)| {
                 format!(
                     "found ineffective before, at ask #{}; {metric} read {was} then and {now} since",
                     last.unwrap_or(0)
@@ -326,7 +336,7 @@ impl Kernel {
             })
         };
         if let Some(why) = found {
-            self.ask_ineffective(venture, lever, why);
+            self.ask_ineffective(venture, lever, why, vec![]);
         }
     }
 }

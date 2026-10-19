@@ -2654,11 +2654,57 @@ pub mod reference {
         )
     }
 
+    /// Is this ineffective ask or relapse void: it cites a trusted
+    /// reading flagged stuck, and a plausible reading of that metric after
+    /// it is further from the last plausible one before it than the noise
+    /// of those before it?
+    fn voided(ledger: &[Entry], venture: &str, e: &Entry) -> bool {
+        let get = |s: Seq| ledger.iter().find(|x| x.seq == s);
+        let Some(metric) = e
+            .record
+            .cites()
+            .iter()
+            .find_map(|c| match &get(*c)?.record {
+                Record::Report {
+                    metric,
+                    claim,
+                    implausible: Some(why),
+                    ..
+                } if claim.authorizes() && why.starts_with("stuck") => Some(metric.clone()),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        let series: Vec<(Seq, f64)> = ledger
+            .iter()
+            .filter_map(|r| match &r.record {
+                Record::Report {
+                    venture: v,
+                    metric: m,
+                    claim,
+                    value: Some(x),
+                    implausible: None,
+                    ..
+                } if v == venture && *m == metric && claim.authorizes() => Some((r.seq, *x)),
+                _ => None,
+            })
+            .collect();
+        let i = series.partition_point(|(s, _)| *s <= e.seq);
+        let Some(&(_, frozen)) = series[..i].last() else {
+            return false;
+        };
+        let values: Vec<f64> = series[..i].iter().map(|p| p.1).collect();
+        let noise = crate::expect::noise(&values);
+        series[i..].iter().any(|(_, x)| (x - frozen).abs() > noise)
+    }
+
     /// Is the lever suspended: some measured ask says it is ineffective
     /// and neither a declared approval of it by the same venture nor a
     /// declared adoption of the venture's mandate after it answers it? Or
     /// does a measured relapse after the latest such ask and after any
-    /// adoption suspend it again?
+    /// adoption suspend it again? An ask or relapse that is void is
+    /// neither.
     pub fn suspended(ledger: &[Entry], venture: &str, action: &str) -> bool {
         let is_ask = |e: &Entry| {
             matches!(&e.record, Record::Ask {
@@ -2694,10 +2740,12 @@ pub mod reference {
                 && cites.iter().any(|c| ledger.iter().any(|e| e.seq == *c && is_ask(e))))
                 && r.seq > adopted
                 && last_ask.is_some_and(|q| r.seq > q)
+                && !voided(ledger, venture, r)
         });
         relapsed
             || ledger.iter().any(|e| {
-                matches!(&e.record, Record::Ask {
+                !voided(ledger, venture, e)
+                    && matches!(&e.record, Record::Ask {
                 claim: Claim::Measured,
                 venture: v,
                 signal: Some(crate::record::Signal::Ineffective { action: a, .. }),

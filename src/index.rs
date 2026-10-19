@@ -686,7 +686,9 @@ impl Index {
     /// later declared adoption of the venture's mandate has answered it;
     /// or a measured relapse after the latest such ask says the restored
     /// lever missed again. While it is, every run is refused. Tightening
-    /// is measured; only a declared decision loosens.
+    /// is measured; only a declared decision loosens, but for a miss seen
+    /// only on stuck readings, which a plausible reading away from the
+    /// frozen value voids (`voided`).
     pub fn suspended(&self, venture: &str, action: &str) -> bool {
         // A declared adoption of the mandate after the ask answers it too.
         let adopted = self.adoptions.get(venture).map_or(0, |a| a.seq);
@@ -699,15 +701,57 @@ impl Index {
                         .approved_by
                         .get(q)
                         .is_some_and(|by| by.contains(venture))
+                    && !self.voided(venture, *q)
             })
         });
         let last_ask = asks.and_then(|a| a.iter().max()).copied().unwrap_or(0);
-        let relapsed = self
-            .relapses
-            .get(&key)
-            .and_then(|r| r.iter().max())
-            .is_some_and(|r| *r > adopted && *r > last_ask);
+        let relapsed = self.relapses.get(&key).is_some_and(|r| {
+            r.iter()
+                .any(|r| *r > adopted && *r > last_ask && !self.voided(venture, *r))
+        });
         unanswered || relapsed
+    }
+
+    /// Is this measured ineffective ask or relapse void? It is when the
+    /// miss it says came only from readings flagged stuck, the ones it
+    /// cites, and a plausible reading of their metric since is new
+    /// evidence: the metric is not frozen. A miss measured on plausible
+    /// readings cites none, and is never void.
+    pub fn voided(&self, venture: &str, seq: Seq) -> bool {
+        let Some(e) = self.get(seq) else {
+            return false;
+        };
+        let metric = e
+            .record
+            .cites()
+            .iter()
+            .find_map(|c| match &self.get(*c)?.record {
+                Record::Report {
+                    metric,
+                    claim,
+                    implausible: Some(why),
+                    ..
+                } if claim.authorizes() && why.starts_with("stuck") => Some(metric.as_str()),
+                _ => None,
+            });
+        metric.is_some_and(|m| self.evidence(venture, m, Some(seq)).is_some())
+    }
+
+    /// New measured evidence about a metric since a record: a plausible
+    /// reading after it further from the frozen value (the last plausible
+    /// reading before it) than the metric's noise then. Returns the two
+    /// values, or None. With no record, anything is new.
+    pub fn evidence(&self, venture: &str, metric: &str, since: Option<Seq>) -> Option<(f64, f64)> {
+        let since = since?;
+        let series = self.series(venture, metric);
+        let i = series.partition_point(|(s, _)| *s <= since);
+        let frozen = series[..i].last()?.1;
+        let values: Vec<f64> = series[..i].iter().map(|(_, x)| *x).collect();
+        let noise = crate::expect::noise(&values);
+        series[i..]
+            .iter()
+            .find(|(_, x)| (x - frozen).abs() > noise)
+            .map(|(_, x)| (frozen, *x))
     }
 
     /// Is any trusted report of this metric between these two numbers,

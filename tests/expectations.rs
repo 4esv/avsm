@@ -167,7 +167,10 @@ impl Fixture {
     }
 
     fn suspended(&self) -> bool {
-        self.k.index().unwrap().suspended("raiser", "boost")
+        let index = self.k.index().unwrap().suspended("raiser", "boost");
+        let reference = avsmd::gate::reference::suspended(&self.entries(), "raiser", "boost");
+        assert_eq!(index, reference, "the index and the reference agree");
+        index
     }
 
     /// The plausibility flag of each report of the metric, oldest first.
@@ -907,4 +910,108 @@ fn confirm_false_lets_the_first_reading_back_act() {
     flap(&mut f);
     assert_eq!(f.flags()[6], None, "{:?}", f.flags());
     assert_eq!(f.intents(), 1, "hesitating is the costlier choice here");
+}
+
+/// The declared decisions in the ledger.
+fn declared(f: &Fixture) -> usize {
+    f.entries()
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.record,
+                Record::Decision {
+                    claim: Claim::Declared,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+/// The probe's stuck_low day with the plant alive: the sensor jumps to 12,
+/// a human vouches for it, boost runs on the 12 after it, and the next 12
+/// is stuck at exactly the value from before the run: no effect seen.
+fn stuck_after_a_vouched_run() -> Fixture {
+    let mut f = tomato();
+    for v in [44.0, 43.0, 44.0, 43.0, 43.4] {
+        f.report(v);
+    }
+    f.report(12.0); // a jump: implausible, asks
+    f.approve_open(implausible_ask);
+    f.report(12.0); // vouched for: crosses, boost runs
+    assert_eq!(f.intents(), 1, "{:#?}", f.entries());
+    f.report(12.0); // stuck at the value from before the run
+    assert!(f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.ineffective().len(), 1);
+    f
+}
+
+#[test]
+fn a_no_effect_seen_only_on_a_stuck_sensor_ends_when_it_reads_again() {
+    let _c = clock();
+    let mut f = stuck_after_a_vouched_run();
+    let decisions = declared(&f);
+    // Frozen: held, and asks nothing more.
+    for _ in 0..6 {
+        f.report(12.0);
+    }
+    assert_eq!(f.intents(), 1, "held while frozen");
+    assert!(f.suspended());
+    // The sensor reads again: 30 is unconfirmed, 31 agrees and confirms
+    // it. The plant is dry and alive; boost runs, and no human was asked.
+    f.report(30.0);
+    assert_eq!(f.intents(), 1, "unconfirmed: not yet");
+    f.report(31.0);
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.intents(), 2, "runs again on a confirmed reading");
+    assert_eq!(declared(&f), decisions, "without a declared approval");
+    assert_eq!(f.ineffective().len(), 1, "and without another ask");
+}
+
+#[test]
+fn a_dead_plant_frozen_after_a_run_never_gets_water_back_on_its_own() {
+    let _c = clock();
+    // The e177dd3 quarter: dead after a watering, the sensor frozen at 20.
+    let mut f = tomato();
+    for v in [40.0, 42.0, 41.0, 43.0, 40.0] {
+        f.report(v);
+    }
+    f.report(20.0); // crosses: boost runs
+    f.report(20.0); // stuck at the value from before the run
+    assert!(f.suspended());
+    let decisions = declared(&f);
+    let mut hostile: Vec<f64> = vec![20.0; 10];
+    // One hostile reading, plausible from 20, then repeated: stuck again.
+    hostile.extend([15.0, 15.0, 15.0, 20.0, 20.0]);
+    // A flap around the frozen value.
+    hostile.extend([95.0, 5.0, 95.0, 5.0, 95.0, 20.0, 20.0]);
+    for v in hostile {
+        f.report(v);
+        f.approve_lever_asks();
+    }
+    assert_eq!(f.intents(), 1, "{:#?}", f.flags());
+    assert!(f.suspended());
+    assert_eq!(declared(&f), decisions, "no human said anything");
+    assert!(f.lever_asks().is_empty());
+}
+
+#[test]
+fn a_relapse_seen_only_on_a_stuck_sensor_ends_when_it_reads_again() {
+    let _c = clock();
+    let mut f = stuck_after_a_vouched_run();
+    // Restored by a human while the sensor is still frozen; a run, and the
+    // next reading is stuck again: relapsed, measured, with no new ask.
+    f.approve_open(ineffective_ask);
+    assert!(!f.suspended());
+    f.k.propose("raiser", "boost", None).unwrap();
+    assert_eq!(f.intents(), 2);
+    f.report(12.0);
+    assert!(f.suspended(), "relapsed: {:#?}", f.entries());
+    assert_eq!(f.ineffective().len(), 1);
+    let decisions = declared(&f);
+    f.report(30.0);
+    f.report(31.0);
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.intents(), 3, "runs again on a confirmed reading");
+    assert_eq!(declared(&f), decisions, "without a declared approval");
 }
