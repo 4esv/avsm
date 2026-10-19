@@ -101,7 +101,7 @@ pub fn canary() -> Result<(), String> {
     let now = 1_700_000_000;
     let permissive = Mandate {
         purpose: "a mandate that permits what self may never do".to_string(),
-        metric: "integrity".to_string(),
+        metric: "integrity".into(),
         controller: Controller::Threshold {
             above: Some(0.0),
             below: None,

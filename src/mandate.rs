@@ -21,8 +21,9 @@ use crate::adapter;
 pub struct Mandate {
     /// What the venture is for, in the human's words.
     pub purpose: String,
-    /// The name of the number the report prints.
-    pub metric: String,
+    /// The name of the number the report prints, or a built-in metric;
+    /// a shell metric may carry a label, which is the name reports bear.
+    pub metric: MetricSpec,
     /// What decides when to act.
     pub controller: Controller,
     /// What the venture may do.
@@ -463,6 +464,95 @@ pub struct Permitted {
     pub fields: Option<BTreeMap<String, FieldType>>,
 }
 
+/// What `metric:` says: a word, a built-in metric like `shell <cmd>`, or
+/// `{shell: <cmd>, label: <name>}`, which is `shell <cmd>` whose reports
+/// carry the label as the metric name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetricSpec {
+    spec: String,
+    label: Option<String>,
+}
+
+impl MetricSpec {
+    pub fn labelled(command: &str, label: &str) -> MetricSpec {
+        MetricSpec {
+            spec: format!("shell {}", command.trim()),
+            label: Some(label.to_string()),
+        }
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+}
+
+impl From<&str> for MetricSpec {
+    fn from(spec: &str) -> MetricSpec {
+        MetricSpec {
+            spec: spec.to_string(),
+            label: None,
+        }
+    }
+}
+
+impl From<String> for MetricSpec {
+    fn from(spec: String) -> MetricSpec {
+        MetricSpec { spec, label: None }
+    }
+}
+
+impl std::ops::Deref for MetricSpec {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.spec
+    }
+}
+
+impl fmt::Display for MetricSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.spec)
+    }
+}
+
+impl PartialEq<&str> for MetricSpec {
+    fn eq(&self, other: &&str) -> bool {
+        self.label.is_none() && self.spec == *other
+    }
+}
+
+impl Serialize for MetricSpec {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match &self.label {
+            None => s.serialize_str(&self.spec),
+            Some(label) => {
+                let mut map = s.serialize_map(Some(2))?;
+                map.serialize_entry(
+                    "shell",
+                    self.spec.strip_prefix("shell ").unwrap_or(&self.spec),
+                )?;
+                map.serialize_entry("label", label)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MetricSpec {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<MetricSpec, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Labelled { shell: String, label: String },
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Text(spec) => MetricSpec::from(spec),
+            Raw::Labelled { shell, label } => MetricSpec::labelled(&shell, &label),
+        })
+    }
+}
+
 /// The type of one field of a json payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -867,13 +957,20 @@ impl Mandate {
         if self.metric.trim().is_empty() {
             return fail(NEEDS_METRIC);
         }
+        if let Some(label) = self.metric.label() {
+            if !is_word(label) {
+                return fail(format!(
+                    "metric label must be one word like temperature or latency_ms, not {label:?}"
+                ));
+            }
+        }
         match adapter::Metric::parse(&self.metric) {
             Ok(Some(_)) => {}
             Ok(None) if is_word(self.metric.trim()) => {}
             Ok(None) => {
                 return fail(format!(
                     "metric must be one word like count or latency_ms, not {:?}",
-                    self.metric
+                    &*self.metric
                 ))
             }
             Err(e) => return fail(format!("metric: {e}")),
@@ -1328,7 +1425,7 @@ impl Mandate {
     pub fn empty() -> Mandate {
         Mandate {
             purpose: String::new(),
-            metric: String::new(),
+            metric: MetricSpec::from(""),
             controller: Controller::Model { backend: None },
             permitted: vec![],
             forbidden: vec![],
@@ -1361,6 +1458,9 @@ impl Mandate {
     /// The metric's name: the word before any adapter argument, as reports
     /// carry it.
     pub fn metric_name(&self) -> &str {
+        if let Some(label) = self.metric.label() {
+            return label;
+        }
         self.metric
             .trim()
             .split(char::is_whitespace)
@@ -1862,6 +1962,27 @@ fn check_metric(v: Option<&Value>) -> Result<(), MandateError> {
         None | Some(Value::Null) => fail(NEEDS_METRIC),
         Some(Value::String(s)) if s.trim().is_empty() => fail(NEEDS_METRIC),
         Some(Value::String(_)) => Ok(()),
+        Some(Value::Mapping(m)) if !m.contains_key("shell") => {
+            fail("metric must be one word like count or latency_ms, not a set of fields")
+        }
+        Some(Value::Mapping(m)) => {
+            const SHAPE: &str = "metric as a set of fields is {shell: <command>, label: <name>}";
+            if let Some(field) = unknown_field(m, &["shell", "label"])? {
+                return fail(format!("{SHAPE}, not a field {field:?}"));
+            }
+            match (m.get("shell"), m.get("label")) {
+                (Some(Value::String(c)), Some(Value::String(l))) if !c.trim().is_empty() => {
+                    if is_word(l.trim()) && l.trim() == l {
+                        Ok(())
+                    } else {
+                        fail(format!(
+                            "metric label must be one word like temperature or latency_ms, not {l:?}"
+                        ))
+                    }
+                }
+                _ => fail(format!("{SHAPE}; both are text")),
+            }
+        }
         Some(other) => fail(format!(
             "metric must be one word like count or latency_ms, not {}",
             describe(other)
@@ -2656,6 +2777,32 @@ max_step: 5000
             .unwrap()
             .expects
             .is_none());
+    }
+
+    #[test]
+    fn a_shell_metric_may_carry_a_label() {
+        let with = |metric: &str| edit("metric: count", &format!("metric: {metric}"));
+        let m = Mandate::parse(&with("{shell: \"echo 7\", label: temperature}")).unwrap();
+        assert_eq!(m.metric_name(), "temperature");
+        assert_eq!(m.metric_adapter().unwrap().name(), "shell");
+        assert_eq!(m.metric.label(), Some("temperature"));
+        // It survives a round trip.
+        let back = Mandate::parse(&serde_yaml::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        // The text form still works and is named shell.
+        let plain = Mandate::parse(&with("shell echo 7")).unwrap();
+        assert_eq!(plain.metric_name(), "shell");
+        assert_eq!(plain.metric.label(), None);
+        for (bad, says) in [
+            ("{shell: echo 7}", "label: <name>"),
+            ("{label: t}", "not a set of fields"),
+            ("{shell: echo 7, label: two words}", "one word"),
+            ("{shell: echo 7, label: t, more: 1}", "more"),
+            ("{shell: \"\", label: t}", "label: <name>"),
+        ] {
+            let msg = fails(&with(bad));
+            assert!(msg.contains(says), "{bad}: {msg}");
+        }
     }
 
     #[test]

@@ -683,7 +683,7 @@ mod tests {
             venture: "shop".to_string(),
             mandate: Mandate {
                 purpose: "Sell more".to_string(),
-                metric: "orders".to_string(),
+                metric: "orders".into(),
                 controller: if classifier {
                     Controller::Classifier { backend: None }
                 } else {

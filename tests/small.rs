@@ -232,3 +232,30 @@ fn a_digest_delta_has_the_precision_of_the_metric() {
     assert!(line.contains("shell=24 (-3.6)"), "{text}");
     assert!(!line.contains("0000"), "{text}");
 }
+
+fn reported(mandate: &str) -> Vec<String> {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut k, _) = kernel(tmp.path(), mandate, vec![]);
+    k.report("shop", false);
+    k.entries()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Report {
+                venture,
+                metric,
+                value,
+                ..
+            } if venture == "shop" => Some(format!("{metric}={}", value.unwrap())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_shell_metric_with_a_label_reports_under_the_label() {
+    let labelled = "purpose: Cool.\nmetric: {shell: echo 7, label: temperature}\ncontroller: {kind: model}\ncadence: 1h\n";
+    assert_eq!(reported(labelled), vec!["temperature=7"]);
+    let plain = "purpose: Cool.\nmetric: shell echo 7\ncontroller: {kind: model}\ncadence: 1h\n";
+    assert_eq!(reported(plain), vec!["shell=7"]);
+}

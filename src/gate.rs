@@ -2403,7 +2403,7 @@ mod tests {
     fn mandate(controller: Controller, permitted: Vec<Permitted>, forbidden: &[&str]) -> Mandate {
         Mandate {
             purpose: "keep the counter low".to_string(),
-            metric: "count".to_string(),
+            metric: "count".into(),
             controller,
             permitted,
             forbidden: forbidden.iter().map(|s| s.to_string()).collect(),
