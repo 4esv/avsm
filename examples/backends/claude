@@ -22,6 +22,7 @@ Environment:
 """
 import json
 import os
+import pwd
 import subprocess
 import sys
 
@@ -38,6 +39,9 @@ def main() -> int:
         return 2
 
     env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+    # avsmd runs a backend with HOME set to its own directory; claude finds
+    # its login under the real home, which the password database still knows.
+    env["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
     model = os.environ.get("AVSM_ESCALATE_MODEL", "sonnet")
     command = [
         "claude", "-p",
