@@ -671,3 +671,36 @@ fn the_warden_reads_a_guard_through_a_built_in_metric() {
     );
     assert_eq!(asks.len(), 1, "{:?}", k.entries().unwrap());
 }
+
+/// The audit asks for an inbox whose target improves downward, over these
+/// (unread, complaints) reports.
+fn inbox_audit_asks(reports: &[(&str, &str)]) -> Vec<Entry> {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = venture(
+        tmp.path(),
+        "inbox",
+        "purpose: Answer mail.\nmetric: unread\ncontroller: {kind: model}\ncadence: 1h\n\
+         audits:\n- {name: complaints, run: cat complaints, worse: up, better: down, tolerance: 1}\n",
+    );
+    let mut k = kernel(&home, Box::new(Silent));
+    k.add(&dir).unwrap();
+    for (unread, complaints) in reports {
+        set(&dir, "complaints", complaints);
+        report(&mut k, &dir, "inbox", unread);
+    }
+    signals(&k, |s| matches!(s, Signal::Audit { .. }))
+}
+
+#[test]
+fn an_audit_knows_which_way_the_target_improves() {
+    // Unread mail falling is the target improving: with complaints up past
+    // tolerance, that asks.
+    let asks = inbox_audit_asks(&[("40", "1"), ("30", "2"), ("20", "4")]);
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert!(matches!(&asks[0].record,
+        Record::Ask { signal: Some(Signal::Audit { audit, target_delta, audit_delta }), .. }
+        if audit == "complaints" && *target_delta == -20.0 && *audit_delta == 3.0));
+    // Unread mail rising is the target getting worse: no audit ask.
+    assert!(inbox_audit_asks(&[("20", "1"), ("30", "2"), ("40", "4")]).is_empty());
+}

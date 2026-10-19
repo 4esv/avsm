@@ -112,8 +112,9 @@ range: [0, 100000]
 max_step: 5000
 ```
 
-An audit asks when the metric rises over its last `window` readings (5 unless
-set) while the audit gets worse by more than its tolerance. No model ever sees
+An audit asks when the metric improves over its last `window` readings (5 unless
+set) while the audit gets worse by more than its tolerance. The metric improves
+going up unless the audit says `better: down`, as for unread mail. No model ever sees
 an audit reading. A report outside `range`, a step past `max_step`, a flap, a
 NaN or a failed report is kept, marked implausible, never acted on, and asks
 once until a plausible report comes. On a threshold, `deadband: 2` acts once

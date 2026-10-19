@@ -360,11 +360,12 @@ impl Kernel {
             let Some((target_delta, audit_delta)) = found else {
                 continue;
             };
-            if target_delta > 0.0 && a.worsened(audit_delta) > a.tolerance {
+            if a.improved(target_delta) > 0.0 && a.worsened(audit_delta) > a.tolerance {
                 self.signal(
                     &v.name,
                     format!(
-                        "{target} rose by {target_delta} while audit {} got worse by {}, past its tolerance {}",
+                        "{target} got better by {} while audit {} got worse by {}, past its tolerance {}",
+                        a.improved(target_delta),
                         a.name,
                         a.worsened(audit_delta),
                         a.tolerance

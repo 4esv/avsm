@@ -140,10 +140,12 @@ impl Guard {
     }
 }
 
-/// Which way an audit gets worse.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A direction: which way an audit gets worse, or which way the target
+/// improves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Worse {
+    #[default]
     Up,
     Down,
 }
@@ -159,12 +161,20 @@ pub struct Audit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<String>,
     pub worse: Worse,
+    /// Which way the target improves: up, unless the metric is one where
+    /// less is better, like unread mail.
+    #[serde(default, skip_serializing_if = "is_up")]
+    pub better: Worse,
     /// How far the audit may move the worse way over the window.
     #[serde(default)]
     pub tolerance: f64,
     /// How many audit readings the window spans, the latest included.
     #[serde(default = "default_window")]
     pub window: u32,
+}
+
+fn is_up(w: &Worse) -> bool {
+    *w == Worse::Up
 }
 
 fn default_window() -> u32 {
@@ -180,6 +190,14 @@ impl Audit {
     /// How much worse the audit got for a change of `delta`.
     pub fn worsened(&self, delta: f64) -> f64 {
         match self.worse {
+            Worse::Up => delta,
+            Worse::Down => -delta,
+        }
+    }
+
+    /// How much the target improved for a change of `delta`.
+    pub fn improved(&self, delta: f64) -> f64 {
+        match self.better {
             Worse::Up => delta,
             Worse::Down => -delta,
         }
@@ -626,7 +644,15 @@ const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadban
 const GUARD_FIELDS: &[&str] = &[
     "name", "run", "adapter", "above", "below", "then", "drawdown", "of",
 ];
-const AUDIT_FIELDS: &[&str] = &["name", "run", "adapter", "worse", "tolerance", "window"];
+const AUDIT_FIELDS: &[&str] = &[
+    "name",
+    "run",
+    "adapter",
+    "worse",
+    "better",
+    "tolerance",
+    "window",
+];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
 const ACTION_FIELDS: &[&str] = &[
     "name",
@@ -1551,6 +1577,7 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
         AUDIT_FIELDS,
         "name, run or adapter, worse: up or down, tolerance",
     )?;
+    check_directions(map.get("audits"))?;
     match map.get("range") {
         None | Some(Value::Null) => {}
         Some(Value::Sequence(items))
@@ -1569,6 +1596,31 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
             describe(other)
         )),
     }
+}
+
+/// An audit's `worse` and `better` are up or down.
+fn check_directions(v: Option<&Value>) -> Result<(), MandateError> {
+    let Some(Value::Sequence(items)) = v else {
+        return Ok(());
+    };
+    for item in items {
+        for (field, what) in [
+            ("worse", "which way the audit gets worse"),
+            ("better", "which way the target improves"),
+        ] {
+            match item.get(field) {
+                None => {}
+                Some(Value::String(w)) if w == "up" || w == "down" => {}
+                Some(other) => {
+                    return fail(format!(
+                        "an audit's {field} is up or down, {what}; not {}",
+                        describe(other)
+                    ))
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A list of sets of fields, each with only the known fields.
@@ -2313,7 +2365,11 @@ max_step: 5000
             ("guards: 3\n", "guards is a list"),
             (
                 "audits:\n  - {name: a, run: ./a, worse: sideways}\n",
-                "sideways",
+                "worse is up or down",
+            ),
+            (
+                "audits:\n  - {name: a, run: ./a, worse: up, better: left}\n",
+                "better is up or down",
             ),
             ("audits:\n  - {name: a, worse: up}\n", "exactly one of run"),
             (
