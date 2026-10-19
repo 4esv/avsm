@@ -164,11 +164,15 @@ fn five_approvals_yield_one_proposal_and_adopting_it_ends_the_asks() {
     let entries = k.entries().unwrap();
     let done = entries
         .iter()
-        .find(|e| e.record.kind() == Kind::Action && e.record.action() == Some("delegate"))
+        .find(|e| e.record.kind() == Kind::Intent && e.record.action() == Some("delegate"))
         .expect("delegate ran");
+    let outcome = entries
+        .iter()
+        .find(|e| matches!(&e.record, Record::Outcome { intent, .. } if *intent == done.seq))
+        .expect("delegate has an outcome");
     assert_eq!(
-        done.record.summary(),
-        "delegate: done  mandate rewritten; delegated: announce"
+        outcome.record.summary(),
+        format!("#{} done  mandate rewritten; delegated: announce", done.seq)
     );
     let adopted = entries.last().unwrap();
     assert!(
@@ -216,7 +220,7 @@ fn five_approvals_yield_one_proposal_and_adopting_it_ends_the_asks() {
         .entries()
         .unwrap()
         .into_iter()
-        .filter(|e| e.record.kind() == Kind::Action && e.record.action() == Some("announce"))
+        .filter(|e| e.record.kind() == Kind::Intent && e.record.action() == Some("announce"))
         .collect();
     let first = k.why(announces.first().unwrap().seq).unwrap();
     assert!(first.contains("shop mandate v1 (#"), "{first}");

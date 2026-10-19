@@ -175,7 +175,12 @@ enum Op {
     Pause(String, Claim),
     Resume(String, Claim),
     Action(String, String, bool, Option<Payload>, Option<u64>),
-    Intent(String, String),
+    Intent(String, String, Option<Payload>),
+    /// An outcome of a record already written, of its venture or another,
+    /// by any claim.
+    Outcome(u64, Claim, bool, Option<String>),
+    /// A lever run as 2.0 records it: an intent, then its outcome.
+    Run(String, String, Claim, bool, Option<Payload>),
     /// A parent lever pulled, by the parent or by someone else.
     Pull(String, String, bool, Payload),
     Readopt(String, bool),
@@ -199,7 +204,22 @@ fn op() -> impl Strategy<Value = Op> {
         3 => (name(), claim()).prop_map(|(v, c)| Op::Resume(v, c)),
         4 => (lever(), any::<bool>(), payload(), prop::option::of(seq()))
             .prop_map(|((v, a), ok, p, d)| Op::Action(v, a, ok, p, d)),
-        2 => lever().prop_map(|(v, a)| Op::Intent(v, a)),
+        2 => (lever(), payload()).prop_map(|((v, a), p)| Op::Intent(v, a, p)),
+        2 => (seq(), claim(), prop::bool::weighted(0.8), prop::option::weighted(0.2, name()))
+            .prop_map(|(x, c, ok, other)| Op::Outcome(x, c, ok, other)),
+        3 => (
+            prop_oneof![
+                3 => (
+                    prop_oneof![3 => Just("parent".to_string()), 1 => name()],
+                    prop::sample::select(&["pause", "resume", "budget", "threshold"][..]).prop_map(str::to_string),
+                ),
+                1 => lever(),
+            ],
+            prop_oneof![4 => Just(Claim::Measured), 1 => claim()],
+            prop::bool::weighted(0.8),
+            prop_oneof![3 => text().prop_map(Some), 1 => payload()],
+        )
+            .prop_map(|((v, a), c, ok, p)| Op::Run(v, a, c, ok, p)),
         3 => (
             prop_oneof![3 => Just("parent".to_string()), 1 => name()],
             prop::sample::select(&["pause", "resume", "budget", "threshold"][..]).prop_map(str::to_string),
@@ -303,13 +323,15 @@ fn record(op: &Op, n: u64) -> Record {
             detail: String::new(),
             payload,
         },
-        Op::Intent(venture, action) => Record::Intent {
+        Op::Intent(venture, action, payload) => Record::Intent {
             claim: Claim::Measured,
             proof: proof(&venture, &action, None),
+            key: Some(avsm::record::key(&venture, &action, &[], payload.as_ref())),
             venture,
             action,
-            payload: None,
+            payload,
         },
+        Op::Outcome(..) | Op::Run(..) => unreachable!("written by build"),
         Op::Pull(venture, action, ok, text) => Record::Action {
             claim: Claim::Measured,
             proof: proof(&venture, &action, None),
@@ -493,7 +515,50 @@ fn build(case: &Case) -> (Ledger, Index, Vec<Adopted>, i64) {
         }
         at += step;
         let n = ledger.len().unwrap();
-        ledger.append_at(record(op, n), at).unwrap();
+        match op {
+            Op::Outcome(x, claim, ok, other) => {
+                let intent = pick(n, *x);
+                let venture = other
+                    .clone()
+                    .or_else(|| {
+                        ledger
+                            .get(intent)
+                            .unwrap()
+                            .map(|e| e.record.venture().to_string())
+                    })
+                    .unwrap_or_else(|| "child".to_string());
+                let outcome = Record::Outcome {
+                    claim: *claim,
+                    venture,
+                    intent,
+                    ok: *ok,
+                    detail: String::new(),
+                };
+                ledger.append_at(outcome, at).unwrap();
+            }
+            Op::Run(venture, action, claim, ok, payload) => {
+                let started = ledger
+                    .append_at(
+                        record(
+                            &Op::Intent(venture.clone(), action.clone(), payload.clone()),
+                            n,
+                        ),
+                        at,
+                    )
+                    .unwrap();
+                let outcome = Record::Outcome {
+                    claim: *claim,
+                    venture: venture.clone(),
+                    intent: started.seq,
+                    ok: *ok,
+                    detail: String::new(),
+                };
+                ledger.append_at(outcome, at).unwrap();
+            }
+            _ => {
+                ledger.append_at(record(op, n), at).unwrap();
+            }
+        }
     }
     index.refresh(&ledger).unwrap();
     (ledger, index, adopted, at + case.later)

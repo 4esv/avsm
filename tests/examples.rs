@@ -14,7 +14,7 @@ use avsm::kernel::Kernel;
 use avsm::record::{Kind, Record};
 use avsm::role::{Context, InferRequest, Role};
 use avsm::warden::LocalWarden;
-use common::{imap_stub, route, Stub};
+use common::{imap_stub, ran, route, Stub};
 
 struct Scripted {
     replies: VecDeque<Vec<Record>>,
@@ -204,7 +204,7 @@ fn github_repo_watches_ci_and_files_issues_and_pull_requests() {
             Some("CI is red\nThe build fails on main."),
         )
         .unwrap();
-    assert!(out.contains("file-issue: done  opened issue #4"), "{out}");
+    assert!(ran(&out, "file-issue", "opened issue #4"), "{out}");
     let diff = "--- a/README\n+++ b/README\n@@ -1 +1,2 @@\n hello\n+fixed\n";
     let out = k.propose("github-repo", "pr", Some(diff)).unwrap();
     let ask = ask_number(&out, "pr");
@@ -269,7 +269,7 @@ fn stripe_store_reads_revenue_researches_freely_and_asks_before_mailing() {
     let out = k
         .propose("stripe-store", "research", Some("What do rivals charge?"))
         .unwrap();
-    assert!(out.contains("research: done  1 finding"), "{out}");
+    assert!(ran(&out, "research", "1 finding"), "{out}");
     assert!(
         out.contains("inferred  report    pricing=?  Rivals charge 25"),
         "{out}"
@@ -483,11 +483,11 @@ fn portfolio_allocates_to_its_two_children_and_sees_their_records() {
         .propose("portfolio", "budget", Some("stripe-store 50"))
         .unwrap();
     assert!(
-        out.contains("budget: done  stripe-store may spend 50 a day"),
+        ran(&out, "budget", "stripe-store may spend 50 a day"),
         "{out}"
     );
     let out = k.propose("portfolio", "pause", Some("mail-inbox")).unwrap();
-    assert!(out.contains("pause: done  mail-inbox is paused"), "{out}");
+    assert!(ran(&out, "pause", "mail-inbox is paused"), "{out}");
     assert!(
         k.status().unwrap().contains("mail-inbox   paused"),
         "{}",

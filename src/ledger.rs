@@ -433,14 +433,18 @@ mod tests {
                 text(),
                 text(),
                 proof(),
-                prop::option::of(payload())
+                prop::option::of(payload()),
+                prop::option::of(text())
             )
-                .prop_map(|(claim, venture, action, proof, payload)| Record::Intent {
-                    claim,
-                    venture,
-                    action,
-                    proof,
-                    payload,
+                .prop_map(|(claim, venture, action, proof, payload, key)| {
+                    Record::Intent {
+                        claim,
+                        venture,
+                        action,
+                        proof,
+                        payload,
+                        key,
+                    }
                 }),
             (claim(), text(), any::<Seq>(), any::<bool>(), text()).prop_map(
                 |(claim, venture, intent, ok, detail)| Record::Outcome {

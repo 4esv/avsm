@@ -198,9 +198,16 @@ fn past_the_bound_the_older_records_are_summarized_and_leave_the_context() {
     assert_eq!(seqs(&ctx.summaries), vec![summary.seq]);
     assert_eq!(seqs(&ctx.entries), vec![8, 9, 10]);
     assert!(ctx.to_summarize.is_empty());
+    // The second turn gave no record, and still left one.
+    let quiet = k.entries().unwrap().last().unwrap().clone();
+    assert!(
+        matches!(&quiet.record, Record::Report { claim: Claim::Inferred, metric, .. } if metric == "nothing"),
+        "{}",
+        quiet.line()
+    );
     assert_eq!(
         k.tail(20).unwrap().lines().count(),
-        12,
+        13,
         "nothing left the ledger"
     );
     let text = k.know("shop").unwrap();
@@ -208,7 +215,7 @@ fn past_the_bound_the_older_records_are_summarized_and_leave_the_context() {
         text.contains("summary=?  Eight readings of five.  (leaves #2 #3 #4 #5 #6 #7)"),
         "{text}"
     );
-    assert_eq!(k.ledger.verify().unwrap(), 12);
+    assert_eq!(k.ledger.verify().unwrap(), 13);
 }
 
 #[test]
@@ -278,8 +285,9 @@ fn a_model_drills_through_the_roles_process_and_each_drill_is_a_record() {
         kinds[4].starts_with("inferred proposal tidy: looked"),
         "{kinds:?}"
     );
+    assert_eq!(kinds[5], "measured intent tidy: starting", "{kinds:?}");
     assert!(
-        kinds[5].starts_with("measured action tidy: done"),
+        kinds[6].starts_with("measured outcome #6 done"),
         "{kinds:?}"
     );
     assert!(dir.join("tidied").exists());

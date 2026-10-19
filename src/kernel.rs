@@ -126,6 +126,10 @@ impl Warden for NoWarden {
     fn measure(&mut self, _venture: &str) -> Result<(Option<f64>, String), String> {
         Err("no warden process; start avsm with: avsm start".to_string())
     }
+
+    fn confirm(&mut self, _intent: Seq) -> Result<Option<(bool, String)>, String> {
+        Err("no warden process; start avsm with: avsm start".to_string())
+    }
 }
 
 impl Kernel {
@@ -162,6 +166,7 @@ impl Kernel {
             refusals: refusals::Tally::default(),
         };
         kernel.reload()?;
+        kernel.recover();
         Ok(kernel)
     }
 
@@ -550,7 +555,98 @@ impl Kernel {
         };
         let entry = self
             .append(self.decision(ask.record.venture(), Verdict::Approve { ask: seq, payload }))?;
+        let mut out = entry.line() + "\n";
+        if let Some(intent) = pending_asked(&ask) {
+            out.push_str(&self.settle(&ask, intent, true, "a human says it happened")?);
+        }
+        Ok(out)
+    }
+
+    /// The declared outcome a human's answer to a pending ask makes.
+    fn settle(&mut self, ask: &Entry, intent: Seq, ok: bool, what: &str) -> Result<String, String> {
+        let detail = match &self.by {
+            Some(who) => format!("{what} ({who}, #{})", ask.seq),
+            None => format!("{what} (#{})", ask.seq),
+        };
+        let entry = self.append(Record::Outcome {
+            claim: Claim::Declared,
+            venture: ask.record.venture().to_string(),
+            intent,
+            ok,
+            detail,
+        })?;
         Ok(entry.line() + "\n")
+    }
+
+    /// Settle every intent with no outcome: a run that may or may not
+    /// have happened is never run again blindly. The warden asks the
+    /// lever's adapter where one can check by the run's key, and the
+    /// answer is a measured outcome; otherwise a human is asked, once,
+    /// and the answer becomes a declared outcome. Until then the gate
+    /// refuses the lever. When the warden cannot look now, it is left
+    /// for later.
+    pub fn recover(&mut self) {
+        let pending: Vec<(Seq, String, String)> = {
+            let Ok(index) = self.index() else { return };
+            index
+                .pending()
+                .filter(|(s, v, _)| {
+                    !index
+                        .open_of(v)
+                        .any(|q| index.get(q).and_then(pending_asked) == Some(*s))
+                })
+                .map(|(s, v, a)| (s, v.to_string(), a.to_string()))
+                .collect()
+        };
+        for (intent, venture, action) in pending {
+            let record = match self.warden.confirm(intent) {
+                Err(e) => {
+                    log(&format!(
+                        "{venture}: intent #{intent} has no outcome and cannot be checked now: {e}"
+                    ));
+                    continue;
+                }
+                Ok(Some((ok, found))) => Record::Outcome {
+                    claim: Claim::Measured,
+                    venture: venture.clone(),
+                    intent,
+                    ok,
+                    detail: format!("checked after a restart: {found}"),
+                },
+                Ok(None) => {
+                    let may_ask = match self.index() {
+                        Ok(index) => self.may_ask(&index),
+                        Err(_) => continue,
+                    };
+                    if !may_ask {
+                        log(&format!(
+                            "{venture}: the asks quota is used up; intent #{intent} stays unsettled and {action} stays refused"
+                        ));
+                        continue;
+                    }
+                    Record::Ask {
+                        claim: Claim::Measured,
+                        venture: venture.clone(),
+                        action: None,
+                        question: format!(
+                            "did {action} happen? intent #{intent} has no outcome; approve if it did, deny if it did not"
+                        ),
+                        refusal: Some(gate::Refusal {
+                            venture: venture.clone(),
+                            action: action.clone(),
+                            steps: vec![],
+                            reasons: vec![Reason::Pending { intent }],
+                        }),
+                        payload: None,
+                        signal: None,
+                    }
+                }
+            };
+            match self.append(record) {
+                Ok(e) => log(&e.line()),
+                Err(e) => log(&format!("{venture}: cannot write record: {e}")),
+            }
+        }
     }
 
     /// Say no to an ask.
@@ -561,9 +657,19 @@ impl Kernel {
         } else {
             reason.trim().to_string()
         };
-        let entry =
-            self.append(self.decision(ask.record.venture(), Verdict::Deny { ask: seq, reason }))?;
-        Ok(entry.line() + "\n")
+        let entry = self.append(self.decision(
+            ask.record.venture(),
+            Verdict::Deny {
+                ask: seq,
+                reason: reason.clone(),
+            },
+        ))?;
+        let mut out = entry.line() + "\n";
+        if let Some(intent) = pending_asked(&ask) {
+            let what = format!("a human says it did not happen: {reason}");
+            out.push_str(&self.settle(&ask, intent, false, &what)?);
+        }
+        Ok(out)
     }
 
     /// File a proposal by hand. It is declared, and it still goes through
@@ -658,6 +764,7 @@ impl Kernel {
     /// declared decisions, and run the nightly cycle when its time comes.
     /// Problems are logged and never stop the pass.
     pub fn tick(&mut self) {
+        self.recover();
         let names: Vec<String> = self.ventures.keys().cloned().collect();
         let adopted = self.adopted();
         // Every state as the ledger stood when the pass began.
@@ -1446,9 +1553,16 @@ impl Kernel {
                 return;
             }
         };
-        if records.is_empty() {
-            log(&format!("{name}: nightly cycle: nothing"));
-        }
+        // A model turn has not happened until its inferred record is
+        // stored: a turn that left none still leaves one.
+        let records = if records.is_empty() {
+            vec![role::nothing_record(
+                name,
+                Some("the role returned no record"),
+            )]
+        } else {
+            records
+        };
         for record in records {
             // A role may only propose or ask, and only for its own venture.
             // A payload is kept only when the lever takes that shape.
@@ -1513,6 +1627,9 @@ impl Kernel {
                         cites,
                     }
                 }
+                Record::Report { metric, note, .. } if metric == role::NOTHING => {
+                    role::nothing_record(name, Some(&note))
+                }
                 Record::Report { metric, note, .. } if metric == role::UNUSABLE => Record::Report {
                     claim: Claim::Inferred,
                     venture: name.to_string(),
@@ -1523,13 +1640,19 @@ impl Kernel {
                     confidence: None,
                     cites: vec![],
                 },
-                other => {
-                    log(&format!(
-                        "{name}: role returned a {} record; only proposals, asks and summaries count",
+                other => Record::Report {
+                    claim: Claim::Inferred,
+                    venture: name.to_string(),
+                    metric: role::UNUSABLE.to_string(),
+                    value: None,
+                    note: format!(
+                        "the role returned a {} record; only proposals, asks and summaries count",
                         other.kind()
-                    ));
-                    continue;
-                }
+                    ),
+                    source: None,
+                    confidence: None,
+                    cites: vec![],
+                },
             };
             let entry = match self.append(record) {
                 Ok(e) => e,
@@ -1693,6 +1816,23 @@ fn spawn_run(home: &Path, name: &str, path: &Path, confine: bool) -> Result<Chil
     }
     cmd.spawn()
         .map_err(|e| format!("cannot run {}: {e}", path.display()))
+}
+
+/// The intent an ask is about, when it asks whether a run with no outcome
+/// happened.
+fn pending_asked(e: &Entry) -> Option<Seq> {
+    match &e.record {
+        Record::Ask {
+            claim: Claim::Measured,
+            action: None,
+            refusal: Some(r),
+            ..
+        } => r.reasons.iter().find_map(|r| match r {
+            Reason::Pending { intent } => Some(*intent),
+            _ => None,
+        }),
+        _ => None,
+    }
 }
 
 /// Does this ask, a delegate ask, name the lever? The question says so.
@@ -1924,7 +2064,18 @@ fn why_in(
         };
         return Ok(format!("{}\n{derivation}", entry.line()));
     }
-    let mut text = gate::why(entry);
+    // An outcome rests on its intent: the proof that let the run start.
+    let mut text = match &entry.record {
+        Record::Outcome { intent, .. } => match index.get(*intent) {
+            Some(started) => format!(
+                "{}\n  outcome of intent #{intent}\n{}",
+                entry.line(),
+                gate::why(started)
+            ),
+            None => gate::why(entry),
+        },
+        _ => gate::why(entry),
+    };
     // The mandate version an action, intent or outcome rests on.
     let proof = match &entry.record {
         Record::Action { proof, .. } | Record::Intent { proof, .. } => Some(proof),
@@ -2263,6 +2414,15 @@ impl Warden for WardenProcess {
             _ => Err("the warden answered the wrong question".to_string()),
         }
     }
+
+    fn confirm(&mut self, intent: Seq) -> Result<Option<(bool, String)>, String> {
+        self.0.send(&ToWarden::Confirm(intent))?;
+        match self.0.recv::<FromWarden>()? {
+            FromWarden::Confirmed(found) => Ok(found),
+            FromWarden::Err(e) => Err(e),
+            _ => Err("the warden answered the wrong question".to_string()),
+        }
+    }
 }
 
 /// The roles, running in a child process that holds no keys.
@@ -2332,6 +2492,10 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
             },
             Ok(ToWarden::Measure(v)) => match warden.measure(&v) {
                 Ok((value, note)) => FromWarden::Measured(value, note),
+                Err(e) => FromWarden::Err(e),
+            },
+            Ok(ToWarden::Confirm(i)) => match warden.confirm(i) {
+                Ok(found) => FromWarden::Confirmed(found),
                 Err(e) => FromWarden::Err(e),
             },
             Err(e) => FromWarden::Err(format!("bad request: {e}")),

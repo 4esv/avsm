@@ -372,7 +372,9 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<String>,
     },
-    /// An irreversible action is about to run.
+    /// A lever is about to run: stored before it runs, so a run never
+    /// happens unrecorded. `key` is the run's idempotency key (see `key`),
+    /// which the lever sees as `AVSM_KEY`; a 1.0 ledger's intents have none.
     Intent {
         claim: Claim,
         venture: String,
@@ -380,8 +382,11 @@ pub enum Record {
         proof: Proof,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<Payload>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
-    /// How an intent went.
+    /// How an intent went: measured when code saw it, declared when a
+    /// human said so.
     Outcome {
         claim: Claim,
         venture: String,
@@ -406,6 +411,18 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         closes: Option<Seq>,
     },
+}
+
+/// The idempotency key of a lever run: sha256 over the venture, the
+/// action, the cited records in order, and the payload text. The same run
+/// asked for again has the same key; any other run has another.
+pub fn key(venture: &str, action: &str, cites: &[Seq], payload: Option<&Payload>) -> String {
+    let mut cites = cites.to_vec();
+    cites.sort_unstable();
+    let text = payload.map(Payload::text);
+    let canonical = serde_json::to_string(&(venture, action, cites, text))
+        .expect("strings and numbers always serialize");
+    hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 
 impl Record {

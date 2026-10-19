@@ -14,7 +14,7 @@ use avsm::kernel::Kernel;
 use avsm::record::{Claim, Kind, Record};
 use avsm::role::{Context, InferRequest, Role};
 use avsm::warden::LocalWarden;
-use common::{route, Stub};
+use common::{ran, route, Stub};
 
 /// A role that answers from a script and keeps what it was shown.
 struct Scripted {
@@ -105,14 +105,11 @@ fn a_budget_moves_between_two_children() {
 
     // Ten for the shop, nothing for the farm.
     let out = lines_of(&mut k, "portfolio", "budget", "shop 10");
-    assert!(
-        out.contains("action    budget: done  shop may spend 10 a day"),
-        "{out}"
-    );
+    assert!(ran(&out, "budget", "shop may spend 10 a day"), "{out}");
     let out = lines_of(&mut k, "portfolio", "budget", "farm 0");
     assert!(out.contains("farm may spend 0 a day"), "{out}");
     let out = k.propose("shop", "spend", None).unwrap();
-    assert!(out.contains("action    spend: done"), "{out}");
+    assert!(ran(&out, "spend", ""), "{out}");
     let out = k.propose("shop", "spend", None).unwrap();
     assert!(
         out.contains(
@@ -131,7 +128,7 @@ fn a_budget_moves_between_two_children() {
     lines_of(&mut k, "portfolio", "budget", "farm 10");
     lines_of(&mut k, "portfolio", "budget", "shop 0");
     let out = k.propose("farm", "spend", None).unwrap();
-    assert!(out.contains("action    spend: done"), "{out}");
+    assert!(ran(&out, "spend", ""), "{out}");
     assert_eq!(
         std::fs::read_to_string(farm.join("spent")).unwrap(),
         "spent\n"
@@ -198,10 +195,7 @@ fn a_child_paused_by_its_parent_cannot_act_and_its_run_stops() {
     assert!(k.run_pid("shop").is_some());
 
     let out = lines_of(&mut k, "portfolio", "pause", "shop");
-    assert!(
-        out.contains("action    pause: done  shop is paused"),
-        "{out}"
-    );
+    assert!(ran(&out, "pause", "shop is paused"), "{out}");
     assert!(k.status().unwrap().contains("shop         paused"));
     k.tick();
     assert_eq!(k.run_pid("shop"), None, "the run is stopped");
@@ -232,14 +226,21 @@ fn a_child_paused_by_its_parent_cannot_act_and_its_run_stops() {
     let resumed = entries
         .iter()
         .rev()
-        .find(|e| e.record.kind() == Kind::Action && e.record.action() == Some("resume"))
+        .find(|e| e.record.kind() == Kind::Intent && e.record.action() == Some("resume"))
         .expect("the resume ran");
-    assert_eq!(resumed.record.summary(), "resume: done  shop may run again");
+    let done = entries
+        .iter()
+        .find(|e| matches!(&e.record, Record::Outcome { intent, .. } if *intent == resumed.seq))
+        .expect("the resume has an outcome");
+    assert_eq!(
+        done.record.summary(),
+        format!("#{} done  shop may run again", resumed.seq)
+    );
     assert!(k.status().unwrap().contains("shop         running"));
     k.tick();
     assert!(k.run_pid("shop").is_some(), "the run is back");
     let out = k.propose("shop", "spend", None).unwrap();
-    assert!(out.contains("action    spend: done"), "{out}");
+    assert!(ran(&out, "spend", ""), "{out}");
 }
 
 #[test]
@@ -262,14 +263,14 @@ fn the_parent_sets_a_childs_threshold() {
     k.report("farm", false);
     assert!(!farm.join("vents").exists(), "27 is under 30");
     let out = lines_of(&mut k, "portfolio", "threshold", "farm above 25");
-    assert!(out.contains("threshold: done  farm acts above 25"), "{out}");
+    assert!(ran(&out, "threshold", "farm acts above 25"), "{out}");
     k.report("farm", false);
     assert!(farm.join("vents").exists(), "27 is over 25");
     let entries = k.entries().unwrap();
     let vent = entries
         .iter()
         .rev()
-        .find(|e| e.record.kind() == Kind::Action && e.record.action() == Some("vent"))
+        .find(|e| e.record.kind() == Kind::Intent && e.record.action() == Some("vent"))
         .unwrap();
     let why = k.why(vent.seq).unwrap();
     assert!(
@@ -305,7 +306,7 @@ fn shared_quotas_are_refused_before_the_gate_and_shown_in_why() {
     k.add(&dir).unwrap();
     // Spend: 10 of 15, then no room for another 10.
     let out = k.propose("shop", "buy", None).unwrap();
-    assert!(out.contains("action    buy: done"), "{out}");
+    assert!(ran(&out, "buy", ""), "{out}");
     let out = k.propose("shop", "buy", None).unwrap();
     assert!(
         out.contains(
@@ -489,13 +490,7 @@ fn the_parents_nightly_call_sees_childrens_records_not_their_raw_input() {
         "{}",
         shop.metric
     );
-    assert!(
-        shop.lines
-            .iter()
-            .any(|l| l.contains("measured  action    spend: done")),
-        "{:?}",
-        shop.lines
-    );
+    assert!(ran(&shop.lines.join("\n"), "spend", ""), "{:?}", shop.lines);
     assert!(
         shop.lines
             .iter()

@@ -2,6 +2,9 @@
 //! scripted human approves, and the ratchet ends the asks. One test in
 //! this file: the virtual clock belongs to the whole process.
 
+mod common;
+
+use common::ran;
 use std::os::unix::fs::PermissionsExt;
 
 use avsm::simulate::{run, Human, Plan, BY};
@@ -82,7 +85,7 @@ fn four_days_in_moments_end_with_the_lever_delegated() {
         "{text}"
     );
     assert!(
-        text.contains("delegate: done  mandate rewritten; delegated: post"),
+        ran(&text, "delegate", "mandate rewritten; delegated: post"),
         "{text}"
     );
     let mandate = std::fs::read_to_string(blog.join("mandate.yaml")).unwrap();
@@ -90,15 +93,10 @@ fn four_days_in_moments_end_with_the_lever_delegated() {
     // From then on the post runs without an ask: the asks have ended.
     let adopted_at = lines
         .iter()
-        .position(|l| l.contains("delegate: done"))
+        .position(|l| l.contains("done  mandate rewritten"))
         .unwrap();
     let later = &lines[adopted_at..];
-    assert!(
-        later
-            .iter()
-            .any(|l| l.contains("measured  action    post: done")),
-        "{text}"
-    );
+    assert!(ran(&later.join("\n"), "post", ""), "{text}");
     assert!(
         !later.iter().any(|l| l.contains("ask       post?")),
         "{text}"

@@ -406,6 +406,26 @@ impl Lever {
         }
     }
 
+    /// Say, by a run's idempotency key, whether a run whose outcome was
+    /// never written happened: Some((happened, what was found)) when the
+    /// adapter can check, None when it cannot. None of the built-in levers
+    /// can yet: none of them leaves the key on the other side to look for,
+    /// so a human says.
+    pub fn confirm(
+        &self,
+        _key: Option<&str>,
+        _adapters: &Adapters,
+        _run_key: &str,
+    ) -> Option<(bool, String)> {
+        match self {
+            Lever::GithubIssue { .. }
+            | Lever::GithubComment { .. }
+            | Lever::GithubPr { .. }
+            | Lever::MailSend { .. }
+            | Lever::HttpPost { .. } => None,
+        }
+    }
+
     /// Pull the lever with a payload. Returns whether it went well and one
     /// line of what happened.
     pub fn run(

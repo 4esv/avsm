@@ -71,7 +71,7 @@ fn text_of(e: &Entry) -> Option<String> {
 
 fn seq_of(out: &str) -> u64 {
     out.lines()
-        .find(|l| l.contains("action    "))
+        .find(|l| l.contains("intent    "))
         .unwrap_or_else(|| out.lines().next().unwrap())
         .trim_start_matches('#')
         .split_whitespace()
@@ -112,7 +112,10 @@ fn add_stores_the_text_and_the_ledger_text_runs() {
     assert_eq!(in_force.len(), 1, "the adopted text still runs");
     assert_eq!(in_force[0].mandate.purpose, "Keep the counter below ten.");
     let out = k.propose("counter", "reset", None).unwrap();
-    assert!(out.contains("reset: done"), "{out}");
+    assert!(
+        out.contains("intent    reset: starting") && out.contains(" done"),
+        "{out}"
+    );
 
     // It takes `add` to adopt the new text.
     k.add(&dir).unwrap();

@@ -80,6 +80,10 @@ pub struct Index {
     adoptions: BTreeMap<String, Adoption>,
     /// Every declared adoption per venture, oldest first: its mandate versions.
     versions: HashMap<String, Vec<Seq>>,
+    /// Intents with a trusted ok outcome: lever runs that are done.
+    done: HashSet<Seq>,
+    /// Intents with no trusted outcome yet: venture, action.
+    pending: BTreeMap<Seq, (String, String)>,
 }
 
 impl Index {
@@ -238,34 +242,14 @@ impl Index {
                 if action == crate::gate::STOP {
                     latest(self.stopped.entry(venture.clone()).or_insert(seq), seq);
                 }
-                if let (true, Some(Payload::Text { text })) = (*ok, payload) {
-                    if let Ok(call) = ParentCall::parse(action, text) {
-                        let pulled = self
-                            .pulled
-                            .entry(call.child().to_string())
-                            .or_default()
-                            .entry(venture)
-                            .or_default();
-                        match call {
-                            ParentCall::Pause { .. } => {
-                                latest(pulled.pause.get_or_insert(seq), seq)
-                            }
-                            ParentCall::Resume { .. } => {
-                                latest(pulled.resume.get_or_insert(seq), seq)
-                            }
-                            ParentCall::Threshold { above, bound, .. } => {
-                                pulled.threshold = Some((seq, above, bound))
-                            }
-                            ParentCall::Budget { amount, .. } => {
-                                pulled.budget = Some((seq, amount))
-                            }
-                        }
-                    }
+                if *ok {
+                    self.pull(venture, seq, action, payload.as_ref());
                 }
                 let cited = cited_decisions(&proof.steps);
                 self.cite(cited);
             }
-            Record::Intent { proof, .. } => {
+            Record::Intent { proof, action, .. } => {
+                self.pending.insert(seq, (venture, action.clone()));
                 let cited = cited_decisions(&proof.steps);
                 self.cite(cited);
             }
@@ -277,9 +261,84 @@ impl Index {
                     self.refusals_open.remove(open);
                 }
             },
+            Record::Outcome {
+                claim, intent, ok, ..
+            } => {
+                // Only a trusted outcome of an earlier intent of the same
+                // venture settles it.
+                let of = match self.get(*intent).map(|i| &i.record) {
+                    Some(Record::Intent {
+                        venture: v,
+                        action,
+                        payload,
+                        ..
+                    }) if *v == venture && *intent < seq && claim.authorizes() => {
+                        Some((action.clone(), payload.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((action, payload)) = of {
+                    self.pending.remove(intent);
+                    if *ok && self.done.insert(*intent) {
+                        self.pull(venture, *intent, &action, payload.as_ref());
+                    }
+                }
+            }
             _ => {}
         }
         self.entries.push(e);
+    }
+
+    /// A parent lever done: an ok action, or an intent with an ok outcome,
+    /// known by its number.
+    fn pull(&mut self, venture: String, seq: Seq, action: &str, payload: Option<&Payload>) {
+        let Some(Payload::Text { text }) = payload else {
+            return;
+        };
+        let Ok(call) = ParentCall::parse(action, text) else {
+            return;
+        };
+        let pulled = self
+            .pulled
+            .entry(call.child().to_string())
+            .or_default()
+            .entry(venture)
+            .or_default();
+        // The latest by number wins, whatever order outcomes come in.
+        match call {
+            ParentCall::Pause { .. } => latest(pulled.pause.get_or_insert(seq), seq),
+            ParentCall::Resume { .. } => latest(pulled.resume.get_or_insert(seq), seq),
+            ParentCall::Threshold { above, bound, .. } => {
+                if pulled.threshold.is_none_or(|(s, _, _)| s < seq) {
+                    pulled.threshold = Some((seq, above, bound))
+                }
+            }
+            ParentCall::Budget { amount, .. } => {
+                if pulled.budget.is_none_or(|(s, _)| s < seq) {
+                    pulled.budget = Some((seq, amount))
+                }
+            }
+        }
+    }
+
+    /// Is this an intent with a trusted ok outcome: a lever run that is done?
+    pub fn done(&self, intent: Seq) -> bool {
+        self.done.contains(&intent)
+    }
+
+    /// Intents with no trusted outcome yet, oldest first, as (seq,
+    /// venture, action): runs that may or may not have happened.
+    pub fn pending(&self) -> impl Iterator<Item = (Seq, &str, &str)> + '_ {
+        self.pending
+            .iter()
+            .map(|(s, (v, a))| (*s, v.as_str(), a.as_str()))
+    }
+
+    /// The oldest intent of this lever with no outcome yet.
+    pub fn pending_of(&self, venture: &str, action: &str) -> Option<Seq> {
+        self.pending()
+            .find(|(_, v, a)| *v == venture && *a == action)
+            .map(|(s, _, _)| s)
     }
 
     fn decide(&mut self, ask: Seq) {

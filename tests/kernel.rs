@@ -2,6 +2,9 @@
 //! on cadence with threshold actions, run supervision, approvals, and the
 //! warden's backends against local stubs.
 
+mod common;
+
+use common::ran;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -132,10 +135,11 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
         (Kind::Decision, "adopted"),
         (Kind::Report, "orders=5"),
         (Kind::Proposal, "tidy: the night is long"),
-        (Kind::Action, "tidy: done"),
+        (Kind::Intent, "tidy: starting"),
+        (Kind::Outcome, "#4 done"),
         (Kind::Proposal, "deploy: the night is long"),
         (Kind::Intent, "deploy: starting"),
-        (Kind::Outcome, "#6 done"),
+        (Kind::Outcome, "#7 done"),
         (Kind::Proposal, "wipe: the night is long"),
         (Kind::Ask, "wipe? may I wipe? it is irreversible"),
         (Kind::Ask, "should we hire?"),
@@ -170,14 +174,14 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
         "{why}"
     );
     assert!(why.contains("(authorizes nothing)"), "{why}");
-    let why = k.why(9).unwrap();
+    let why = k.why(10).unwrap();
     assert!(
         why.contains("because    wipe is irreversible and no declared decision approves it"),
         "{why}"
     );
 
     // Approving the ask makes the next tick act: intent, then outcome.
-    k.approve(9, None).unwrap();
+    k.approve(10, None).unwrap();
     k.tick();
     let entries = k.entries().unwrap();
     let last = kinds(&entries);
@@ -187,11 +191,11 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
         (Kind::Intent, "wipe: starting".to_string()),
         "{last:?}"
     );
-    assert!(last[last.len() - 1].1.starts_with("#12 done"), "{last:?}");
+    assert!(last[last.len() - 1].1.starts_with("#13 done"), "{last:?}");
     assert!(dir.join("wiped").exists());
     let why = k.why(entries.len() as u64 - 1).unwrap();
     assert!(
-        why.contains("decision   #11  declared  approved ask #9"),
+        why.contains("decision   #12  declared  approved ask #10"),
         "{why}"
     );
 
@@ -220,8 +224,13 @@ fn threshold_acts_on_measured_reports_until_the_cap() {
         k.report("counter", false);
     }
     let got = kinds(&k.entries().unwrap());
-    let actions = got.iter().filter(|(k, _)| *k == Kind::Action).count();
-    assert_eq!(actions, 2, "{got:?}");
+    let runs = got.iter().filter(|(k, _)| *k == Kind::Intent).count();
+    assert_eq!(runs, 2, "{got:?}");
+    let done = got
+        .iter()
+        .filter(|(k, s)| *k == Kind::Outcome && s.contains(" done"))
+        .count();
+    assert_eq!(done, 2, "{got:?}");
     assert_eq!(
         std::fs::read_to_string(dir.join("resets")).unwrap(),
         "reset\nreset\n"
@@ -458,7 +467,8 @@ fn warden_and_roles_run_as_separate_processes() {
     let got = kinds(&k.entries().unwrap());
     assert_eq!(got[1].0, Kind::Proposal, "{got:?}");
     assert!(got[1].1.starts_with("tidy: chosen by k"), "{got:?}");
-    assert_eq!(got[2].0, Kind::Action, "{got:?}");
+    assert_eq!(got[2].0, Kind::Intent, "{got:?}");
+    assert_eq!(got[3].0, Kind::Outcome, "{got:?}");
     assert!(dir.join("tidied").exists());
 
     // The warden re-checks the gate: an unjustified action is refused.
@@ -547,7 +557,7 @@ fn self_reports_integrity_and_halts_everything_when_it_fails() {
     );
     assert!(
         got.iter()
-            .any(|(kind, s)| *kind == Kind::Action && s.starts_with("reset: done")),
+            .any(|(kind, s)| *kind == Kind::Intent && s.starts_with("reset: starting")),
         "{got:?}"
     );
     assert!(k
@@ -598,7 +608,10 @@ fn self_reports_integrity_and_halts_everything_when_it_fails() {
         resets_before
     );
     assert!(
-        got.iter().filter(|(kind, _)| *kind == Kind::Action).count() == 2,
+        got.iter()
+            .filter(|(kind, _)| matches!(kind, Kind::Action | Kind::Intent))
+            .count()
+            == 2,
         "{got:?}"
     );
 
@@ -663,9 +676,11 @@ fn payload_levers_ask_first_run_with_what_the_human_approved() {
             Kind::Proposal,
             "label: tag it  [json \"{\\\"tag\\\":\\\"new\\\"}\"]",
         ),
-        (Kind::Action, "label: done"),
+        (Kind::Intent, "label: starting"),
+        (Kind::Outcome, "#5 done"),
         (Kind::Proposal, "tidy: the night is long"),
-        (Kind::Action, "tidy: done"),
+        (Kind::Intent, "tidy: starting"),
+        (Kind::Outcome, "#8 done"),
     ];
     assert_eq!(got.len(), expect.len(), "{got:?}");
     for (g, e) in got.iter().zip(expect.iter()) {
@@ -709,15 +724,17 @@ fn payload_levers_ask_first_run_with_what_the_human_approved() {
     let action = entries
         .iter()
         .rev()
-        .find(|e| e.record.kind() == Kind::Action)
+        .find(|e| e.record.kind() == Kind::Intent)
         .unwrap();
+    assert_eq!(action.record.summary(), "announce: starting");
+    let outcome = entries.last().unwrap();
     assert!(
-        action
+        outcome
             .record
             .summary()
-            .starts_with("announce: done  sent text"),
+            .starts_with(&format!("#{} done  sent text", action.seq)),
         "{}",
-        action.record.summary()
+        outcome.record.summary()
     );
     assert_eq!(
         std::fs::read_to_string(dir.join("announced")).unwrap(),
@@ -731,11 +748,11 @@ fn payload_levers_ask_first_run_with_what_the_human_approved() {
     );
     let why = k.why(action.seq).unwrap();
     assert!(
-        why.contains("decision   #8  declared  approved ask #3"),
+        why.contains("decision   #10  declared  approved ask #3"),
         "{why}"
     );
     assert!(
-        why.contains("payload    #8  declared  text \"Hello all, amended\""),
+        why.contains("payload    #10  declared  text \"Hello all, amended\""),
         "{why}"
     );
 
@@ -745,10 +762,7 @@ fn payload_levers_ask_first_run_with_what_the_human_approved() {
         text.contains("declared  proposal  announce: proposed by hand  [text \"From me\"]"),
         "{text}"
     );
-    assert!(
-        text.contains("measured  action    announce: done"),
-        "{text}"
-    );
+    assert!(ran(&text, "announce", ""), "{text}");
     assert_eq!(
         std::fs::read_to_string(dir.join("announced")).unwrap(),
         "From me"

@@ -187,6 +187,11 @@ pub enum Reason {
         used: u32,
         cap: Cap,
     },
+    /// An earlier run of this lever has an intent and no outcome: it may
+    /// or may not have happened, and it is never run again blindly.
+    Pending {
+        intent: Seq,
+    },
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -769,7 +774,7 @@ pub fn gate_in(
     for s in seqs {
         if let Some(e) = index.get(s) {
             load_entry(&mut p, e);
-            load_call(&mut p, e);
+            load_call(&mut p, e, &|s| index.done(s));
         }
     }
 
@@ -778,6 +783,7 @@ pub fn gate_in(
         .iter()
         .filter(|m| index.get(m.seq).is_some_and(|e| adopts(e, m)))
         .collect();
+    let pending = index.pending_of(v, a);
     load_mandates(
         &mut p,
         &adopted,
@@ -796,6 +802,7 @@ pub fn gate_in(
         candidate,
         &|s| index.get(s),
         &adopted,
+        pending,
         extra_steps,
         extra_reasons,
     )
@@ -927,15 +934,25 @@ fn load_family_mandates(p: &mut Rules, adopted: &[&Adopted]) {
     }
 }
 
-/// A pause or resume a parent pulled, as a fact.
-fn load_call(p: &mut Rules, e: &Entry) {
-    if let Record::Action {
-        venture,
-        action,
-        ok: true,
-        payload: Some(Payload::Text { text }),
-        ..
-    } = &e.record
+/// A pause or resume a parent pulled, as a fact: an ok action, as a 1.0
+/// ledger has it, or an intent that `done` says has an ok outcome.
+fn load_call(p: &mut Rules, e: &Entry, done: &dyn Fn(Seq) -> bool) {
+    let (venture, action, text) = match &e.record {
+        Record::Action {
+            venture,
+            action,
+            ok: true,
+            payload: Some(Payload::Text { text }),
+            ..
+        } => (venture, action, text),
+        Record::Intent {
+            venture,
+            action,
+            payload: Some(Payload::Text { text }),
+            ..
+        } if done(e.seq) => (venture, action, text),
+        _ => return,
+    };
     {
         match ParentCall::parse(action, text) {
             Ok(ParentCall::Pause { child }) => p.parent_pause.push((e.seq, venture.clone(), child)),
@@ -1015,7 +1032,7 @@ pub fn state_in(index: &Index, mandates: &[Adopted], venture: &str) -> State {
     for s in index.pause_sources(venture) {
         if let Some(e) = index.get(s) {
             load_entry(&mut p, e);
-            load_call(&mut p, e);
+            load_call(&mut p, e, &|s| index.done(s));
         }
     }
     let adopted: Vec<&Adopted> = mandates.iter().collect();
@@ -1041,6 +1058,7 @@ fn assemble<'a>(
     candidate: &Candidate,
     find: &dyn Fn(Seq) -> Option<&'a Entry>,
     adopted: &[&Adopted],
+    pending: Option<Seq>,
     extra_steps: Vec<Step>,
     extra_reasons: Vec<Reason>,
 ) -> Result<Proof, Refusal> {
@@ -1072,6 +1090,11 @@ fn assemble<'a>(
         });
     }
 
+    // A run that may or may not have happened is settled before the lever
+    // runs again: by an adapter that can check, or by a human.
+    if let Some(intent) = pending {
+        reasons.push(Reason::Pending { intent });
+    }
     for &s in &candidate.cites {
         if find(s).is_none() {
             reasons.push(Reason::UnknownRecord { seq: s });
@@ -1530,6 +1553,10 @@ impl fmt::Display for Reason {
             Reason::OverQuota { what, used, cap } => {
                 write!(f, "the {what} quota is {cap} and {used} are already used")
             }
+            Reason::Pending { intent } => write!(
+                f,
+                "intent #{intent} has no outcome; until it is known whether it happened, it does not run again"
+            ),
         }
     }
 }
@@ -1678,8 +1705,53 @@ pub mod reference {
         out
     }
 
+    /// The outcomes that settle an intent: trusted, later, of the same
+    /// venture. (intent, ok) for each.
+    fn settled(ledger: &[Entry]) -> Vec<(Seq, bool)> {
+        ledger
+            .iter()
+            .filter_map(|o| match &o.record {
+                Record::Outcome {
+                    claim,
+                    venture,
+                    intent,
+                    ok,
+                    ..
+                } if claim.authorizes() && *intent < o.seq => ledger
+                    .iter()
+                    .find(|i| i.seq == *intent)
+                    .filter(
+                        |i| matches!(&i.record, Record::Intent { venture: v, .. } if v == venture),
+                    )
+                    .map(|_| (*intent, *ok)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Intents with an ok outcome: lever runs that are done.
+    fn done(ledger: &[Entry]) -> HashSet<Seq> {
+        settled(ledger)
+            .into_iter()
+            .filter(|(_, ok)| *ok)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The oldest intent of this lever with no outcome.
+    fn pending(ledger: &[Entry], venture: &str, action: &str) -> Option<Seq> {
+        let settled: HashSet<Seq> = settled(ledger).into_iter().map(|(i, _)| i).collect();
+        ledger
+            .iter()
+            .filter(|e| matches!(&e.record, Record::Intent { venture: v, action: a, .. } if v == venture && a == action))
+            .map(|e| e.seq)
+            .filter(|s| !settled.contains(s))
+            .min()
+    }
+
     /// The parent levers pulled on `child` by its parent, oldest first:
-    /// each successful action's sequence number and what it set.
+    /// each successful action's, or done intent's, sequence number and
+    /// what it set.
     fn parent_calls(
         ledger: &[Entry],
         mandates: &[&Adopted],
@@ -1695,7 +1767,8 @@ pub mod reference {
         if !is_child_of(mandates, child, &parent) {
             return vec![];
         }
-        ledger
+        let done = done(ledger);
+        let mut calls: Vec<(Seq, ParentCall)> = ledger
             .iter()
             .filter_map(|e| match &e.record {
                 Record::Action {
@@ -1704,13 +1777,25 @@ pub mod reference {
                     ok: true,
                     payload: Some(Payload::Text { text }),
                     ..
-                } if *venture == parent => ParentCall::parse(action, text)
-                    .ok()
-                    .filter(|c| c.child() == child)
-                    .map(|c| (e.seq, c)),
+                }
+                | Record::Intent {
+                    venture,
+                    action,
+                    payload: Some(Payload::Text { text }),
+                    ..
+                } if *venture == parent
+                    && (e.record.kind() == Kind::Action || done.contains(&e.seq)) =>
+                {
+                    ParentCall::parse(action, text)
+                        .ok()
+                        .filter(|c| c.child() == child)
+                        .map(|c| (e.seq, c))
+                }
                 _ => None,
             })
-            .collect()
+            .collect();
+        calls.sort_by_key(|(s, _)| *s);
+        calls
     }
 
     /// The threshold that applies to a venture now, if its controller is one.
@@ -1847,6 +1932,7 @@ pub mod reference {
             candidate,
             &|s| ledger.iter().find(|e| e.seq == s),
             &adopted,
+            pending(ledger, v, a),
             extra_steps,
             extra_reasons,
         )
@@ -1856,8 +1942,9 @@ pub mod reference {
     /// pulled.
     fn load_family(p: &mut Rules, ledger: &[Entry], adopted: &[&Adopted]) {
         load_family_mandates(p, adopted);
+        let done = done(ledger);
         for e in ledger {
-            load_call(p, e);
+            load_call(p, e, &|s| done.contains(&s));
         }
     }
 
@@ -3053,6 +3140,15 @@ mod tests {
                 steps: vec![],
             },
             payload: Some(text("hi")),
+            key: None,
+        });
+        let i = fx.entries.len() as Seq;
+        fx.push(Record::Outcome {
+            claim: Claim::Measured,
+            venture: V.into(),
+            intent: i,
+            ok: true,
+            detail: String::new(),
         });
         let s = fx.push(proposal_with(Claim::Inferred, "mail", text("again")));
         let refusal = gate_with(

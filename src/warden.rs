@@ -17,7 +17,7 @@ use crate::index::Index;
 use crate::ledger::Ledger;
 use crate::mandate::{Mandate, ParentCall};
 use crate::record::Verdict;
-use crate::record::{Claim, Entry, Payload, Record};
+use crate::record::{self, Claim, Entry, Payload, Record, Seq};
 use crate::research;
 use crate::role::InferRequest;
 use crate::venture;
@@ -29,9 +29,17 @@ pub const MAX_REPLY: usize = 256 * 1024;
 
 /// What the kernel asks of the warden.
 pub trait Warden {
-    /// Gate the action again; if it passes, run it and write the action
-    /// record (or intent then outcome). Returns the records written.
+    /// Gate the action again; if it passes, write the intent, run it, and
+    /// write the outcome (a stop is one action record). Returns the
+    /// records written.
     fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, String>;
+    /// For an intent with no outcome: ask the lever's adapter, by the
+    /// intent's key, whether the run happened. Some((happened, what it
+    /// found)) when the adapter can tell; None when it cannot, and a human
+    /// must. An error means the warden could not look now; try later.
+    fn confirm(&mut self, _intent: Seq) -> Result<Option<(bool, String)>, String> {
+        Ok(None)
+    }
     /// Send a prompt to a backend with its key and return the reply text.
     fn infer(&mut self, request: &InferRequest) -> Result<String, String>;
     /// Measure a venture's metric through its adapter, with the key the
@@ -83,6 +91,30 @@ impl Warden for LocalWarden {
             .get(&venture)
             .and_then(|v| v.mandate.permitted(&action))
             .is_some_and(crate::mandate::Permitted::is_parent_lever);
+        // The payload comes from the record the proof names, never from
+        // the request: the gate chose the record, the warden only reads it.
+        let payload = match proof.payload_from() {
+            Some(seq) => index.get(seq).and_then(|e| e.record.payload().cloned()),
+            None => None,
+        };
+        let key = record::key(&venture, &action, &candidate.cites, payload.as_ref());
+        // Recorded, then done: every lever run stores its intent before it
+        // runs and its outcome after. Only stop is a bare action.
+        let intent = |proof: gate::Proof, payload: Option<Payload>| Record::Intent {
+            claim: Claim::Measured,
+            venture: venture.clone(),
+            action: action.clone(),
+            proof,
+            payload,
+            key: Some(key.clone()),
+        };
+        let outcome = |intent: &Entry, ok: bool, detail: String| Record::Outcome {
+            claim: Claim::Measured,
+            venture: venture.clone(),
+            intent: intent.seq,
+            ok,
+            detail,
+        };
         if action == DELEGATE {
             // The changed mandate is the payload the proof names; writing
             // it and adopting it is the action, and the adoption is
@@ -94,10 +126,9 @@ impl Warden for LocalWarden {
                 .path
                 .clone()
                 .ok_or_else(|| format!("{venture} has no mandate file to rewrite"))?;
-            let text = proof
-                .payload_from()
-                .and_then(|seq| index.get(seq))
-                .and_then(|e| e.record.payload().map(Payload::text))
+            let text = payload
+                .as_ref()
+                .map(Payload::text)
                 .ok_or("the proof names no mandate text")?;
             let mandate = Mandate::parse(&text).map_err(|e| format!("the new mandate: {e}"))?;
             let by = proof
@@ -108,8 +139,6 @@ impl Warden for LocalWarden {
                     _ => None,
                 });
             let path = dir.join(venture::MANDATE_FILE);
-            std::fs::write(&path, &text)
-                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
             let hash = Mandate::hash(&text);
             let delegated: Vec<&str> = mandate
                 .permitted
@@ -117,25 +146,32 @@ impl Warden for LocalWarden {
                 .filter(|p| p.delegated)
                 .map(|p| p.name.as_str())
                 .collect();
-            written.push(append(Record::Action {
-                claim: Claim::Measured,
-                venture: venture.clone(),
-                action,
-                proof,
-                ok: true,
-                detail: format!(
-                    "mandate rewritten; delegated: {}",
-                    if delegated.is_empty() {
-                        "nothing".to_string()
-                    } else {
-                        delegated.join(", ")
-                    }
+            // The mandate text is the payload the decision approved; the
+            // intent cites it by the proof and does not carry it again.
+            let started = append(intent(proof, None))?;
+            let (ok, detail) = match std::fs::write(&path, &text) {
+                Ok(()) => (
+                    true,
+                    format!(
+                        "mandate rewritten; delegated: {}",
+                        if delegated.is_empty() {
+                            "nothing".to_string()
+                        } else {
+                            delegated.join(", ")
+                        }
+                    ),
                 ),
-                payload: None,
-            })?);
+                Err(e) => (false, format!("cannot write {}: {e}", path.display())),
+            };
+            let done = append(outcome(&started, ok, detail))?;
+            written.push(started);
+            written.push(done);
+            if !ok {
+                return Ok(written);
+            }
             written.push(append(Record::Decision {
                 claim: Claim::Declared,
-                venture,
+                venture: venture.clone(),
                 verdict: Verdict::Adopt {
                     mandate: hash,
                     path: dir.to_string_lossy().into_owned(),
@@ -145,16 +181,23 @@ impl Warden for LocalWarden {
             })?);
             return Ok(written);
         }
-        if (action == STOP || action == RESUME) && !parent_lever {
+        if action == STOP && !parent_lever {
+            // Stopping runs nothing: the record is the stop.
             written.push(append(Record::Action {
                 claim: Claim::Measured,
-                venture,
-                action,
+                venture: venture.clone(),
+                action: action.clone(),
                 proof,
                 ok: true,
                 detail: String::new(),
                 payload: None,
             })?);
+            return Ok(written);
+        }
+        if action == RESUME && !parent_lever {
+            let started = append(intent(proof, None))?;
+            written.push(append(outcome(&started, true, String::new()))?);
+            written.insert(0, started);
             return Ok(written);
         }
         let v = ventures
@@ -165,18 +208,13 @@ impl Warden for LocalWarden {
             .permitted(&action)
             .ok_or_else(|| format!("{venture} does not permit {action}"))?;
         let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
-        // The payload comes from the record the proof names, never from
-        // the request: the gate chose the record, the warden only reads it.
-        let payload = match proof.payload_from() {
-            Some(seq) => index.get(seq).and_then(|e| e.record.payload().cloned()),
-            None => None,
-        };
         if perm.takes().is_some() && payload.is_none() {
             return Err(format!("{action} takes a payload and the proof names none"));
         }
         if perm.is_parent_lever() {
             // Non-negotiable 10: a parent allocates. Pulling the lever is
-            // the record itself; the child's gate reads it from the ledger.
+            // the record itself; the child's gate reads the intent once its
+            // outcome says it is done.
             let text = payload.as_ref().map(Payload::text).unwrap_or_default();
             let call = ParentCall::parse(&action, &text)?;
             let child = ventures
@@ -190,19 +228,15 @@ impl Warden for LocalWarden {
                     call.child()
                 ));
             }
-            written.push(append(Record::Action {
-                claim: Claim::Measured,
-                venture,
-                action,
-                proof,
-                ok: true,
-                detail: call.describe(),
-                payload,
-            })?);
+            let started = append(intent(proof, payload))?;
+            let done = append(outcome(&started, true, call.describe()))?;
+            written.push(started);
+            written.push(done);
             return Ok(written);
         }
         if perm.is_research() {
             let question = payload.as_ref().map(Payload::text).unwrap_or_default();
+            let started = append(intent(proof, payload))?;
             let (ok, detail, findings) =
                 match research(&self.config, &self.home, &question, &venture) {
                     Ok(f) => (
@@ -216,16 +250,9 @@ impl Warden for LocalWarden {
                     ),
                     Err(e) => (false, e, vec![]),
                 };
-            let done = append(Record::Action {
-                claim: Claim::Measured,
-                venture: venture.clone(),
-                action,
-                proof,
-                ok,
-                detail,
-                payload,
-            })?;
-            let seq = done.seq;
+            let done = append(outcome(&started, ok, detail))?;
+            let seq = started.seq;
+            written.push(started);
             written.push(done);
             for record in research::records(&venture, &findings, seq) {
                 written.push(append(record)?);
@@ -242,7 +269,6 @@ impl Warden for LocalWarden {
             }
         }
         let proof_text = proof.to_string();
-        let (for_venture, for_action) = (venture.clone(), action.clone());
         let pull = |payload: Option<&Payload>| -> (bool, String) {
             match (perm.lever_adapter(), &perm.run, payload) {
                 (Some(lever), _, Some(p)) => lever.run(
@@ -254,46 +280,22 @@ impl Warden for LocalWarden {
                     &self.config.adapters,
                     p,
                     &Occasion {
-                        venture: &for_venture,
-                        action: &for_action,
+                        venture: &venture,
+                        action: &action,
                         proof: &proof_text,
                     },
                 ),
                 (Some(lever), _, None) => (false, format!("{} needs a payload", lever.name())),
-                (None, Some(run), p) => run_lever(&dir, run, p, ACTION_TIMEOUT),
-                (None, None, _) => (false, format!("{for_action} has no command and no adapter")),
+                (None, Some(run), p) => run_lever(&dir, run, p, Some(&key), ACTION_TIMEOUT),
+                (None, None, _) => (false, format!("{action} has no command and no adapter")),
             }
         };
-        if perm.reversible {
-            let (ok, detail) = pull(payload.as_ref());
-            written.push(append(Record::Action {
-                claim: Claim::Measured,
-                venture,
-                action,
-                proof,
-                ok,
-                detail,
-                payload,
-            })?);
-        } else {
-            let intent = append(Record::Intent {
-                claim: Claim::Measured,
-                venture: venture.clone(),
-                action,
-                proof,
-                payload: payload.clone(),
-            })?;
-            let (ok, detail) = pull(payload.as_ref());
-            let outcome = append(Record::Outcome {
-                claim: Claim::Measured,
-                venture,
-                intent: intent.seq,
-                ok,
-                detail,
-            })?;
-            written.push(intent);
-            written.push(outcome);
-        }
+        // Reversible or not, the intent is stored before the lever runs.
+        let started = append(intent(proof, payload.clone()))?;
+        let (ok, detail) = pull(payload.as_ref());
+        let done = append(outcome(&started, ok, detail))?;
+        written.push(started);
+        written.push(done);
         Ok(written)
     }
 
@@ -403,6 +405,34 @@ impl Warden for LocalWarden {
             .map_err(|e| e.to_string())?;
         let ventures = venture::from_adoptions(self.index.adoptions());
         self.measure_in(&ventures, venture)
+    }
+
+    fn confirm(&mut self, intent: Seq) -> Result<Option<(bool, String)>, String> {
+        self.index
+            .refresh(&self.ledger)
+            .map_err(|e| e.to_string())?;
+        let Some(Record::Intent {
+            venture,
+            action,
+            key: Some(key),
+            ..
+        }) = self.index.get(intent).map(|e| &e.record)
+        else {
+            return Ok(None);
+        };
+        let ventures = venture::from_adoptions(self.index.adoptions());
+        let Some(lever) = ventures
+            .get(venture)
+            .and_then(|v| v.mandate.permitted(action))
+            .and_then(|p| p.lever_adapter())
+        else {
+            return Ok(None);
+        };
+        let secret = lever
+            .key_name()
+            .and_then(|k| self.keys.get(k))
+            .map(String::as_str);
+        Ok(lever.confirm(secret, &self.config.adapters, key))
     }
 }
 
@@ -615,17 +645,23 @@ pub fn run_command(dir: &Path, command: &str, stdin: &str, timeout: Duration) ->
 
 /// Run a lever's command with its payload, if it takes one, on standard
 /// input: the text, the JSON, the diff, or the path of the file. The
-/// shape is in `AVSM_PAYLOAD` so a script can tell which it got.
+/// shape is in `AVSM_PAYLOAD` so a script can tell which it got, and the
+/// run's idempotency key in `AVSM_KEY` so a script can tell a run it has
+/// already done.
 pub fn run_lever(
     dir: &Path,
     command: &str,
     payload: Option<&Payload>,
+    key: Option<&str>,
     timeout: Duration,
 ) -> (bool, String) {
-    let (env, stdin): (Vec<(&str, String)>, String) = match payload {
+    let (mut env, stdin): (Vec<(&str, String)>, String) = match payload {
         Some(p) => (vec![("AVSM_PAYLOAD", p.takes().to_string())], p.text()),
         None => (vec![], String::new()),
     };
+    if let Some(k) = key {
+        env.push(("AVSM_KEY", k.to_string()));
+    }
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let ran = run_with(dir, "sh", &["-c", command], &env, &stdin, timeout);
     (ran.ok, ran.detail(timeout))
@@ -653,6 +689,7 @@ pub enum ToWarden {
     Execute(Candidate),
     Infer(InferRequest),
     Measure(String),
+    Confirm(Seq),
 }
 
 /// What a warden process answers.
@@ -662,6 +699,7 @@ pub enum FromWarden {
     Done(Vec<Entry>),
     Text(String),
     Measured(Option<f64>, String),
+    Confirmed(Option<(bool, String)>),
     Err(String),
 }
 
@@ -704,18 +742,20 @@ mod tests {
             tmp.path(),
             "echo \"$AVSM_PAYLOAD: $(cat)\"",
             Some(&payload),
+            None,
             Duration::from_secs(5),
         );
         assert!(ok);
         assert_eq!(out, "json: {\"n\":1}");
         let (ok, out) = run_lever(
             tmp.path(),
-            "echo \"[$AVSM_PAYLOAD]\"",
+            "echo \"[$AVSM_PAYLOAD][$AVSM_KEY]\"",
             None,
+            Some("k1"),
             Duration::from_secs(5),
         );
         assert!(ok);
-        assert_eq!(out, "[]");
+        assert_eq!(out, "[][k1]");
     }
 
     #[test]

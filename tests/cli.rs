@@ -1,6 +1,9 @@
 //! Every command, through the real binary and its socket, against a temp
 //! ledger.
 
+mod common;
+
+use common::ran;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -317,11 +320,12 @@ fn examples_counter_end_to_end() {
     let action = loop {
         let (ok, text) = avsm(&home, &["tail", "50"]);
         assert!(ok, "{text}");
-        if let Some(line) = text
-            .lines()
-            .find(|l| l.contains("measured  action    reset: done"))
-        {
-            break line.to_string();
+        if ran(&text, "reset", "count is 0 again") {
+            break text
+                .lines()
+                .find(|l| l.contains("intent    reset: starting"))
+                .unwrap()
+                .to_string();
         }
         assert!(
             began.elapsed() < Duration::from_secs(30),
@@ -329,7 +333,6 @@ fn examples_counter_end_to_end() {
         );
         std::thread::sleep(Duration::from_millis(200));
     };
-    assert!(action.contains("count is 0 again"), "{action}");
     let seq = action
         .trim_start_matches('#')
         .split_whitespace()
@@ -389,10 +392,7 @@ fn propose_asks_and_approve_edit_over_the_socket() {
         text.contains("declared  proposal  announce: proposed by hand  [text \"Hello all\"]"),
         "{text}"
     );
-    assert!(
-        text.contains("measured  action    announce: done"),
-        "{text}"
-    );
+    assert!(ran(&text, "announce", ""), "{text}");
     assert_eq!(
         std::fs::read_to_string(dir.join("announced")).unwrap(),
         "Hello all"

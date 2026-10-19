@@ -68,6 +68,7 @@ fn reason_key(r: &Reason) -> String {
         } => format!("WrongPayload({action},{takes},{found})"),
         Reason::OverBudget { cost, budget, .. } => format!("OverBudget({budget},{cost})"),
         Reason::OverQuota { what, cap, .. } => format!("OverQuota({what},{cap})"),
+        Reason::Pending { intent } => format!("Pending({intent})"),
     }
 }
 

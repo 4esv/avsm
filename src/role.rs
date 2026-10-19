@@ -16,6 +16,9 @@ pub const SUMMARY: &str = "summary";
 /// The metric of the record a cycle leaves when the reply could not be
 /// used. Its note says why in words of avsm's own, never the model's.
 pub const UNUSABLE: &str = "unusable";
+/// The metric of the record a cycle leaves when the model chose to do
+/// nothing. Its note is the model's reason, one bounded line.
+pub const NOTHING: &str = "nothing";
 
 /// What a role is shown.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -244,7 +247,7 @@ pub fn prompt_with(ctx: &Context, drilled: &str) -> InferRequest {
              or do nothing. Everything you say is recorded as inferred and never authorizes \
              anything by itself. Reply with one JSON object on one line and nothing else, \
              in one of these forms:\n\
-             {{\"choice\": \"nothing\"}}\n\
+             {{\"choice\": \"nothing\", \"reason\": \"<one sentence>\"}}\n\
              {{\"choice\": \"action\", \"action\": \"<one of: {}>\", \"reason\": \"<one sentence>\"}}\n\
              {{\"choice\": \"ask\", \"question\": \"<one sentence>\", \"action\": \"<permitted name, or omit>\"}}\n\
              An action that takes a payload needs a \"payload\" field too: a string for text, \
@@ -401,6 +404,40 @@ pub fn unusable_record(ctx: &Context, why: &str, reply: &str) -> Record {
     }
 }
 
+/// The most characters the reason of a turn that chose nothing may hold.
+pub const NOTHING_MAX: usize = 300;
+
+/// The record a turn that chose nothing leaves behind: inferred, with the
+/// model's reason as one line of plain text, cut to `NOTHING_MAX`. A turn
+/// has not happened until its record is stored, a quiet one included.
+pub fn nothing_record(venture: &str, reason: Option<&str>) -> Record {
+    let reason: String = reason
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(NOTHING_MAX)
+        .collect();
+    Record::Report {
+        claim: Claim::Inferred,
+        venture: venture.to_string(),
+        metric: NOTHING.to_string(),
+        value: None,
+        note: if reason.is_empty() {
+            "no reason given".to_string()
+        } else {
+            reason
+        },
+        source: None,
+        confidence: None,
+        cites: vec![],
+    }
+}
+
 /// A word from a reply, fit to be named in a record, or a stand-in.
 fn word_or<'a>(s: &'a str, stand_in: &'a str) -> &'a str {
     let s = s.trim();
@@ -449,7 +486,7 @@ pub fn read_reply(ctx: &Context, reply: &str) -> Result<Vec<Record>, String> {
     {
         if let Ok(r) = serde_json::from_str::<Reply>(json) {
             return match r.choice.trim().to_lowercase().as_str() {
-                "nothing" => Ok(vec![]),
+                "nothing" => Ok(vec![nothing_record(&venture, r.reason.as_deref())]),
                 "action" => match r.action.as_deref().map(str::trim) {
                     Some(a) if permitted(a) => Ok(vec![proposal(
                         a,
@@ -490,7 +527,7 @@ pub fn read_reply(ctx: &Context, reply: &str) -> Result<Vec<Record>, String> {
         .trim_matches(|c: char| c == '"' || c == '\'' || c == '.' || c == '`')
         .to_lowercase();
     if word == "nothing" {
-        return Ok(vec![]);
+        return Ok(vec![nothing_record(&venture, None)]);
     }
     if word.is_empty() {
         return Err("the reply was empty".to_string());
@@ -792,8 +829,14 @@ mod tests {
     #[test]
     fn an_unusable_reply_says_why_and_keeps_none_of_its_words() {
         let c = ctx(false);
-        assert_eq!(read_reply(&c, "{\"choice\": \"nothing\"}"), Ok(vec![]));
-        assert_eq!(read_reply(&c, "Nothing."), Ok(vec![]));
+        assert_eq!(
+            read_reply(&c, "{\"choice\": \"nothing\"}"),
+            Ok(vec![nothing_record(&c.venture, None)])
+        );
+        assert_eq!(
+            read_reply(&c, "Nothing."),
+            Ok(vec![nothing_record(&c.venture, None)])
+        );
         let why = read_reply(&c, "{\"choice\":\"action\",\"action\":\"wire_funds\"}").unwrap_err();
         assert!(
             why.contains("action wire_funds, which the mandate does not permit"),
@@ -853,7 +896,29 @@ mod tests {
     #[test]
     fn replies_become_inferred_records_or_nothing() {
         let c = ctx(false);
-        assert!(parse_reply(&c, "{\"choice\": \"nothing\"}").is_empty());
+        // Nothing is a record too: the model's reason, one bounded line.
+        let r = parse_reply(
+            &c,
+            "{\"choice\": \"nothing\", \"reason\": \"all quiet\\nreally\", \"extra\": 1}",
+        );
+        assert_eq!(
+            r,
+            vec![nothing_record(&c.venture, Some("all quiet really"))]
+        );
+        assert!(
+            matches!(&r[0], Record::Report { claim: Claim::Inferred, metric, note, .. }
+                if metric == NOTHING && note == "all quiet really"),
+            "{r:?}"
+        );
+        let long = format!(
+            "{{\"choice\": \"nothing\", \"reason\": \"{}\"}}",
+            "x".repeat(5000)
+        );
+        let r = parse_reply(&c, &long);
+        assert!(
+            matches!(&r[0], Record::Report { note, .. } if note.chars().count() == NOTHING_MAX),
+            "{r:?}"
+        );
         let r = parse_reply(
             &c,
             "Sure. {\"choice\":\"action\",\"action\":\"discount\",\"reason\":\"slow day\"}",
@@ -974,8 +1039,14 @@ mod tests {
     #[test]
     fn labels_work_for_classifiers() {
         let c = ctx(true);
-        assert!(parse_reply(&c, "nothing\n").is_empty());
-        assert!(parse_reply(&c, "Nothing.").is_empty());
+        assert_eq!(
+            parse_reply(&c, "nothing\n"),
+            vec![nothing_record(&c.venture, None)]
+        );
+        assert_eq!(
+            parse_reply(&c, "Nothing."),
+            vec![nothing_record(&c.venture, None)]
+        );
         let r = parse_reply(&c, "discount");
         assert!(
             matches!(&r[..], [Record::Proposal { action, reason, .. }] if action == "discount" && reason == "chosen by test")

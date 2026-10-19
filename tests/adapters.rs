@@ -14,7 +14,7 @@ use avsm::kernel::Kernel;
 use avsm::record::{Kind, Record};
 use avsm::role::{Context, InferRequest, Role};
 use avsm::warden::LocalWarden;
-use common::{imap_stub, route, Stub};
+use common::{imap_stub, ran, route, Stub};
 
 /// A role that never says anything.
 struct Quiet;
@@ -305,7 +305,11 @@ fn lever_adapters_pull_through_the_warden() {
         .propose("desk", "file-issue", Some("A title\nThe body\nmore"))
         .unwrap();
     assert!(
-        out.contains("action    file-issue: done  opened issue #7 https://github.com/o/r/issues/7"),
+        ran(
+            &out,
+            "file-issue",
+            "opened issue #7 https://github.com/o/r/issues/7"
+        ),
         "{out}"
     );
     let seen = stub.seen_at("/repos/o/r/issues");
@@ -316,16 +320,17 @@ fn lever_adapters_pull_through_the_warden() {
         Some("bearer ghp_1")
     );
     let out = k.propose("desk", "comment", Some("Thanks!")).unwrap();
-    assert!(out.contains("comment: done  commented on #3"), "{out}");
+    assert!(ran(&out, "comment", "commented on #3"), "{out}");
     let out = k.propose("desk", "reply", Some("#9\nSee above.")).unwrap();
-    assert!(out.contains("reply: done  commented on #9"), "{out}");
+    assert!(ran(&out, "reply", "commented on #9"), "{out}");
     assert_eq!(
         stub.seen_at("/repos/o/r/issues/9/comments")[0].json()["body"],
         "See above."
     );
     let out = k.propose("desk", "reply", Some("no number here")).unwrap();
     assert!(
-        out.contains("reply: failed  github.comment: the first line of the text names the issue"),
+        out.contains("intent    reply: starting")
+            && out.contains(" failed  github.comment: the first line of the text names the issue"),
         "{out}"
     );
 
@@ -362,11 +367,13 @@ fn lever_adapters_pull_through_the_warden() {
             outcome.line()
         );
     }
+    // The reversible levers above have outcomes too; these are the last three.
     let summaries: Vec<String> = k
         .entries()
         .unwrap()
         .iter()
         .filter(|e| e.record.kind() == Kind::Outcome)
+        .skip(4)
         .map(|e| e.record.summary())
         .collect();
     assert!(
@@ -499,10 +506,7 @@ fn research_runs_the_configured_command_and_writes_inferred_findings() {
     let out = k
         .propose("shop", "research", Some("What do rivals charge?"))
         .unwrap();
-    assert!(
-        out.contains("measured  action    research: done  2 findings"),
-        "{out}"
-    );
+    assert!(ran(&out, "research", "2 findings"), "{out}");
     assert!(
         out.contains("inferred  report    pricing=9  Rivals charge 9"),
         "{out}"
@@ -519,7 +523,7 @@ fn research_runs_the_configured_command_and_writes_inferred_findings() {
     let entries = k.entries().unwrap();
     let action = entries
         .iter()
-        .find(|e| e.record.kind() == Kind::Action)
+        .find(|e| e.record.kind() == Kind::Intent)
         .unwrap();
     let finding = entries
         .iter()
@@ -548,7 +552,8 @@ fn research_runs_the_configured_command_and_writes_inferred_findings() {
     let mut k = kernel(&home);
     let out = k.propose("shop", "research", Some("Anything?")).unwrap();
     assert!(
-        out.contains("research: failed  no research backend"),
+        out.contains("intent    research: starting")
+            && out.contains(" failed  no research backend"),
         "{out}"
     );
     assert_eq!(

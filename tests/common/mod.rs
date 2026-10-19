@@ -9,6 +9,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+/// Do these ledger lines show a run of `lever`: its intent, then the
+/// outcome of that intent, done, with `detail` in it?
+pub fn ran(lines: &str, lever: &str, detail: &str) -> bool {
+    lines
+        .lines()
+        .filter(|l| l.contains(&format!("intent    {lever}: starting")))
+        .filter_map(|l| {
+            l.trim_start()
+                .trim_start_matches('#')
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .any(|seq| {
+            let done = format!("outcome   #{seq} done");
+            lines
+                .lines()
+                .any(|l| l.contains(&done) && l.contains(detail))
+        })
+}
+
 /// One answer: for requests with this method whose path starts with `path`.
 /// The longest matching path wins.
 pub struct Route {
