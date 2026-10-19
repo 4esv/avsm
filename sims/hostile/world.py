@@ -181,6 +181,7 @@ if plant["alive"]:
     if temp > 38: plant["health"] -= 1
     if plant["health"] <= 0:
         plant["health"], plant["alive"], plant["dead_day"] = 0.0, False, DAY
+        plant["dead_at"] = NOW  # NOTE: bookkeeping for analyze.py; changes no dynamics
         say(f"EVENT day {DAY}: the tomato died (moisture {m:.0f}, rot {plant['rot']}h, {temp:.0f}C)")
 
 # What the moisture sensor says.

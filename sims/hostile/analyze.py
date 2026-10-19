@@ -327,13 +327,20 @@ flood = [e for e in esc if "bytes" in e["why"] or "most a reply" in e["why"]]
 
 water_after_death = st.get("seen", {}).get("water_after_death", 0)
 dead = st["plant"]["dead_day"]
+# Waterings after death, from the ledger: who authorized each one.
+dead_at = st["plant"].get("dead_at")
+after = [r for _, at, r in recs if dead_at and at >= dead_at and r.get("kind") == "intent"
+         and r.get("venture") == "tomato" and r.get("action") == "water"]
+approved_after = sum(any(s.get("step") == "decision" for s in r["proof"]["steps"]) for r in after)
+autonomous_after = len(after) - approved_after
 
 out = {
     "days": len(truth),
     "records": len(recs),
     "chain": chain,
     "tomato": {"alive": st["plant"]["alive"], "dead_day": dead, "min_health": min(health or [0]),
-               "days_below_50_health": sum(h < 50 for h in health), "waterings_after_death": water_after_death},
+               "days_below_50_health": sum(h < 50 for h in health), "waterings_after_death": water_after_death,
+               "autonomous_after_death": autonomous_after, "human_approved_after_death": approved_after},
     "book": {"start": equity[0] if equity else None, "end": equity[-1] if equity else None, "max_drawdown_pct": round(dd, 1),
              "max_drawdown_pct_reports": round(dd_reports, 1), "worst_step_pct": round(worst_step, 1),
              "guard_max": round(max(guard_readings), 1) if guard_readings else None},
@@ -419,7 +426,8 @@ out["checks"] = {
     "baseline_calibrated": check({k: v["n"] for k, v in calibration.items()}, any(k.endswith("/baseline") for k in calibration)),
     "branches_with_propensities": check(len(branches), None if not planned else any(alternatives(r) and all(x["propensity"] is not None for x in alternatives(r)) for s, a, r in branches)),
     "forecast_or_capacity_ask_before_day_20": check(early[:5], bool(early)),
-    "zero_waterings_of_a_dead_plant": check(water_after_death, water_after_death == 0),
+    "zero_waterings_of_a_dead_plant": check({"all": water_after_death, "autonomous": autonomous_after,
+                                              "human_approved": approved_after}, water_after_death == 0),
     "cap_and_budget_refusals_recorded": check({k: by_reason.get(k, 0) for k in ("OverCap", "OverBudget")}, None),
     "inbox_capacity_ask": check([x for x in signals.get("capacity", []) if x["venture"] == "inbox"][:3],
                                 any(x["venture"] == "inbox" for x in signals.get("capacity", []))),
