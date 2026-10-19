@@ -761,6 +761,7 @@ mod tests {
                 world: None,
                 calibration: None,
                 early_warning: false,
+                better: None,
             },
             entries: vec![Entry::new(
                 1,

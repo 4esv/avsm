@@ -321,6 +321,14 @@ pub fn render(m: &Mandate) -> String {
             m.metric_name()
         ));
     }
+    match m.direction() {
+        Some(w) => line(format!(
+            "better: {} going {} is the target improving; capacity is checked against it",
+            m.metric_name(),
+            way(w)
+        )),
+        None => line("no direction declared; capacity is not checked".to_string()),
+    }
     if let Some(c) = m.calibration {
         line(format!(
             "calibration: the world model's rankings run only once its mean skill over the last 20 scores is at least {}; until then they ask",

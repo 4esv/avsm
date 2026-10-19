@@ -234,6 +234,31 @@ pub struct Outcome {
     pub trials: usize,
     pub pbo: Vec<(Policy, Option<Pbo>)>,
     pub marks: Vec<String>,
+    /// Runs of the `forecast` lever the branches tried, across all of
+    /// them, and forecast records the branches wrote: always 0, since a
+    /// branch never forecasts.
+    pub tried: usize,
+    pub nested: usize,
+}
+
+thread_local! {
+    /// How deep in forecast branches this thread is: 0 outside any.
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread is running a forecast branch until the guard drops.
+struct InBranch(u32);
+
+impl InBranch {
+    fn enter() -> InBranch {
+        InBranch(DEPTH.with(|d| d.replace(d.get() + 1)))
+    }
+}
+
+impl Drop for InBranch {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(self.0));
+    }
 }
 
 impl Outcome {
@@ -567,11 +592,20 @@ struct Trace {
     delegations: f64,
     /// The first day each (kind, metric) wall was hit.
     walls: BTreeMap<(String, String), u32>,
+    /// Intents of the `forecast` lever, and forecast records, in the
+    /// branch.
+    tried: usize,
+    nested: usize,
 }
 
 /// Run a forecast against the ledger at its head. Nothing is written to
 /// `source`; the caller writes the records the outcome gives.
 pub fn run(source: &Ledger, home: &Path, opts: &Options) -> Result<Outcome, String> {
+    // The depth guard: whatever path reaches here from inside a branch,
+    // a branch never forecasts, so a forecast never recurses.
+    if DEPTH.with(std::cell::Cell::get) > 0 {
+        return Err("a forecast branch never forecasts".to_string());
+    }
     opts.check()?;
     let entries = source.all().map_err(|e| e.to_string())?;
     let index = Index::from_entries(&entries);
@@ -750,6 +784,7 @@ fn run_branch(home: &Path, b: &Branch, shared: &Shared) -> Result<BTreeMap<Strin
     }
     let _clock = clock::scoped(shared.start);
     let _quiet = crate::kernel::quiet();
+    let _depth = InBranch::enter();
     let sim = Arc::new(Simulation::branch(b.seed));
     let role = Worst {
         seed: b.seed,
@@ -838,6 +873,7 @@ fn read_branch(
                 }
             }
             Record::Ask { .. } => p.asks += 1.0,
+            Record::Forecast { .. } => p.nested += 1,
             Record::Refusal {
                 reason,
                 count,
@@ -867,6 +903,9 @@ fn read_branch(
                 if ![DELEGATE, STOP, RESUME].contains(&action.as_str()) =>
             {
                 let perm = m.permitted(action);
+                if perm.is_some_and(crate::mandate::Permitted::is_forecast) {
+                    p.tried += 1;
+                }
                 p.spend += f64::from(perm.map_or(0, |p| p.cost));
                 if proof.decision().is_none() {
                     p.delegations += 1.0;
@@ -910,28 +949,13 @@ pub fn better(m: &Mandate) -> f64 {
     }
 }
 
-/// The way the venture wants its metric to go, if the mandate says.
+/// The way the venture wants its metric to go, as the mandate declares
+/// it: the threshold's side, else `better`. Never guessed.
 pub fn target(m: &Mandate) -> Option<Direction> {
-    match &m.controller {
-        Controller::Threshold { above: Some(_), .. } => Some(Direction::Down),
-        Controller::Threshold { below: Some(_), .. } => Some(Direction::Up),
-        Controller::Plan { better, .. } => Some(match better {
-            crate::mandate::Worse::Up => Direction::Up,
-            crate::mandate::Worse::Down => Direction::Down,
-        }),
-        _ => {
-            let dirs: BTreeSet<bool> = m
-                .permitted
-                .iter()
-                .filter_map(|p| p.expects.map(|e| e.direction == Direction::Up))
-                .collect();
-            match dirs.into_iter().collect::<Vec<_>>().as_slice() {
-                [true] => Some(Direction::Up),
-                [false] => Some(Direction::Down),
-                _ => None,
-            }
-        }
-    }
+    m.direction().map(|w| match w {
+        crate::mandate::Worse::Up => Direction::Up,
+        crate::mandate::Worse::Down => Direction::Down,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1145,6 +1169,12 @@ fn aggregate(
         trials: opts.sweep.as_ref().map_or(0, |s| s.values.len()),
         pbo: pbo_by,
         marks,
+        tried: paths.iter().flat_map(|p| p.values()).map(|t| t.tried).sum(),
+        nested: paths
+            .iter()
+            .flat_map(|p| p.values())
+            .map(|t| t.nested)
+            .sum(),
     }
 }
 
@@ -1311,21 +1341,9 @@ pub fn capacity(index: &Index, venture: &str, mandate: &Mandate) -> Option<Gap> 
         .filter(|p| !(p.is_research() || p.is_forecast() || p.is_parent_lever()))
         .filter_map(|p| Some((p, effect_of(&base, p)?)))
         .collect();
-    // Where the mandate does not say which way is better, the levers do
-    // when they all move the metric the same way: that is what they are
-    // there for.
-    let toward = target(mandate).or_else(|| {
-        let ups: BTreeSet<bool> = effects
-            .iter()
-            .filter(|(_, e)| *e != 0.0)
-            .map(|(_, e)| *e > 0.0)
-            .collect();
-        match ups.into_iter().collect::<Vec<_>>().as_slice() {
-            [true] => Some(Direction::Up),
-            [false] => Some(Direction::Down),
-            _ => None,
-        }
-    })?;
+    // Which way is better is declared or there is no check: a guessed
+    // direction makes a debatable ask, and a debatable ask is noise.
+    let toward = target(mandate)?;
     let want = if toward == Direction::Down { -1.0 } else { 1.0 };
     let per_day = 86_400.0 / base.period as f64;
     let drift = base.drift.iter().sum::<f64>() / base.drift.len() as f64 * per_day;
@@ -1346,7 +1364,9 @@ pub fn capacity(index: &Index, venture: &str, mandate: &Mandate) -> Option<Gap> 
         most += effect.abs() * runs_a_day;
         levers.push(p.name.clone());
     }
-    if most >= drift.abs() {
+    // No lever with a known effect toward the target, measured or
+    // declared, is nothing to compare against: not a gap to ask about.
+    if levers.is_empty() || most >= drift.abs() {
         return None;
     }
     Some(Gap {
@@ -1355,11 +1375,7 @@ pub fn capacity(index: &Index, venture: &str, mandate: &Mandate) -> Option<Gap> 
         most,
         levers,
         toward,
-        limit: if limits.is_empty() {
-            "nothing permitted moves it back".to_string()
-        } else {
-            limits.into_iter().collect::<Vec<_>>().join("; ")
-        },
+        limit: limits.into_iter().collect::<Vec<_>>().join("; "),
     })
 }
 
@@ -1408,6 +1424,23 @@ mod tests {
             .contains("no permitted.fire.cap"));
         assert!(set_field(MANDATE, "permitted.water.cap", "lots").is_err());
         assert!(set_field(MANDATE, "nope", "1").is_err());
+    }
+
+    #[test]
+    fn inside_a_branch_the_depth_guard_refuses_a_forecast() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let opts = Options::new(vec![], config::Forecast::default());
+        let outside = run(&ledger, tmp.path(), &opts).unwrap_err();
+        assert!(outside.contains("nothing to forecast"), "{outside}");
+        {
+            let _branch = InBranch::enter();
+            let inside = run(&ledger, tmp.path(), &opts).unwrap_err();
+            assert_eq!(inside, "a forecast branch never forecasts");
+        }
+        assert!(run(&ledger, tmp.path(), &opts)
+            .unwrap_err()
+            .contains("nothing to forecast"));
     }
 
     #[test]

@@ -63,6 +63,9 @@
 #     a phisher, never a customer, is never a sender. better: down because
 #     unread falling is the target improving; the audit asks if customers
 #     wait longer while unread falls (archiving customers to look done).
+#   - trader and inbox declare better: up (grow the book) and better:
+#     down (less unread mail); capacity is checked only against a
+#     declared direction, never one guessed from the levers.
 #   - garden: children with priority and floor (tomato first, floor 2) and
 #     allocation {deadband: 4, hold: 7d}: a budget change of 3, like
 #     trader 3 <-> 6, sits inside the deadband and is refused.
@@ -150,6 +153,7 @@ metric: equity
 controller: {kind: model}
 cadence: 6h
 parent: garden
+better: up
 guards:
   - {name: drawdown, drawdown: 15%, of: equity, then: ask}
   - {name: exposure, run: ./book, above: 60, then: ask}
@@ -213,6 +217,7 @@ metric: unread
 controller: {kind: model}
 cadence: 6h
 parent: garden
+better: down
 range: [0, 100000]
 max_step: 50
 audits:

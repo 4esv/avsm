@@ -353,7 +353,7 @@ impl Kernel {
             ("know", [what]) => self.know(what),
             ("digest", []) => self.digest(),
             ("forecast", rest) => {
-                let opts = crate::forecast::Options::parse(rest, self.config.forecast)?;
+                let opts = crate::forecast::Options::parse(rest, self.config.forecast_settings())?;
                 let (outcome, written) = self.forecast(&opts, &[])?;
                 let mut out = outcome.render();
                 for e in &written {
@@ -425,8 +425,8 @@ impl Kernel {
         if let Some(e) = self.check_capacity(&name) {
             out.push_str(&format!("  {}\n", e.line()));
         }
-        if self.forecasts && self.config.forecast.seeds > 0 {
-            let opts = crate::forecast::Options::new(vec![name.clone()], self.config.forecast);
+        if let (true, Some(settings)) = (self.forecasts, self.config.automatic_forecast()) {
+            let opts = crate::forecast::Options::new(vec![name.clone()], settings);
             match self.forecast(&opts, &[entry.seq]) {
                 Ok((_, written)) => {
                     for e in &written {
@@ -1132,9 +1132,8 @@ impl Kernel {
                 // The forecast runs on the proposed mandate before the ask
                 // is written, and the ask cites it.
                 let mut forecast = vec![];
-                if self.forecasts && self.config.forecast.seeds > 0 {
-                    let mut opts =
-                        crate::forecast::Options::new(vec![v.name.clone()], self.config.forecast);
+                if let (true, Some(settings)) = (self.forecasts, self.config.automatic_forecast()) {
+                    let mut opts = crate::forecast::Options::new(vec![v.name.clone()], settings);
                     opts.mandates.insert(v.name.clone(), changed.clone());
                     match self.forecast(&opts, &[proposal.seq]) {
                         Ok((_, written)) => {
@@ -1845,9 +1844,12 @@ impl Kernel {
             .and_then(Permitted::takes);
         let (mut approve, mut deny) = (None, None);
         if let Some(a) = action {
-            if a != DELEGATE && self.forecasts && self.config.forecast.seeds > 0 {
-                let mut opts =
-                    crate::forecast::Options::new(vec![venture.to_string()], self.config.forecast);
+            if let (true, true, Some(settings)) = (
+                a != DELEGATE,
+                self.forecasts,
+                self.config.automatic_forecast(),
+            ) {
+                let mut opts = crate::forecast::Options::new(vec![venture.to_string()], settings);
                 opts.days = packet::DAYS;
                 opts.seeds = packet::SEEDS;
                 match crate::forecast::run(&self.ledger, &self.home, &opts) {

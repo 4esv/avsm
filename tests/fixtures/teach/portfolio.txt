@@ -5,4 +5,5 @@
   may pause  4/day  reversible, takes text
   may resume  4/day  reversible, takes text and will ask first
   may threshold  4/day  reversible, takes text and will ask first
+  no direction declared; capacity is not checked
   parent of stripe-store, mail-inbox

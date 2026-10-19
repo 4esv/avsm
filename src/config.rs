@@ -54,16 +54,31 @@ pub struct Config {
     /// payload, self proposes delegating it. 0 turns the ratchet off.
     #[serde(default = "default_ratchet")]
     pub ratchet: u32,
-    /// How far and how wide the forecasts at add, before a ratchet ask
-    /// and by the `forecast` lever look.
-    #[serde(default)]
-    pub forecast: Forecast,
+    /// How far and how wide forecasts look. Present with seeds above 0,
+    /// the daemon and a simulation forecast at add and before a ratchet
+    /// ask; absent or with seeds 0, they do not. `avsm forecast` and the
+    /// `forecast` lever use it, or the defaults when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<Forecast>,
     /// Off when absent. When set, a canary ask goes out after every this
     /// many real asks: an ask that can never run, whose content is
     /// plausibly wrong, to measure whether the human reads what they
     /// approve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canary_asks: Option<CanaryAsks>,
+}
+
+impl Config {
+    /// How far and how wide a forecast asked for looks.
+    pub fn forecast_settings(&self) -> Forecast {
+        self.forecast.unwrap_or_default()
+    }
+
+    /// The settings of the forecasts at add and before a ratchet ask:
+    /// None when config.yaml leaves them out or says seeds 0.
+    pub fn automatic_forecast(&self) -> Option<Forecast> {
+        self.forecast.filter(|f| f.seeds > 0)
+    }
 }
 
 /// `canary_asks:` in config.yaml.
@@ -210,7 +225,7 @@ impl Default for Config {
             remote_users: vec![],
             quotas: Quotas::default(),
             ratchet: default_ratchet(),
-            forecast: Forecast::default(),
+            forecast: None,
             canary_asks: None,
         }
     }
@@ -288,18 +303,19 @@ impl Config {
         if config.canary_asks.is_some_and(|c| c.every == 0) {
             return Err("canary_asks.every is 1 or more asks".to_string());
         }
-        if !(1..=crate::forecast::MAX_DAYS).contains(&config.forecast.days) {
+        let f = config.forecast_settings();
+        if !(1..=crate::forecast::MAX_DAYS).contains(&f.days) {
             return Err(format!(
                 "forecast.days is 1 to {}, not {}",
                 crate::forecast::MAX_DAYS,
-                config.forecast.days
+                f.days
             ));
         }
-        if config.forecast.seeds > crate::forecast::MAX_SEEDS {
+        if f.seeds > crate::forecast::MAX_SEEDS {
             return Err(format!(
                 "forecast.seeds is 0 (no forecast at add or before a ratchet ask) to {}, not {}",
                 crate::forecast::MAX_SEEDS,
-                config.forecast.seeds
+                f.seeds
             ));
         }
         for (name, url) in [

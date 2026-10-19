@@ -2,3 +2,4 @@
   watching temperature every 1m
   controller threshold: runs vent when temperature is above 30
   may vent  12/hour  reversible
+  better: temperature going down is the target improving; capacity is checked against it

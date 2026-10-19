@@ -462,6 +462,119 @@ fn caps_that_cannot_keep_up_get_a_capacity_ask_before_any_saturation() {
 }
 
 #[test]
+fn with_no_direction_declared_capacity_is_not_checked() {
+    let _c = clock();
+    let mut f = fixture("");
+    // The same inbox, losing ground at seven a day, but nothing in the
+    // mandate says which way is better: reply's expects moves unread down,
+    // and that is not a declaration.
+    let body = "controller: {kind: model}\ncadence: 1d\n\
+         permitted:\n- {name: reply, run: echo ran >> invoked, cap: 20/day, reversible: true, delegated: true, expects: down 1 within 1}\n";
+    let dir = f.tmp.path().join("inbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        format!("purpose: Grow.\nmetric: unread\n{body}"),
+    )
+    .unwrap();
+    script(&dir, "report", "cat value");
+    std::fs::write(dir.join("value"), "3\n").unwrap();
+    let added = f.k.add(&dir).unwrap();
+    assert!(
+        added.contains("no direction declared; capacity is not checked"),
+        "{added}"
+    );
+    f.history("inbox", &[3.0, 10.0, 17.0, 24.0, 31.0, 38.0], DAY);
+    let m = &f.k.ventures["inbox"].mandate;
+    assert!(forecast::capacity(&f.k.index().unwrap(), "inbox", m).is_none());
+    f.now += HOUR;
+    avsm::clock::set(f.now);
+    f.k.tick();
+    assert!(!f.entries().iter().any(|e| matches!(
+        &e.record,
+        Record::Ask {
+            signal: Some(Signal::Capacity { .. }),
+            ..
+        }
+    )));
+
+    // Declared, the same history asks, and teachback says so.
+    let text = std::fs::read_to_string(dir.join("mandate.yaml")).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        text.replace("cadence: 1d\n", "cadence: 1d\nbetter: down\n"),
+    )
+    .unwrap();
+    let added = f.k.add(&dir).unwrap();
+    assert!(
+        added.contains("better: unread going down is the target improving"),
+        "{added}"
+    );
+    assert!(f
+        .entries()
+        .iter()
+        .any(|e| matches!(&e.record, Record::Ask { signal: Some(Signal::Capacity { metric, .. }), .. } if metric == "unread")));
+}
+
+#[test]
+fn a_declared_direction_with_no_known_lever_effect_asks_nothing() {
+    let _c = clock();
+    let mut f = fixture("");
+    // Unread grows and better is down, but reply has no measured runs
+    // and declares no expects: there is nothing to weigh the drift
+    // against, so no ask.
+    f.venture(
+        "inbox",
+        "unread",
+        "controller: {kind: model}\ncadence: 1d\nbetter: down\n\
+         permitted:\n- {name: reply, run: echo ran >> invoked, cap: 5/day, reversible: true}\n",
+    );
+    f.history("inbox", &[3.0, 10.0, 17.0, 24.0], DAY);
+    let m = &f.k.ventures["inbox"].mandate;
+    assert!(forecast::capacity(&f.k.index().unwrap(), "inbox", m).is_none());
+}
+
+#[test]
+fn the_mandates_better_is_the_default_for_a_plan_and_an_audit() {
+    use avsm::mandate::{Controller, Mandate, Worse};
+    let m = Mandate::parse(
+        "purpose: p\nmetric: unread\nbetter: down\n\
+         controller: {kind: plan}\ncadence: 1h\n\
+         permitted:\n- {name: reply, run: ./reply, cap: 5/day, reversible: true}\n\
+         audits:\n- {name: a, run: ./a, worse: up}\n- {name: b, run: ./b, worse: up, better: up}\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        m.controller,
+        Controller::Plan {
+            better: Worse::Down,
+            ..
+        }
+    ));
+    assert_eq!(m.audits[0].better, Worse::Down);
+    assert_eq!(m.audits[1].better, Worse::Up, "its own field still wins");
+    let own = Mandate::parse(
+        "purpose: p\nmetric: unread\nbetter: down\n\
+         controller: {kind: plan, better: up}\ncadence: 1h\n\
+         permitted:\n- {name: reply, run: ./reply, cap: 5/day, reversible: true}\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        own.controller,
+        Controller::Plan {
+            better: Worse::Up,
+            ..
+        }
+    ));
+    assert!(Mandate::parse(
+        "purpose: p\nmetric: unread\nbetter: left\ncontroller: {kind: model}\ncadence: 1h\n"
+    )
+    .unwrap_err()
+    .0
+    .contains("better is up or down"));
+}
+
+#[test]
 fn a_controller_asked_once_a_night_counts_once_a_day_against_the_drift() {
     let _c = clock();
     let mut f = fixture("");
@@ -470,7 +583,7 @@ fn a_controller_asked_once_a_night_counts_once_a_day_against_the_drift() {
     f.venture(
         "inbox",
         "unread",
-        "controller: {kind: model}\ncadence: 1d\n\
+        "controller: {kind: model}\ncadence: 1d\nbetter: down\n\
          permitted:\n- {name: reply, run: echo ran >> invoked, cap: 20/day, reversible: true, delegated: true, expects: down 1 within 1}\n",
     );
     f.history("inbox", &[3.0, 10.0, 17.0, 24.0], DAY);
@@ -551,6 +664,92 @@ fn a_sweep_reports_its_trial_count_and_a_pbo() {
         ])
         .unwrap();
     assert!(out.contains("3 trials"), "{out}");
+}
+
+/// Simulate a day of the garden in a fresh home with this config, and
+/// return its ledger.
+fn simulate_garden(config: &str) -> Vec<Entry> {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.yaml"), config).unwrap();
+    let dir = tmp.path().join("garden");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        format!("purpose: Grow.\nmetric: level\n{GARDEN}"),
+    )
+    .unwrap();
+    script(&dir, "report", "echo 80");
+    let plan = avsm::simulate::Plan {
+        days: 1,
+        step: 6 * HOUR,
+        human: avsm::simulate::Human::ApproveAll,
+        start: Some(T0),
+        add: vec![dir],
+        world: None,
+    };
+    let mut out = Vec::new();
+    avsm::simulate::run(&home, &plan, &mut out).unwrap();
+    Kernel::open(&home).unwrap().entries().unwrap()
+}
+
+#[test]
+fn a_simulation_forecasts_at_add_as_its_config_says() {
+    let _c = clock();
+    let entries = simulate_garden("nightly: never\nforecast: {days: 10, seeds: 4}\n");
+    let adopt = entries
+        .iter()
+        .find(|e| e.record.venture() == "garden" && e.record.kind() == Kind::Decision)
+        .unwrap()
+        .seq;
+    let forecasts: Vec<(String, u32, u32, Vec<u64>)> = entries
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Forecast {
+                policy,
+                horizon,
+                seeds,
+                cites,
+                ..
+            } => Some((policy.clone(), *horizon, *seeds, cites.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        forecasts,
+        ["all", "none", "mixed"].map(|p| (p.to_string(), 10, 4, vec![adopt]))
+    );
+    // Off with seeds 0, and off with no forecast key at all.
+    for config in [
+        "nightly: never\nforecast: {days: 10, seeds: 0}\n",
+        "nightly: never\n",
+    ] {
+        let entries = simulate_garden(config);
+        assert!(
+            !entries.iter().any(|e| e.record.kind() == Kind::Forecast),
+            "{config}"
+        );
+    }
+}
+
+#[test]
+fn a_branch_never_forecasts() {
+    let _c = clock();
+    // The branches get this config, forecasts on; the worst-case role
+    // proposes the delegated forecast lever every night in every branch.
+    let mut f = fixture("forecast: {days: 1, seeds: 2}\n");
+    f.venture(
+        "blog",
+        "posts",
+        "controller: {kind: model}\ncadence: 6h\n\
+         permitted:\n- {name: forecast, cap: 3/day, reversible: true, delegated: true}\n",
+    );
+    f.history("blog", &[1.0, 2.0, 3.0], 6 * HOUR);
+    let opts = f.opts(&["blog"], 3, 2);
+    let (outcome, _) = f.k.forecast(&opts, &[]).unwrap();
+    assert!(outcome.tried > 0, "the lever was never tried in a branch");
+    assert_eq!(outcome.nested, 0, "a branch wrote a forecast");
 }
 
 /// A role that proposes posting, with a payload, every night.

@@ -97,6 +97,11 @@ pub struct Mandate {
     /// plan controller.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub early_warning: bool,
+    /// Which way the target improves, declared: up or down. A plan's and
+    /// an audit's `better` default to it. Capacity is checked against the
+    /// threshold's side, else this; never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub better: Option<Worse>,
 }
 
 /// Where an escalation may go beyond this machine.
@@ -885,6 +890,7 @@ const FIELDS: &[&str] = &[
     "world",
     "calibration",
     "early_warning",
+    "better",
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadband", "hold"];
 const GUARD_FIELDS: &[&str] = &[
@@ -1049,7 +1055,22 @@ impl Mandate {
         check_shape(&value)?;
         // Read from the text again rather than from `value`: serde keeps
         // the line number that way, should anything slip past the checks.
-        let mandate: Mandate = serde_yaml::from_str(text).map_err(|e| MandateError(plain(&e)))?;
+        let mut mandate: Mandate =
+            serde_yaml::from_str(text).map_err(|e| MandateError(plain(&e)))?;
+        // A plan's and an audit's `better`, left out, are the mandate's.
+        if let Some(b) = mandate.better {
+            let unset = |v: Option<&Value>| v.and_then(|v| v.get("better")).is_none();
+            if let Controller::Plan { better, .. } = &mut mandate.controller {
+                if unset(value.get("controller")) {
+                    *better = b;
+                }
+            }
+            for (i, a) in mandate.audits.iter_mut().enumerate() {
+                if unset(value.get("audits").and_then(|l| l.get(i))) {
+                    a.better = b;
+                }
+            }
+        }
         mandate.validate()?;
         Ok(mandate)
     }
@@ -1591,6 +1612,18 @@ impl Mandate {
             world: None,
             calibration: None,
             early_warning: false,
+            better: None,
+        }
+    }
+
+    /// Which way the target improves, as the mandate declares it: the
+    /// threshold's side (below an `above` bound is better), else
+    /// `better`. None when neither says.
+    pub fn direction(&self) -> Option<Worse> {
+        match &self.controller {
+            Controller::Threshold { above: Some(_), .. } => Some(Worse::Down),
+            Controller::Threshold { below: Some(_), .. } => Some(Worse::Up),
+            _ => self.better,
         }
     }
 
@@ -1929,6 +1962,16 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
         Some(other) => {
             return fail(format!(
                 "calibration is a skill score like 0.1, the bar the world model must reach, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match map.get("better") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if s == "up" || s == "down" => {}
+        Some(other) => {
+            return fail(format!(
+                "better is up or down, which way the target improves, not {}",
                 describe(other)
             ))
         }
@@ -2912,7 +2955,7 @@ max_step: 5000
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step, escalate, world, calibration, early_warning"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step, escalate, world, calibration, early_warning, better"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");

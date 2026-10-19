@@ -2725,6 +2725,7 @@ mod tests {
             world: None,
             calibration: None,
             early_warning: false,
+            better: None,
         }
     }
 

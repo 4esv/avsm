@@ -275,6 +275,10 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
     clock::set(start);
     let sim = Arc::new(Simulation::new(plan.world.clone()));
     let mut kernel = Kernel::simulated(home, sim)?;
+    // Forecasts at add and before a ratchet ask, as `avsm start` makes
+    // them, when config.yaml asks for them. Each branch runs on its own
+    // thread's clock with a keyless warden, and never forecasts itself.
+    kernel.forecasts = true;
     kernel.adopt_self()?;
     for dir in &plan.add {
         let name = crate::venture::name_of(

@@ -353,7 +353,8 @@ impl Warden for LocalWarden {
                 written.insert(0, started);
                 return Ok(written);
             }
-            let opts = crate::forecast::Options::for_lever(&venture, self.config.forecast);
+            let opts =
+                crate::forecast::Options::for_lever(&venture, self.config.forecast_settings());
             let ran = crate::forecast::run(&self.ledger, &self.home, &opts);
             let mut append = |record: Record| self.ledger.append(record).map_err(|e| e.to_string());
             let (ok, detail) = match &ran {
