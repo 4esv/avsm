@@ -703,6 +703,11 @@ fn a_simulation_forecasts_at_add_as_its_config_says() {
         .find(|e| e.record.venture() == "garden" && e.record.kind() == Kind::Decision)
         .unwrap()
         .seq;
+    let first = entries
+        .iter()
+        .find(|e| matches!(&e.record, Record::Report { venture, metric, .. } if venture == "garden" && metric == "level"))
+        .unwrap()
+        .seq;
     let forecasts: Vec<(String, u32, u32, Vec<u64>)> = entries
         .iter()
         .filter_map(|e| match &e.record {
@@ -718,7 +723,7 @@ fn a_simulation_forecasts_at_add_as_its_config_says() {
         .collect();
     assert_eq!(
         forecasts,
-        ["all", "none", "mixed"].map(|p| (p.to_string(), 10, 4, vec![adopt]))
+        ["all", "none", "mixed"].map(|p| (p.to_string(), 10, 4, vec![adopt, first]))
     );
     // Off only with seeds 0.
     let entries = simulate_garden("nightly: never\nforecast: {days: 10, seeds: 0}\n");
@@ -856,22 +861,116 @@ const BLOG: &str = "controller: {kind: model}\ncadence: 1h\n\
      permitted:\n- {name: post, run: echo ran >> invoked, cap: 9/day, reversible: true, takes: text}\n\
      - {name: forecast, cap: 3/day, reversible: true, delegated: true}\n";
 
+/// A role that proposes posting each of these texts, in one night.
+struct Posts(Vec<&'static str>);
+
+impl Role for Posts {
+    fn decide(
+        &mut self,
+        ctx: &Context,
+        _infer: &mut dyn FnMut(&InferRequest) -> Result<String, String>,
+        _drill: &mut dyn FnMut(&str, &str) -> Result<String, String>,
+    ) -> Result<Vec<Record>, String> {
+        Ok(self
+            .0
+            .iter()
+            .map(|t| Record::Proposal {
+                cites: vec![],
+                claim: Claim::Inferred,
+                venture: ctx.venture.clone(),
+                action: "post".into(),
+                reason: "news".into(),
+                payload: Some(Payload::Text {
+                    text: t.to_string(),
+                }),
+            })
+            .collect())
+    }
+}
+
+/// The open asks of `post` after one night of these proposals.
+fn post_asks(texts: Vec<&'static str>) -> usize {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path(), "");
+    let warden = LocalWarden::open(&home).unwrap();
+    let k = Kernel::with(&home, Box::new(Posts(texts)), Box::new(warden)).unwrap();
+    let mut f = Fixture { tmp, k, now: T0 };
+    f.venture("blog", "posts", BLOG);
+    f.k.cycle("blog");
+    let index = f.k.index().unwrap();
+    index
+        .open_asks()
+        .into_iter()
+        .filter(|q| {
+            index
+                .get(*q)
+                .is_some_and(|e| e.record.action() == Some("post"))
+        })
+        .count()
+}
+
+#[test]
+fn asks_are_one_per_lever_and_payload() {
+    let _c = clock();
+    assert_eq!(post_asks(vec!["a", "b", "c", "d", "e"]), 5);
+    assert_eq!(post_asks(vec!["same", "same", "same"]), 1);
+}
+
+#[test]
+fn a_lever_that_asks_each_time_runs_no_more_than_the_asks_quota() {
+    let _c = clock();
+    let mut f = fixture("");
+    // Seven a day; reply asks each time (it takes a payload and is not
+    // delegated): twenty a day by its cap, five by the model's choices,
+    // two by an asks quota of 2/day.
+    f.venture(
+        "inbox",
+        "unread",
+        "controller: {kind: model}\ncadence: 1d\nbetter: down\n\
+         permitted:\n- {name: reply, run: echo ran >> invoked, cap: 20/day, reversible: true, takes: text, expects: down 1 within 1}\n",
+    );
+    f.history("inbox", &[3.0, 10.0, 17.0, 24.0], DAY);
+    let m = &f.k.ventures["inbox"].mandate;
+    let index = f.k.index().unwrap();
+    let gap = forecast::capacity_with(&index, "inbox", m, Some(2.0)).unwrap();
+    assert_eq!((gap.drift, gap.most), (7.0, 2.0));
+    assert!(
+        gap.describe()
+            .contains("the asks quota, shared by every venture, at most"),
+        "{}",
+        gap.describe()
+    );
+    // Without a quota the choices bind.
+    assert_eq!(forecast::capacity(&index, "inbox", m).unwrap().most, 5.0);
+}
+
 #[test]
 fn forecasts_at_add_and_as_a_lever() {
     let _c = clock();
     let mut f = fixture("forecast: {days: 1, seeds: 2}\n");
     f.k.forecasts = true;
-    // At add, after the adoption, citing it; with no reading yet, the
-    // branches start from nothing rather than run the report program.
+    // At add: nothing yet, and the report program never runs for it.
     let dir = f.venture("blog", "posts", BLOG);
     assert!(
         !dir.join("reads").exists(),
         "a forecast ran the report program"
     );
+    assert!(!f
+        .entries()
+        .iter()
+        .any(|e| e.record.kind() == Kind::Forecast));
+    // On the first trusted reading: the forecast of the add, citing the
+    // adoption and that report, its metric's quantiles filled.
+    f.history("blog", &[1.0], HOUR);
     let entries = f.entries();
     let adopt = entries
         .iter()
         .rfind(|e| e.record.venture() == "blog" && e.record.kind() == Kind::Decision)
+        .unwrap()
+        .seq;
+    let report = entries
+        .iter()
+        .find(|e| matches!(&e.record, Record::Report { venture, metric, .. } if venture == "blog" && metric == "posts"))
         .unwrap()
         .seq;
     let at_add: Vec<&Entry> = entries
@@ -879,13 +978,26 @@ fn forecasts_at_add_and_as_a_lever() {
         .filter(|e| e.record.kind() == Kind::Forecast)
         .collect();
     assert_eq!(at_add.len(), 3);
-    assert!(at_add
-        .iter()
-        .all(|e| e.seq > adopt && e.record.cites() == [adopt]));
+    for e in &at_add {
+        assert_eq!(e.record.cites(), [adopt, report]);
+        let Record::Forecast { metrics, .. } = &e.record else {
+            unreachable!()
+        };
+        assert_eq!(metrics[0].name, "posts");
+        assert!(metrics[0].quantiles.valid(), "{metrics:?}");
+    }
+    // Only the first reading: the next two add none.
+    f.history("blog", &[2.0, 3.0], HOUR);
+    assert_eq!(
+        f.entries()
+            .iter()
+            .filter(|e| e.record.kind() == Kind::Forecast)
+            .count(),
+        3
+    );
 
     // As a lever: delegated, so a proposal runs it, recorded then done,
     // and its forecast records cite the intent.
-    f.history("blog", &[1.0, 2.0, 3.0], HOUR);
     let lines = f.k.propose("blog", "forecast", None).unwrap();
     let entries = f.entries();
     let intent = entries

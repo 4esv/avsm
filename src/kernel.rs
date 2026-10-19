@@ -22,7 +22,7 @@ use crate::index::Index;
 use crate::ledger::Ledger;
 use crate::mandate::{self, Cap, Controller, Permitted, Restart};
 use crate::packet;
-use crate::record::{Claim, Entry, Kind, Packet, Payload, Record, Seq, Signal, Verdict};
+use crate::record::{self, Claim, Entry, Kind, Packet, Payload, Record, Seq, Signal, Verdict};
 use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role, SUMMARY};
 use crate::venture::{self, Venture};
 use crate::warden::{self, Failure, FromWarden, LocalWarden, ToWarden, Warden};
@@ -93,6 +93,9 @@ pub struct Kernel {
     /// the target faster than the levers can bring it back, each with the
     /// clean checks in a row since. Asked once an episode.
     short: BTreeMap<String, u32>,
+    /// Each venture's last packet forecast, with the report of its metric
+    /// it started from: asks before the next reading reuse it.
+    packet_forecasts: RefCell<BTreeMap<String, (Seq, crate::forecast::Outcome)>>,
     /// The local date each venture's capacity was last checked nightly.
     capacity_checked: BTreeMap<String, NaiveDate>,
     /// A forecast branch ticks only the ventures it forecasts: the rest,
@@ -226,6 +229,7 @@ impl Kernel {
             forecasts: false,
             short: BTreeMap::new(),
             capacity_checked: BTreeMap::new(),
+            packet_forecasts: RefCell::new(BTreeMap::new()),
             scope: None,
         };
         kernel.reload()?;
@@ -423,25 +427,44 @@ impl Kernel {
         }
         let mut out = format!("added {name} from {}\n", dir.display());
         out.push_str(&crate::teach::render(&mandate));
-        // What the mandate can keep up with, and where it leads, before
-        // anything runs under it. They follow the adoption in the ledger;
-        // the adoption stays the last line shown, where scripts read it.
+        // What the mandate can keep up with, before anything runs under
+        // it. It follows the adoption in the ledger; the adoption stays the
+        // last line shown, where scripts read it. The forecast waits for
+        // the venture's first trusted, plausible reading under it.
         if let Some(e) = self.check_capacity(&name) {
             out.push_str(&format!("  {}\n", e.line()));
         }
-        if let (true, Some(settings)) = (self.forecasts, self.config.automatic_forecast()) {
-            let opts = crate::forecast::Options::new(vec![name.clone()], settings);
-            match self.forecast(&opts, &[entry.seq]) {
-                Ok((_, written)) => {
-                    for e in &written {
-                        out.push_str(&format!("  {}\n", e.line()));
-                    }
-                }
-                Err(e) => out.push_str(&format!("  no forecast: {e}\n")),
-            }
-        }
         out.push_str(&format!("  {}\n", entry.line()));
         Ok(out)
+    }
+
+    /// When `report` is the venture's first trusted, plausible reading
+    /// since its adoption, forecast it, citing the adoption and the
+    /// report. From the ledger, so a restart neither repeats nor skips it.
+    fn forecast_first_reading(&mut self, v: &Venture, metric: &str, report: Seq) {
+        if v.name == SELF || !self.forecasts {
+            return;
+        }
+        let Some(settings) = self.config.automatic_forecast() else {
+            return;
+        };
+        let first = {
+            let Ok(index) = self.index() else { return };
+            let since: Vec<Seq> = index
+                .series(&v.name, metric)
+                .iter()
+                .map(|(s, _)| *s)
+                .filter(|s| *s > v.adopted)
+                .collect();
+            since == [report]
+        };
+        if !first {
+            return;
+        }
+        let opts = crate::forecast::Options::new(vec![v.name.clone()], settings);
+        if let Err(e) = self.forecast(&opts, &[v.adopted, report]) {
+            log(&format!("{}: no forecast: {e}", v.name));
+        }
     }
 
     /// Forecast as `opts` says, and write what it found into the ledger:
@@ -485,7 +508,12 @@ impl Kernel {
         let v = self.ventures.get(name)?.clone();
         let gap = {
             let index = self.index().ok()?;
-            crate::forecast::capacity(&index, name, &v.mandate)
+            let asks = self
+                .config
+                .quotas
+                .asks
+                .map(|c| f64::from(c.count) * 86_400.0 / c.per.as_secs().max(1) as f64);
+            crate::forecast::capacity_with(&index, name, &v.mandate, asks)
         };
         let Some(gap) = gap else {
             if let Some(clean) = self.short.get_mut(name) {
@@ -1488,6 +1516,9 @@ impl Kernel {
         if implausible.is_some() {
             return;
         }
+        // The forecast of a fresh adoption runs on its first trusted,
+        // plausible reading, so the branches start from a value.
+        self.forecast_first_reading(&v, &metric, entry.seq);
         let plans = name != SELF && matches!(v.mandate.controller, Controller::Plan { .. });
         if name != SELF && (plans || v.mandate.early_warning) {
             self.early_warning(name, &metric);
@@ -1663,11 +1694,6 @@ impl Kernel {
             match gate::gate_in(&index, &candidate, &adopted, &self.config.quotas, now()) {
                 Ok(proof) => Ok(proof),
                 Err(refusal) => {
-                    let already = index.open_of(name).any(|q| {
-                        index
-                            .get(q)
-                            .is_some_and(|e| e.record.action() == Some(action))
-                    });
                     let may_ask = self.may_ask(&index);
                     let cited: Vec<&Entry> = candidate
                         .cites
@@ -1677,6 +1703,7 @@ impl Kernel {
                     // The ask carries the payload the lever would consume,
                     // from whichever cited record brought it.
                     let payload = cited.iter().find_map(|e| e.record.payload().cloned());
+                    let already = asked_already(&index, name, action, payload.as_ref());
                     // The question carries the proposal's reason, so the
                     // human sees why without a drill.
                     let reason = cited
@@ -1864,7 +1891,33 @@ impl Kernel {
                 let mut opts = crate::forecast::Options::new(vec![venture.to_string()], settings);
                 opts.days = packet::DAYS;
                 opts.seeds = packet::SEEDS;
-                match crate::forecast::run(&self.ledger, &self.home, &opts) {
+                // A packet reads approve-all against deny-all, and the
+                // same of every ask of the venture: one forecast per
+                // reading of its metric serves them all.
+                opts.policies = vec![crate::forecast::Policy::All, crate::forecast::Policy::None];
+                let reading = self.index().ok().and_then(|i| {
+                    i.series(venture, v.mandate.metric_name())
+                        .last()
+                        .map(|(s, _)| *s)
+                });
+                let cached = reading.and_then(|r| {
+                    self.packet_forecasts
+                        .borrow()
+                        .get(venture)
+                        .filter(|(at, _)| *at == r)
+                        .map(|(_, o)| o.clone())
+                });
+                let ran = match cached {
+                    Some(o) => Ok(o),
+                    None => crate::forecast::run(&self.ledger, &self.home, &opts).inspect(|o| {
+                        if let Some(r) = reading {
+                            self.packet_forecasts
+                                .borrow_mut()
+                                .insert(venture.to_string(), (r, o.clone()));
+                        }
+                    }),
+                };
+                match ran {
                     Ok(outcome) => {
                         approve = packet::option_forecast(
                             &outcome,
@@ -2513,6 +2566,27 @@ fn pending_asked(e: &Entry) -> Option<Seq> {
         } => Some(*intent),
         _ => None,
     }
+}
+
+/// Is an ask open for this lever of this venture with this payload? Asks
+/// are one per (venture, lever, payload): five different replies are five
+/// asks, the same reply twice is one.
+pub(crate) fn asked_already(
+    index: &Index,
+    venture: &str,
+    action: &str,
+    payload: Option<&Payload>,
+) -> bool {
+    let key = payload.map(|p| record::key(venture, action, &[], Some(p)));
+    index.open_of(venture).any(|q| {
+        index.get(q).is_some_and(|e| {
+            e.record.action() == Some(action)
+                && e.record
+                    .payload()
+                    .map(|p| record::key(venture, action, &[], Some(p)))
+                    == key
+        })
+    })
 }
 
 /// Does this ask, a delegate ask, name the lever? The question says so.

@@ -117,6 +117,8 @@ pub struct Options {
     /// Where the branch homes go; the system's temporary directory when
     /// None. They are deleted after, whatever happens.
     pub scratch: Option<PathBuf>,
+    /// The policies to run: all three, unless the caller reads fewer.
+    pub policies: Vec<Policy>,
 }
 
 impl Options {
@@ -129,6 +131,7 @@ impl Options {
             sweep: None,
             mandates: BTreeMap::new(),
             scratch: None,
+            policies: Policy::EVERY.to_vec(),
         }
     }
 
@@ -173,6 +176,9 @@ impl Options {
     }
 
     fn check(&self) -> Result<(), String> {
+        if self.policies.is_empty() {
+            return Err("a forecast needs at least one policy".to_string());
+        }
         if !(1..=MAX_DAYS).contains(&self.days) {
             return Err(format!("--days is 1 to {MAX_DAYS}, not {}", self.days));
         }
@@ -730,7 +736,7 @@ pub fn run(source: &Ledger, home: &Path, opts: &Options) -> Result<Outcome, Stri
     };
     let mut branches = Vec::new();
     for variant in 0..variants.len() {
-        for policy in Policy::EVERY {
+        for policy in opts.policies.iter().copied() {
             for i in 0..opts.seeds {
                 branches.push(Branch {
                     variant,
@@ -986,7 +992,7 @@ fn aggregate(
                 continue;
             }
             let m = &mandates[vi][name];
-            for policy in Policy::EVERY {
+            for policy in opts.policies.iter().copied() {
                 let seeds = of(vi, name, policy);
                 let mut metric_names = vec![m.metric_name().to_string()];
                 metric_names.extend(m.guards.iter().map(|g| g.metric()));
@@ -1040,7 +1046,7 @@ fn aggregate(
     if opts.sweep.is_none() {
         for name in names {
             let mut hit: BTreeMap<(String, String), Vec<PolicyDay>> = BTreeMap::new();
-            for policy in Policy::EVERY {
+            for policy in opts.policies.iter().copied() {
                 let seeds = of(0, name, policy);
                 let mut first: BTreeMap<(String, String), u32> = BTreeMap::new();
                 for p in &seeds {
@@ -1057,7 +1063,7 @@ fn aggregate(
                 }
             }
             for ((kind, metric), mut days) in hit {
-                for policy in Policy::EVERY {
+                for policy in opts.policies.iter().copied() {
                     if !days.iter().any(|d| d.policy == policy.name()) {
                         days.push(PolicyDay {
                             policy: policy.name().to_string(),
@@ -1100,7 +1106,7 @@ fn aggregate(
         if let Some(name) = swept {
             let sign = better(&mandates[0][name]);
             let metric = mandates[0][name].metric_name().to_string();
-            for policy in Policy::EVERY {
+            for policy in opts.policies.iter().copied() {
                 let columns: Vec<Vec<&Trace>> =
                     (0..variants.len()).map(|v| of(v, name, policy)).collect();
                 let rows: Vec<Vec<f64>> = (0..opts.seeds as usize)
@@ -1331,6 +1337,19 @@ fn turns(mandate: &Mandate, lever: &str) -> (f64, &'static str) {
 /// by `expects`. Some when the drift is away from the target and
 /// the levers cannot keep up; None when they can, or nothing says.
 pub fn capacity(index: &Index, venture: &str, mandate: &Mandate) -> Option<Gap> {
+    capacity_with(index, venture, mandate, None)
+}
+
+/// `capacity`, with the asks quota a day when there is one: a lever that
+/// needs a decision each time runs at most as often as it can be asked.
+/// The quota is shared by every venture, so the whole of it is an upper
+/// bound, never what one venture gets.
+pub fn capacity_with(
+    index: &Index,
+    venture: &str,
+    mandate: &Mandate,
+    asks_a_day: Option<f64>,
+) -> Option<Gap> {
     let base = Baseline::from_index(index, venture, mandate);
     if base.drift.len() < 2 {
         return None;
@@ -1358,8 +1377,17 @@ pub fn capacity(index: &Index, venture: &str, mandate: &Mandate) -> Option<Gap> 
         }
         let cap = f64::from(p.cap.count) * 86_400.0 / p.cap.per.as_secs().max(1) as f64;
         let (turns, why) = turns(mandate, &p.name);
-        let runs_a_day = cap.min(turns);
-        limits.insert(if turns < cap { why } else { "the cap" });
+        let mut runs_a_day = cap.min(turns);
+        let mut limit = if turns < cap { why } else { "the cap" };
+        // Each run of a lever that asks each time is an ask.
+        let asks_each_time = !p.reversible || (p.takes().is_some() && !p.delegated);
+        if let (true, Some(quota)) = (asks_each_time, asks_a_day) {
+            if quota < runs_a_day {
+                runs_a_day = quota;
+                limit = "the asks quota, shared by every venture, at most";
+            }
+        }
+        limits.insert(limit);
         most += effect.abs() * runs_a_day;
         levers.push(p.name.clone());
     }

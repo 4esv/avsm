@@ -322,11 +322,8 @@ impl Kernel {
                                 let Ok(index) = self.index() else {
                                     return Settled::Done;
                                 };
-                                let already = index.open_of(name).any(|q| {
-                                    index.get(q).is_some_and(|e| {
-                                        e.record.action().is_some()
-                                            && e.record.action() == action.as_deref()
-                                    })
+                                let already = action.as_deref().is_some_and(|a| {
+                                    super::asked_already(&index, name, a, payload.as_ref())
                                 });
                                 (already, self.may_ask(&index))
                             };

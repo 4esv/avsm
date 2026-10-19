@@ -242,15 +242,11 @@ impl Kernel {
             let Ok(index) = self.index() else {
                 return vec![format!("{venture}: cannot read the ledger")];
             };
-            let already = index.open_of(venture).any(|q| {
-                index
-                    .get(q)
-                    .is_some_and(|e| e.record.action() == Some(best.as_str()))
-            });
             let payload = cites
                 .iter()
                 .filter_map(|s| index.get(*s))
                 .find_map(|e| e.record.payload().cloned());
+            let already = super::asked_already(&index, venture, best, payload.as_ref());
             (already, self.may_ask(&index), payload)
         };
         let line = if already {
