@@ -21,10 +21,12 @@
 //! reads the truth is not locked out forever. A declared approval of the
 //! ask vouches for one reading, the anchor; its repeats are still checked.
 //!
-//! Stuck, where the metric varies and away from a bound of its range: a
-//! reading exactly equal to the three before it, or to the one before it
-//! when a lever expected to move the metric ran between. At a bound, a
-//! repeat is dry soil, and a lever that does not move it is ineffective.
+//! Stuck, away from a bound of its range: a reading exactly equal to the
+//! readings before it, when the metric's own plausible history says so
+//! long a run of exact repeats is less likely than ALPHA; or equal to the
+//! one before it when a lever expected to move the metric ran between,
+//! where the metric varies. At a bound, a repeat is dry soil, and a lever
+//! that does not move it is ineffective.
 //! A flap is three steps in a row past max_step, each the other way, in
 //! the raw readings whatever was believed.
 //!
@@ -51,9 +53,25 @@ fn subject(s: &Signal) -> String {
 /// step: the last of them is plausible, whatever the anchor was.
 pub const AGREE: usize = 3;
 
-/// A reading exactly equal to each of this many readings before it is
-/// stuck, where the metric's plausible history varies.
-pub const STUCK: usize = 3;
+/// The significance level of the stuck test: a run of exact repeats is
+/// stuck when the metric's history makes it less likely than this. With
+/// p the chance of a repeat, a reading is flagged only when p^r < ALPHA
+/// for its run of r repeats, so a sensor that is not stuck, with p told
+/// right by its history, is flagged on fewer than one reading in 1/ALPHA
+/// = 100, whatever its p. On a continuous sensor with 21 clean steps (p
+/// = 1/23) that makes the third identical reading stuck (p^2 = 0.0019)
+/// and not the second (0.043); on a metric that repeats one step in two,
+/// the eighth (0.0078).
+pub const ALPHA: f64 = 0.01;
+
+/// How many of the latest steps of the plausible history say how often
+/// the metric repeats exactly. Stuck readings are implausible and never
+/// enter it, and a repeat at a bound of the range says nothing of the
+/// sensor and is no step of it, so a metric frozen for weeks, or dry at
+/// its floor, is still judged by the history from when it varied. 256
+/// steps let a clean history bring p below ALPHA by itself (it needs 99)
+/// and keep the check one pass over at most 257 stretches.
+pub const WINDOW: usize = 256;
 
 /// How many of the latest readings, plausible or not, a reading is
 /// checked against for agreeing and flapping.
@@ -63,8 +81,72 @@ const RECENT: usize = 3;
 /// lever ran during it.
 const PLATEAU: usize = 256;
 
-/// How many plausible readings say whether a metric varies.
+/// How many plausible readings say whether a metric varies, for a repeat
+/// after a lever ran and for agreeing.
 pub const HISTORY: usize = 20;
+
+/// The run of exact repeats a reading ends, and what it is judged by.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Plateau<'a> {
+    /// The readings just before that equal this one exactly, missing ones
+    /// skipped: a missing reading neither counts as a repeat nor breaks a
+    /// run of them.
+    pub repeats: usize,
+    /// A lever whose `expects` moves this metric ran, ok, since the first
+    /// of those repeats.
+    pub moved: bool,
+    /// The plausible history as stretches of exactly equal readings, value
+    /// and how many, oldest first; the latest WINDOW + 1 are enough.
+    pub history: &'a [(f64, usize)],
+}
+
+/// A probability to two significant figures: 0.0021, or 3.4e-9.
+fn two_figures(p: f64) -> String {
+    if p >= 1e-4 {
+        let digits = (1.0 - p.log10().floor()).max(2.0) as usize;
+        format!("{p:.digits$}")
+    } else {
+        format!("{p:.1e}")
+    }
+}
+
+/// What the history before a run of `repeats` exact repeats of `x` says
+/// of how often the metric repeats: of its latest WINDOW steps between
+/// consecutive readings, how many there are, how many are exactly zero,
+/// and the smoothed chance of a repeat they give, (zero + 1) / (steps +
+/// 2). The run's own repeats are what is judged, so they are not
+/// evidence; the step into it is. A repeat at a bound is no step. A
+/// history with no step but zero ones has not been seen to vary, and
+/// gives no chance: nothing to judge the run against.
+fn repeat_chance(
+    history: &[(f64, usize)],
+    x: f64,
+    repeats: usize,
+    bound: impl Fn(f64) -> bool,
+) -> (usize, usize, Option<f64>) {
+    let (mut steps, mut zero) = (0, 0);
+    let last = history.len().saturating_sub(1);
+    for (i, &(v, n)) in history.iter().enumerate().rev() {
+        let n = if i == last && v == x {
+            n - repeats.min(n.saturating_sub(1))
+        } else {
+            n
+        };
+        if !bound(v) {
+            let z = (n - 1).min(WINDOW - steps);
+            steps += z;
+            zero += z;
+        }
+        if i > 0 && steps < WINDOW {
+            steps += 1;
+        }
+        if steps >= WINDOW {
+            break;
+        }
+    }
+    let p = (zero < steps).then(|| (zero + 1) as f64 / (steps + 2) as f64);
+    (steps, zero, p)
+}
 
 /// The median absolute step between consecutive readings, or 0 with
 /// fewer than two.
@@ -83,21 +165,19 @@ fn median_step(history: &[f64]) -> f64 {
 }
 
 /// Why a reading is not to be believed, or None when it is. `before`
-/// holds the latest plausible readings, up to HISTORY, oldest first;
-/// `recent` the values of the latest readings, plausible or not, oldest
-/// first. `repeats` counts the readings just before that equal this one
-/// exactly, missing ones skipped: a missing reading neither counts as a
-/// repeat nor breaks a run of them. `moved` says a lever whose `expects`
-/// moves this metric ran, ok, since the first of those repeats.
+/// holds the latest plausible readings a step is measured from, up to
+/// HISTORY, oldest first; `recent` the values of the latest readings,
+/// plausible or not, oldest first; `plateau` the run of exact repeats
+/// this reading ends.
 pub fn implausible(
     value: Option<f64>,
     before: &[f64],
     recent: &[Option<f64>],
     range: Option<[f64; 2]>,
     max_step: Option<f64>,
-    repeats: usize,
-    moved: bool,
+    plateau: Plateau,
 ) -> Option<String> {
+    let Plateau { repeats, moved, .. } = plateau;
     let Some(x) = value else {
         return Some("missing".to_string());
     };
@@ -114,15 +194,27 @@ pub fn implausible(
         }
     }
     let s = max_step?;
-    // Exact repeats are the stuck signature, where the metric varies. A
-    // metric that never varies is not stuck, and neither is a reading at
-    // a declared bound of its range: dry soil reads its floor.
+    // Exact repeats are the stuck signature, as rare as the metric's own
+    // history says they are: a run of them less likely than ALPHA is
+    // stuck. A metric that seldom varies repeats often and is never
+    // stuck, nor one that has never varied, and neither is a reading at a
+    // declared bound of its range: dry soil reads its floor.
     let varies = median_step(before) > 0.0;
     let bound = |x: f64| range.is_some_and(|[lo, hi]| x == lo || x == hi);
-    if varies && !bound(x) && repeats >= STUCK {
-        return Some(format!(
-            "stuck: {x} exactly, as the {STUCK} readings before it, where the metric varies"
-        ));
+    if repeats >= 1 && !bound(x) {
+        let (steps, zero, p) = repeat_chance(plateau.history, x, repeats, bound);
+        let chance = p.map(|p| p.powi(i32::try_from(repeats).unwrap_or(i32::MAX)));
+        if let Some(chance) = chance.filter(|c| *c < ALPHA) {
+            let before = if repeats == 1 {
+                "the reading before it".to_string()
+            } else {
+                format!("the {repeats} readings before it")
+            };
+            return Some(format!(
+                "stuck: {x} exactly, as {before}; a repeat has happened in {zero} of {steps} steps (p {} < {ALPHA})",
+                two_figures(chance)
+            ));
+        }
     }
     // The readings just before are exactly this one, and a lever that is
     // expected to move the metric ran among them. At a bound that is the
@@ -411,6 +503,8 @@ impl Kernel {
             return (None, false);
         };
         let before = anchored_before(&index, venture, metric, HISTORY);
+        let history = index.stretches(venture, metric);
+        let history = &history[history.len().saturating_sub(WINDOW + 1)..];
         let recent = recent(&index, venture, metric, RECENT);
         // The readings just before that equal this one exactly. A missing
         // or out-of-range reading says nothing about the value and is
@@ -451,8 +545,11 @@ impl Kernel {
             &recent,
             range,
             max_step,
-            plateau.len(),
-            moved,
+            Plateau {
+                repeats: plateau.len(),
+                moved,
+                history,
+            },
         );
         let fresh = reports(&index, venture, metric)
             .next()
@@ -801,13 +898,32 @@ mod tests {
 
     /// Why a reading of the metric is implausible, with no recent run.
     fn doubted(value: Option<f64>, before: &[f64], m: &Mandate) -> Option<String> {
-        implausible(value, before, &[], m.range, m.max_step, 0, false)
+        implausible(value, before, &[], m.range, m.max_step, Plateau::default())
+    }
+
+    /// Readings as the index keeps them: stretches of equal ones.
+    fn stretches(values: &[f64]) -> Vec<(f64, usize)> {
+        let mut out = Vec::new();
+        for &x in values {
+            crate::index::stretch(&mut out, x);
+        }
+        out
+    }
+
+    /// A run of `repeats` judged by `history`, with no lever run.
+    fn run(repeats: usize, history: &[(f64, usize)]) -> Plateau<'_> {
+        Plateau {
+            repeats,
+            moved: false,
+            history,
+        }
     }
 
     #[test]
     fn three_agreeing_readings_re_anchor_and_nothing_less_does() {
         let (range, step) = (Some([0.0, 1000.0]), Some(50.0));
         let anchor = [60.0, 60.0, 60.0];
+        let history = stretches(&anchor);
         let at = |x: f64, recent: &[Option<f64>]| {
             implausible(
                 Some(x),
@@ -815,8 +931,7 @@ mod tests {
                 recent,
                 range,
                 step,
-                reps(x, recent),
-                false,
+                run(reps(x, recent), &history),
             )
         };
         // Stuck at 60, then the truth near 0: the third agreeing re-anchors.
@@ -833,7 +948,7 @@ mod tests {
         // Re-anchored, a small wiggle back is no flap.
         let after = [60.0, 60.0, 0.0];
         assert_eq!(
-            implausible(Some(1.0), &after, &[], range, step, 0, false),
+            implausible(Some(1.0), &after, &[], range, step, Plateau::default()),
             None
         );
     }
@@ -842,6 +957,7 @@ mod tests {
     fn exact_repeats_are_stuck_where_the_metric_varies_and_never_agree() {
         let (range, step) = (Some([0.0, 1000.0]), Some(50.0));
         let varied = [40.0, 42.0, 41.0, 43.0, 41.0];
+        let history = stretches(&varied);
         let at = |x: f64, recent: &[Option<f64>]| {
             implausible(
                 Some(x),
@@ -849,8 +965,7 @@ mod tests {
                 recent,
                 range,
                 step,
-                reps(x, recent),
-                false,
+                run(reps(x, recent), &history),
             )
         };
         let stuck = at(41.0, &[Some(41.0), Some(41.0), Some(41.0)]).unwrap();
@@ -868,11 +983,145 @@ mod tests {
         let flat = [50.0; 10];
         let same = [Some(50.0), Some(50.0), Some(50.0)];
         assert_eq!(
-            implausible(Some(50.0), &flat, &same, range, step, 3, false),
+            implausible(
+                Some(50.0),
+                &flat,
+                &same,
+                range,
+                step,
+                run(3, &stretches(&flat))
+            ),
             None
         );
         assert_eq!(median_step(&flat), 0.0);
         assert_eq!(median_step(&varied), 2.0);
+    }
+
+    /// Feed these readings in order as `doubt` would: each judged by the
+    /// plausible ones before it, and kept as history only when plausible.
+    /// Returns why each one is implausible.
+    fn feed(readings: &[f64]) -> Vec<Option<String>> {
+        let (range, step) = (Some([0.0, 100.0]), Some(30.0));
+        let mut history: Vec<(f64, usize)> = Vec::new();
+        let mut raw: Vec<Option<f64>> = Vec::new();
+        let mut out = Vec::new();
+        for &x in readings {
+            let from = history.len().saturating_sub(WINDOW + 1);
+            let flat: Vec<f64> = history
+                .iter()
+                .flat_map(|&(v, n)| std::iter::repeat_n(v, n))
+                .collect();
+            let before = &flat[flat.len().saturating_sub(HISTORY)..];
+            let recent = &raw[raw.len().saturating_sub(RECENT)..];
+            let why = implausible(
+                Some(x),
+                before,
+                recent,
+                range,
+                step,
+                run(reps(x, &raw), &history[from..]),
+            );
+            if why.is_none() {
+                crate::index::stretch(&mut history, x);
+            }
+            raw.push(Some(x));
+            out.push(why);
+        }
+        out
+    }
+
+    /// `n` readings of a continuous sensor that never repeat exactly.
+    fn continuous(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| 50.0 + 20.0 * (i as f64 * 0.7).sin() + i as f64 * 1e-3)
+            .collect()
+    }
+
+    #[test]
+    fn a_continuous_sensor_is_stuck_on_its_third_identical_reading() {
+        let mut r = continuous(21);
+        let x = r[20] + 0.5;
+        r.extend([x, x, x]);
+        let why = feed(&r);
+        assert!(why[..22].iter().all(Option::is_none), "{why:?}");
+        assert_eq!(why[22], None, "two identical readings: p 1/23 = 0.043");
+        let stuck = why[23].as_deref().unwrap();
+        assert!(stuck.starts_with("stuck"), "{stuck}");
+        assert!(
+            stuck.contains("a repeat has happened in 0 of 21 steps (p 0.0019 < 0.01)"),
+            "{stuck}"
+        );
+    }
+
+    #[test]
+    fn a_coarse_sensor_that_often_repeats_is_not_stuck_on_a_plateau() {
+        // A third of its steps are exact repeats, and its median step is 1.
+        let cycle = [
+            40.0, 40.0, 41.0, 42.0, 42.0, 43.0, 44.0, 44.0, 43.0, 42.0, 42.0, 41.0,
+        ];
+        let mut r: Vec<f64> = cycle.iter().copied().cycle().take(60).collect();
+        assert!(median_step(&r) > 0.0);
+        r.extend([43.0; 4]);
+        let why = feed(&r);
+        assert!(why.iter().all(Option::is_none), "{why:?}");
+    }
+
+    #[test]
+    fn a_metric_frozen_after_a_long_varied_history_stays_stuck() {
+        // The dead plant: 300 varied readings, then the sensor reads one
+        // value for good. Stuck readings never enter the history, so the
+        // 50th is judged by the same varied steps as the third.
+        let mut r = continuous(300);
+        r.extend([r[299] + 0.5; 50]);
+        let why = feed(&r);
+        assert!(why[..300].iter().all(Option::is_none));
+        let frozen = &why[300..];
+        assert_eq!(frozen[0], None);
+        assert!(
+            frozen[2..]
+                .iter()
+                .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
+            "{frozen:?}"
+        );
+        // A clean history of WINDOW steps makes even one repeat unlikely
+        // enough: p 1/258.
+        let second = frozen[1].as_deref().unwrap();
+        assert!(
+            second.contains("in 0 of 256 steps (p 0.0039 < 0.01)"),
+            "{second}"
+        );
+
+        // Dry at its floor for longer than WINDOW, then reading 12 for
+        // good: a repeat at the floor is no step, so 12 is judged by the
+        // history from when the metric varied.
+        let mut r = continuous(300);
+        while r[r.len() - 1] > 0.0 {
+            r.push((r[r.len() - 1] - 10.0).max(0.0));
+        }
+        let dry = r.len();
+        r.extend([0.0; 400]);
+        r.extend([12.0; 10]);
+        let why = feed(&r);
+        assert!(why[..dry + 401].iter().all(Option::is_none), "{why:?}");
+        assert!(
+            why[dry + 402..]
+                .iter()
+                .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
+            "{:?}",
+            &why[dry + 400..]
+        );
+    }
+
+    #[test]
+    fn a_metric_that_never_varied_is_never_stuck_and_one_that_did_is() {
+        assert!(feed(&[50.0; 300]).iter().all(Option::is_none));
+        // Once varied, always varies: a few steps, then one value for good,
+        // is stuck once the run is unlikely by those steps (p 1/5).
+        let mut r = vec![47.0, 48.0, 49.0, 50.0];
+        r.extend([50.0; 100]);
+        let why = feed(&r);
+        assert!(why[..6].iter().all(Option::is_none), "{why:?}");
+        assert!(why[6..].iter().all(Option::is_some), "{why:?}");
     }
 
     #[test]

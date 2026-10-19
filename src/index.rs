@@ -114,6 +114,9 @@ pub struct Index {
     /// Every trusted, plausible report with a value, per venture and
     /// metric, by number.
     series: HashMap<String, HashMap<String, Vec<(Seq, f64)>>>,
+    /// The same series as stretches of exactly equal readings: value and
+    /// how many, oldest first.
+    stretches: HashMap<String, HashMap<String, Vec<(f64, usize)>>>,
     /// Reports of what a run did to the metric, by the intent they cite.
     expected: HashSet<Seq>,
     /// Every intent per venture and action, by number.
@@ -262,6 +265,21 @@ impl Index {
                         .or_default();
                     let i = list.partition_point(|(s, _)| *s <= seq);
                     list.insert(i, (seq, *x));
+                    let st = self
+                        .stretches
+                        .entry(venture.clone())
+                        .or_default()
+                        .entry(metric.clone())
+                        .or_default();
+                    if i + 1 == list.len() {
+                        stretch(st, *x);
+                    } else {
+                        // Out of order: rare, so built again.
+                        st.clear();
+                        for (_, v) in list.iter() {
+                            stretch(st, *v);
+                        }
+                    }
                     if x.is_finite() {
                         let peak = self
                             .peaks
@@ -607,6 +625,15 @@ impl Index {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// The trusted reports of a venture's metric with a value, as
+    /// stretches of exactly equal readings, oldest first.
+    pub fn stretches(&self, venture: &str, metric: &str) -> &[(f64, usize)] {
+        self.stretches
+            .get(venture)
+            .and_then(|m| m.get(metric))
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// A venture's predictions no score has resolved yet, oldest first.
     pub fn open_predictions(&self, venture: &str) -> Vec<Seq> {
         self.predictions
@@ -928,6 +955,14 @@ fn by_time<T>(list: &mut Vec<T>, item: T, at: impl Fn(&T) -> i64) {
 /// The part of a time-ordered list after `since`.
 fn after<T>(list: &[T], since: i64, at: impl Fn(&T) -> i64) -> &[T] {
     &list[list.partition_point(|x| at(x) <= since)..]
+}
+
+/// Add a reading to stretches of exactly equal readings.
+pub fn stretch(stretches: &mut Vec<(f64, usize)>, x: f64) {
+    match stretches.last_mut() {
+        Some((v, n)) if *v == x => *n += 1,
+        _ => stretches.push((x, 1)),
+    }
 }
 
 #[cfg(test)]
