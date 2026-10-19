@@ -12,6 +12,8 @@ use crate::record::{Claim, Entry, Payload, Record, Seq};
 pub const MAX_DRILLS: usize = 3;
 /// The most characters a summary may hold.
 pub const SUMMARY_MAX: usize = 4000;
+/// The most independent choices one reply may carry.
+pub const MAX_CHOICES: usize = 5;
 /// The metric a summary record carries.
 pub const SUMMARY: &str = "summary";
 /// The metric of the record a cycle leaves when the reply could not be
@@ -287,13 +289,18 @@ pub fn prompt_with(ctx: &Context, drilled: &str) -> InferRequest {
     } else {
         format!(
             "You are the overnight reviewer for a supervised venture. You cannot act. \
-             You may propose exactly one permitted action, ask the human one question, \
+             You may propose permitted actions, ask the human a question, \
              or do nothing. Everything you say is recorded as inferred and never authorizes \
              anything by itself. Reply with one JSON object on one line and nothing else, \
              in one of these forms:\n\
              {{\"choice\": \"nothing\", \"reason\": \"<one sentence>\"}}\n\
              {{\"choice\": \"action\", \"action\": \"<one of: {}>\", \"reason\": \"<one sentence>\"}}\n\
              {{\"choice\": \"ask\", \"question\": \"<one sentence>\", \"action\": \"<permitted name, or omit>\"}}\n\
+             When several things need doing (several mails to answer, say), you may return up to {} \
+             independent choices at once: {{\"choices\": [<a choice as above>, ...]}}. Each is \
+             judged alone, by its own lever's limits; none waits on another, so do not order them \
+             or make one depend on another. More than {} are dropped, and a choice that cannot be \
+             read is dropped alone while the others still count. One choice stays as it is.\n\
              An action that takes a payload needs a \"payload\" field too: a string for text, \
              diff or file; an object for json. A human reads the payload before it runs.\n\
              Before choosing you may look things up, at most {} times, with \
@@ -304,6 +311,8 @@ pub fn prompt_with(ctx: &Context, drilled: &str) -> InferRequest {
             } else {
                 names.join(", ")
             },
+            MAX_CHOICES,
+            MAX_CHOICES,
             MAX_DRILLS,
         )
     };
@@ -544,46 +553,83 @@ pub fn read_reply(ctx: &Context, reply: &str) -> Result<Vec<Record>, String> {
         signal: None,
         payload,
     };
+    let choose = |r: Reply| -> Result<Record, String> {
+        match r.choice.trim().to_lowercase().as_str() {
+            "nothing" => Ok(nothing_record(&venture, r.reason.as_deref())),
+            "action" => match r.action.as_deref().map(str::trim) {
+                Some(a) if permitted(a) => Ok(proposal(
+                    a,
+                    r.reason
+                        .unwrap_or_else(|| format!("chosen by {}", ctx.backend)),
+                    payload_for(a, r.payload.as_ref()),
+                )),
+                Some(a) => Err(format!(
+                    "it chose action {}, which the mandate does not permit",
+                    word_or(a, "<not a word>")
+                )),
+                None => Err("it chose an action and named none".to_string()),
+            },
+            "ask" => {
+                let action = r
+                    .action
+                    .filter(|a| permitted(a.trim()))
+                    .map(|a| a.trim().to_string());
+                let payload = action
+                    .as_deref()
+                    .and_then(|a| payload_for(a, r.payload.as_ref()));
+                Ok(ask(
+                    action,
+                    r.question
+                        .unwrap_or_else(|| format!("{} asked for your attention", ctx.backend)),
+                    payload,
+                ))
+            }
+            other => Err(format!(
+                "it chose {}, which is not a choice here",
+                word_or(other, "<not a word>")
+            )),
+        }
+    };
     if let Some(json) = text
         .find('{')
         .and_then(|s| text.rfind('}').map(|e| &text[s..=e]))
     {
-        if let Ok(r) = serde_json::from_str::<Reply>(json) {
-            return match r.choice.trim().to_lowercase().as_str() {
-                "nothing" => Ok(vec![nothing_record(&venture, r.reason.as_deref())]),
-                "action" => match r.action.as_deref().map(str::trim) {
-                    Some(a) if permitted(a) => Ok(vec![proposal(
-                        a,
-                        r.reason
-                            .unwrap_or_else(|| format!("chosen by {}", ctx.backend)),
-                        payload_for(a, r.payload.as_ref()),
-                    )]),
-                    Some(a) => Err(format!(
-                        "it chose action {}, which the mandate does not permit",
-                        word_or(a, "<not a word>")
-                    )),
-                    None => Err("it chose an action and named none".to_string()),
-                },
-                "ask" => {
-                    let action = r
-                        .action
-                        .filter(|a| permitted(a.trim()))
-                        .map(|a| a.trim().to_string());
-                    let payload = action
-                        .as_deref()
-                        .and_then(|a| payload_for(a, r.payload.as_ref()));
-                    Ok(vec![ask(
-                        action,
-                        r.question
-                            .unwrap_or_else(|| format!("{} asked for your attention", ctx.backend)),
-                        payload,
-                    )])
+        // Several independent choices: each is read as a single choice is,
+        // the first MAX_CHOICES count, and each one that cannot be used
+        // leaves an unusable record of its own while the rest still count.
+        if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(json)
+        {
+            if !obj.contains_key("choice") {
+                if let Some(serde_json::Value::Array(choices)) = obj.get("choices") {
+                    if choices.is_empty() {
+                        return Err("it gave an empty list of choices".to_string());
+                    }
+                    let mut out = Vec::new();
+                    for c in choices.iter().take(MAX_CHOICES) {
+                        let one = match serde_json::from_value::<Reply>(c.clone()) {
+                            Ok(r) => choose(r),
+                            Err(_) => Err("a choice was not a choice object".to_string()),
+                        };
+                        out.push(
+                            one.unwrap_or_else(|why| unusable_record(ctx, &why, &c.to_string())),
+                        );
+                    }
+                    if choices.len() > MAX_CHOICES {
+                        out.push(unusable_record(
+                            ctx,
+                            &format!(
+                                "it gave {} choices and at most {MAX_CHOICES} count; the rest were dropped",
+                                choices.len()
+                            ),
+                            json,
+                        ));
+                    }
+                    return Ok(out);
                 }
-                other => Err(format!(
-                    "it chose {}, which is not a choice here",
-                    word_or(other, "<not a word>")
-                )),
-            };
+            }
+        }
+        if let Ok(r) = serde_json::from_str::<Reply>(json) {
+            return choose(r).map(|r| vec![r]);
         }
     }
     let line = text.lines().next().unwrap_or("").trim();

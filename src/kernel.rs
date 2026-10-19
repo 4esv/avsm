@@ -1727,8 +1727,17 @@ impl Kernel {
             }
         };
         // A reply that could not be used is the other trigger.
+        // A reply with several choices of which some could be used already
+        // has its answer: only a reply with nothing usable escalates.
+        let chose = records.iter().any(|r| match r {
+            Record::Proposal { .. } | Record::Ask { .. } => true,
+            Record::Report { metric, .. } => metric == role::NOTHING,
+            _ => false,
+        });
         let unusable: Option<String> = records.iter().find_map(|r| match r {
-            Record::Report { metric, note, .. } if metric == role::UNUSABLE => Some(note.clone()),
+            Record::Report { metric, note, .. } if metric == role::UNUSABLE && !chose => {
+                Some(note.clone())
+            }
             _ => None,
         });
         // A model turn has not happened until its inferred record is
