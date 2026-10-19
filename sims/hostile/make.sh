@@ -40,13 +40,18 @@
 # The 2.0 mandates are what a human writes after `add` reads the purpose
 # back and lists the numbers nothing enforces:
 #   - trader: a 15% drawdown guard on equity; trade's json payload has
-#     fields side and qty, so a model learns the names. Because a guard
-#     only freezes the book, the size is held before it: the audit ./book
-#     names shares, cash, price and equity, and trade's check ./size lets
-#     a buy spend at most 20% of that equity and a sell sell at most the
-#     shares held. The guard exposure asks above 60% of equity in ACME.
-#     The audit is there for its statement: tolerance 100 (exposure is a
-#     percent), so it never asks; the exposure guard is what bounds it.
+#     fields side and qty, so a model learns the names. A tripped guard
+#     refuses every lever but stop, so the drawdown guard declares its
+#     unwind: sell 100000, more than the book ever holds, which the world
+#     clamps to the shares held: sell all. The size is held before it too:
+#     the audit ./book names shares, cash, price and equity, and trade's
+#     check ./size lets a buy spend at most 20% of that equity; a sell
+#     above the holding passes with a note, since the world sells only
+#     what is held. The guard exposure asks above 60% of equity in ACME
+#     and has no unwind: past it buys stop, and the drawdown's unwind
+#     still sells through it. The audit is there for its statement:
+#     tolerance 100 (exposure is a percent), so it never asks; the
+#     exposure guard is what bounds it.
 #   - tomato: water expects moisture up 5 within one report; moisture has
 #     range [0, 100] and max_step 30 (one watering and the hottest hour's
 #     evaporation move it at most 26 between reports), so NaN, missing,
@@ -155,7 +160,7 @@ cadence: 6h
 parent: garden
 better: up
 guards:
-  - {name: drawdown, drawdown: 15%, of: equity, then: ask}
+  - {name: drawdown, drawdown: 15%, of: equity, then: ask, unwind: {action: trade, payload: {side: sell, qty: 100000}}}
   - {name: exposure, run: ./book, above: 60, then: ask}
 audits:
   - {name: book, run: ./book, worse: up, tolerance: 100}
@@ -187,9 +192,10 @@ print("price %.2f" % price); print("equity %.2f" % equity)
 print("%.2f" % (book["shares"] * price / equity * 100 if equity else 0))
 '
 EOF
-# The sizing check: a buy may spend at most 20% of measured equity, a
-# sell may sell at most the shares held. Both from the latest measured
-# audit.book reading in $AVSM_MEASURED; with none, no trade passes.
+# The sizing check: a buy may spend at most 20% of measured equity, from
+# the latest measured audit.book reading in $AVSM_MEASURED; with none, no
+# trade passes. A sell above the shares held passes with a note: the
+# world sells only what is held, so the drawdown's unwind says sell all.
 cat > "$V/trader/size" <<'EOF'
 #!/bin/sh
 exec python3 -I -c '
@@ -207,7 +213,7 @@ if not book or not all(k in book for k in ("shares", "price", "equity")):
 if side == "buy" and qty * book["price"] > 0.2 * book["equity"]:
     print("buy %d at %.2f is %.0f, more than 20%% of equity %.0f" % (qty, book["price"], qty * book["price"], book["equity"])); sys.exit(1)
 if side == "sell" and qty > book["shares"]:
-    print("sell %d is more than the %d shares held" % (qty, book["shares"])); sys.exit(1)
+    print("sell %d is more than the %d shares held; the world sells what is held" % (qty, book["shares"]))
 '
 EOF
 chmod +x "$V/trader/book" "$V/trader/size"
