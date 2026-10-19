@@ -385,7 +385,7 @@ fn the_digest_says_what_the_night_did_and_is_written_as_a_record() {
 }
 
 #[test]
-fn an_approved_delegation_that_cannot_run_says_so_in_the_ledger() {
+fn an_invalid_edit_of_a_delegation_is_refused_before_it_is_approved() {
     let tmp = tempfile::tempdir().unwrap();
     let home = home(tmp.path(), "nightly: never\ndefault: k\nbackends:\n  k: {kind: command, run: echo nothing}\nratchet: 5\n");
     let role = Scripted {
@@ -407,34 +407,176 @@ fn an_approved_delegation_that_cannot_run_says_so_in_the_ledger() {
         k.approve(ask, None).unwrap();
         k.tick();
     }
-    // The human edits the new mandate into something that is not YAML.
+    // The human edits the new mandate into something that is not YAML:
+    // approve refuses it, nothing is decided, the mandate is untouched.
     let ask = open_ask(&k, "delegate").expect("self proposed");
-    k.approve(ask, Some("purpose: Sell more.\nthis line is not yaml\n"))
-        .unwrap();
+    let before = k.entries().unwrap().len();
+    let err = k
+        .approve(ask, Some("purpose: Sell more.\nthis line is not yaml\n"))
+        .expect_err("refused at approve");
+    assert!(!err.is_empty());
     k.tick();
-    let entries = k.entries().unwrap();
-    let failed = entries
-        .iter()
-        .find(|e| {
-            e.record.kind() == Kind::Report
-                && e.record.claim() == Claim::Measured
-                && e.record
-                    .summary()
-                    .contains("delegate=?  did not run: the new mandate")
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "{}",
-                entries
-                    .iter()
-                    .map(|e| e.line())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        });
-    assert_eq!(failed.record.venture(), "shop");
+    assert_eq!(k.entries().unwrap().len(), before, "nothing written");
+    assert!(open_ask(&k, "delegate").is_some());
     assert_eq!(
         std::fs::read_to_string(dir.join("mandate.yaml")).unwrap(),
         SHOP
+    );
+}
+
+fn kernel_with(tmp: &Path, ratchet: u32, replies: Vec<Vec<Record>>) -> Kernel {
+    let home = home(
+        tmp,
+        &format!("nightly: never\ndefault: k\nbackends:\n  k: {{kind: command, run: echo nothing}}\nratchet: {ratchet}\n"),
+    );
+    let role = Scripted {
+        replies: replies.into(),
+        seen: Arc::new(Mutex::new(vec![])),
+    };
+    let mut k = Kernel::with(
+        &home,
+        Box::new(role),
+        Box::new(LocalWarden::open(&home).unwrap()),
+    )
+    .unwrap();
+    k.adopt_self().unwrap();
+    k
+}
+
+fn wipe(n: usize) -> Vec<Record> {
+    vec![Record::Proposal {
+        claim: Claim::Inferred,
+        venture: "shop".into(),
+        action: "wipe".into(),
+        reason: format!("tidy {n}"),
+        payload: None,
+    }]
+}
+
+const IRREVERSIBLE: &str =
+    "purpose: Sell more.\nmetric: shell echo 5\ncontroller: {kind: model}\ncadence: 1h\n\
+permitted:\n  - name: wipe\n    run: \"echo x >> wiped\"\n    cap: 99/day\n    reversible: false\n";
+
+fn delegate_asks(k: &Kernel) -> usize {
+    k.entries()
+        .unwrap()
+        .iter()
+        .filter(|e| e.record.action() == Some("delegate"))
+        .count()
+}
+
+#[test]
+fn ten_approvals_of_an_irreversible_lever_give_no_delegate_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = kernel_with(tmp.path(), 5, (1..=10).map(wipe).collect());
+    let dir = venture(tmp.path(), "shop", IRREVERSIBLE);
+    k.add(&dir).unwrap();
+    for _ in 1..=10 {
+        k.cycle("shop");
+        let ask = open_ask(&k, "wipe").expect("wipe asks each time");
+        k.approve(ask, None).unwrap();
+        k.tick();
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("wiped")).unwrap().len(),
+        20,
+        "ten approvals, ten runs"
+    );
+    assert_eq!(
+        delegate_asks(&k),
+        0,
+        "an irreversible lever is never proposed"
+    );
+    assert!(open_ask(&k, "delegate").is_none());
+}
+
+#[test]
+fn five_approvals_of_a_reversible_payload_lever_still_give_a_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = kernel_with(tmp.path(), 5, (1..=5).map(announce).collect());
+    k.add(&venture(tmp.path(), "shop", SHOP)).unwrap();
+    for _ in 1..=5 {
+        k.cycle("shop");
+        let ask = open_ask(&k, "announce").unwrap();
+        k.approve(ask, None).unwrap();
+        k.tick();
+    }
+    assert_eq!(delegate_asks(&k), 2, "one proposal, one ask");
+}
+
+/// A delegate ask for the shop, open, with its mandate text as payload.
+fn delegate_ask(tmp: &Path) -> (Kernel, u64, PathBuf) {
+    let mut k = kernel_with(tmp, 2, (1..=2).map(announce).collect());
+    let dir = venture(tmp, "shop", SHOP);
+    k.add(&dir).unwrap();
+    for _ in 1..=2 {
+        k.cycle("shop");
+        let ask = open_ask(&k, "announce").unwrap();
+        k.approve(ask, None).unwrap();
+        k.tick();
+    }
+    let ask = open_ask(&k, "delegate").expect("delegate ask");
+    (k, ask, dir)
+}
+
+fn decisions(k: &Kernel) -> usize {
+    k.entries()
+        .unwrap()
+        .iter()
+        .filter(|e| e.record.kind() == Kind::Decision)
+        .count()
+}
+
+#[test]
+fn an_invalid_edited_mandate_is_refused_at_approve_and_nothing_is_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut k, ask, dir) = delegate_ask(tmp.path());
+    let before = decisions(&k);
+    let len = k.entries().unwrap().len();
+    let original = std::fs::read_to_string(dir.join("mandate.yaml")).unwrap();
+
+    let err = k
+        .approve(ask, Some("purpose: [unclosed\n  metric: : :"))
+        .expect_err("bad YAML is refused");
+    assert!(!err.is_empty());
+
+    let unknown = format!("{original}bogus_field: 1\n");
+    let err = k
+        .approve(ask, Some(&unknown))
+        .expect_err("an unknown field is refused");
+    assert!(err.contains("bogus_field"), "{err}");
+
+    assert_eq!(decisions(&k), before, "no decision record written");
+    assert_eq!(k.entries().unwrap().len(), len, "nothing written at all");
+    assert!(open_ask(&k, "delegate").is_some(), "the ask stays open");
+    k.tick();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("mandate.yaml")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn a_valid_edited_mandate_is_approved_and_adopted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut k, ask, dir) = delegate_ask(tmp.path());
+    let edited = SHOP.replace("cap: 9/day", "cap: 3/day").replace(
+        "reversible: true\n",
+        "reversible: true\n    delegated: true\n",
+    );
+    k.approve(ask, Some(&edited)).unwrap();
+    k.tick();
+    let text = std::fs::read_to_string(dir.join("mandate.yaml")).unwrap();
+    assert!(text.contains("cap: 3/day"), "{text}");
+    let entries = k.entries().unwrap();
+    assert!(
+        entries
+            .last()
+            .unwrap()
+            .record
+            .summary()
+            .starts_with("adopted mandate"),
+        "{}",
+        entries.last().unwrap().line()
     );
 }

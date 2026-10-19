@@ -562,7 +562,28 @@ impl Kernel {
                     .payload()
                     .map(Payload::takes)
                     .ok_or_else(|| format!("#{seq} carries no payload to amend"))?;
-                Some(Payload::parse(takes, text)?)
+                let parsed = Payload::parse(takes, text)?;
+                if ask.record.action() == Some(DELEGATE) {
+                    // A mandate is checked exactly as `add` would, before
+                    // any decision is recorded.
+                    let m = crate::mandate::Mandate::parse(text).map_err(|e| e.0)?;
+                    self.check_family(ask.record.venture(), &m)?;
+                    if m.metric_adapter().is_none() {
+                        let report = self
+                            .ventures
+                            .get(ask.record.venture())
+                            .and_then(|v| v.path.as_ref())
+                            .is_some_and(|d| d.join("report").is_file());
+                        if !report {
+                            return Err(format!(
+                                "{} watches {} but holds no report program to read it",
+                                ask.record.venture(),
+                                m.metric_name()
+                            ));
+                        }
+                    }
+                }
+                Some(parsed)
             }
         };
         let entry = self
@@ -844,8 +865,9 @@ impl Kernel {
                 continue;
             }
             for perm in &v.mandate.permitted {
-                let asks_each_time =
-                    !perm.delegated && (!perm.reversible || perm.takes().is_some());
+                // An irreversible lever is never proposed for delegation,
+                // however often it was approved; only a human writes that.
+                let asks_each_time = !perm.delegated && perm.reversible && perm.takes().is_some();
                 if !asks_each_time || (perm.is_parent_lever() && perm.name == "resume") {
                     continue;
                 }
