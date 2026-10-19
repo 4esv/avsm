@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""analyze.py <run dir>: hold the ledger against the world's truth.
+"""analyze.py <run dir> [run log]: hold the ledger against the world's truth.
 
 Reads <run dir>/home/ledger.db (the records, read only), <run dir>/world/
 state.json and <run dir>/world/log (the world's TRUTH, EVENT, LEVER and
-POISON lines). Reads no stderr and no run log. Prints one JSON object:
+POISON lines). Its numbers come from no stderr and no run log; given the
+run log, it only checks that every cap or budget refusal avsm printed is
+also a refusal record (same venture, lever and day). Prints one JSON object:
 the 1.0 kit's numbers under the same keys, the 2.0 ones beside them, and
 `checks`, each proof target with its value and whether it held (null when
 the run did not reach it). Counts and comparisons only; no judgement.
 """
-import collections, hashlib, json, os, re, sqlite3, sys
+import collections, datetime, hashlib, json, os, re, sqlite3, sys
 
 R = sys.argv[1]
 GENESIS = "0" * 64
@@ -334,6 +336,24 @@ after = [r for _, at, r in recs if dead_at and at >= dead_at and r.get("kind") =
 approved_after = sum(any(s.get("step") == "decision" for s in r["proof"]["steps"]) for r in after)
 autonomous_after = len(after) - approved_after
 
+# Every cap or budget refusal avsm printed has a refusal record that day.
+printed, unrecorded = None, []
+if len(sys.argv) > 2:
+    REFUSED = re.compile(r"avsm: (\S+): (\S+) refused: .*(the cap is|the parent.s budget is)")
+    recorded = {(r["venture"], r["action"], (at - start) // 86400) for _, at, r in recs
+                if r.get("kind") == "refusal" and re.search(r"OverCap|OverBudget", r.get("reason", ""))}
+    printed = []
+    on = 0
+    with open(sys.argv[2], errors="replace") as f:
+        for l in f:
+            m = re.search(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)", l)
+            if m:
+                t = datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+                on = (int(t.timestamp()) - start) // 86400
+            m = REFUSED.search(l)
+            if m: printed.append((m.group(1), m.group(2), on))
+    unrecorded = sorted({p for p in printed if p not in recorded})
+
 out = {
     "days": len(truth),
     "records": len(recs),
@@ -428,7 +448,9 @@ out["checks"] = {
     "forecast_or_capacity_ask_before_day_20": check(early[:5], bool(early)),
     "zero_waterings_of_a_dead_plant": check({"all": water_after_death, "autonomous": autonomous_after,
                                               "human_approved": approved_after}, water_after_death == 0),
-    "cap_and_budget_refusals_recorded": check({k: by_reason.get(k, 0) for k in ("OverCap", "OverBudget")}, None),
+    "cap_and_budget_refusals_recorded": check({**{k: by_reason.get(k, 0) for k in ("OverCap", "OverBudget")},
+                                                "printed_without_record": unrecorded[:5]},
+                                               None if printed is None else not unrecorded),
     "inbox_capacity_ask": check([x for x in signals.get("capacity", []) if x["venture"] == "inbox"][:3],
                                 any(x["venture"] == "inbox" for x in signals.get("capacity", []))),
     "backlog_falls": check(inbox[::10][-4:], bool(inbox) and inbox[-1] < max(inbox)),
