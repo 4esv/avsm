@@ -9,7 +9,7 @@ use avsm::gate::{self, reference, Adopted, Candidate, Proof, Step};
 use avsm::index::Index;
 use avsm::ledger::Ledger;
 use avsm::mandate::{Cap, Mandate};
-use avsm::record::{Claim, Payload, Record, Seq, Verdict};
+use avsm::record::{Claim, Payload, Record, Seq, Signal, Verdict};
 use proptest::prelude::*;
 
 const START: i64 = 1_700_000_000;
@@ -191,6 +191,9 @@ enum Op {
     /// A parent lever pulled, by the parent or by someone else.
     Pull(String, String, bool, Payload),
     Readopt(String, bool),
+    /// An ask that a lever is ineffective, by any claim, and perhaps an
+    /// approval of it by any claim and venture.
+    Ineffective(String, String, Claim, Option<(Claim, String)>),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -234,6 +237,8 @@ fn op() -> impl Strategy<Value = Op> {
             text(),
         )
             .prop_map(|(v, lever, ok, text)| Op::Pull(v, lever, ok, text)),
+        3 => (lever(), claim(), prop::option::of((claim(), name())))
+            .prop_map(|((v, a), c, ok)| Op::Ineffective(v, a, c, ok)),
         1 => (prop::sample::select(VENTURES).prop_map(str::to_string), any::<bool>())
             .prop_map(|(v, same)| Op::Readopt(v, same)),
     ]
@@ -338,7 +343,7 @@ fn record(op: &Op, n: u64) -> Record {
             action,
             payload,
         },
-        Op::Outcome(..) | Op::Run(..) => unreachable!("written by build"),
+        Op::Outcome(..) | Op::Run(..) | Op::Ineffective(..) => unreachable!("written by build"),
         Op::Pull(venture, action, ok, text) => Record::Action {
             claim: Claim::Measured,
             proof: proof(&venture, &action, None),
@@ -562,6 +567,42 @@ fn build(case: &Case) -> (Ledger, Index, Vec<Adopted>, i64) {
                 };
                 ledger.append_at(outcome, at).unwrap();
             }
+            Op::Ineffective(venture, action, claim, approval) => {
+                let ask = ledger
+                    .append_at(
+                        Record::Ask {
+                            claim: *claim,
+                            venture: venture.clone(),
+                            action: None,
+                            question: "ineffective".to_string(),
+                            refusal: None,
+                            payload: None,
+                            signal: Some(Signal::Ineffective {
+                                action: action.clone(),
+                                why: "no effect".to_string(),
+                            }),
+                        },
+                        at,
+                    )
+                    .unwrap();
+                if let Some((claim, by)) = approval {
+                    let verdict = Verdict::Approve {
+                        ask: ask.seq,
+                        payload: None,
+                    };
+                    ledger
+                        .append_at(
+                            Record::Decision {
+                                claim: *claim,
+                                venture: by.clone(),
+                                verdict,
+                                by: None,
+                            },
+                            at,
+                        )
+                        .unwrap();
+                }
+            }
             _ => {
                 ledger.append_at(record(op, n), at).unwrap();
             }
@@ -631,6 +672,13 @@ proptest! {
             prop_assert_eq!(
                 gate::spent_today_in(&index, &refs, v, now),
                 reference::spent_today(&entries, &refs, v, now)
+            );
+        }
+        for (v, a) in LEVERS {
+            prop_assert_eq!(
+                index.suspended(v, a),
+                reference::suspended(&entries, v, a),
+                "suspended {} {}", v, a
             );
         }
         prop_assert_eq!(index.open_asks(), reference::open_asks(&entries));

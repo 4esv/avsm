@@ -14,6 +14,9 @@ use crate::ledger::{Ledger, LedgerError};
 use crate::mandate::ParentCall;
 use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Signal, Verdict};
 
+/// The metric of the reports that say what a run did to the venture's metric.
+pub const EXPECTATION: &str = "expectation";
+
 /// The latest parent levers one venture pulled on another.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pulled {
@@ -86,6 +89,19 @@ pub struct Index {
     done: HashSet<Seq>,
     /// Intents with no trusted outcome yet: venture, action.
     pending: BTreeMap<Seq, (String, String)>,
+    /// Every trusted report with a value, per venture and metric, by number.
+    series: HashMap<String, HashMap<String, Vec<(Seq, f64)>>>,
+    /// Reports of what a run did to the metric, by the intent they cite.
+    expected: HashSet<Seq>,
+    /// Every intent per venture and action, by number.
+    intents_of: HashMap<(String, String), Vec<Seq>>,
+    /// The trusted outcome of an intent: its number, and whether it was ok.
+    /// An ok outcome wins over a failed one.
+    settled: HashMap<Seq, (Seq, bool)>,
+    /// Measured asks that say a lever is ineffective, per venture and lever.
+    ineffective: HashMap<(String, String), Vec<Seq>>,
+    /// The ventures whose declared approval answered an ask.
+    approved_by: HashMap<Seq, HashSet<String>>,
 }
 
 impl Index {
@@ -170,8 +186,22 @@ impl Index {
                 claim,
                 metric,
                 value,
+                cites,
                 ..
             } => {
+                if let (Some(x), true) = (value, claim.authorizes()) {
+                    let list = self
+                        .series
+                        .entry(venture.clone())
+                        .or_default()
+                        .entry(metric.clone())
+                        .or_default();
+                    let i = list.partition_point(|(s, _)| *s <= seq);
+                    list.insert(i, (seq, *x));
+                }
+                if metric == EXPECTATION && *claim == Claim::Measured {
+                    self.expected.extend(cites.iter().copied());
+                }
                 if value.is_some() && claim.authorizes() {
                     latest(
                         self.reports
@@ -200,6 +230,12 @@ impl Index {
                             self.decide(*ask);
                         }
                         if *claim == Claim::Declared {
+                            if let Verdict::Approve { ask, .. } = verdict {
+                                self.approved_by
+                                    .entry(*ask)
+                                    .or_default()
+                                    .insert(venture.clone());
+                            }
                             self.answers.entry(venture).or_default().push(seq);
                             if matches!(verdict, Verdict::Approve { .. })
                                 && !self.acted.contains(&seq)
@@ -227,7 +263,14 @@ impl Index {
                     _ => {}
                 }
             }
-            Record::Ask { .. } => {
+            Record::Ask { claim, signal, .. } => {
+                if let (Claim::Measured, Some(Signal::Ineffective { action, .. })) = (claim, signal)
+                {
+                    self.ineffective
+                        .entry((venture.clone(), action.clone()))
+                        .or_default()
+                        .push(seq);
+                }
                 by_time(&mut self.asks_at, at, |t| *t);
                 if !self.decided.contains(&seq) {
                     self.open.insert(seq);
@@ -251,6 +294,10 @@ impl Index {
                 self.cite(cited);
             }
             Record::Intent { proof, action, .. } => {
+                self.intents_of
+                    .entry((venture.clone(), action.clone()))
+                    .or_default()
+                    .push(seq);
                 self.pending.insert(seq, (venture, action.clone()));
                 let cited = cited_decisions(&proof.steps);
                 self.cite(cited);
@@ -281,6 +328,11 @@ impl Index {
                 };
                 if let Some((action, payload)) = of {
                     self.pending.remove(intent);
+                    if *ok {
+                        self.settled.insert(*intent, (seq, true));
+                    } else {
+                        self.settled.entry(*intent).or_insert((seq, false));
+                    }
                     if *ok && self.done.insert(*intent) {
                         let started = self.get(*intent).map_or(at, |i| i.at);
                         self.pull(venture, *intent, started, &action, payload.as_ref());
@@ -352,6 +404,57 @@ impl Index {
         self.pending()
             .find(|(_, v, a)| *v == venture && *a == action)
             .map(|(s, _, _)| s)
+    }
+
+    /// The trusted reports of a venture's metric with a value, oldest first.
+    pub fn series(&self, venture: &str, metric: &str) -> &[(Seq, f64)] {
+        self.series
+            .get(venture)
+            .and_then(|m| m.get(metric))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Every intent of a lever, oldest first.
+    pub fn intents_of(&self, venture: &str, action: &str) -> &[Seq] {
+        self.intents_of
+            .get(&(venture.to_string(), action.to_string()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The trusted outcome of an intent: its number and whether it was ok.
+    pub fn settled(&self, intent: Seq) -> Option<(Seq, bool)> {
+        self.settled.get(&intent).copied()
+    }
+
+    /// Has a report already said what this intent did to the metric?
+    pub fn expectation_reported(&self, intent: Seq) -> bool {
+        self.expected.contains(&intent)
+    }
+
+    /// The latest measured ask saying this lever is ineffective.
+    pub fn last_ineffective(&self, venture: &str, action: &str) -> Option<Seq> {
+        self.ineffective
+            .get(&(venture.to_string(), action.to_string()))?
+            .iter()
+            .copied()
+            .max()
+    }
+
+    /// Is this lever's delegation suspended: a measured ask says it is
+    /// ineffective and no declared approval of that ask, by the same
+    /// venture, has answered it. Tightening is measured; only a declared
+    /// decision loosens.
+    pub fn suspended(&self, venture: &str, action: &str) -> bool {
+        self.ineffective
+            .get(&(venture.to_string(), action.to_string()))
+            .is_some_and(|asks| {
+                asks.iter().any(|q| {
+                    !self
+                        .approved_by
+                        .get(q)
+                        .is_some_and(|by| by.contains(venture))
+                })
+            })
     }
 
     fn decide(&mut self, ask: Seq) {

@@ -11,7 +11,7 @@ Use these words and no synonyms.
 - report, proposal, action, ask, decision, intent, outcome, refusal
 - running, asking, paused
 - ledger, gate, proof, adapter, canary, warden
-- parent, child, payload, adapter (built-in metric or lever), digest, know
+- parent, child, payload, adapter (built-in metric or lever), digest, know, expects
 - Commands: start, add, status, tail, asks, approve, deny, pause, resume, why, know, propose, digest
 
 ## Non-negotiables

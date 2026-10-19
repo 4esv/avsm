@@ -307,6 +307,10 @@ pub enum Signal {
     /// A run of `action` has an intent and no outcome: whether it happened
     /// is a human's to say, and until then the lever is refused.
     Pending { intent: Seq, action: String },
+    /// A delegated lever ran and the metric did not move as the mandate
+    /// expects, or its runs kept failing. While the ask is not approved by
+    /// a declared decision, the gate treats the lever as not delegated.
+    Ineffective { action: String, why: String },
 }
 
 /// One ledger record. Every variant carries its claim and its venture.

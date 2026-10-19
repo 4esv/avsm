@@ -6,6 +6,7 @@
 pub mod adapter;
 pub mod clock;
 pub mod config;
+pub mod expect;
 pub mod gate;
 pub mod index;
 pub mod kernel;

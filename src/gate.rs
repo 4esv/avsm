@@ -820,6 +820,7 @@ pub fn gate_in(
         now,
         |venture, action, since| index.used(venture, action, since),
         |venture| effective_threshold_in(index, mandates, venture),
+        |venture, action| index.suspended(venture, action),
     );
     load_family_mandates(&mut p, &adopted);
     let budget = budget_of_in(index, &adopted, v);
@@ -861,6 +862,7 @@ fn load_mandates(
     now: i64,
     used: impl Fn(&str, &str, i64) -> u32,
     threshold: impl Fn(&str) -> Option<Threshold>,
+    suspended: impl Fn(&str, &str) -> bool,
 ) {
     for m in adopted {
         let venture = m.venture.clone();
@@ -871,7 +873,8 @@ fn load_mandates(
                 perm.name.clone(),
                 perm.cap.count,
                 perm.reversible,
-                perm.delegated,
+                // A delegation a measured ask suspended is not one.
+                perm.delegated && !suspended(&venture, &perm.name),
             ));
             let window = perm.cap.per.as_secs() as i64;
             let n = used(&venture, &perm.name, now - window);
@@ -1248,7 +1251,11 @@ fn assemble<'a>(
                     action: perm.name.clone(),
                     cap: perm.cap,
                     reversible: perm.reversible,
-                    delegated: perm.delegated,
+                    delegated: p
+                        .permitted
+                        .iter()
+                        .find(|x| x.0 == *v && x.1 == perm.name)
+                        .map_or(perm.delegated, |x| x.4),
                     takes: perm.takes(),
                     cost: perm.cost,
                 }),
@@ -2127,6 +2134,7 @@ pub mod reference {
                     .count() as u32
             },
             |venture| effective_threshold(ledger, mandates, venture),
+            |venture, action| suspended(ledger, venture, action),
         );
         load_family(&mut p, ledger, &adopted);
         let budget = budget_of(ledger, &adopted, v);
@@ -2151,6 +2159,27 @@ pub mod reference {
             extra_steps,
             extra_reasons,
         )
+    }
+
+    /// Is the lever's delegation suspended: some measured ask says it is
+    /// ineffective and no declared approval by the same venture answers it?
+    pub fn suspended(ledger: &[Entry], venture: &str, action: &str) -> bool {
+        ledger.iter().any(|e| {
+            matches!(&e.record, Record::Ask {
+                claim: Claim::Measured,
+                venture: v,
+                signal: Some(crate::record::Signal::Ineffective { action: a, .. }),
+                ..
+            } if v == venture && a == action)
+                && !ledger.iter().any(|d| {
+                    matches!(&d.record, Record::Decision {
+                        claim: Claim::Declared,
+                        venture: dv,
+                        verdict: Verdict::Approve { ask, .. },
+                        ..
+                    } if dv == venture && *ask == e.seq)
+                })
+        })
     }
 
     /// Parents and children as facts, and every pause and resume a parent
@@ -2222,6 +2251,8 @@ mod tests {
             takes: None,
             cost: 0,
             check: None,
+            expects: None,
+            revoke_after: None,
         }
     }
 

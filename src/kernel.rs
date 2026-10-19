@@ -26,6 +26,7 @@ use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role, SUMMA
 use crate::venture::{self, Venture};
 use crate::warden::{self, Failure, FromWarden, LocalWarden, ToWarden, Warden};
 
+mod expect;
 mod refusals;
 
 /// How long a report may take.
@@ -61,6 +62,8 @@ pub struct Kernel {
     namespaces: Option<bool>,
     /// Refusals written and not yet closed, with their counts.
     refusals: refusals::Tally,
+    /// How each run of a lever with expectations went, once judged.
+    judged: BTreeMap<Seq, expect::Run>,
 }
 
 /// What the kernel knows about a venture beyond the ledger.
@@ -166,6 +169,7 @@ impl Kernel {
             by: None,
             namespaces: None,
             refusals: refusals::Tally::default(),
+            judged: BTreeMap::new(),
         };
         kernel.reload()?;
         kernel.recover();
@@ -1069,6 +1073,7 @@ impl Kernel {
             return;
         }
         let Some(val) = value else { return };
+        self.judge(name);
         // The bound is the mandate's, or the one the parent set.
         let threshold = match self.index() {
             Ok(index) => gate::effective_threshold_in(&index, &self.adopted(), name),
@@ -1211,6 +1216,7 @@ impl Kernel {
             Ok(_) => match self.warden.execute(&candidate) {
                 Ok(written) => {
                     lines.extend(written.iter().map(Entry::line));
+                    self.judge(name);
                     // A changed mandate adopted: take it on afresh, as
                     // `avsm add` would.
                     let adopted = written.iter().any(|e| {

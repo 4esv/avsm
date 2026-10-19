@@ -243,6 +243,13 @@ pub struct Permitted {
     /// the run, even a human-approved one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<String>,
+    /// What a run should do to the venture's metric, like `up 5 within 3`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expects: Option<Expects>,
+    /// On a delegated lever: this many misses in a row suspend the
+    /// delegation until a human approves the ask it raises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoke_after: Option<u32>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -316,6 +323,86 @@ impl<'de> Deserialize<'de> for Cap {
     }
 }
 
+/// Which way a run should move the metric.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Up,
+    Down,
+}
+
+/// What a run should do to the venture's metric: `up 5 within 3` or
+/// `down within 2`. The size is optional; `within` counts reports.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Expects {
+    pub direction: Direction,
+    pub size: Option<f64>,
+    pub within: u32,
+}
+
+impl fmt::Display for Expects {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let dir = match self.direction {
+            Direction::Up => "up",
+            Direction::Down => "down",
+        };
+        match self.size {
+            Some(size) => write!(f, "{dir} {size} within {}", self.within),
+            None => write!(f, "{dir} within {}", self.within),
+        }
+    }
+}
+
+impl FromStr for Expects {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Expects, String> {
+        let shape = || format!("expects looks like up 5 within 3 or down within 2, not {s:?}");
+        let words: Vec<&str> = s.split_whitespace().collect();
+        let (direction, rest) = match words.split_first() {
+            Some((&"up", rest)) => (Direction::Up, rest),
+            Some((&"down", rest)) => (Direction::Down, rest),
+            _ => return Err(shape()),
+        };
+        let (size, rest) = match rest {
+            [n, rest @ ..] if *n != "within" => {
+                let size: f64 = n.parse().map_err(|_| shape())?;
+                if !size.is_finite() || size <= 0.0 {
+                    return Err(format!(
+                        "the size in expects is a number above 0, not {n:?}; the direction says up or down"
+                    ));
+                }
+                (Some(size), rest)
+            }
+            rest => (None, rest),
+        };
+        let within = match rest {
+            ["within", n] => n.parse::<u32>().map_err(|_| shape())?,
+            _ => return Err(shape()),
+        };
+        if within == 0 {
+            return Err("expects needs at least 1 report to look at: within 1 or more".to_string());
+        }
+        Ok(Expects {
+            direction,
+            size,
+            within,
+        })
+    }
+}
+
+impl Serialize for Expects {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Expects {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Expects, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// What to do when `run` dies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -376,6 +463,8 @@ const ACTION_FIELDS: &[&str] = &[
     "takes",
     "cost",
     "check",
+    "expects",
+    "revoke_after",
 ];
 
 /// Names no permitted action may take: they are built in.
@@ -1406,11 +1495,44 @@ fn check_action(position: usize, item: &Value) -> Result<(), MandateError> {
         }
     }
     match map.get("cost") {
-        None => Ok(()),
+        None => {}
         Some(value) => match value.as_u64() {
-            Some(n) if n <= u64::from(u32::MAX) => Ok(()),
+            Some(n) if n <= u64::from(u32::MAX) => {}
+            _ => {
+                return fail(format!(
+                    "{who} cost is a whole number of what one run spends, not {}",
+                    describe(value)
+                ))
+            }
+        },
+    }
+    match map.get("expects") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(e)) => {
+            e.parse::<Expects>()
+                .map_err(|e| MandateError(format!("{who} {e}")))?;
+        }
+        Some(other) => {
+            return fail(format!(
+                "{who} expects is text like up 5 within 3, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match map.get("revoke_after") {
+        None | Some(Value::Null) => Ok(()),
+        Some(value) => match value.as_u64() {
+            Some(n) if (1..=u64::from(u32::MAX)).contains(&n) => {
+                if map.get("delegated") == Some(&Value::Bool(true)) {
+                    Ok(())
+                } else {
+                    fail(format!(
+                        "{who} revoke_after takes back a delegation, so the lever must be delegated: true"
+                    ))
+                }
+            }
             _ => fail(format!(
-                "{who} cost is a whole number of what one run spends, not {}",
+                "{who} revoke_after is a whole number of misses in a row, 1 or more, not {}",
                 describe(value)
             )),
         },
@@ -1745,6 +1867,59 @@ forbidden: [rm]
     }
 
     #[test]
+    fn expects_parses_with_and_without_a_size() {
+        let e: Expects = "up 5 within 3".parse().unwrap();
+        assert_eq!(
+            e,
+            Expects {
+                direction: Direction::Up,
+                size: Some(5.0),
+                within: 3
+            }
+        );
+        let e: Expects = "down within 2".parse().unwrap();
+        assert_eq!(e.direction, Direction::Down);
+        assert_eq!(e.size, None);
+        assert_eq!(e.to_string(), "down within 2");
+        for bad in [
+            "",
+            "sideways 5 within 3",
+            "up 5",
+            "up 0 within 3",
+            "up -2 within 3",
+            "up 5 within 0",
+            "up 5 within",
+        ] {
+            assert!(bad.parse::<Expects>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn expects_and_revoke_after_are_checked_in_the_mandate() {
+        let with = |fields: &str| {
+            edit(
+                "    delegated: false\n",
+                &format!("    delegated: true\n    {fields}\n"),
+            )
+        };
+        let m = Mandate::parse(&with("expects: up 5 within 3\n    revoke_after: 2")).unwrap();
+        let p = m.permitted("deploy").unwrap();
+        assert_eq!(p.expects.unwrap().within, 3);
+        assert_eq!(p.revoke_after, Some(2));
+        assert!(fails(&with("expects: sideways")).contains("expects looks like"));
+        assert!(fails(&with("revoke_after: 0")).contains("revoke_after"));
+        let msg = fails(&edit("    delegated: false\n", "    revoke_after: 2\n"));
+        assert!(msg.contains("must be delegated: true"), "{msg}");
+        // Old mandates parse unchanged.
+        assert!(Mandate::parse(VALID)
+            .unwrap()
+            .permitted("deploy")
+            .unwrap()
+            .expects
+            .is_none());
+    }
+
+    #[test]
     fn metric_must_be_one_word() {
         let msg = fails(&edit("metric: count", "metric: request count"));
         assert_eq!(
@@ -1930,7 +2105,7 @@ forbidden: [rm]
         ));
         assert_eq!(
             msg,
-            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes, cost, check"
+            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes, cost, check, expects, revoke_after"
         );
     }
 

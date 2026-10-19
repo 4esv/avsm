@@ -611,6 +611,8 @@ mod tests {
             takes: None,
             cost: 0,
             check: None,
+            expects: None,
+            revoke_after: None,
         };
         Context {
             venture: "shop".to_string(),
@@ -1004,6 +1006,8 @@ mod tests {
             takes: None,
             cost: 0,
             check: None,
+            expects: None,
+            revoke_after: None,
         });
         c.children = vec![ChildView {
             name: "shop".to_string(),
