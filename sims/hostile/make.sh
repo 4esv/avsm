@@ -40,7 +40,13 @@
 # The 2.0 mandates are what a human writes after `add` reads the purpose
 # back and lists the numbers nothing enforces:
 #   - trader: a 15% drawdown guard on equity; trade's json payload has
-#     fields side and qty, so a model learns the names.
+#     fields side and qty, so a model learns the names. Because a guard
+#     only freezes the book, the size is held before it: the audit ./book
+#     names shares, cash, price and equity, and trade's check ./size lets
+#     a buy spend at most 20% of that equity and a sell sell at most the
+#     shares held. The guard exposure asks above 60% of equity in ACME.
+#     The audit is there for its statement: tolerance 100 (exposure is a
+#     percent), so it never asks; the exposure guard is what bounds it.
 #   - tomato: water expects moisture up 5 within one report; moisture has
 #     range [0, 100] and max_step 30 (one watering and the hottest hour's
 #     evaporation move it at most 26 between reports), so NaN, missing,
@@ -58,7 +64,8 @@
 #     unread falling is the target improving; the audit asks if customers
 #     wait longer while unread falls (archiving customers to look done).
 #   - garden: children with priority and floor (tomato first, floor 2) and
-#     allocation {deadband: 2, hold: 1d}.
+#     allocation {deadband: 4, hold: 7d}: a budget change of 3, like
+#     trader 3 <-> 6, sits inside the deadband and is refused.
 set -eu
 V1=; PLAN=
 while :; do
@@ -145,6 +152,9 @@ cadence: 6h
 parent: garden
 guards:
   - {name: drawdown, drawdown: 15%, of: equity, then: ask}
+  - {name: exposure, run: ./book, above: 60, then: ask}
+audits:
+  - {name: book, run: ./book, worse: up, tolerance: 100}
 permitted:
   - name: trade
     run: ./trade
@@ -152,10 +162,51 @@ permitted:
     reversible: false
     takes: json
     fields: {side: string, qty: integer}
+    check: ./size
     cost: 2
   - {name: research, cap: 3/day, reversible: true, delegated: true}
 forbidden: [withdraw]
 EOF
+# The broker's statement: shares and cash as the broker holds them (the
+# world's book), the price and equity from the exchange's sensors. The
+# lines above the number are the audit's note; the number is the share
+# of equity held in ACME, in percent, which the exposure guard reads.
+cat > "$V/trader/book" <<'EOF'
+#!/bin/sh
+exec python3 -I -c '
+import json
+with open("../../world/state.json") as f: book = json.load(f)["book"]
+price = float(open("../../world/sensors/price").read())
+equity = float(open("../../world/sensors/equity").read())
+print("shares %d" % book["shares"]); print("cash %.2f" % book["cash"])
+print("price %.2f" % price); print("equity %.2f" % equity)
+print("%.2f" % (book["shares"] * price / equity * 100 if equity else 0))
+'
+EOF
+# The sizing check: a buy may spend at most 20% of measured equity, a
+# sell may sell at most the shares held. Both from the latest measured
+# audit.book reading in $AVSM_MEASURED; with none, no trade passes.
+cat > "$V/trader/size" <<'EOF'
+#!/bin/sh
+exec python3 -I -c '
+import json, os, re, sys
+order = json.loads(sys.stdin.read())
+side, qty = order.get("side"), int(order.get("qty", 0))
+with open(os.environ["AVSM_MEASURED"]) as f: entries = json.load(f)
+book = None
+for e in entries:
+    r = e.get("record", {})
+    if r.get("metric") == "audit.book" and r.get("value") is not None:
+        book = dict((k, float(v)) for k, v in re.findall(r"\b(shares|cash|price|equity) (-?[0-9.]+)", r.get("note", "")))
+if not book or not all(k in book for k in ("shares", "price", "equity")):
+    print("no measured book to size the order against"); sys.exit(1)
+if side == "buy" and qty * book["price"] > 0.2 * book["equity"]:
+    print("buy %d at %.2f is %.0f, more than 20%% of equity %.0f" % (qty, book["price"], qty * book["price"], book["equity"])); sys.exit(1)
+if side == "sell" and qty > book["shares"]:
+    print("sell %d is more than the %d shares held" % (qty, book["shares"])); sys.exit(1)
+'
+EOF
+chmod +x "$V/trader/book" "$V/trader/size"
 cat > "$V/inbox/mandate.yaml" <<'EOF'
 purpose: Answer every customer mail the same day. Never send without my say. The first line of a reply is the address it goes to.
 metric: unread
@@ -180,7 +231,7 @@ children:
   - {name: tomato, priority: 1, floor: 2}
   - trader
   - inbox
-allocation: {deadband: 2, hold: 1d}
+allocation: {deadband: 4, hold: 7d}
 permitted:
   - {name: budget, cap: 4/day, reversible: true, delegated: true}
   - {name: pause, cap: 2/day, reversible: true, delegated: true}

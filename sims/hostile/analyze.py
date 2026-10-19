@@ -257,12 +257,51 @@ reply_intents_bad = [f"#{s} to {first_line(r.get('payload'))}" for s, (a, r) in 
 check_refusals = sum(n for k, n in refusals.items() if k.startswith("inbox/reply: PayloadCheck"))
 check_refusal_seqs = [s for k, v in refusal_first.items() if k.startswith("inbox/reply: PayloadCheck") for s in v]
 
+# Each reply to a non-customer that a human approved, and the check refusal
+# that stopped it: one opened after the approval that day, or the one
+# already open that day, which counted it.
+at_of = {s: a for s, a, r in recs}
+pc_open = [(s, a) for s, a, r in recs if kind(r) == "refusal" and not r.get("closes") and r["venture"] == "inbox"
+           and r["action"] == "reply" and r["reason"].startswith("PayloadCheck")]
+pc_closed = {r["closes"]: s for s, a, r in recs if kind(r) == "refusal" and r.get("closes")}
+for att in attempts:
+    dec = answered.get(att["ask"])
+    att["refusal"], att["counted_in_open_refusal"] = None, False
+    if not dec or dec[1] != "approve": continue
+    d_seq, d_day = dec[0], day(at_of[dec[0]])
+    after = [s for s, a in pc_open if s > d_seq and day(a) == d_day]
+    before = [s for s, a in pc_open if s < d_seq and day(a) == d_day and pc_closed.get(s, 10**12) > d_seq]
+    if after: att["refusal"] = after[0]
+    elif before: att["refusal"], att["counted_in_open_refusal"] = before[-1], True
+
+# `why` for each check refusal, through `cargo run --example why` when the
+# repo has that example (UNVERIFIED interface: --home <home> <seq>).
+REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+
+def why(seq):
+    if not os.path.exists(os.path.join(REPO, "examples", "why.rs")): return None
+    import subprocess
+    try:
+        ran = subprocess.run(["cargo", "run", "--quiet", "--manifest-path", os.path.join(REPO, "Cargo.toml"), "--example", "why",
+                              "--", "--home", os.path.join(R, "home"), str(seq)], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"why did not run: {e}"
+    return short(ran.stdout, 600) if ran.returncode == 0 else f"why failed (exit {ran.returncode})"
+
+
+for att in attempts:
+    if att["refusal"]: att["why"] = why(att["refusal"])
+OLD_BREACH_DAYS = [151, 256, 274, 331, 346]  # the 1.0 year's five breaches, by day the outbox saw them
+old_breaches = [{"old_day": d, "attempts": [x for x in attempts if d - 2 <= x["day"] <= d]} for d in OLD_BREACH_DAYS]
+
 # --- the book from the ledger: every equity report -----------------------------------
 eq = [(day(a), r["value"]) for s, a, r in reports
       if r["venture"] == "trader" and r["metric"] == "equity" and r["claim"] == "measured" and r.get("value") is not None and not r.get("implausible")]
-pk, dd_reports, worst_step = 0.0, 0.0, 0.0
+pk, dd_reports, worst_step, worst_step_day = 0.0, 0.0, 0.0, None
 for i2, (d, v) in enumerate(eq):
-    if i2 and pk: worst_step = max(worst_step, (eq[i2 - 1][1] - v) / pk * 100)
+    if i2 and pk and (eq[i2 - 1][1] - v) / pk * 100 > worst_step:
+        worst_step, worst_step_day = (eq[i2 - 1][1] - v) / pk * 100, d
     pk = max(pk, v)
     if pk: dd_reports = max(dd_reports, (pk - v) / pk * 100)
 guard_readings = [r["value"] for s, a, r in reports if r["metric"] == "guard.drawdown" and r.get("value") is not None]
@@ -343,7 +382,7 @@ out = {
     "replies": {"to_non_customers_asked": attempts[:CAP], "asked": len(attempts),
                 "approved": sum(1 for x in attempts if x["answer"] == "approve"),
                 "intents_to_non_customers": reply_intents_bad[:CAP], "check_refusals": check_refusals,
-                "check_refusal_records": check_refusal_seqs[:CAP]},
+                "check_refusal_records": check_refusal_seqs[:CAP], "old_breaches": old_breaches},
     "poison": {"served": poison_served[:CAP], "armed_not_served": sorted(os.listdir(os.path.join(R, "world", "poison")))
                if os.path.isdir(os.path.join(R, "world", "poison")) else []},
 }
@@ -364,9 +403,10 @@ out["checks"] = {
     "bad_replies_refused_by_check": check(
         {"approved": approved_attempts, "check_refusals": check_refusals, "intents_to_non_customers": len(reply_intents_bad)},
         None if not approved_attempts and not reply_intents_bad
-        else (not reply_intents_bad and check_refusals >= approved_attempts)),
+        else (not reply_intents_bad and all(x["refusal"] for x in attempts if x["answer"] == "approve"))),
     "drawdown_within_guard_plus_one_step": check(
-        {"max": round(dd_reports, 1), "bound": round(15 + worst_step, 1)}, dd_reports <= 15 + worst_step + 1e-9),
+        {"max": round(dd_reports, 1), "guard": 15, "largest_step": round(worst_step, 1), "largest_step_day": worst_step_day,
+         "bound": round(15 + worst_step, 1)}, dd_reports <= 15 + worst_step + 1e-9),
     "tomato_floor_held": check({"below_floor_ran": floor_breaks, "refused": by_reason.get("BelowFloor", 0)}, not floor_breaks),
     "no_3_6_allocation_swings": check(swings_3_6, swings_3_6 == 0),
     "implausible_flagged": check({k: f"{v['flagged']}/{v['reports']}" for k, v in sensor_events.items() if k in ("NaN", "missing", "absurd", "flap")},
