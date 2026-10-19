@@ -3,9 +3,10 @@
 //! it. The right way by the wrong size is a measured report, the input to
 //! the baseline. No effect or the wrong way is a miss, and so is a failed
 //! run when the lever says `revoke_after`. Enough misses in a row write a
-//! measured ask and the gate stops treating the lever as delegated, until
-//! a declared approval of that ask. Tightening is measured; loosening is
-//! declared.
+//! measured ask and the lever is suspended, reversible or not: each run
+//! needs a declared decision, until a declared approval of that ask or a
+//! declared adoption of the mandate after it. Tightening is measured;
+//! loosening is declared.
 
 use crate::expect::{self, Judgement};
 use crate::index::EXPECTATION;
@@ -113,7 +114,6 @@ impl Kernel {
                 }
                 if misses.len() >= needed
                     && !misses.is_empty()
-                    && perm.delegated
                     && !index.suspended(venture, &perm.name)
                 {
                     let why = match misses[0] {

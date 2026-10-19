@@ -379,7 +379,13 @@ ascent! {
     relation irreversible_ok(String, String);
     irreversible_ok(v, a) <-- permitted(v, a, _, false, true);
     irreversible_ok(v, a) <-- permitted(v, a, _, false, _), approved(v, a, _, _);
+    // venture, action: a measured ask says the lever is ineffective and no
+    // declared decision has answered it
+    relation suspended(String, String);
     relation needs_decision(String, String);
+    // A suspended lever needs a declared decision for each run, whatever
+    // its reversibility or delegation.
+    needs_decision(v, a) <-- candidate(v, a), suspended(v, a), !approved(v, a, _, _);
     needs_decision(v, a) <-- candidate(v, a), permitted(v, a, _, false, _), !irreversible_ok(v, a);
 
     // Non-negotiable 9: content a model produced is inferred until a human
@@ -873,9 +879,11 @@ fn load_mandates(
                 perm.name.clone(),
                 perm.cap.count,
                 perm.reversible,
-                // A delegation a measured ask suspended is not one.
-                perm.delegated && !suspended(&venture, &perm.name),
+                perm.delegated,
             ));
+            if suspended(&venture, &perm.name) {
+                p.suspended.push((venture.clone(), perm.name.clone()));
+            }
             let window = perm.cap.per.as_secs() as i64;
             let n = used(&venture, &perm.name, now - window);
             p.used.push((venture.clone(), perm.name.clone(), n));
@@ -1251,11 +1259,7 @@ fn assemble<'a>(
                     action: perm.name.clone(),
                     cap: perm.cap,
                     reversible: perm.reversible,
-                    delegated: p
-                        .permitted
-                        .iter()
-                        .find(|x| x.0 == *v && x.1 == perm.name)
-                        .map_or(perm.delegated, |x| x.4),
+                    delegated: perm.delegated,
                     takes: perm.takes(),
                     cost: perm.cost,
                 }),
@@ -2161,8 +2165,9 @@ pub mod reference {
         )
     }
 
-    /// Is the lever's delegation suspended: some measured ask says it is
-    /// ineffective and no declared approval by the same venture answers it?
+    /// Is the lever suspended: some measured ask says it is ineffective
+    /// and neither a declared approval of it by the same venture nor a
+    /// declared adoption of the venture's mandate after it answers it?
     pub fn suspended(ledger: &[Entry], venture: &str, action: &str) -> bool {
         ledger.iter().any(|e| {
             matches!(&e.record, Record::Ask {
@@ -2178,6 +2183,15 @@ pub mod reference {
                         verdict: Verdict::Approve { ask, .. },
                         ..
                     } if dv == venture && *ask == e.seq)
+                })
+                && !ledger.iter().any(|d| {
+                    d.seq > e.seq
+                        && matches!(&d.record, Record::Decision {
+                            claim: Claim::Declared,
+                            venture: dv,
+                            verdict: Verdict::Adopt { .. },
+                            ..
+                        } if dv == venture)
                 })
         })
     }

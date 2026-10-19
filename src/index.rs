@@ -440,19 +440,23 @@ impl Index {
             .max()
     }
 
-    /// Is this lever's delegation suspended: a measured ask says it is
-    /// ineffective and no declared approval of that ask, by the same
-    /// venture, has answered it. Tightening is measured; only a declared
-    /// decision loosens.
+    /// Is this lever suspended: a measured ask says it is ineffective and
+    /// neither a declared approval of that ask by the same venture nor a
+    /// later declared adoption of the venture's mandate has answered it.
+    /// While it is, each run needs a declared decision. Tightening is
+    /// measured; only a declared decision loosens.
     pub fn suspended(&self, venture: &str, action: &str) -> bool {
+        // A declared adoption of the mandate after the ask answers it too.
+        let adopted = self.adoptions.get(venture).map_or(0, |a| a.seq);
         self.ineffective
             .get(&(venture.to_string(), action.to_string()))
             .is_some_and(|asks| {
                 asks.iter().any(|q| {
-                    !self
-                        .approved_by
-                        .get(q)
-                        .is_some_and(|by| by.contains(venture))
+                    *q > adopted
+                        && !self
+                            .approved_by
+                            .get(q)
+                            .is_some_and(|by| by.contains(venture))
                 })
             })
     }

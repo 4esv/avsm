@@ -55,6 +55,10 @@ struct Fixture {
 }
 
 fn fixture(lever: &str, run: &str) -> Fixture {
+    fixture_of(false, lever, run)
+}
+
+fn fixture_of(reversible: bool, lever: &str, run: &str) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -72,7 +76,7 @@ fn fixture(lever: &str, run: &str) -> Fixture {
         format!(
             "purpose: Keep the count up.\nmetric: count\n\
              controller: {{kind: threshold, below: 5, action: boost}}\ncadence: 1h\n\
-             permitted:\n- {{name: boost, run: {run}, cap: 1/day, reversible: false, {lever}}}\n"
+             permitted:\n- {{name: boost, run: {run}, cap: 1/day, reversible: {reversible}, {lever}}}\n"
         ),
     )
     .unwrap();
@@ -289,12 +293,45 @@ fn failures_do_not_count_without_revoke_after() {
 }
 
 #[test]
-fn a_lever_that_is_not_delegated_is_not_suspended() {
+fn a_reversible_lever_that_does_nothing_is_suspended_after_one_miss() {
     let _c = clock();
-    let mut f = fixture("expects: up 5 within 2", "echo boost >> boosts");
-    f.report(3.0); // asks: irreversible and not delegated
-    assert_eq!(f.intents(), 0);
-    assert!(f.ineffective().is_empty());
+    // The tomato died and the water ran on: a reversible lever, fired by
+    // a threshold, whose runs do not move the metric.
+    let mut f = fixture_of(true, "expects: up 5 within 1", "echo boost >> boosts");
+    f.report(3.0); // crosses: runs, reversibly
+    assert_eq!(f.intents(), 1);
+    f.report(3.0); // no effect: suspended
+    assert!(f.suspended());
+    for _ in 0..50 {
+        f.report_tomorrow(3.0);
+    }
+    assert_eq!(f.intents(), 1, "50 more crossings, no more runs");
+    assert_eq!(f.lever_asks().len(), 1, "one open ask, not fifty");
+    assert_eq!(f.ineffective().len(), 1);
+}
+
+#[test]
+fn a_lever_that_is_not_delegated_can_be_suspended() {
+    let _c = clock();
+    let mut f = fixture_of(true, "expects: up 5 within 1", "echo boost >> boosts");
+    f.report(3.0);
+    f.report(3.0);
+    assert!(f.suspended());
+    assert_eq!(f.ineffective().len(), 1);
+}
+
+#[test]
+fn a_declared_adoption_after_the_ask_restores_the_lever() {
+    let _c = clock();
+    let (mut f, ask) = suspended();
+    f.k.deny(ask, "no").unwrap();
+    assert!(f.suspended());
+    let runs = f.intents();
+    let dir = f.dir.clone();
+    f.k.add(&dir).unwrap();
+    assert!(!f.suspended());
+    f.report_tomorrow(3.0);
+    assert_eq!(f.intents(), runs + 1, "runs again");
 }
 
 /// A suspended lever, and the ask that suspended it.
