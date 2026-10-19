@@ -1011,6 +1011,12 @@ fn signal_group(child: &std::process::Child, signal: libc::c_int) {
     }
 }
 
+/// Is anything left in the group `child` leads?
+fn group_alive(child: &std::process::Child) -> bool {
+    // SAFETY: kill with signal 0 only checks; it has no memory preconditions.
+    unsafe { libc::kill(-(child.id() as libc::pid_t), 0) == 0 }
+}
+
 /// Like `run_with`, keeping at most `cap` bytes of each of stdout and
 /// stderr; the rest is read and dropped so the child never blocks.
 pub fn run_bounded(
@@ -1021,6 +1027,21 @@ pub fn run_bounded(
     stdin: &str,
     timeout: Duration,
     cap: usize,
+) -> Ran {
+    run_draining(dir, program, args, env, stdin, timeout, cap, &draining)
+}
+
+/// `run_bounded`, told by `draining` when avsmd is stopping.
+#[allow(clippy::too_many_arguments)]
+fn run_draining(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    stdin: &str,
+    timeout: Duration,
+    cap: usize,
+    draining: &dyn Fn() -> bool,
 ) -> Ran {
     let mut child = match Command::new(program)
         .args(args)
@@ -1078,29 +1099,41 @@ pub fn run_bounded(
     let mut drained: Option<Instant> = None;
     // PERF: most children exit within milliseconds; poll fast, then back off.
     let mut wait = Duration::from_millis(1);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None)
-                if began.elapsed() > timeout
-                    || drained.is_some_and(|d| d.elapsed() > DRAIN_GRACE) =>
-            {
-                signal_group(&child, libc::SIGKILL);
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
+    // The leader's exit, once it has exited.
+    let mut exited = None;
+    let mut killed = false;
+    loop {
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exited = Some(status),
+                Ok(None) => {}
+                Err(_) => break,
             }
-            Ok(None) if drained.is_none() && draining() => {
-                signal_group(&child, libc::SIGTERM);
-                drained = Some(Instant::now());
-            }
-            Ok(None) => {
-                std::thread::sleep(wait);
-                wait = (wait * 2).min(Duration::from_millis(20));
-            }
-            Err(_) => break None,
         }
-    };
+        // NOTE: a drain ends with the group, not with its leader. A leader
+        // that forks (dash's `sh -c ./lever` does) dies on the SIGTERM
+        // while what it started ignores it and holds the output pipes:
+        // the drain still owes that group its SIGKILL.
+        let alive = exited.is_none() || (drained.is_some() && group_alive(&child));
+        if !alive {
+            break;
+        }
+        if began.elapsed() > timeout || drained.is_some_and(|d| d.elapsed() > DRAIN_GRACE) {
+            signal_group(&child, libc::SIGKILL);
+            let _ = child.kill();
+            let _ = child.wait();
+            killed = true;
+            break;
+        }
+        if drained.is_none() && draining() {
+            signal_group(&child, libc::SIGTERM);
+            drained = Some(Instant::now());
+            continue;
+        }
+        std::thread::sleep(wait);
+        wait = (wait * 2).min(Duration::from_millis(20));
+    }
+    let status = exited.filter(|_| !killed);
     let (stdout, stderr) = reader.join().unwrap_or_default();
     Ran {
         ok: status.is_some_and(|s| s.success()),
@@ -1254,6 +1287,34 @@ mod tests {
         );
         assert!(ran.ok && !ran.killed);
         assert_eq!(ran.stdout.len(), 100);
+    }
+
+    /// The leader forks, dies on the drain's SIGTERM, and leaves a child
+    /// that ignores it holding stdout: the drain still ends the group
+    /// within its grace, and the run reads as killed.
+    #[test]
+    fn a_drain_kills_what_the_leader_left_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let began = Instant::now();
+        let ran = run_draining(
+            tmp.path(),
+            "sh",
+            &[
+                "-c",
+                "sh -c \"trap '' TERM; touch started; sleep 60\"; true",
+            ],
+            &[],
+            "",
+            Duration::from_secs(120),
+            usize::MAX,
+            &|| tmp.path().join("started").exists(),
+        );
+        let took = began.elapsed();
+        assert!(ran.killed && !ran.ok, "{ran:?}");
+        assert!(
+            took < DRAIN_GRACE + Duration::from_secs(3),
+            "took {took:?}, past the grace"
+        );
     }
 
     #[test]
