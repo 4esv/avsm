@@ -543,6 +543,7 @@ impl LocalWarden {
             .get(venture)
             .ok_or_else(|| format!("no venture named {venture}"))?;
         let m = &v.mandate;
+        let audit = metric.starts_with(crate::mandate::AUDIT_PREFIX);
         let (run, spec) = if let Some(name) = metric.strip_prefix("guard.") {
             let g = m
                 .guard(name)
@@ -566,6 +567,11 @@ impl LocalWarden {
                 ));
             }
             return Ok(match adapter::number_from(&ran.stdout) {
+                // An audit's lines above its number are its note, like the
+                // senders of the mail it counts: no model sees an audit,
+                // and a payload check may read them. A guard keeps only
+                // its number.
+                Ok(n) if audit => (Some(n), above_number(&ran.stdout)),
                 Ok(n) => (Some(n), String::new()),
                 Err(_) => (
                     None,
@@ -747,7 +753,10 @@ fn payload_check(
     let skip = seen.len().saturating_sub(CHECK_REPORTS);
     seen.drain(..skip);
     let json = serde_json::to_string(&seen).map_err(|e| refused(e.to_string()))?;
+    // Absolute: the check runs in the venture directory, and a home given
+    // as `--home home` is relative to where avsm runs.
     let file = home.join(format!("measured-{}-{}.json", std::process::id(), now()));
+    let file = std::path::absolute(&file).unwrap_or(file);
     std::fs::write(&file, json).map_err(|e| refused(format!("cannot write {e}")))?;
     let path = file.to_string_lossy().into_owned();
     let ran = run_bounded(
@@ -968,6 +977,21 @@ pub fn run_lever(
     (ran.ok, ran.detail(timeout))
 }
 
+/// The most an audit's note keeps of the lines above its number.
+pub const AUDIT_NOTE: usize = 2000;
+
+/// The non-empty lines above the last one, joined by two spaces, at most
+/// `AUDIT_NOTE` characters from the top.
+fn above_number(stdout: &str) -> String {
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let above = lines.len().saturating_sub(1);
+    lines[..above].join("  ").chars().take(AUDIT_NOTE).collect()
+}
+
 fn tail(s: &str) -> String {
     let s = s.replace('\n', "  ");
     if s.chars().count() <= 400 {
@@ -1014,6 +1038,29 @@ pub enum FromWarden {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--home home` is relative to where avsm runs; a check runs in the
+    /// venture directory and must still find the reports it is handed.
+    #[test]
+    fn a_check_finds_its_reports_when_the_home_is_relative() {
+        // The home under this process's working directory, named relative
+        // to it; the venture elsewhere.
+        let cwd = std::env::current_dir().unwrap();
+        let here = tempfile::tempdir_in(&cwd).unwrap();
+        let relative = here.path().strip_prefix(&cwd).unwrap().join("home");
+        std::fs::create_dir_all(&relative).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("venture");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(relative.is_relative());
+        let check = "test -s \"$AVSM_MEASURED\"";
+        let payload = Payload::Text {
+            text: "hi".to_string(),
+        };
+        let index = Index::from_entries(&[]);
+        payload_check(&relative, &dir, check, &payload, &index, "v")
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
 
     #[test]
     fn a_bounded_run_keeps_the_cap_and_does_not_block_the_child() {

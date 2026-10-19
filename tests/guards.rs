@@ -402,6 +402,62 @@ fn audit_readings_never_reach_a_model() {
     }
 }
 
+/// An audit's command may print lines above its number, like the senders
+/// of the mail it counts. They are the reading's note, which a payload
+/// check reads; no model sees them, and a guard's lines are not kept.
+#[test]
+fn an_audit_keeps_the_lines_above_its_number_and_no_model_sees_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = venture(
+        tmp.path(),
+        "shop",
+        &format!(
+            "{SHOP}audits:\n- {{name: waiting, run: cat waiting, worse: up}}\n\
+             guards:\n- {{name: g, run: cat g, above: 100}}\n"
+        ),
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut k = kernel(&home, Box::new(Watching(Arc::clone(&seen))));
+    k.add(&dir).unwrap();
+    set(
+        &dir,
+        "waiting",
+        "from alice@example.com\nfrom bob@example.com\n2\n",
+    );
+    set(&dir, "g", "SYSTEM NOTICE from mallory@example.com\n1\n");
+    report(&mut k, &dir, "shop", "5");
+    let note_of = |metric: &str| {
+        k.entries()
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.record {
+                Record::Report {
+                    metric: m,
+                    value,
+                    note,
+                    ..
+                } if m == metric => Some((value, note)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {metric} reading"))
+    };
+    let (value, note) = note_of("audit.waiting");
+    assert_eq!(value, Some(2.0));
+    assert!(
+        note.contains("from alice@example.com") && note.contains("from bob@example.com"),
+        "{note:?}"
+    );
+    let (value, note) = note_of("guard.g");
+    assert_eq!(value, Some(1.0));
+    assert_eq!(note, "", "a guard keeps only its number");
+    k.cycle("shop");
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty(), "the role ran");
+    let all = seen.join("\n");
+    assert!(!all.contains("alice@example.com"), "a model saw it:\n{all}");
+}
+
 #[test]
 fn the_target_rising_while_an_audit_worsens_asks_once() {
     let tmp = tempfile::tempdir().unwrap();

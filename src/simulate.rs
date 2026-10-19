@@ -29,7 +29,8 @@ pub enum Human {
     /// Leave every ask open.
     Away,
     /// Deny every third ask it answers; approve the rest, a text payload
-    /// with a line added first, as `approve --edit` would.
+    /// with a line added first, as `approve --edit` would (a mandate with
+    /// the line as a comment, so it still parses).
     Mixed,
 }
 
@@ -331,11 +332,55 @@ fn answer(kernel: &Kernel, human: Human, seq: Seq, n: u64) -> Vec<String> {
             .ok()
             .and_then(|p| p.strip_prefix("text\n").map(str::to_string))
         {
-            let edited = format!("{}\n\n{EDIT}\n", text.trim_end());
-            return vec!["approve".to_string(), q, "--payload".to_string(), edited];
+            return vec![
+                "approve".to_string(),
+                q,
+                "--payload".to_string(),
+                edited(&text),
+            ];
         }
     }
     vec!["approve".to_string(), q]
 }
 
+/// A text payload as the mixed human saves it: a line added at the end,
+/// or, when the text is a mandate, the same line as a YAML comment, so
+/// the mandate it approves still parses.
+pub fn edited(text: &str) -> String {
+    let text = text.trim_end();
+    if Mandate::parse(text).is_ok() {
+        format!("{text}\n# {EDIT}\n")
+    } else {
+        format!("{text}\n\n{EDIT}\n")
+    }
+}
+
 use chrono::Timelike;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mandate the ratchet would put in a delegate ask, with a lever
+    /// list a bare line would break.
+    const MANDATE: &str = "purpose: Keep the tomato alive.\nmetric: moisture\n\
+        controller: {kind: threshold, below: 35, action: water}\ncadence: 2h\n\
+        permitted:\n  - name: water\n    run: ./water\n    cap: 4/day\n    reversible: true\n    delegated: true\n";
+
+    #[test]
+    fn the_mixed_human_edits_a_mandate_with_a_comment_and_it_still_parses() {
+        let before = Mandate::parse(MANDATE).unwrap();
+        let text = edited(MANDATE);
+        assert!(text.contains(&format!("# {EDIT}")), "{text}");
+        let after = Mandate::parse(&text).unwrap_or_else(|e| panic!("{e}:\n{text}"));
+        assert_eq!(before, after, "a comment changes nothing");
+    }
+
+    #[test]
+    fn the_mixed_human_edits_other_text_with_a_line() {
+        assert_eq!(
+            edited("A title\nA body\n"),
+            format!("A title\nA body\n\n{EDIT}\n")
+        );
+    }
+}
