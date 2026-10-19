@@ -957,7 +957,7 @@ fn a_constant_metric_is_never_stuck() {
 }
 
 #[test]
-fn expects_is_never_judged_on_stuck_readings() {
+fn a_reading_stuck_at_the_value_before_a_run_judges_it_ineffective() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let dir = venture(
@@ -985,15 +985,16 @@ fn expects_is_never_judged_on_stuck_readings() {
             .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
         "{f:?}"
     );
-    assert!(
-        signals(&k, |s| matches!(s, Signal::Ineffective { .. })).is_empty(),
-        "no judgement on a frozen number"
+    // The lever did nothing anyone can see: the frozen number judges it
+    // ineffective, and only restricts. It is never a premise.
+    let ineffective = signals(&k, |s| matches!(s, Signal::Ineffective { .. }));
+    assert_eq!(ineffective.len(), 1, "{ineffective:?}");
+    let _ = k.propose("pot", "water", None);
+    assert_eq!(
+        count(&k, Kind::Intent, "water"),
+        1,
+        "suspended: never runs again"
     );
-    assert!(!k
-        .entries()
-        .unwrap()
-        .iter()
-        .any(|e| matches!(&e.record, Record::Report { metric, .. } if metric == "expectation")));
 }
 
 #[test]

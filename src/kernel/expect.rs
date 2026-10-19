@@ -3,7 +3,9 @@
 //! it. The right way by the wrong size is a measured report, the input to
 //! the baseline. No effect or the wrong way is a miss, and so is a failed
 //! run when the lever says `revoke_after`. A run whose step spans a
-//! reading code marked implausible is never judged. Enough misses in a row
+//! reading code marked implausible is never judged, unless that reading is
+//! stuck at the value from before the run: the lever did nothing, and the
+//! reading that says so only restricts. Enough misses in a row
 //! write a measured ask and the lever is suspended, reversible or not:
 //! every run is refused, and none asks, until a declared approval of that
 //! ask or a declared adoption of the mandate after it. One ask an episode:
@@ -85,8 +87,46 @@ impl Kernel {
                     let Some((outcome, ok)) = index.settled(intent) else {
                         break;
                     };
+                    // The first readings after the run, until a plausible one:
+                    // one flagged stuck at the last plausible value from
+                    // before the run says the lever did nothing. The
+                    // reading stays implausible; it only restricts.
+                    let stuck = perm.expects.as_ref().and_then(|_| {
+                        let series = index.series(venture, &metric);
+                        let b = series.partition_point(|(s, _)| *s < intent);
+                        let frozen = series[..b].last()?.1;
+                        index
+                            .of(venture)
+                            .filter(|e| e.seq > outcome)
+                            .filter_map(|e| match &e.record {
+                                Record::Report {
+                                    metric: m,
+                                    claim,
+                                    value: Some(x),
+                                    implausible,
+                                    ..
+                                } if *m == metric && claim.authorizes() => {
+                                    Some((*x, implausible.as_deref()))
+                                }
+                                _ => None,
+                            })
+                            .take_while(|(_, flag)| flag.is_some())
+                            .find(|(x, flag)| {
+                                *x == frozen && flag.is_some_and(|f| f.starts_with("stuck"))
+                            })
+                            .map(|(x, _)| x)
+                    });
                     let result = if !ok {
                         Run::Failed
+                    } else if let Some(x) = stuck {
+                        Run::Ineffective(format!(
+                            "no effect seen: {metric} stuck at {x} after {} ran; {} expects {}",
+                            perm.name,
+                            perm.name,
+                            perm.expects
+                                .as_ref()
+                                .map_or_else(String::new, |e| e.to_string()),
+                        ))
                     } else if let Some(expects) = &perm.expects {
                         let series = index.series(venture, &metric);
                         let b = series.partition_point(|(s, _)| *s < intent);

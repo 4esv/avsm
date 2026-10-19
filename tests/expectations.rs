@@ -757,3 +757,44 @@ fn a_denied_ineffective_lever_asks_again_only_on_new_evidence() {
     assert_eq!(f.ineffective().len(), 2, "one open at a time");
     assert_eq!(f.intents(), 1);
 }
+
+#[test]
+fn a_reading_stuck_after_a_run_is_no_effect_and_never_lets_it_run_again() {
+    let _c = clock();
+    // The hostile quarter: the plant died after a watering and the sensor
+    // froze. The stuck reading is implausible, and the evidence the lever
+    // did nothing; a later plausible reading must not run it again.
+    let mut f = tomato();
+    for v in [40.0, 42.0, 41.0, 43.0, 40.0] {
+        f.report(v);
+    }
+    f.report(20.0); // crosses: boost runs
+    assert_eq!(f.intents(), 1);
+    f.report(20.0); // exactly as before the run: stuck, and no effect
+    assert!(
+        f.flags()[6]
+            .as_deref()
+            .is_some_and(|w| w.starts_with("stuck")),
+        "{:?}",
+        f.flags()
+    );
+    assert!(f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.ineffective().len(), 1);
+    assert!(
+        matches!(&f.ineffective()[0].record, Record::Ask { signal: Some(Signal::Ineffective { why, .. }), .. }
+            if why.contains("stuck at 20")),
+        "{:?}",
+        f.ineffective()
+    );
+    // Another sensor event, plausible and different, crosses the threshold.
+    f.report(25.0);
+    f.report_tomorrow(22.0);
+    assert!(
+        f.flags()[7..].iter().all(Option::is_none),
+        "{:?}",
+        f.flags()
+    );
+    assert_eq!(f.intents(), 1, "suspended: not run again");
+    assert!(f.lever_asks().is_empty(), "{:?}", f.lever_asks());
+    assert!(f.suspended_refusals() > 0, "the refusal is a record");
+}
