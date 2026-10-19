@@ -337,6 +337,17 @@ def first_need(after, until=None):
     return None
 
 
+def episode_start(need):
+    """The first step of the over-SLO run that `need` closes: avsm may read
+    the breach a step before the hold the analyzer models, and acting early
+    is not acting late."""
+    begun = None
+    for t in truth:
+        if t["now"] > need: break
+        begun = (begun or t["now"]) if t["p95"] > SLO_MS else None
+    return begun or need
+
+
 def first_scale_up(after):
     for s, a, r in intents:
         if r["venture"] == "service" and r["action"] == "scale_up" and a >= after and ok_run(s): return s, a
@@ -344,7 +355,7 @@ def first_scale_up(after):
 
 
 need = first_need(onset)
-act = first_scale_up(need) if need else None
+act = first_scale_up(episode_start(need)) if need else None
 regime = {"need_at_day": None if need is None else round((need - start) / DAY_S, 2),
           "first_scale_up": None if not act else f"#{act[0]} day {(act[1] - start) / DAY_S:.2f}",
           "flagged_after_n_days": regime_flagged[:10], "doubt_asks_after_n_days": regime_doubt_asks[:10]}
@@ -425,7 +436,7 @@ outage = {"runs": len(o_runs), "against_evidence": against[:CAP_LIST],
 # ask fit in 2 days with room to spare.
 RESUME_N = 2
 need2 = first_need(o_hi)
-act2 = first_scale_up(need2) if need2 else None
+act2 = first_scale_up(episode_start(need2)) if need2 else None
 resumed = {"need_at_day": None if need2 is None else round((need2 - start) / DAY_S, 2),
            "first_scale_up": None if not act2 else f"#{act2[0]} day {(act2[1] - start) / DAY_S:.2f}",
            "ineffective_asks_after": [f"#{s} day {(a - start) / DAY_S:.2f}" for s, a, r in ineff if a >= o_hi][:10]}
