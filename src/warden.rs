@@ -32,7 +32,7 @@ pub trait Warden {
     /// Gate the action again; if it passes, write the intent, run it, and
     /// write the outcome (a stop is one action record). Returns the
     /// records written.
-    fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, String>;
+    fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, Failure>;
     /// For an intent with no outcome: ask the lever's adapter, by the
     /// intent's key, whether the run happened. Some((happened, what it
     /// found)) when the adapter can tell; None when it cannot, and a human
@@ -45,6 +45,38 @@ pub trait Warden {
     /// Measure a venture's metric through its adapter, with the key the
     /// adapter is scoped to. The value, or None with a note saying why.
     fn measure(&mut self, venture: &str) -> Result<(Option<f64>, String), String>;
+}
+
+/// Why `execute` wrote nothing. A refusal is the warden's own typed
+/// answer; text from a lever, a path or a name is only ever an error.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Failure {
+    /// A payload check said no. The kernel writes a refusal record.
+    Refused { reason_key: String, detail: String },
+    /// It could not run, for this reason.
+    Error(String),
+}
+
+impl From<&str> for Failure {
+    fn from(e: &str) -> Failure {
+        Failure::Error(e.to_string())
+    }
+}
+
+impl From<String> for Failure {
+    fn from(e: String) -> Failure {
+        Failure::Error(e)
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Refused { reason_key, detail } => write!(f, "{reason_key}: {detail}"),
+            Failure::Error(e) => f.write_str(e),
+        }
+    }
 }
 
 /// The warden in this process.
@@ -72,7 +104,7 @@ impl LocalWarden {
 }
 
 impl Warden for LocalWarden {
-    fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, String> {
+    fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, Failure> {
         self.index
             .refresh(&self.ledger)
             .map_err(|e| e.to_string())?;
@@ -209,7 +241,7 @@ impl Warden for LocalWarden {
             .ok_or_else(|| format!("{venture} does not permit {action}"))?;
         let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
         if perm.takes().is_some() && payload.is_none() {
-            return Err(format!("{action} takes a payload and the proof names none"));
+            return Err(format!("{action} takes a payload and the proof names none").into());
         }
         if perm.is_parent_lever() {
             // Non-negotiable 10: a parent allocates. Pulling the lever is
@@ -226,7 +258,8 @@ impl Warden for LocalWarden {
                 return Err(format!(
                     "{} is not a child of {venture}: both mandates must say so",
                     call.child()
-                ));
+                )
+                .into());
             }
             let started = append(intent(proof, payload))?;
             let done = append(outcome(&started, true, call.describe()))?;
@@ -264,7 +297,8 @@ impl Warden for LocalWarden {
                 if !v.mandate.allows_host(&host) {
                     return Err(format!(
                         "{action} would reach {host}, which is not in {venture}'s network list"
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -516,8 +550,7 @@ fn fallbacks_apply(model: &str) -> bool {
     .any(|p| model.starts_with(p))
 }
 
-/// What a refusal by a payload check is called: the reason key, and the
-/// start of the error the warden returns.
+/// What a refusal by a payload check is called in its reason key.
 pub const PAYLOAD_CHECK: &str = "PayloadCheck";
 /// The most reports a check sees.
 pub const CHECK_REPORTS: usize = 500;
@@ -526,8 +559,8 @@ pub const CHECK_REPORTS: usize = 500;
 pub const CHECK_READ: usize = 4096;
 const CHECK_DETAIL: usize = 200;
 
-/// Run a lever's check. `Ok` when it exits 0. Otherwise an error starting
-/// `PayloadCheck: `, with the check's bounded stdout as the detail.
+/// Run a lever's check. `Ok` when it exits 0. Otherwise a typed refusal,
+/// with the check's bounded stdout in its detail.
 fn payload_check(
     home: &Path,
     dir: &Path,
@@ -535,7 +568,11 @@ fn payload_check(
     payload: &Payload,
     index: &Index,
     venture: &str,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
+    let refused = |detail: String| Failure::Refused {
+        reason_key: PAYLOAD_CHECK.to_string(),
+        detail,
+    };
     // Measured and declared reports only: an inferred record never
     // authorizes, so a check never sees one.
     let mut seen: Vec<&Entry> = index
@@ -544,9 +581,9 @@ fn payload_check(
         .collect();
     let skip = seen.len().saturating_sub(CHECK_REPORTS);
     seen.drain(..skip);
-    let json = serde_json::to_string(&seen).map_err(|e| format!("{PAYLOAD_CHECK}: {e}"))?;
+    let json = serde_json::to_string(&seen).map_err(|e| refused(e.to_string()))?;
     let file = home.join(format!("measured-{}-{}.json", std::process::id(), now()));
-    std::fs::write(&file, json).map_err(|e| format!("{PAYLOAD_CHECK}: cannot write {e}"))?;
+    std::fs::write(&file, json).map_err(|e| refused(format!("cannot write {e}")))?;
     let path = file.to_string_lossy().into_owned();
     let ran = run_bounded(
         dir,
@@ -576,9 +613,9 @@ fn payload_check(
     } else {
         format!("exit {}", ran.code.unwrap_or(-1))
     };
-    Err(format!("{PAYLOAD_CHECK}: {check} failed ({how})  {out}")
-        .trim()
-        .to_string())
+    Err(refused(
+        format!("{check} failed ({how})  {out}").trim().to_string(),
+    ))
 }
 
 /// What running something came to.
@@ -789,6 +826,11 @@ pub enum ToWarden {
 #[serde(rename_all = "snake_case")]
 pub enum FromWarden {
     Done(Vec<Entry>),
+    /// A payload check refused the run.
+    Refused {
+        reason_key: String,
+        detail: String,
+    },
     Text(String),
     Measured(Option<f64>, String),
     Confirmed(Option<(bool, String)>),

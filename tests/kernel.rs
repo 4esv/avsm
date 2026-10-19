@@ -480,7 +480,7 @@ fn warden_and_roles_run_as_separate_processes() {
         cites: vec![],
     };
     let mut w = WardenProcess::spawn_exe(exe, &home).unwrap();
-    let err = w.execute(&bogus).unwrap_err();
+    let err = w.execute(&bogus).unwrap_err().to_string();
     assert!(
         err.contains("nothing measured or declared calls for tidy"),
         "{err}"

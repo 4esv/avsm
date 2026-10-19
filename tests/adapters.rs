@@ -618,3 +618,30 @@ fn the_network_list_holds_adapters_to_their_hosts() {
     assert!(out.contains(" done"), "{out}");
     assert_eq!(stub.seen().len(), 2);
 }
+
+/// A lever's own error text can never pass for a payload-check refusal: a
+/// lever named PayloadCheck that the network list stops "did not run".
+#[test]
+fn a_levers_own_error_is_never_a_payload_check_refusal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = Stub::start(vec![route("GET", "/health", 200, "{}")]);
+    let home = home(tmp.path(), &stub.url, "cat > sent.eml");
+    let mut k = kernel(&home);
+    let mandate = format!(
+        "purpose: Watch.\nmetric: http.status {0}/health\ncontroller: {{kind: model}}\ncadence: 1h\nnetwork: none\n\
+         permitted:\n- {{name: PayloadCheck, adapter: http.post {0}/hook, cap: 3/day, reversible: false, delegated: true}}\n",
+        stub.url
+    );
+    k.add(&venture(tmp.path(), "shut", &mandate)).unwrap();
+    let out = k
+        .propose("shut", "PayloadCheck", Some("{\"a\":1}"))
+        .unwrap();
+    assert!(out.contains("PayloadCheck did not run: "), "{out}");
+    let refusals: Vec<_> = k
+        .entries()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.record.kind() == Kind::Refusal)
+        .collect();
+    assert!(refusals.is_empty(), "{refusals:?}");
+}

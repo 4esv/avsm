@@ -24,7 +24,7 @@ use crate::mandate::{self, Cap, Controller, Permitted, Restart};
 use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Signal, Verdict};
 use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role, SUMMARY};
 use crate::venture::{self, Venture};
-use crate::warden::{self, FromWarden, LocalWarden, ToWarden, Warden};
+use crate::warden::{self, Failure, FromWarden, LocalWarden, ToWarden, Warden};
 
 mod refusals;
 
@@ -115,8 +115,10 @@ impl Role for NoRole {
 struct NoWarden;
 
 impl Warden for NoWarden {
-    fn execute(&mut self, _candidate: &Candidate) -> Result<Vec<Entry>, String> {
-        Err("no warden process; start avsm with: avsm start".to_string())
+    fn execute(&mut self, _candidate: &Candidate) -> Result<Vec<Entry>, Failure> {
+        Err("no warden process; start avsm with: avsm start"
+            .to_string()
+            .into())
     }
 
     fn infer(&mut self, _request: &InferRequest) -> Result<String, String> {
@@ -1229,14 +1231,14 @@ impl Kernel {
                         }
                     }
                 }
-                Err(e) if e.starts_with(warden::PAYLOAD_CHECK) => {
+                Err(Failure::Refused { reason_key, detail }) => {
                     // The check said no after the gate said yes: a refusal
                     // record, no intent, nothing run.
-                    lines.push(format!("{name}: {action} refused: {e}"));
+                    lines.push(format!("{name}: {action} refused: {detail}"));
                     log(lines.last().map_or("", String::as_str));
-                    self.refuse(name, action, warden::PAYLOAD_CHECK.to_string(), e, false);
+                    self.refuse(name, action, reason_key, detail, false);
                 }
-                Err(e) => {
+                Err(Failure::Error(e)) => {
                     lines.push(format!("{name}: {action} did not run: {e}"));
                     // The gate said yes and nothing ran: the ledger says so.
                     let first: String = e.lines().next().unwrap_or("").chars().take(200).collect();
@@ -2394,12 +2396,15 @@ impl WardenProcess {
 }
 
 impl Warden for WardenProcess {
-    fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, String> {
+    fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, Failure> {
         self.0.send(&ToWarden::Execute(candidate.clone()))?;
         match self.0.recv::<FromWarden>()? {
             FromWarden::Done(entries) => Ok(entries),
-            FromWarden::Err(e) => Err(e),
-            _ => Err("the warden answered the wrong question".to_string()),
+            FromWarden::Refused { reason_key, detail } => {
+                Err(Failure::Refused { reason_key, detail })
+            }
+            FromWarden::Err(e) => Err(e.into()),
+            _ => Err("the warden answered the wrong question".to_string().into()),
         }
     }
 
@@ -2490,7 +2495,10 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
         let reply = match serde_json::from_str::<ToWarden>(line.trim()) {
             Ok(ToWarden::Execute(c)) => match warden.execute(&c) {
                 Ok(e) => FromWarden::Done(e),
-                Err(e) => FromWarden::Err(e),
+                Err(Failure::Refused { reason_key, detail }) => {
+                    FromWarden::Refused { reason_key, detail }
+                }
+                Err(Failure::Error(e)) => FromWarden::Err(e),
             },
             Ok(ToWarden::Infer(r)) => match warden.infer(&r) {
                 Ok(t) => FromWarden::Text(t),

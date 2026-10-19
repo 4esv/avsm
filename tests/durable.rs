@@ -30,7 +30,7 @@ impl Role for FakeRole {
 struct Confirming(LocalWarden);
 
 impl Warden for Confirming {
-    fn execute(&mut self, c: &Candidate) -> Result<Vec<Entry>, String> {
+    fn execute(&mut self, c: &Candidate) -> Result<Vec<Entry>, avsm::warden::Failure> {
         self.0.execute(c)
     }
     fn infer(&mut self, r: &InferRequest) -> Result<String, String> {
