@@ -1225,6 +1225,41 @@ fn a_capacity_ask_says_under_each_policy_whether_the_metric_holds_its_threshold(
 }
 
 #[test]
+fn a_cap_spent_while_the_metric_is_on_the_right_side_gets_no_capacity_ask() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("tomato", "moisture", TOMATO);
+    // Four runs a day, every day, from somewhere other than the threshold
+    // (a human, say), while moisture reads 50 throughout.
+    for _ in 0..3 {
+        for i in 0..12 {
+            f.history("tomato", &[50.0], 2 * HOUR);
+            if i % 3 == 0 {
+                f.k.append(Record::Intent {
+                    claim: Claim::Measured,
+                    venture: "tomato".into(),
+                    action: "water".into(),
+                    proof: gate::Proof {
+                        venture: "tomato".into(),
+                        action: "water".into(),
+                        steps: vec![],
+                    },
+                    payload: None,
+                    key: None,
+                })
+                .unwrap();
+            }
+        }
+        f.k.check_capacity("tomato");
+    }
+    let m = f.k.ventures["tomato"].mandate.clone();
+    let used = f.k.index().unwrap().used("tomato", "water", f.now - DAY);
+    assert_eq!(used, 4, "the cap is spent");
+    assert!(forecast::cap_spent(&f.k.index().unwrap(), "tomato", &m, f.now).is_none());
+    assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+}
+
+#[test]
 fn a_cap_with_margin_left_gets_no_capacity_ask() {
     let _c = clock();
     let mut f = fixture("");
@@ -1234,6 +1269,16 @@ fn a_cap_with_margin_left_gets_no_capacity_ask() {
     // One day spent is not two days running.
     tomato_days(&mut f, 1, |_| vec![30.0; 12]);
     tomato_days(&mut f, 1, three_low);
+    assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+    // Four low readings a day, each answered: the cap is used up, but no
+    // reading went unanswered, so it never bound.
+    tomato_days(&mut f, 3, |_| {
+        (0..12)
+            .map(|i| if i % 3 == 0 { 30.0 } else { 50.0 })
+            .collect()
+    });
+    let used = f.k.index().unwrap().used("tomato", "water", f.now - DAY);
+    assert_eq!(used, 4, "the cap is used up");
     assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
 }
 
@@ -1362,13 +1407,63 @@ fn a_metric_not_worse_every_day_gets_no_held_back_ask() {
     let _c = clock();
     let mut f = fixture("");
     f.venture("inbox", "unread", INBOX);
-    // Up one day, down the next.
-    for d in 0..8 {
-        let base = if d % 2 == 0 { 10.0 } else { 14.0 };
-        f.history("inbox", &[base; 4], 6 * HOUR);
+    // Three days rising: too short a history to say.
+    for d in 0..3 {
+        f.history("inbox", &[10.0 + 3.0 * d as f64; 4], 6 * HOUR);
+        let a = reply_ask(&mut f);
+        f.k.deny(a, "not now").unwrap();
+        f.k.check_capacity("inbox");
+    }
+    assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+    // Rising each day it was read, but one day of the week unread: not
+    // known to be worse each day.
+    for d in 3..10 {
+        if d == 6 {
+            f.now += DAY;
+            continue;
+        }
+        f.history("inbox", &[10.0 + 3.0 * d as f64; 4], 6 * HOUR);
+    }
+    f.k.check_capacity("inbox");
+    assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+    // Worse over the week, but up two and down one: not worse each day.
+    for x in [16.0, 20.0, 18.0, 22.0, 26.0, 24.0, 28.0] {
+        f.history("inbox", &[x; 4], 6 * HOUR);
         let a = reply_ask(&mut f);
         f.k.deny(a, "not now").unwrap();
     }
     f.k.check_capacity("inbox");
     assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+}
+
+#[test]
+fn a_rising_metric_whose_lever_ran_its_cap_names_the_cap() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture(
+        "inbox",
+        "unread",
+        "controller: {kind: model}\ncadence: 6h\nbetter: down\n\
+         permitted:\n- {name: archive, run: echo ran >> invoked, cap: 1/day, reversible: true, delegated: true}\n",
+    );
+    inbox_days(&mut f, 0..8, |f| {
+        f.k.append(Record::Intent {
+            claim: Claim::Measured,
+            venture: "inbox".into(),
+            action: "archive".into(),
+            proof: gate::Proof {
+                venture: "inbox".into(),
+                action: "archive".into(),
+                steps: vec![],
+            },
+            payload: None,
+            key: None,
+        })
+        .unwrap();
+    });
+    f.k.check_capacity("inbox");
+    let asks = capacity_asks(&f);
+    assert_eq!(asks.len(), 1, "{:#?}", f.entries());
+    let q = question(&asks[0]);
+    assert!(q.contains("archive ran 7 of 7: the cap"), "{q}");
 }

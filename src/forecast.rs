@@ -1444,9 +1444,10 @@ const MAX_CITES: usize = 8;
 const ASKS_SPENT: &str = "AsksQuotaSpent";
 const DAY_SECS: i64 = 86_400;
 
-/// The cap binds: a threshold controller's lever was spent to its cap in
-/// each of the last `SPENT_WINDOWS` cap windows, and in each the metric
-/// was still read past the threshold. Zero margin, measured; nothing here
+/// The cap binds: in each of the last `SPENT_WINDOWS` cap windows, the
+/// metric was read past a threshold controller's bound while its lever had
+/// already been run its cap's count in the cap window before the reading,
+/// so the reading went unanswered. Zero margin, measured; nothing here
 /// foresees what the world does next.
 pub fn cap_spent(index: &Index, venture: &str, mandate: &Mandate, now: i64) -> Option<Gap> {
     let Controller::Threshold {
@@ -1477,15 +1478,19 @@ pub fn cap_spent(index: &Index, venture: &str, mandate: &Mandate, now: i64) -> O
     let at = |s: Seq| index.get(s).map_or(i64::MIN, |e| e.at);
     let mut cites = Vec::new();
     let mut latest = None;
+    // The runs in the cap window before `t`, not counting one at `t`, the
+    // answer to the reading itself.
+    let spent = |t: i64| {
+        index.used(venture, action, t - per) - index.used(venture, action, t - 1) >= p.cap.count
+    };
     for k in 0..SPENT_WINDOWS {
         let (from, to) = (now - (k + 1) * per, now - k * per);
-        let used = index.used(venture, action, from) - index.used(venture, action, to);
-        if used < p.cap.count {
-            return None;
-        }
         let lo = series.partition_point(|(s, _)| at(*s) <= from);
         let hi = series.partition_point(|(s, _)| at(*s) <= to);
-        let (seq, x) = *series[lo..hi].iter().rev().find(|(_, x)| past(*x))?;
+        let (seq, x) = *series[lo..hi]
+            .iter()
+            .rev()
+            .find(|(s, x)| past(*x) && spent(at(*s)))?;
         latest.get_or_insert(x);
         cites.push(seq);
     }
