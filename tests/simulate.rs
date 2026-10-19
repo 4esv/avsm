@@ -28,10 +28,13 @@ fn four_days_in_moments_end_with_the_lever_delegated() {
     )
     .unwrap();
     std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // NOTE: forecasts stay on, but small. The default (30 days x 16 seeds,
+    // three times here) is ~40 CPU-seconds of branches, and this test
+    // times the virtual clock, not forecast throughput.
     std::fs::write(
         home.join("config.yaml"),
         format!(
-            "nightly: \"03:00\"\ndefault: k\nbackends:\n  k: {{kind: command, run: {}}}\nratchet: 2\n",
+            "nightly: \"03:00\"\ndefault: k\nbackends:\n  k: {{kind: command, run: {}}}\nratchet: 2\nforecast: {{days: 2, seeds: 2}}\n",
             backend.display()
         ),
     )
