@@ -162,7 +162,7 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
         k.status()
             .unwrap()
             .lines()
-            .next()
+            .nth(1)
             .unwrap()
             .split_whitespace()
             .nth(1),
@@ -506,7 +506,13 @@ fn warden_and_roles_run_as_separate_processes() {
     assert_eq!(written.len(), 1);
     assert_eq!(written[0].record.kind(), Kind::Action);
     assert_eq!(
-        k.status().unwrap().split_whitespace().nth(1),
+        k.status()
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .nth(1),
         Some("paused")
     );
 }
@@ -573,7 +579,7 @@ fn self_reports_integrity_and_halts_everything_when_it_fails() {
     assert!(k
         .status()
         .unwrap()
-        .contains("self         running  integrity=1"));
+        .contains("self         running     integrity=1"));
 
     // Tamper with the ledger behind avsm's back. The next self report sees it.
     let conn = rusqlite::Connection::open(home.join("ledger.db")).unwrap();

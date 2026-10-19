@@ -202,7 +202,7 @@ fn metric_adapters_measure_through_the_warden_with_scoped_keys() {
     // The status line and the ledger line read as any other metric.
     let status = k.status().unwrap();
     assert!(
-        status.contains("mrr          running  stripe.mrr=50"),
+        status.contains("mrr          running     stripe.mrr=50"),
         "{status}"
     );
     assert_eq!(

@@ -53,7 +53,7 @@ fn the_commands_answer_on_a_1_0_ledger() {
     // Where a venture's directory is gone the status says so; where it is
     // still there (this may be the machine that wrote the ledger) the 1.0
     // adoption reads from it as before.
-    for line in status.lines().filter(|l| !l.starts_with("self")) {
+    for line in status.lines().skip(1).filter(|l| !l.starts_with("self")) {
         assert!(
             line.contains("cannot read") || line.contains("reported"),
             "{line}"

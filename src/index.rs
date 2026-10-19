@@ -112,6 +112,9 @@ pub struct Index {
     peaks: HashMap<String, HashMap<String, f64>>,
     /// Inferred predictions no measured score cites yet, per venture.
     predictions: HashMap<String, BTreeSet<Seq>>,
+    /// The latest trusted report of each venture's metric, value or not,
+    /// and whether code marked it implausible.
+    flagged: HashMap<(String, String), (Seq, bool)>,
 }
 
 impl Index {
@@ -220,6 +223,15 @@ impl Index {
                             .entry(metric.clone())
                             .or_insert(*x);
                         *peak = peak.max(*x);
+                    }
+                }
+                if claim.authorizes() {
+                    let slot = self
+                        .flagged
+                        .entry((venture.clone(), metric.clone()))
+                        .or_insert((seq, implausible.is_some()));
+                    if seq >= slot.0 {
+                        *slot = (seq, implausible.is_some());
                     }
                 }
                 if metric == EXPECTATION && *claim == Claim::Measured {
@@ -530,6 +542,37 @@ impl Index {
     /// The latest trusted report of a metric with a value.
     pub fn latest_report(&self, venture: &str, metric: &str) -> Option<Seq> {
         self.reports.get(venture)?.get(metric).copied()
+    }
+
+    /// Is the latest trusted report of any of a venture's metrics flagged
+    /// implausible?
+    pub fn implausible_now(&self, venture: &str) -> bool {
+        self.flagged
+            .iter()
+            .any(|((v, _), (_, flag))| v == venture && *flag)
+    }
+
+    /// Does a venture have a suspended lever?
+    pub fn any_suspended(&self, venture: &str) -> bool {
+        self.ineffective
+            .keys()
+            .any(|(v, a)| v == venture && self.suspended(v, a))
+    }
+
+    /// The signals of a venture's open asks that code measured, oldest
+    /// first. An ask that is not measured says nothing about the venture.
+    pub fn signals_of(&self, venture: &str) -> Vec<&Signal> {
+        self.open_of(venture)
+            .filter_map(|s| self.get(s))
+            .filter_map(|e| match &e.record {
+                Record::Ask {
+                    claim: Claim::Measured,
+                    signal: Some(sig),
+                    ..
+                } => Some(sig),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The records that pause or resume a venture, the latest of each

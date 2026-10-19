@@ -139,7 +139,14 @@ fn every_command_against_a_temp_ledger() {
     // The self venture exists from the first start.
     let (ok, text) = run(&["status"]);
     assert!(ok, "{text}");
-    assert!(text.starts_with("self         running  "), "{text}");
+    assert_eq!(text.lines().next(), Some("all running"), "{text}");
+    assert!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("self         running  "),
+        "{text}"
+    );
 
     let (ok, text) = run(&["tail"]);
     assert!(ok);
@@ -170,10 +177,17 @@ fn every_command_against_a_temp_ledger() {
 
     let (ok, text) = run(&["status"]);
     assert!(ok, "{text}");
-    assert!(text.starts_with("counter      running  "), "{text}");
+    assert_eq!(text.lines().next(), Some("all running"), "{text}");
     assert!(
         text.lines()
             .nth(1)
+            .unwrap()
+            .starts_with("counter      running  "),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .nth(2)
             .unwrap()
             .starts_with("self         running  "),
         "{text}"
@@ -209,7 +223,18 @@ fn every_command_against_a_temp_ledger() {
     );
     let (ok, text) = run(&["status"]);
     assert!(ok);
-    assert!(text.starts_with("counter      paused   "), "{text}");
+    assert_eq!(
+        text.lines().next(),
+        Some("caution: 1 venture needs you: counter paused"),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("counter      paused      "),
+        "{text}"
+    );
     let (ok, text) = run(&["pause", "nothing"]);
     assert!(!ok);
     assert!(text.contains("no venture named nothing"), "{text}");
@@ -223,7 +248,14 @@ fn every_command_against_a_temp_ledger() {
     let resumed = seq_of(text.trim());
     let (ok, text) = run(&["status"]);
     assert!(ok);
-    assert!(text.starts_with("counter      running  "), "{text}");
+    assert_eq!(text.lines().next(), Some("all running"), "{text}");
+    assert!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("counter      running  "),
+        "{text}"
+    );
 
     let (ok, text) = run(&["why", &adopt]);
     assert!(ok, "{text}");

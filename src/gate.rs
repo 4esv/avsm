@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Quotas;
 use crate::index::{Index, Pulled};
 use crate::mandate::{Cap, Controller, Mandate, ParentCall, Permitted};
-use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Takes, Verdict};
+use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Signal, Takes, Verdict};
 
 /// The action that always passes.
 pub const STOP: &str = crate::mandate::STOP;
@@ -1098,27 +1098,103 @@ fn load_entry(p: &mut Rules, e: &Entry) {
     }
 }
 
-/// What a venture is doing, as the ledger tells it.
+/// What a venture is doing, as the records tell it. Never read from the
+/// text a model wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Running,
     Asking,
+    Saturated,
+    Ineffective,
+    Implausible,
+    Guarded,
     Paused,
 }
+
+/// The states that need a human, highest precedence first. The first that
+/// holds is the state; none holding is running.
+pub const PRECEDENCE: [State; 6] = [
+    State::Paused,
+    State::Guarded,
+    State::Implausible,
+    State::Ineffective,
+    State::Saturated,
+    State::Asking,
+];
 
 impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad(match self {
             State::Running => "running",
             State::Asking => "asking",
+            State::Saturated => "saturated",
+            State::Ineffective => "ineffective",
+            State::Implausible => "implausible",
+            State::Guarded => "guarded",
             State::Paused => "paused",
         })
     }
 }
 
+/// Which of the states hold for a venture, before precedence picks one.
+#[derive(Clone, Copy, Debug, Default)]
+struct Holds {
+    paused: bool,
+    guarded: bool,
+    implausible: bool,
+    ineffective: bool,
+    saturated: bool,
+    asking: bool,
+}
+
+impl Holds {
+    fn holds(&self, s: State) -> bool {
+        match s {
+            State::Paused => self.paused,
+            State::Guarded => self.guarded,
+            State::Implausible => self.implausible,
+            State::Ineffective => self.ineffective,
+            State::Saturated => self.saturated,
+            State::Asking => self.asking,
+            State::Running => true,
+        }
+    }
+
+    fn state(&self) -> State {
+        PRECEDENCE
+            .iter()
+            .copied()
+            .find(|s| self.holds(*s))
+            .unwrap_or(State::Running)
+    }
+
+    /// Fold in what a measured, open signal says. Signals that no unit
+    /// maps to a state of their own mean asking.
+    fn signal(&mut self, sig: &Signal) {
+        match sig {
+            Signal::Guard { .. } => self.guarded = true,
+            Signal::Implausible { .. } => self.implausible = true,
+            Signal::Ineffective { .. } => self.ineffective = true,
+            Signal::Saturated { .. } => self.saturated = true,
+            Signal::Pending { .. } | Signal::Audit { .. } => self.asking = true,
+        }
+    }
+}
+
+/// Is a guard of the venture reading past its bound now? `reading` gives
+/// the latest trusted value of a metric.
+fn guard_out(mandates: &[Adopted], venture: &str, reading: &dyn Fn(&str) -> Option<f64>) -> bool {
+    mandates
+        .iter()
+        .filter(|m| m.venture == venture)
+        .flat_map(|m| m.mandate.guards.iter())
+        .any(|g| reading(&g.metric()).is_some_and(|x| g.breached(x)))
+}
+
 /// The state of a venture: paused after a declared pause, a stop action
-/// or its parent's pause, until a declared resume; asking while an ask has
-/// no declared decision; running otherwise.
+/// or its parent's pause, until a declared resume; otherwise the first of
+/// guarded, implausible, ineffective, saturated and asking that the
+/// records support; running when none does.
 pub fn state(ledger: &[Entry], mandates: &[Adopted], venture: &str) -> State {
     state_in(&Index::from_entries(ledger), mandates, venture)
 }
@@ -1136,13 +1212,39 @@ pub fn state_in(index: &Index, mandates: &[Adopted], venture: &str) -> State {
     let adopted: Vec<&Adopted> = mandates.iter().collect();
     load_family_mandates(&mut p, &adopted);
     p.run();
-    if p.paused.iter().any(|(v,)| v == venture) {
-        State::Paused
-    } else if index.open_of(venture).next().is_some() {
-        State::Asking
-    } else {
-        State::Running
+    let mut h = Holds {
+        paused: p.paused.iter().any(|(v,)| v == venture),
+        guarded: guard_out(mandates, venture, &|metric| {
+            let e = index.get(index.latest_report(venture, metric)?)?;
+            match &e.record {
+                Record::Report { value, .. } => *value,
+                _ => None,
+            }
+        }),
+        implausible: index.implausible_now(venture),
+        ineffective: index.any_suspended(venture),
+        asking: index.open_of(venture).next().is_some(),
+        saturated: false,
+    };
+    for sig in index.signals_of(venture) {
+        h.signal(sig);
     }
+    h.state()
+}
+
+/// The state of the whole: the worst state of any venture. A halted self
+/// is paused, which is the worst there is.
+pub fn system_state(index: &Index, mandates: &[Adopted], ventures: &[String]) -> State {
+    ventures
+        .iter()
+        .map(|v| state_in(index, mandates, v))
+        .min_by_key(|s| {
+            PRECEDENCE
+                .iter()
+                .position(|p| p == s)
+                .unwrap_or(PRECEDENCE.len())
+        })
+        .unwrap_or(State::Running)
 }
 
 /// Asks with no declared decision yet, oldest first.
@@ -2367,13 +2469,85 @@ pub mod reference {
         let adopted: Vec<&Adopted> = mandates.iter().collect();
         load_family(&mut p, ledger, &adopted);
         p.run();
-        if p.paused.iter().any(|(v,)| v == venture) {
-            State::Paused
-        } else if p.open_ask.iter().any(|(_, v)| v == venture) {
-            State::Asking
-        } else {
-            State::Running
+        let mut h = Holds {
+            paused: p.paused.iter().any(|(v,)| v == venture),
+            guarded: guard_out(mandates, venture, &|metric| {
+                latest_report(ledger, venture, metric, true).and_then(|e| match &e.record {
+                    Record::Report { value, .. } => *value,
+                    _ => None,
+                })
+            }),
+            implausible: metrics(ledger, venture).iter().any(|m| {
+                latest_report(ledger, venture, m, false)
+                    .is_some_and(|e| e.record.implausible().is_some())
+            }),
+            ineffective: ledger.iter().any(|e| {
+                matches!(&e.record, Record::Ask {
+                    claim: Claim::Measured,
+                    venture: v,
+                    signal: Some(Signal::Ineffective { action, .. }),
+                    ..
+                } if v == venture && suspended(ledger, venture, action))
+            }),
+            asking: p.open_ask.iter().any(|(_, v)| v == venture),
+            saturated: false,
+        };
+        for (q, v) in p.open_ask.iter() {
+            if v != venture {
+                continue;
+            }
+            if let Some(Entry {
+                record:
+                    Record::Ask {
+                        claim: Claim::Measured,
+                        signal: Some(sig),
+                        ..
+                    },
+                ..
+            }) = ledger.iter().find(|e| e.seq == *q)
+            {
+                h.signal(sig);
+            }
         }
+        h.state()
+    }
+
+    /// The metrics a venture has trusted reports of.
+    fn metrics(ledger: &[Entry], venture: &str) -> BTreeSet<String> {
+        ledger
+            .iter()
+            .filter_map(|e| match &e.record {
+                Record::Report {
+                    claim,
+                    venture: v,
+                    metric,
+                    ..
+                } if v == venture && claim.authorizes() => Some(metric.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The latest trusted report of a metric, with a value or not.
+    fn latest_report<'a>(
+        ledger: &'a [Entry],
+        venture: &str,
+        metric: &str,
+        with_value: bool,
+    ) -> Option<&'a Entry> {
+        ledger
+            .iter()
+            .filter(|e| {
+                matches!(&e.record, Record::Report {
+                    claim,
+                    venture: v,
+                    metric: m,
+                    value,
+                    ..
+                } if v == venture && m == metric && claim.authorizes()
+                    && (!with_value || value.is_some()))
+            })
+            .max_by_key(|e| e.seq)
     }
 
     /// Asks with no declared decision yet, oldest first.

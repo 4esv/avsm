@@ -182,6 +182,8 @@ enum Op {
     Report(String, String, Claim, Option<f64>, Option<u64>, bool),
     Proposal(String, String, Claim, Option<Payload>),
     Ask(String, Option<String>, Claim, Option<Payload>),
+    /// An algedonic ask: venture, claim, which signal.
+    Signalled(String, Claim, u8),
     Approve(String, Claim, u64, Option<Payload>),
     Deny(String, Claim, u64),
     Pause(String, Claim),
@@ -222,6 +224,7 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|(v, m, c, x, cites, doubt)| Op::Report(v, m.to_string(), c, x, cites, doubt)),
         3 => (lever(), claim(), payload()).prop_map(|((v, a), c, p)| Op::Proposal(v, a, c, p)),
         3 => (lever(), any::<bool>(), claim(), payload()).prop_map(|((v, a), some, c, p)| Op::Ask(v, some.then_some(a), c, p)),
+        3 => (name(), claim(), 0u8..6).prop_map(|(v, c, k)| Op::Signalled(v, c, k)),
         3 => (name(), claim(), seq(), payload()).prop_map(|(v, c, q, p)| Op::Approve(v, c, q, p)),
         2 => (name(), claim(), seq()).prop_map(|(v, c, q)| Op::Deny(v, c, q)),
         1 => (name(), claim()).prop_map(|(v, c)| Op::Pause(v, c)),
@@ -317,6 +320,43 @@ fn record(op: &Op, n: u64) -> Record {
             refusal: None,
             signal: None,
             payload,
+        },
+        Op::Signalled(venture, claim, k) => Record::Ask {
+            cites: vec![],
+            claim,
+            venture,
+            action: None,
+            question: "signal".to_string(),
+            refusal: None,
+            payload: None,
+            signal: Some(match k {
+                0 => Signal::Saturated {
+                    action: "reset".to_string(),
+                    reason: "cap".to_string(),
+                },
+                1 => Signal::Pending {
+                    intent: pick(n, 3),
+                    action: "reset".to_string(),
+                },
+                2 => Signal::Guard {
+                    guard: "spend".to_string(),
+                    value: 60.0,
+                    bound: 50.0,
+                },
+                3 => Signal::Audit {
+                    audit: "quality".to_string(),
+                    target_delta: 1.0,
+                    audit_delta: -1.0,
+                },
+                4 => Signal::Implausible {
+                    metric: "count".to_string(),
+                    why: "a step too big".to_string(),
+                },
+                _ => Signal::Ineffective {
+                    action: "reset".to_string(),
+                    why: "no effect".to_string(),
+                },
+            }),
         },
         Op::Approve(venture, claim, q, payload) => Record::Decision {
             claim,
@@ -726,6 +766,13 @@ proptest! {
                 reference::spent_today(&entries, &refs, v, now)
             );
         }
+        let names: Vec<String> = NAMES.iter().map(|v| v.to_string()).collect();
+        let worst = NAMES
+            .iter()
+            .map(|v| reference::state(&entries, &mandates, v))
+            .min_by_key(|s| gate::PRECEDENCE.iter().position(|p| p == s).unwrap_or(99))
+            .unwrap();
+        prop_assert_eq!(gate::system_state(&index, &mandates, &names), worst);
         for (v, a) in LEVERS {
             prop_assert_eq!(
                 index.suspended(v, a),

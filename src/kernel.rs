@@ -454,9 +454,14 @@ impl Kernel {
         }
         let index = self.index()?;
         let now = now();
-        let mut out = String::new();
-        for v in self.ventures.values() {
-            let state = gate::state_in(&index, &self.adopted(), &v.name);
+        let adopted = self.adopted();
+        let states: Vec<(&str, gate::State)> = self
+            .ventures
+            .values()
+            .map(|v| (v.name.as_str(), gate::state_in(&index, &adopted, &v.name)))
+            .collect();
+        let mut out = caution(&states);
+        for (v, (_, state)) in self.ventures.values().zip(&states) {
             let last = index
                 .of(&v.name)
                 .rev()
@@ -474,7 +479,7 @@ impl Kernel {
             if let Some(note) = self.runtime.get(&v.name).and_then(|rt| rt.note.as_deref()) {
                 detail.push_str(&format!("  ({note})"));
             }
-            out.push_str(&format!("{:<12} {:<8} {detail}\n", v.name, state));
+            out.push_str(&format!("{:<12} {:<11} {detail}\n", v.name, state));
         }
         Ok(out)
     }
@@ -2850,6 +2855,25 @@ pub fn start(home: &Path) -> Result<(), String> {
     kernel.lock().unwrap_or_else(|p| p.into_inner()).shutdown();
     let _ = std::fs::remove_file(&sock);
     Ok(())
+}
+
+/// The master caution line: which ventures need a human, or that none do.
+fn caution(states: &[(&str, gate::State)]) -> String {
+    let need: Vec<String> = states
+        .iter()
+        .filter(|(_, s)| *s != gate::State::Running)
+        .map(|(v, s)| format!("{v} {s}"))
+        .collect();
+    if need.is_empty() {
+        return "all running\n".to_string();
+    }
+    let n = need.len();
+    let (noun, verb) = if n == 1 {
+        ("venture", "needs")
+    } else {
+        ("ventures", "need")
+    };
+    format!("caution: {n} {noun} {verb} you: {}\n", need.join(", "))
 }
 
 #[cfg(test)]
