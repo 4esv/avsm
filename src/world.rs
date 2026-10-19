@@ -148,16 +148,26 @@ pub fn model_name(mandate: &Mandate) -> &'static str {
 
 // ----- the baseline -----
 
-/// The built-in world model. State is the metric value. A step resamples
-/// a drift, the change between two reports with no lever run between
-/// them; an action adds a resampled effect of that lever, the change from
-/// the last report before a run to the report at its `expects` horizon.
+/// The built-in world model. State is the metric value and the peak it
+/// has reached: `{"value", "peak"}`, or a bare number. Each step of time
+/// resamples a drift, the change between two reports with no lever run
+/// between them. An action adds a resampled effect of that lever: the
+/// change from the last report before a run to the report at its
+/// `expects` horizon, net of the drift the metric would have made over
+/// those reports anyway, so drift is counted once, per step, at any
+/// horizon. Drawdown guards are computed along the rolled path, from the
+/// peak so far to the value now.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Baseline {
     pub drift: Vec<f64>,
+    /// Per lever: what a run moved the metric, net of drift.
     pub effects: BTreeMap<String, Vec<f64>>,
     /// The latest value, the state when none is given.
     pub last: Option<f64>,
+    /// The highest trusted, plausible value, the peak when none is given.
+    pub peak: Option<f64>,
+    /// The names of the drawdown guards over the metric.
+    pub drawdowns: Vec<String>,
     /// Seconds between reports, typically: one drift per period.
     pub period: i64,
 }
@@ -173,7 +183,7 @@ impl Baseline {
             .flat_map(|p| index.intents_of(venture, &p.name).iter().copied())
             .collect();
         runs.sort_unstable();
-        let drift = series
+        let drift: Vec<f64> = series
             .windows(2)
             .filter(|w| {
                 let i = runs.partition_point(|s| *s <= w[0].0);
@@ -181,6 +191,11 @@ impl Baseline {
             })
             .map(|w| w[1].1 - w[0].1)
             .collect();
+        let drift_mean = if drift.is_empty() {
+            0.0
+        } else {
+            drift.iter().sum::<f64>() / drift.len() as f64
+        };
         // Measured `expectation` reports say what a run did; where one
         // exists it stands for that run.
         let mut said: BTreeMap<Seq, f64> = BTreeMap::new();
@@ -198,13 +213,15 @@ impl Baseline {
         let mut effects = BTreeMap::new();
         for p in &mandate.permitted {
             let within = p.expects.map_or(1, |e| e.within.max(1)) as usize;
+            // What the metric would have moved over the horizon anyway.
+            let carried = drift_mean * within as f64;
             let mut samples = Vec::new();
             for &intent in index.intents_of(venture, &p.name) {
                 let Some((outcome, true)) = index.settled(intent) else {
                     continue;
                 };
                 if let Some(x) = said.get(&intent) {
-                    samples.push(*x);
+                    samples.push(*x - carried);
                     continue;
                 }
                 let b = series.partition_point(|(s, _)| *s < intent);
@@ -213,7 +230,7 @@ impl Baseline {
                     b.checked_sub(1).and_then(|i| series.get(i)),
                     series.get(a + within - 1),
                 ) {
-                    samples.push(then.1 - base.1);
+                    samples.push(then.1 - base.1 - carried);
                 }
             }
             if !samples.is_empty() {
@@ -231,10 +248,18 @@ impl Baseline {
             .copied()
             .unwrap_or(mandate.cadence.as_secs() as i64)
             .max(1);
+        let drawdowns = mandate
+            .guards
+            .iter()
+            .filter(|g| g.drawdown.is_some())
+            .map(|g| g.name.clone())
+            .collect();
         Baseline {
             drift,
             effects,
             last: series.last().map(|(_, v)| *v),
+            peak: index.peak(venture, metric),
+            drawdowns,
             period,
         }
     }
@@ -269,8 +294,15 @@ impl WorldModel for Baseline {
     ) -> Result<Next, String> {
         let mut x = state
             .as_f64()
+            .or_else(|| state.get("value").and_then(Value::as_f64))
             .or(self.last)
             .ok_or("the baseline has no state and no history to start from")?;
+        let mut peak = state
+            .get("peak")
+            .and_then(Value::as_f64)
+            .or(self.peak)
+            .unwrap_or(x)
+            .max(x);
         let mut rng = mix(seed, now as u64);
         let steps = if dt <= 0 {
             0
@@ -279,6 +311,7 @@ impl WorldModel for Baseline {
         };
         for _ in 0..steps.min(10_000) {
             x += self.draw(&self.drift, &mut rng);
+            peak = peak.max(x);
         }
         if let Some(a) = action {
             let samples = self.effects.get(&a.name).map_or(&[][..], Vec::as_slice);
@@ -290,11 +323,21 @@ impl WorldModel for Baseline {
             } else {
                 self.draw(&[], &mut rng)
             };
+            peak = peak.max(x);
         }
+        // A drawdown as the kernel reads one: percent below the peak.
+        let guards = if peak > 0.0 {
+            self.drawdowns
+                .iter()
+                .map(|g| (g.clone(), (peak - x) / peak * 100.0))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         Ok(Next {
-            state: Value::from(x),
+            state: serde_json::json!({ "value": x, "peak": peak }),
             metric: x,
-            guards: BTreeMap::new(),
+            guards,
         })
     }
 }
@@ -607,6 +650,118 @@ mod tests {
         assert_eq!(b.period, 3600);
     }
 
+    /// A metric that climbs a steady 2 a report, with `boost` runs that
+    /// each move it 7 over the one report after: 5 of their own.
+    fn steady(within: Option<u32>) -> (Index, Mandate) {
+        let expects = within.map_or(String::new(), |w| format!(", expects: up within {w}"));
+        let m = Mandate::parse(&format!(
+            "purpose: p\nmetric: count\ncontroller: {{kind: model}}\ncadence: 1h\n\
+             permitted:\n- {{name: boost, run: ./boost, cap: 9/day, reversible: true{expects}}}\n"
+        ))
+        .unwrap();
+        let mut l = Ledger {
+            entries: vec![],
+            at: 1_800_000_000,
+        };
+        let mut x = 100.0;
+        for _ in 0..5 {
+            for _ in 0..4 {
+                x += 2.0;
+                l.report(x);
+            }
+            l.run("boost");
+            x += 7.0;
+            l.report(x);
+            // The rest of the horizon, if any, drifts as ever.
+            for _ in 1..within.unwrap_or(1) {
+                x += 2.0;
+                l.report(x);
+            }
+        }
+        (Index::from_entries(&l.entries), m)
+    }
+
+    fn p50_after(b: &Baseline, x: f64, dt: i64) -> f64 {
+        let boost = Action {
+            name: "boost".to_string(),
+            payload: None,
+        };
+        let members = ensemble(b, &Value::from(x), Some(&boost), 4, 9000, dt, 100).unwrap();
+        quantiles(&members.iter().map(|n| n.metric).collect::<Vec<_>>())
+            .unwrap()
+            .p50
+    }
+
+    #[test]
+    fn drift_is_counted_once_on_a_lever_step() {
+        let (index, m) = steady(None);
+        let b = Baseline::from_index(&index, V, &m);
+        assert!(b.drift.iter().all(|d| *d == 2.0), "{:?}", b.drift);
+        // The runs moved it 7 over a step that drifts 2: 5 is the lever's.
+        assert!(b.effects["boost"].iter().all(|e| *e == 5.0), "{b:?}");
+        let x = b.last.unwrap();
+        let moved = p50_after(&b, x, b.period) - x;
+        assert!(
+            (moved - 7.0).abs() < 1e-9,
+            "one step after the lever: {moved:+}, not 9"
+        );
+        // No time passing: the lever's own 5.
+        assert!((p50_after(&b, x, 0) - x - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn over_a_longer_horizon_drift_is_still_counted_once_a_step() {
+        // The lever's runs are judged three reports on: 7 + 2 + 2 = 11
+        // measured, of which 6 is three steps of drift.
+        let (index, m) = steady(Some(3));
+        let b = Baseline::from_index(&index, V, &m);
+        assert!(b.effects["boost"].iter().all(|e| *e == 5.0), "{b:?}");
+        let x = b.last.unwrap();
+        let moved = p50_after(&b, x, 3 * b.period) - x;
+        assert!((moved - 11.0).abs() < 1e-9, "three steps after: {moved:+}");
+    }
+
+    #[test]
+    fn a_drawdown_guard_is_computed_along_the_rolled_path() {
+        let m = Mandate::parse(
+            "purpose: p\nmetric: count\ncontroller: {kind: model}\ncadence: 1h\n\
+             guards:\n- {name: dd, drawdown: 15%, of: count}\n",
+        )
+        .unwrap();
+        let b = Baseline::from_index(&Index::default(), V, &m);
+        assert_eq!(b.drawdowns, vec!["dd".to_string()]);
+        // 100, up 20, down 19: the path peaks at 120 and ends at 101.
+        let up = Baseline {
+            drift: vec![20.0; 3],
+            ..b.clone()
+        };
+        let down = Baseline {
+            drift: vec![-19.0; 3],
+            ..b.clone()
+        };
+        let first = up.step(&Value::from(100.0), None, 1, 0, 3600).unwrap();
+        assert_eq!(first.metric, 120.0);
+        assert_eq!(first.guards["dd"], 0.0);
+        let then = down.step(&first.state, None, 1, 3600, 3600).unwrap();
+        assert_eq!(then.metric, 101.0);
+        let dd = then.guards["dd"];
+        assert!((dd - 19.0 / 120.0 * 100.0).abs() < 1e-9, "{dd}");
+        assert!((dd - 15.8).abs() < 0.05, "{dd}");
+        // Past 15%: the guard would trip on this path.
+        assert!(m.guard("dd").unwrap().breached(dd));
+        // The peak the ledger holds counts too.
+        let mut l = Ledger {
+            entries: vec![],
+            at: 1_800_000_000,
+        };
+        for x in [100.0, 120.0, 101.0] {
+            l.report(x);
+        }
+        let from_ledger = Baseline::from_index(&Index::from_entries(&l.entries), V, &m);
+        let now = from_ledger.step(&Value::Null, None, 1, 0, 0).unwrap();
+        assert!((now.guards["dd"] - 19.0 / 120.0 * 100.0).abs() < 1e-9);
+    }
+
     #[test]
     fn under_three_samples_the_baseline_is_persistence_plus_spread() {
         let b = Baseline {
@@ -614,6 +769,7 @@ mod tests {
             effects: BTreeMap::from([("boost".to_string(), vec![50.0])]),
             last: Some(10.0),
             period: 60,
+            ..Baseline::default()
         };
         let boost = Action {
             name: "boost".to_string(),
