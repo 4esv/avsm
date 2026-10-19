@@ -9,11 +9,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use avsm::gate;
-use avsm::kernel::Kernel;
-use avsm::record::{self, Claim, Entry, Kind, Record, Signal};
-use avsm::role::{self, Context, InferRequest, ModelRole, Role};
-use avsm::warden::LocalWarden;
+use avsmd::gate;
+use avsmd::kernel::Kernel;
+use avsmd::record::{self, Claim, Entry, Kind, Record, Signal};
+use avsmd::role::{self, Context, InferRequest, ModelRole, Role};
+use avsmd::warden::LocalWarden;
 use common::{imap_stub, ran};
 
 /// The virtual clock is shared by the whole process: one test at a time.
@@ -25,7 +25,7 @@ const DAY: i64 = 86_400;
 
 fn clock() -> MutexGuard<'static, ()> {
     let guard = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
-    avsm::clock::set(T0);
+    avsmd::clock::set(T0);
     guard
 }
 
@@ -190,7 +190,7 @@ fn lever(name: &str) -> String {
 /// A report of the planner's metric, an hour on.
 fn plan_report(k: &mut Kernel, dir: &Path, now: &mut i64, value: f64) {
     *now += HOUR;
-    avsm::clock::set(*now);
+    avsmd::clock::set(*now);
     std::fs::write(dir.join("value"), format!("{value}\n")).unwrap();
     k.report("shop", false);
 }
@@ -484,7 +484,7 @@ fn hindsight_a_lever_that_does_nothing_is_judged_ineffective_and_loses_its_deleg
     let mut now = T0;
     let mut report = |k: &mut Kernel, value: f64, later: i64| {
         now += later;
-        avsm::clock::set(now);
+        avsmd::clock::set(now);
         std::fs::write(dir.join("value"), format!("{value}\n")).unwrap();
         k.report("raiser", false);
     };
@@ -814,7 +814,7 @@ fn overfit_mandates_a_sweep_of_noise_reports_a_high_pbo_and_a_dominant_variant_a
     let noise: Vec<Vec<f64>> = (0..48)
         .map(|_| (0..20).map(|_| uniform()).collect())
         .collect();
-    let pbo = avsm::pbo::cscv(&noise).expect("a matrix to judge");
+    let pbo = avsmd::pbo::cscv(&noise).expect("a matrix to judge");
     assert!(pbo.pbo >= 0.4, "pure noise should look overfit: {pbo:?}");
 
     let dominant: Vec<Vec<f64>> = noise
@@ -825,7 +825,7 @@ fn overfit_mandates_a_sweep_of_noise_reports_a_high_pbo_and_a_dominant_variant_a
             row
         })
         .collect();
-    let pbo = avsm::pbo::cscv(&dominant).unwrap();
+    let pbo = avsmd::pbo::cscv(&dominant).unwrap();
     assert!(pbo.pbo <= 0.1, "a real winner should not: {pbo:?}");
 }
 

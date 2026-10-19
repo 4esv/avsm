@@ -6,10 +6,10 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Kind, Payload, Record};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Kind, Payload, Record};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 
 struct Scripted {
     replies: VecDeque<Vec<Record>>,
@@ -184,7 +184,7 @@ fn five_approvals_yield_one_proposal_and_adopting_it_ends_the_asks() {
     assert_eq!(adopted.record.claim(), Claim::Declared);
     let text = std::fs::read_to_string(dir.join("mandate.yaml")).unwrap();
     assert!(
-        matches!(&adopted.record, Record::Decision { verdict: avsm::record::Verdict::Adopt { text: Some(t), .. }, .. } if *t == text),
+        matches!(&adopted.record, Record::Decision { verdict: avsmd::record::Verdict::Adopt { text: Some(t), .. }, .. } if *t == text),
         "a delegate adoption stores the mandate it adopted: {}",
         adopted.line()
     );
@@ -317,7 +317,7 @@ fn the_digest_says_what_the_night_did_and_is_written_as_a_record() {
     .unwrap();
     // A reading from two days ago, for the delta.
     let day = 86_400;
-    let now = avsm::kernel::now();
+    let now = avsmd::kernel::now();
     k.ledger
         .append_at(
             Record::report(Claim::Measured, "shop", "shell", Some(8.0), ""),

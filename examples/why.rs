@@ -8,8 +8,8 @@
 
 use std::path::Path;
 
-use avsm::kernel::Kernel;
-use avsm::record::Seq;
+use avsmd::kernel::Kernel;
+use avsmd::record::Seq;
 
 /// `why` for each seq, one after another.
 fn run(home: &Path, seqs: &[String]) -> Result<String, String> {
@@ -46,8 +46,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use avsm::ledger::Ledger;
-    use avsm::record::{Claim, Record};
+    use avsmd::ledger::Ledger;
+    use avsmd::record::{Claim, Record};
 
     #[test]
     fn it_prints_why_for_each_seq_of_a_ledger() {

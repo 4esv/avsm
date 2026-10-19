@@ -13,9 +13,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use avsm::kernel::Kernel;
-use avsm::protocol::request_remote;
-use avsm::tailscale::{self, Tailscaled, Whois};
+use avsmd::kernel::Kernel;
+use avsmd::protocol::request_remote;
+use avsmd::tailscale::{self, Tailscaled, Whois};
 
 /// Says what it was told to say about an address.
 struct StubWhois(HashMap<String, Result<String, String>>);
@@ -151,7 +151,7 @@ fn the_binary_reaches_a_remote_daemon_with_a_flag() {
         .unwrap();
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("cannot reach avsm at 127.0.0.1:1"),
+        String::from_utf8_lossy(&out.stderr).contains("cannot reach avsmd at 127.0.0.1:1"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -269,22 +269,21 @@ fn without_tailscaled_the_daemon_says_so_and_keeps_its_socket() {
     )
     .unwrap();
     let log = std::fs::File::create(tmp.path().join("log")).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_avsm"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_avsmd"))
         .arg("--home")
         .arg(&home)
-        .arg("start")
         .env("PATH", "/nonexistent")
         .stdout(Stdio::null())
         .stderr(log)
         .spawn()
         .unwrap();
-    let sock = avsm::kernel::socket_path(&home);
+    let sock = avsmd::kernel::socket_path(&home);
     let began = Instant::now();
-    while !avsm::protocol::alive(&sock) {
+    while !avsmd::protocol::alive(&sock) {
         assert!(
             // NOTE: it starts in about 0.1 s; 60 s only covers a loaded machine.
             began.elapsed() < Duration::from_secs(60),
-            "avsm did not start"
+            "avsmd did not start"
         );
         std::thread::sleep(Duration::from_millis(50));
     }

@@ -6,9 +6,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Kind, Record};
-use avsm::simulate::{run, Human, Plan};
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Kind, Record};
+use avsmd::simulate::{run, Human, Plan};
 
 /// The virtual clock belongs to the whole process: one test at a time.
 static CLOCK: Mutex<()> = Mutex::new(());

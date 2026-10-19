@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use avsm::mandate::{Cap, Controller, Mandate, Permitted, Restart};
+use avsmd::mandate::{Cap, Controller, Mandate, Permitted, Restart};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

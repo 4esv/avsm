@@ -9,12 +9,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use avsm::config::Quotas;
-use avsm::gate::{self, Candidate, Proof, Reason};
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Entry, Kind, Record, Seq, Signal, MAX_ALTERNATIVES};
-use avsm::role::ModelRole;
-use avsm::warden::LocalWarden;
+use avsmd::config::Quotas;
+use avsmd::gate::{self, Candidate, Proof, Reason};
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Entry, Kind, Record, Seq, Signal, MAX_ALTERNATIVES};
+use avsmd::role::ModelRole;
+use avsmd::warden::LocalWarden;
 
 /// The virtual clock is shared by the whole process: one test at a time.
 static CLOCK: Mutex<()> = Mutex::new(());
@@ -24,7 +24,7 @@ const HOUR: i64 = 3_600;
 
 fn clock() -> MutexGuard<'static, ()> {
     let guard = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
-    avsm::clock::set(T0);
+    avsmd::clock::set(T0);
     guard
 }
 
@@ -150,7 +150,7 @@ fn fixture(s: Setup) -> Fixture {
 impl Fixture {
     fn report(&mut self, value: f64) {
         self.now += HOUR;
-        avsm::clock::set(self.now);
+        avsmd::clock::set(self.now);
         std::fs::write(self.dir.join("value"), format!("{value}\n")).unwrap();
         self.k.report("shop", false);
     }
@@ -457,9 +457,9 @@ fn a_branch_has_the_chosen_the_top_three_alternatives_and_propensities() {
 
 #[test]
 fn the_same_seed_gives_the_same_branch_record() {
-    use avsm::mandate::Worse;
-    use avsm::plan::{self, Lever, Problem};
-    use avsm::world::{Baseline, Drift};
+    use avsmd::mandate::Worse;
+    use avsmd::plan::{self, Lever, Problem};
+    use avsmd::world::{Baseline, Drift};
     use std::collections::BTreeMap;
     let mut world = Baseline {
         effects: BTreeMap::from([
@@ -491,11 +491,11 @@ fn the_same_seed_gives_the_same_branch_record() {
                 better: Worse::Up,
                 guards: &[],
                 levers: vec![lever("boost"), lever("tidy")],
-                seed: avsm::world::mix(base, 1),
+                seed: avsmd::world::mix(base, 1),
             },
         )
         .unwrap();
-        avsm::kernel::plan::branch_record("shop", &found, 8, 4, Worse::Up)
+        avsmd::kernel::plan::branch_record("shop", &found, 8, 4, Worse::Up)
     };
     assert_eq!(branch(7), branch(7));
     assert_eq!(branch(7).canonical(), branch(7).canonical());
@@ -505,7 +505,7 @@ fn the_same_seed_gives_the_same_branch_record() {
 // ----- critical slowing down -----
 
 fn splitmix64(state: &mut u64) -> u64 {
-    avsm::world::splitmix64(state)
+    avsmd::world::splitmix64(state)
 }
 
 fn normal(rng: &mut u64) -> f64 {
@@ -556,7 +556,7 @@ fn warned(series: &[f64]) -> Vec<Entry> {
     let mut now = T0;
     for x in series {
         now += HOUR;
-        avsm::clock::set(now);
+        avsmd::clock::set(now);
         std::fs::write(dir.join("value"), format!("{x}\n")).unwrap();
         k.report("shop", false);
     }
@@ -696,7 +696,7 @@ fn drawdown_fixture(guards: &'static str) -> Fixture {
     let mut at = f.now;
     let mut push = |f: &mut Fixture, r: Record| {
         at += HOUR;
-        avsm::clock::set(at);
+        avsmd::clock::set(at);
         f.k.append(r).unwrap()
     };
     let run =

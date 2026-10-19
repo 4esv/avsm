@@ -1,0 +1,24 @@
+# avsmd as a systemd user service: started at login, started again if it
+# fails. systemd stops it with SIGTERM, and avsmd drains within 10 s.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/avsmd.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now avsmd
+#   loginctl enable-linger "$USER"    # keeps it running while logged out
+#
+# Point ExecStart at your avsmd (command -v avsmd). Diagnostics go to the
+# journal: journalctl --user -u avsmd
+
+[Unit]
+Description=avsmd, the obedient paperclip maximizer
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/avsmd
+Restart=on-failure
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

@@ -7,7 +7,7 @@ mod common;
 use common::ran;
 use std::os::unix::fs::PermissionsExt;
 
-use avsm::simulate::{run, Human, Plan, BY};
+use avsmd::simulate::{run, Human, Plan, BY};
 
 /// The world the simulation runs levers in: the post a run would write
 /// lands in posts/, as the real lever would have written it.
@@ -60,7 +60,7 @@ fn four_days_in_moments_end_with_the_lever_delegated() {
     assert!(began.elapsed().as_secs() < 30, "days pass in moments");
 
     // Time was virtual: every record is dated inside the four days.
-    let k = avsm::kernel::Kernel::open(&home).unwrap();
+    let k = avsmd::kernel::Kernel::open(&home).unwrap();
     let entries = k.entries().unwrap();
     assert!(
         entries

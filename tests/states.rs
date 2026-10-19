@@ -4,13 +4,13 @@
 
 use std::path::{Path, PathBuf};
 
-use avsm::gate::{self, Adopted, State, PRECEDENCE};
-use avsm::index::Index;
-use avsm::kernel::Kernel;
-use avsm::ledger::Ledger;
-use avsm::mandate::Mandate;
-use avsm::record::{Claim, Record, Signal, Verdict};
-use avsm::warden::LocalWarden;
+use avsmd::gate::{self, Adopted, State, PRECEDENCE};
+use avsmd::index::Index;
+use avsmd::kernel::Kernel;
+use avsmd::ledger::Ledger;
+use avsmd::mandate::Mandate;
+use avsmd::record::{Claim, Record, Signal, Verdict};
+use avsmd::warden::LocalWarden;
 
 const V: &str = "tomato";
 const MANDATE: &str = "purpose: grow
@@ -427,11 +427,11 @@ fn kernel(tmp: &Path) -> Kernel {
     let home = home(tmp);
     let warden = LocalWarden::open(&home).unwrap();
     struct Quiet;
-    impl avsm::role::Role for Quiet {
+    impl avsmd::role::Role for Quiet {
         fn decide(
             &mut self,
-            _: &avsm::role::Context,
-            _: &mut dyn FnMut(&avsm::role::InferRequest) -> Result<String, String>,
+            _: &avsmd::role::Context,
+            _: &mut dyn FnMut(&avsmd::role::InferRequest) -> Result<String, String>,
             _: &mut dyn FnMut(&str, &str) -> Result<String, String>,
         ) -> Result<Vec<Record>, String> {
             Ok(vec![])

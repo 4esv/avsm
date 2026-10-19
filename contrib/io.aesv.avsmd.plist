@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  avsmd as a launchd user agent: started at login, started again if it
+  exits. launchd stops it with SIGTERM, and avsmd drains within 10 s.
+
+    cp contrib/io.aesv.avsmd.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.aesv.avsmd.plist
+
+  Point the ProgramArguments entry at your avsmd (command -v avsmd).
+  Diagnostics go to standard error, which launchd writes where
+  StandardErrorPath says; launchd does not expand ~ there.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.aesv.avsmd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/avsmd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/avsmd.log</string>
+</dict>
+</plist>

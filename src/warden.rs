@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -947,6 +948,42 @@ pub fn run_with(
     run_bounded(dir, program, args, env, stdin, timeout, usize::MAX)
 }
 
+/// Set in the warden process when avsmd is stopping.
+static DRAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long a run in flight has, once avsmd is stopping, between SIGTERM
+/// and SIGKILL: inside the daemon's drain bound, with time left to write
+/// the outcome.
+pub const DRAIN_GRACE: Duration = Duration::from_secs(7);
+
+extern "C" fn on_drain(_: libc::c_int) {
+    DRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// In the warden process: SIGTERM and SIGINT drain instead of killing it.
+/// The run in flight gets SIGTERM, then SIGKILL after `DRAIN_GRACE`, and
+/// its outcome is written either way.
+pub fn drain_on_signals() {
+    // SAFETY: the handler only stores to an atomic.
+    unsafe {
+        libc::signal(libc::SIGTERM, on_drain as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_drain as *const () as libc::sighandler_t);
+    }
+}
+
+fn draining() -> bool {
+    DRAINING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Signal a child and everything it started: it leads a process group of
+/// its own.
+fn signal_group(child: &std::process::Child, signal: libc::c_int) {
+    // SAFETY: kill has no memory preconditions.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), signal);
+    }
+}
+
 /// Like `run_with`, keeping at most `cap` bytes of each of stdout and
 /// stderr; the rest is read and dropped so the child never blocks.
 pub fn run_bounded(
@@ -977,6 +1014,9 @@ pub fn run_bounded(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // A group of its own, so a stop or a timeout reaches what it
+        // started too, and a ^C at the terminal reaches only avsmd.
+        .process_group(0)
         .spawn()
     {
         Ok(c) => c,
@@ -1007,15 +1047,25 @@ pub fn run_bounded(
         (out, err)
     });
     let began = Instant::now();
+    // When this run was told avsmd is stopping.
+    let mut drained: Option<Instant> = None;
     // PERF: most children exit within milliseconds; poll fast, then back off.
     let mut wait = Duration::from_millis(1);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if began.elapsed() > timeout => {
+            Ok(None)
+                if began.elapsed() > timeout
+                    || drained.is_some_and(|d| d.elapsed() > DRAIN_GRACE) =>
+            {
+                signal_group(&child, libc::SIGKILL);
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
+            }
+            Ok(None) if drained.is_none() && draining() => {
+                signal_group(&child, libc::SIGTERM);
+                drained = Some(Instant::now());
             }
             Ok(None) => {
                 std::thread::sleep(wait);

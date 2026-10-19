@@ -1,8 +1,8 @@
 //! Teachback: the mandate read back as plain sentences, and the numbers in
 //! the purpose that nothing enforces.
 
-use avsm::mandate::Mandate;
-use avsm::teach::render;
+use avsmd::mandate::Mandate;
+use avsmd::teach::render;
 
 fn golden(example: &str) {
     let text = std::fs::read_to_string(format!("examples/{example}/mandate.yaml")).unwrap();

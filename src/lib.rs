@@ -1,4 +1,4 @@
-//! avsm: the obedient paperclip maximizer.
+//! avsmd: the obedient paperclip maximizer.
 //!
 //! A supervisor kernel where models only propose, code only proves, and
 //! every fact carries its provenance.
@@ -6,6 +6,8 @@
 pub mod adapter;
 pub mod clock;
 pub mod config;
+pub mod doctor;
+pub mod exit;
 pub mod expect;
 pub mod facts;
 pub mod forecast;

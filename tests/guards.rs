@@ -8,12 +8,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use avsm::gate::{self, Adopted, Candidate, Reason, State};
-use avsm::kernel::Kernel;
-use avsm::mandate::Mandate;
-use avsm::record::{Claim, Entry, Kind, Record, Seq, Signal, Verdict, GENESIS};
-use avsm::role::{self, Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::gate::{self, Adopted, Candidate, Reason, State};
+use avsmd::kernel::Kernel;
+use avsmd::mandate::Mandate;
+use avsmd::record::{Claim, Entry, Kind, Record, Seq, Signal, Verdict, GENESIS};
+use avsmd::role::{self, Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 
 struct Silent;
 
@@ -158,7 +158,7 @@ fn a_guard_that_pauses_pauses_and_no_approval_gets_a_lever_past_it() {
         },
         &k.adopted(),
         &k.config.quotas,
-        avsm::kernel::now(),
+        avsmd::kernel::now(),
     )
     .unwrap_err();
     assert!(
@@ -182,7 +182,7 @@ fn a_guard_that_pauses_pauses_and_no_approval_gets_a_lever_past_it() {
         },
         &k.adopted(),
         &k.config.quotas,
-        avsm::kernel::now(),
+        avsmd::kernel::now(),
     )
     .is_ok());
 }
@@ -905,7 +905,7 @@ fn a_measured_or_inferred_approval_never_re_anchors() {
     for claim in [Claim::Measured, Claim::Inferred] {
         let (mut k, dir, tmp, ask) = stuck_at_60();
         let mut ledger =
-            avsm::ledger::Ledger::open(&tmp.path().join("home").join("ledger.db")).unwrap();
+            avsmd::ledger::Ledger::open(&tmp.path().join("home").join("ledger.db")).unwrap();
         ledger
             .append(Record::Decision {
                 claim,

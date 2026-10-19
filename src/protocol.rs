@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::exit::{self, Exit};
 use crate::kernel::Kernel;
 
 /// The kernel's answer.
@@ -20,22 +21,36 @@ pub struct Response {
     pub text: String,
 }
 
-/// Send a command to a running avsm and wait for the answer.
-pub fn request(sock: &Path, args: &[String]) -> Result<Response, String> {
+/// Send a command to a running avsmd and wait for the answer. No daemon
+/// is EX_UNAVAILABLE, a socket this user may not open EX_NOPERM.
+pub fn request(sock: &Path, args: &[String]) -> Result<Response, Exit> {
     let stream = UnixStream::connect(sock).map_err(|e| match e.kind() {
-        ErrorKind::NotFound | ErrorKind::ConnectionRefused => {
-            "avsm is not running; start it with: avsm start".to_string()
-        }
-        _ => format!("cannot reach avsm at {}: {e}", sock.display()),
+        ErrorKind::NotFound | ErrorKind::ConnectionRefused => Exit::new(
+            exit::UNAVAILABLE,
+            "avsmd is not running; start it with: avsmd",
+        ),
+        ErrorKind::PermissionDenied => Exit::new(
+            exit::NOPERM,
+            format!("cannot reach avsmd at {}: {e}", sock.display()),
+        ),
+        _ => Exit::new(
+            exit::UNAVAILABLE,
+            format!("cannot reach avsmd at {}: {e}", sock.display()),
+        ),
     })?;
     exchange(&stream, |s| s.shutdown(Shutdown::Write), args)
 }
 
-/// Send a command to an avsm listening on the tailnet at `host:port` and
+/// Send a command to an avsmd listening on the tailnet at `host:port` and
 /// wait for the answer. The command carries no identity: tailscaled tells
 /// the daemon who is asking.
-pub fn request_remote(at: &str, args: &[String]) -> Result<Response, String> {
-    let stream = TcpStream::connect(at).map_err(|e| format!("cannot reach avsm at {at}: {e}"))?;
+pub fn request_remote(at: &str, args: &[String]) -> Result<Response, Exit> {
+    let stream = TcpStream::connect(at).map_err(|e| {
+        Exit::new(
+            exit::UNAVAILABLE,
+            format!("cannot reach avsmd at {at}: {e}"),
+        )
+    })?;
     exchange(&stream, |s| s.shutdown(Shutdown::Write), args)
 }
 
@@ -43,7 +58,7 @@ fn exchange<S>(
     mut stream: &S,
     shutdown: impl Fn(&S) -> std::io::Result<()>,
     args: &[String],
-) -> Result<Response, String>
+) -> Result<Response, Exit>
 where
     for<'a> &'a S: Read + Write,
 {
@@ -52,15 +67,16 @@ where
         .write_all(line.as_bytes())
         .and_then(|_| stream.write_all(b"\n"))
         .and_then(|_| shutdown(stream))
-        .map_err(|e| format!("cannot talk to avsm: {e}"))?;
+        .map_err(|e| Exit::new(exit::UNAVAILABLE, format!("cannot talk to avsmd: {e}")))?;
     let mut answer = String::new();
     BufReader::new(stream)
         .read_line(&mut answer)
-        .map_err(|e| format!("avsm did not answer: {e}"))?;
-    serde_json::from_str(&answer).map_err(|e| format!("avsm gave a bad answer: {e}"))
+        .map_err(|e| Exit::new(exit::UNAVAILABLE, format!("avsmd did not answer: {e}")))?;
+    serde_json::from_str(&answer)
+        .map_err(|e| Exit::new(exit::SOFTWARE, format!("avsmd gave a bad answer: {e}")))
 }
 
-/// Is an avsm answering at this socket?
+/// Is an avsmd answering at this socket?
 pub fn alive(sock: &Path) -> bool {
     UnixStream::connect(sock).is_ok()
 }
@@ -69,7 +85,7 @@ pub fn alive(sock: &Path) -> bool {
 pub fn bind(sock: &Path) -> Result<UnixListener, String> {
     if sock.exists() {
         if alive(sock) {
-            return Err(format!("avsm is already running at {}", sock.display()));
+            return Err(format!("avsmd is already running at {}", sock.display()));
         }
         std::fs::remove_file(sock)
             .map_err(|e| format!("cannot replace {}: {e}", sock.display()))?;
@@ -111,7 +127,15 @@ pub fn answer<S: Read + Write>(mut stream: S, kernel: &Arc<Mutex<Kernel>>, by: O
                 let mut kernel = kernel
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match kernel.handle_as(&args, by) {
+                crate::kernel::debug(&format!("command: {}", args.join(" ")));
+                // Draining: a command that waited out the last tick is
+                // not run.
+                let handled = if crate::kernel::stopping() {
+                    Err("avsmd is stopping; nothing done".to_string())
+                } else {
+                    kernel.handle_as(&args, by)
+                };
+                match handled {
                     Ok(text) => Response { ok: true, text },
                     Err(text) => Response { ok: false, text },
                 }

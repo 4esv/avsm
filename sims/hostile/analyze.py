@@ -339,7 +339,7 @@ autonomous_after = len(after) - approved_after
 # Every cap or budget refusal avsm printed has a refusal record that day.
 printed, unrecorded = None, []
 if len(sys.argv) > 2:
-    REFUSED = re.compile(r"avsm: (\S+): (\S+) refused: .*(the cap is|the parent.s budget is)")
+    REFUSED = re.compile(r"avsmd?: (\S+): (\S+) refused: .*(the cap is|the parent.s budget is)")
     recorded = {(r["venture"], r["action"], (at - start) // 86400) for _, at, r in recs
                 if r.get("kind") == "refusal" and re.search(r"OverCap|OverBudget", r.get("reason", ""))}
     printed = []

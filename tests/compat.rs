@@ -4,9 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
-use avsm::kernel::Kernel;
-use avsm::ledger::Ledger;
-use avsm::record::{Record, Verdict};
+use avsmd::kernel::Kernel;
+use avsmd::ledger::Ledger;
+use avsmd::record::{Record, Verdict};
 
 fn open_copy(tmp: &Path) -> PathBuf {
     let home = tmp.join("home");

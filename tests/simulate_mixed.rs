@@ -4,7 +4,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use avsm::simulate::{run, Human, Plan, BY, EDIT};
+use avsmd::simulate::{run, Human, Plan, BY, EDIT};
 
 /// A world that says when each simulated day begins, and takes the
 /// lever runs: a post lands in posts/ as the real lever would write it.
@@ -73,7 +73,7 @@ fn the_mixed_human_denies_every_third_ask_and_edits_what_runs() {
     assert!(text.contains("  world: day 0 begins\n"), "{text}");
     assert!(text.contains("  world: day 2 begins\n"), "{text}");
     assert_eq!(text.matches("  world: day ").count(), 3, "{text}");
-    let k = avsm::kernel::Kernel::open(&home).unwrap();
+    let k = avsmd::kernel::Kernel::open(&home).unwrap();
     assert_eq!(
         k.ledger.verify().unwrap(),
         k.entries().unwrap().len() as u64

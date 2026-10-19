@@ -19,7 +19,7 @@ jobs:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     env:
-      TARBALL: avsm-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+      TARBALL: avsmd-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,10 +29,15 @@ jobs:
         with:
           tool: cross
       - run: cross build --release --locked --target ${{ matrix.target }}
-      - name: Check the binary is static
-        run: file target/${{ matrix.target }}/release/avsm | grep -E 'statically linked|static-pie linked'
-      - name: Package
-        run: tar -C target/${{ matrix.target }}/release -czf "$TARBALL" avsm
+      - name: Check both binaries are static
+        run: |
+          for bin in avsmd avsm; do
+            file target/${{ matrix.target }}/release/$bin | grep -E 'statically linked|static-pie linked'
+          done
+      - name: Package the daemon, the client and the service files
+        run: |
+          cp -R contrib target/${{ matrix.target }}/release/contrib
+          tar -C target/${{ matrix.target }}/release -czf "$TARBALL" avsmd avsm contrib
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.TARBALL }}
@@ -63,6 +68,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish to crates.io
+      - name: Publish avsmd to crates.io
         if: env.CARGO_REGISTRY_TOKEN != ''
-        run: cargo publish --locked
+        run: cargo publish --locked --package avsmd

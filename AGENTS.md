@@ -1,6 +1,8 @@
 # AGENTS.md
 
-avsm, the obedient paperclip maximizer: an agentic daemon that pursues the goals you give it, acts only within the limits you set, and has proof for everything it does.
+avsmd, the obedient paperclip maximizer: an agentic daemon that pursues the goals you give it, acts only within the limits you set, and has proof for everything it does.
+
+Two binaries from the crate `avsmd`: `avsmd`, the daemon (foreground, flags `-t -T -f -d` as sshd has them; it starts its warden and roles as hidden subcommands of itself), and `avsm`, the client (and the hidden `simulate`).
 
 ## Vocabulary
 
@@ -15,7 +17,7 @@ Use these words and no synonyms.
 - escalate, escalation (the `escalate:` backend asked when the first cannot answer)
 - packet (premises, options, reason: what an ask carries for the human, built by code)
 - canary is the self venture's check that the gate still refuses what it must. A canary ask is a different thing: an ask that can never run, written every n asks (`canary_asks`) to measure whether the human reads what they approve. Say "canary ask", never "canary" alone, for it.
-- Commands: start, add, status, tail, asks, approve, deny, pause, resume, why, know, propose, digest, forecast
+- Commands: avsmd (the daemon), add, status, tail, asks, approve, deny, pause, resume, why, know, propose, digest, forecast, doctor
 
 ## Non-negotiables
 

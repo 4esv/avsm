@@ -7,13 +7,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use avsm::config::{self, Quotas};
-use avsm::forecast::{self, Options, Policy, Sweep};
-use avsm::gate::{self, Candidate};
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Entry, Kind, Payload, Record, Signal};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::config::{self, Quotas};
+use avsmd::forecast::{self, Options, Policy, Sweep};
+use avsmd::gate::{self, Candidate};
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Entry, Kind, Payload, Record, Signal};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 
 /// The virtual clock is shared by the whole process: one test at a time.
 static CLOCK: Mutex<()> = Mutex::new(());
@@ -25,7 +25,7 @@ const DAY: i64 = 86_400;
 
 fn clock() -> MutexGuard<'static, ()> {
     let guard = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
-    avsm::clock::set(T0);
+    avsmd::clock::set(T0);
     guard
 }
 
@@ -103,7 +103,7 @@ impl Fixture {
         let dir = self.tmp.path().join(name);
         for v in values {
             self.now += gap;
-            avsm::clock::set(self.now);
+            avsmd::clock::set(self.now);
             std::fs::write(dir.join("value"), format!("{v}\n")).unwrap();
             self.k.report(name, false);
         }
@@ -399,7 +399,7 @@ fn caps_that_cannot_keep_up_get_a_capacity_ask_before_any_saturation() {
     f.history("inbox", &[100.0, 120.0, 140.0, 160.0, 180.0], DAY);
     // Past the nightly time, before the next report is due.
     f.now += HOUR / 2;
-    avsm::clock::set(f.now);
+    avsmd::clock::set(f.now);
     f.k.tick();
     let entries = f.entries();
     let capacity: Vec<&Entry> = entries
@@ -488,7 +488,7 @@ fn with_no_direction_declared_capacity_is_not_checked() {
     let m = &f.k.ventures["inbox"].mandate;
     assert!(forecast::capacity(&f.k.index().unwrap(), "inbox", m).is_none());
     f.now += HOUR;
-    avsm::clock::set(f.now);
+    avsmd::clock::set(f.now);
     f.k.tick();
     assert!(!f.entries().iter().any(|e| matches!(
         &e.record,
@@ -536,7 +536,7 @@ fn a_declared_direction_with_no_known_lever_effect_asks_nothing() {
 
 #[test]
 fn the_mandates_better_is_the_default_for_a_plan_and_an_audit() {
-    use avsm::mandate::{Controller, Mandate, Worse};
+    use avsmd::mandate::{Controller, Mandate, Worse};
     let m = Mandate::parse(
         "purpose: p\nmetric: unread\nbetter: down\n\
          controller: {kind: plan}\ncadence: 1h\n\
@@ -681,16 +681,16 @@ fn simulate_garden(config: &str) -> Vec<Entry> {
     )
     .unwrap();
     script(&dir, "report", "echo 80");
-    let plan = avsm::simulate::Plan {
+    let plan = avsmd::simulate::Plan {
         days: 1,
         step: 6 * HOUR,
-        human: avsm::simulate::Human::ApproveAll,
+        human: avsmd::simulate::Human::ApproveAll,
         start: Some(T0),
         add: vec![dir],
         world: None,
     };
     let mut out = Vec::new();
-    avsm::simulate::run(&home, &plan, &mut out).unwrap();
+    avsmd::simulate::run(&home, &plan, &mut out).unwrap();
     Kernel::open(&home).unwrap().entries().unwrap()
 }
 
@@ -733,7 +733,7 @@ fn a_simulation_forecasts_at_add_as_its_config_says() {
 #[test]
 fn with_no_forecast_key_a_simulation_forecasts_with_the_defaults() {
     let _c = clock();
-    let none = avsm::config::Config::parse("nightly: never\n").unwrap();
+    let none = avsmd::config::Config::parse("nightly: never\n").unwrap();
     assert_eq!(
         none.automatic_forecast(),
         Some(config::Forecast {
@@ -741,7 +741,7 @@ fn with_no_forecast_key_a_simulation_forecasts_with_the_defaults() {
             seeds: 16
         })
     );
-    let off = avsm::config::Config::parse("forecast: {seeds: 0}\n").unwrap();
+    let off = avsmd::config::Config::parse("forecast: {seeds: 0}\n").unwrap();
     assert_eq!(off.automatic_forecast(), None);
     let entries = simulate_garden("nightly: never\n");
     let forecasts: Vec<(String, u32, u32)> = entries
@@ -793,7 +793,7 @@ fn a_capacity_gap_that_comes_and_goes_asks_once_a_quiet_week_closes_it() {
     let night = |f: &mut Fixture, n: i64, per_day: i64| {
         f.history("inbox", &[(100 + per_day * n) as f64], DAY);
         f.now += HOUR / 2;
-        avsm::clock::set(f.now);
+        avsmd::clock::set(f.now);
         f.k.tick();
         for q in f.k.open_asks().unwrap() {
             f.k.deny(q, "seen").unwrap();
@@ -1045,7 +1045,7 @@ fn a_ratchet_delegate_ask_cites_the_forecast_of_the_proposed_mandate() {
                 .expect("post asks each time");
         f.k.approve(q, None).unwrap();
         f.now += 60;
-        avsm::clock::set(f.now);
+        avsmd::clock::set(f.now);
         f.k.tick();
     }
     let entries = f.entries();
@@ -1099,7 +1099,7 @@ fn time_a_month_of_the_greenhouse() {
     f.k.add(&copy).unwrap();
     for _ in 0..(24 * 60) {
         f.now += 60;
-        avsm::clock::set(f.now);
+        avsmd::clock::set(f.now);
         f.k.report("greenhouse", false);
     }
     let opts = f.opts(&["greenhouse"], 30, 16);

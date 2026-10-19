@@ -7,10 +7,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Entry, Kind, Record, Seq, Signal};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Entry, Kind, Record, Seq, Signal};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 
 /// The virtual clock is shared by the whole process: one test at a time.
 static CLOCK: Mutex<()> = Mutex::new(());
@@ -20,7 +20,7 @@ const DAY: i64 = 86_400;
 
 fn clock() -> MutexGuard<'static, ()> {
     let guard = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
-    avsm::clock::set(T0);
+    avsmd::clock::set(T0);
     guard
 }
 
@@ -199,7 +199,7 @@ fn a_day_change_closes_with_the_count() {
         k.report("counter", false);
     }
     assert_eq!(refusals(&k).len(), 1);
-    avsm::clock::set(T0 + 2 * DAY);
+    avsmd::clock::set(T0 + 2 * DAY);
     k.tick();
     let got = refusals(&k);
     let (_, _, count, closes) = fields(&got[1]);
@@ -287,7 +287,7 @@ fn saturation_asks_again_only_after_a_cap_window_without_the_limit() {
     assert_eq!(saturation_asks(&k).len(), 1);
     // A full cap window with no refusal for the limit ends it; the next
     // saturation is a new episode.
-    avsm::clock::set(T0 + 2 * DAY);
+    avsmd::clock::set(T0 + 2 * DAY);
     k.report("counter", false); // reset runs: the cap allows it
     k.report("counter", false); // refused again
     assert_eq!(saturation_asks(&k).len(), 2);
@@ -298,7 +298,7 @@ fn a_three_day_saturation_answered_every_time_asks_once() {
     let _c = clock();
     let (_tmp, mut k) = counter("");
     for hour in 0..72 {
-        avsm::clock::set(T0 + hour * 3_600);
+        avsmd::clock::set(T0 + hour * 3_600);
         k.report("counter", false);
         for ask in saturation_asks(&k) {
             if k.index().unwrap().is_open(ask.seq) {

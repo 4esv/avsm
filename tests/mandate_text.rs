@@ -4,12 +4,12 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use avsm::kernel::Kernel;
-use avsm::mandate::Mandate;
-use avsm::record::{Claim, Entry, Record, Verdict};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::selfventure;
-use avsm::warden::LocalWarden;
+use avsmd::kernel::Kernel;
+use avsmd::mandate::Mandate;
+use avsmd::record::{Claim, Entry, Record, Verdict};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::selfventure;
+use avsmd::warden::LocalWarden;
 
 const MANDATE: &str = "purpose: Keep the counter below ten.\n\
      metric: count\n\

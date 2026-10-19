@@ -5,10 +5,10 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Kind, Payload, Record};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Kind, Payload, Record};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 
 struct Scripted {
     replies: VecDeque<Vec<Record>>,
@@ -219,7 +219,7 @@ fn a_digest_delta_has_the_precision_of_the_metric() {
     let tmp = tempfile::tempdir().unwrap();
     let mandate = "purpose: Cool.\nmetric: shell echo 24\ncontroller: {kind: model}\ncadence: 1h\n";
     let (mut k, _) = kernel(tmp.path(), mandate, vec![]);
-    let now = avsm::kernel::now();
+    let now = avsmd::kernel::now();
     k.ledger
         .append_at(
             Record::report(Claim::Measured, "shop", "shell", Some(27.6), ""),

@@ -72,6 +72,36 @@ impl Ledger {
         Ledger::prepare(Connection::open(path)?)
     }
 
+    /// Open an existing ledger file to read, writing nothing: no schema,
+    /// no journal mode. With no write-ahead log beside it, every record is
+    /// in the file and nobody is writing, so it opens immutable and no
+    /// journal file is made; with one, a writer may be at work and the
+    /// log is read through the files it already made.
+    pub fn open_read_only(path: &Path) -> Result<Ledger, LedgerError> {
+        use rusqlite::OpenFlags;
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = if Path::new(&wal).exists() {
+            Connection::open_with_flags(path, flags)?
+        } else {
+            // A URI, so the path is percent-encoded where it must be.
+            let mut uri = String::from("file:");
+            for b in path.to_string_lossy().bytes() {
+                match b {
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                        uri.push(b as char)
+                    }
+                    _ => uri.push_str(&format!("%{b:02X}")),
+                }
+            }
+            uri.push_str("?immutable=1");
+            Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI)?
+        };
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(Ledger { conn })
+    }
+
     /// A ledger that lives only in memory, for tests.
     pub fn open_in_memory() -> Result<Ledger, LedgerError> {
         Ledger::prepare(Connection::open_in_memory()?)

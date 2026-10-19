@@ -2,18 +2,23 @@ use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 
-/// The obedient paperclip maximizer: a daemon that pursues the goals you
-/// give it, acts only within the limits you set, and has proof for
-/// everything it does.
+use avsmd::exit::{self, Exit};
+
+/// The obedient paperclip maximizer: talk to avsmd, the daemon that
+/// pursues the goals you give it, acts only within the limits you set,
+/// and has proof for everything it does.
 #[derive(Parser)]
 #[command(name = "avsm", version, about, long_about = None)]
 struct Cli {
-    /// Where avsm keeps its files (default: $AVSM_HOME, else ~/.avsm)
+    /// Where avsmd keeps its files (default: $AVSMD_HOME, else
+    /// ~/Library/Application Support/avsmd on macOS and
+    /// $XDG_STATE_HOME/avsmd, or ~/.local/state/avsmd, elsewhere)
     #[arg(long, global = true, value_name = "DIR")]
     home: Option<PathBuf>,
-    /// Talk to an avsm on another machine over Tailscale, as host:port
+    /// Talk to avsmd on another machine over Tailscale, as host:port
     #[arg(long, global = true, value_name = "HOST:PORT")]
     remote: Option<String>,
     #[command(subcommand)]
@@ -22,8 +27,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run avsm in the foreground: watch every venture and answer the other commands
-    Start,
     /// Take on a venture: a directory with a mandate.yaml in it
     Add {
         /// The venture directory
@@ -34,8 +37,11 @@ enum Command {
     /// Show the latest records
     Tail {
         /// How many records to show
-        #[arg(default_value_t = 20)]
+        #[arg(default_value_t = 20, conflicts_with = "since")]
         count: usize,
+        /// Show every record after this record number instead
+        #[arg(long, value_name = "NUMBER")]
+        since: Option<String>,
     },
     /// List the questions waiting for you
     Asks,
@@ -99,12 +105,9 @@ enum Command {
         #[arg(long, num_args = 2, value_names = ["FIELD", "VALUES"])]
         sweep: Option<Vec<String>>,
     },
-    /// The warden process; avsm start runs it for you
-    #[command(hide = true)]
-    Warden,
-    /// The roles process; avsm start runs it for you
-    #[command(hide = true)]
-    Roles,
+    /// Check this machine's avsmd: its home, config, ledger, mandates and
+    /// the daemon itself; change nothing, and say how to fix what fails
+    Doctor,
     /// Run the ventures in a home of their own over simulated days
     #[command(hide = true)]
     Simulate {
@@ -134,19 +137,25 @@ enum Command {
     },
 }
 
-fn done(result: Result<(), String>) -> ExitCode {
+fn done(result: Result<(), Exit>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("avsm: {e}");
-            ExitCode::FAILURE
+            eprintln!("avsm: {}", e.text.trim_end());
+            ExitCode::from(e.code)
         }
     }
 }
 
+/// A command avsmd answered with a no: the input named something it
+/// could not take.
+fn refused(text: impl Into<String>) -> Exit {
+    Exit::new(exit::DATAERR, text)
+}
+
 /// The payload given on the command line, or read from standard input
 /// when it is `-` or when nothing was given and input is not a terminal.
-fn payload_argument(words: Vec<String>) -> Result<Option<String>, String> {
+fn payload_argument(words: Vec<String>) -> Result<Option<String>, Exit> {
     let joined = words.join(" ");
     let from_stdin = joined == "-" || (joined.is_empty() && !std::io::stdin().is_terminal());
     if !from_stdin {
@@ -159,7 +168,7 @@ fn payload_argument(words: Vec<String>) -> Result<Option<String>, String> {
     let mut text = String::new();
     std::io::stdin()
         .read_to_string(&mut text)
-        .map_err(|e| format!("cannot read the payload: {e}"))?;
+        .map_err(|e| Exit::new(exit::NOINPUT, format!("cannot read the payload: {e}")))?;
     Ok(if text.trim().is_empty() {
         None
     } else {
@@ -169,24 +178,20 @@ fn payload_argument(words: Vec<String>) -> Result<Option<String>, String> {
 
 /// Fetch an ask's payload, let the human change it in their editor, and
 /// approve with what they saved.
-fn approve_edited(
-    sock: &std::path::Path,
-    remote: Option<&str>,
-    number: &str,
-) -> Result<(), String> {
+fn approve_edited(sock: &std::path::Path, remote: Option<&str>, number: &str) -> Result<(), Exit> {
     let send = |args: &[String]| match remote {
-        Some(at) => avsm::protocol::request_remote(at, args),
-        None => avsm::protocol::request(sock, args),
+        Some(at) => avsmd::protocol::request_remote(at, args),
+        None => avsmd::protocol::request(sock, args),
     };
     let args = vec!["payload".to_string(), number.to_string()];
     let answer = send(&args)?;
     if !answer.ok {
-        return Err(answer.text.trim_end().to_string());
+        return Err(refused(answer.text.trim_end()));
     }
     let (kind, content) = answer
         .text
         .split_once('\n')
-        .ok_or_else(|| "avsm gave a bad answer".to_string())?;
+        .ok_or_else(|| Exit::new(exit::SOFTWARE, "avsmd gave a bad answer"))?;
     let ext = match kind.trim() {
         "json" => "json",
         "diff" => "diff",
@@ -197,7 +202,12 @@ fn approve_edited(
         number.trim_start_matches('#'),
         std::process::id()
     ));
-    std::fs::write(&path, content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    std::fs::write(&path, content).map_err(|e| {
+        Exit::new(
+            exit::CANTCREAT,
+            format!("cannot write {}: {e}", path.display()),
+        )
+    })?;
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_string());
@@ -207,12 +217,25 @@ fn approve_edited(
         .arg("editor")
         .arg(&path)
         .status()
-        .map_err(|e| format!("cannot run the editor ({editor}): {e}"))?;
+        .map_err(|e| {
+            Exit::new(
+                exit::UNAVAILABLE,
+                format!("cannot run the editor ({editor}): {e}"),
+            )
+        })?;
     if !status.success() {
         let _ = std::fs::remove_file(&path);
-        return Err("the editor did not finish; nothing approved".to_string());
+        return Err(Exit::new(
+            exit::TEMPFAIL,
+            "the editor did not finish; nothing approved",
+        ));
     }
-    let edited = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let edited = std::fs::read_to_string(&path).map_err(|e| {
+        Exit::new(
+            exit::NOINPUT,
+            format!("cannot read {}: {e}", path.display()),
+        )
+    })?;
     let _ = std::fs::remove_file(&path);
     let args = vec![
         "approve".to_string(),
@@ -225,18 +248,38 @@ fn approve_edited(
     if answer.ok {
         Ok(())
     } else {
-        Err("not approved".to_string())
+        Err(refused("not approved"))
     }
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let home = cli.home.unwrap_or_else(avsm::kernel::default_home);
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let _ = e.print();
+            return match e.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => ExitCode::SUCCESS,
+                _ => ExitCode::from(exit::USAGE),
+            };
+        }
+    };
+    let home = cli.home.unwrap_or_else(avsmd::kernel::default_home);
     let remote = cli.remote;
     let args: Vec<String> = match cli.command {
-        Command::Start => return done(avsm::kernel::start(&home)),
-        Command::Warden => return done(avsm::kernel::warden_main(&home)),
-        Command::Roles => return done(avsm::kernel::roles_main()),
+        Command::Doctor => {
+            if remote.is_some() {
+                return done(Err(Exit::new(
+                    exit::USAGE,
+                    "doctor checks this machine; run it where avsmd runs",
+                )));
+            }
+            let found = avsmd::doctor::doctor(
+                &home,
+                avsmd::kernel::old_home(|v| std::env::var_os(v)).as_deref(),
+            );
+            print!("{}", found.out);
+            return ExitCode::from(found.code);
+        }
         Command::Simulate {
             days,
             step,
@@ -247,15 +290,25 @@ fn main() -> ExitCode {
         } => {
             let step = match humantime::parse_duration(&step) {
                 Ok(d) => d.as_secs() as i64,
-                Err(_) => return done(Err(format!("step is a duration like 1h, not {step:?}"))),
+                Err(_) => {
+                    return done(Err(Exit::new(
+                        exit::USAGE,
+                        format!("step is a duration like 1h, not {step:?}"),
+                    )))
+                }
             };
             let human = match approve.as_str() {
-                "all" => avsm::simulate::Human::ApproveAll,
-                "none" => avsm::simulate::Human::Away,
-                "mixed" => avsm::simulate::Human::Mixed,
-                other => return done(Err(format!("approve is all, none or mixed, not {other:?}"))),
+                "all" => avsmd::simulate::Human::ApproveAll,
+                "none" => avsmd::simulate::Human::Away,
+                "mixed" => avsmd::simulate::Human::Mixed,
+                other => {
+                    return done(Err(Exit::new(
+                        exit::USAGE,
+                        format!("approve is all, none or mixed, not {other:?}"),
+                    )))
+                }
             };
-            let plan = avsm::simulate::Plan {
+            let plan = avsmd::simulate::Plan {
                 days,
                 step,
                 human,
@@ -263,21 +316,26 @@ fn main() -> ExitCode {
                 add: ventures,
                 world,
             };
-            return done(avsm::simulate::run(&home, &plan, &mut std::io::stdout()));
+            return done(
+                avsmd::simulate::run(&home, &plan, &mut std::io::stdout()).map_err(Exit::from),
+            );
         }
         Command::Add { dir } => {
             let dir = dir.canonicalize().unwrap_or(dir);
             vec!["add".to_string(), dir.to_string_lossy().into_owned()]
         }
         Command::Status => vec!["status".to_string()],
-        Command::Tail { count } => vec!["tail".to_string(), count.to_string()],
+        Command::Tail {
+            since: Some(seq), ..
+        } => vec!["tail".to_string(), "--since".to_string(), seq],
+        Command::Tail { count, .. } => vec!["tail".to_string(), count.to_string()],
         Command::Asks => vec!["asks".to_string()],
         Command::Approve {
             number,
             edit: false,
         } => vec!["approve".to_string(), number],
         Command::Approve { number, edit: true } => {
-            let sock = avsm::kernel::socket_path(&home);
+            let sock = avsmd::kernel::socket_path(&home);
             return done(approve_edited(&sock, remote.as_deref(), &number));
         }
         Command::Propose {
@@ -325,21 +383,16 @@ fn main() -> ExitCode {
         }
     };
     let answer = match &remote {
-        Some(at) => avsm::protocol::request_remote(at, &args),
-        None => avsm::protocol::request(&avsm::kernel::socket_path(&home), &args),
+        Some(at) => avsmd::protocol::request_remote(at, &args),
+        None => avsmd::protocol::request(&avsmd::kernel::socket_path(&home), &args),
     };
     match answer {
-        Ok(answer) => {
+        Ok(answer) if answer.ok => {
             print!("{}", answer.text);
-            if answer.ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("avsm: {e}");
-            ExitCode::FAILURE
-        }
+        // A no is a diagnostic: it goes to standard error.
+        Ok(answer) => done(Err(refused(answer.text))),
+        Err(e) => done(Err(e)),
     }
 }

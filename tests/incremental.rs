@@ -4,12 +4,12 @@
 //! must agree: the same proof or refusal, word for word, the same state
 //! for every venture, the same open asks.
 
-use avsm::config::Quotas;
-use avsm::gate::{self, reference, Adopted, Candidate, Proof, Step};
-use avsm::index::Index;
-use avsm::ledger::Ledger;
-use avsm::mandate::{Cap, Mandate};
-use avsm::record::{Claim, Payload, Record, Seq, Signal, Verdict};
+use avsmd::config::Quotas;
+use avsmd::gate::{self, reference, Adopted, Candidate, Proof, Step};
+use avsmd::index::Index;
+use avsmd::ledger::Ledger;
+use avsmd::mandate::{Cap, Mandate};
+use avsmd::record::{Claim, Payload, Record, Seq, Signal, Verdict};
 use proptest::prelude::*;
 
 const START: i64 = 1_700_000_000;
@@ -402,7 +402,7 @@ fn record(op: &Op, n: u64) -> Record {
         Op::Intent(venture, action, payload) => Record::Intent {
             claim: Claim::Measured,
             proof: proof(&venture, &action, None),
-            key: Some(avsm::record::key(&venture, &action, &[], payload.as_ref())),
+            key: Some(avsmd::record::key(&venture, &action, &[], payload.as_ref())),
             venture,
             action,
             payload,
@@ -432,7 +432,7 @@ fn record(op: &Op, n: u64) -> Record {
             action: Some(action),
             made_at: START,
             resolves_at: START + HOUR,
-            quantiles: avsm::record::Quantiles::from_values([
+            quantiles: avsmd::record::Quantiles::from_values([
                 1.0, 2.0, 3.0, 12.0, 13.0, 14.0, 15.0,
             ]),
             events: vec![],
@@ -481,7 +481,7 @@ fn cand() -> impl Strategy<Value = Cand> {
 /// The candidate as the kernel would form it: a proposal's lever, an
 /// approved ask's lever, a resume on a resume, the threshold's action on
 /// a report.
-fn resolve(cand: &Cand, entries: &[avsm::record::Entry]) -> Candidate {
+fn resolve(cand: &Cand, entries: &[avsmd::record::Entry]) -> Candidate {
     let n = entries.len() as u64;
     let (venture, action, mut cites) = match cand {
         Cand::Any(v, a, c) => (

@@ -1,4 +1,4 @@
-# avsm
+# avsmd
 
 The obedient paperclip maximizer. An agentic daemon that pursues the goals you
 give it, acts only within the limits you set, and has proof for everything it
@@ -18,7 +18,7 @@ not because the model is good. You wake up to work done, not work to do.
 
 ## Install
 
-    cargo install avsm
+    cargo install avsmd
 
 Or from source:
 
@@ -26,15 +26,17 @@ Or from source:
     cd avsm
     cargo install --path .
 
-One static binary, Linux, no public listener: avsm answers its own commands over
-a Unix socket in `~/.avsm` (or `$AVSM_HOME`).
+Two binaries: `avsmd`, the daemon, and `avsm`, which gives it commands. No
+public listener: avsmd answers over a Unix socket in its home,
+`~/Library/Application Support/avsmd` on macOS and `$XDG_STATE_HOME/avsmd`
+(`~/.local/state/avsmd`) on Linux, or `$AVSMD_HOME`, or `--home`.
 
 ## Add a venture
 
-Start the daemon. It runs in the foreground, so give it a terminal or a systemd
-unit:
+Start the daemon. It runs in the foreground, so give it a terminal or a service
+(see Running it):
 
-    avsm start
+    avsmd
 
 In another terminal, take on the example venture:
 
@@ -140,7 +142,7 @@ from the model asks and never runs. A prediction never authorizes anything.
 With `controller: {kind: model}` (or `kind: classifier`, which answers with one
 word), once a night avsm shows a backend the mandate and the recent records and
 takes its reply as a proposal, a question for you, or nothing. Backends are
-named in `~/.avsm/config.yaml`; any API in the Anthropic or OpenAI style works,
+named in `config.yaml` in the home; any API in the Anthropic or OpenAI style works,
 and so does a local command, so a classifier you trained yourself fits:
 
 ```yaml
@@ -153,9 +155,9 @@ backends:
   mine: { kind: command, run: /opt/mine/classify }
 ```
 
-Keys go in `~/.avsm/keys`, one `name=value` per line, readable by you alone.
-Only the warden, the one process avsm starts that may act, ever reads them; the
-process that talks to models holds no keys and runs as `nobody` when avsm runs
+Keys go in `keys` in the home, one `name=value` per line, readable by you alone.
+Only the warden, the one process avsmd starts that may act, ever reads them; the
+process that talks to models holds no keys and runs as `nobody` when avsmd runs
 as root.
 
 #### When the model cannot answer
@@ -189,6 +191,29 @@ times, and every look is a record. A mandate may also permit `research`, a
 lever that sends a question to a command you name under `research:` in the
 config and keeps what comes back as inferred facts, each with its source. No
 provider is built in; the command is the provider.
+
+## Running it
+
+avsmd runs in the foreground and never forks. `contrib/` holds a launchd agent
+(`io.aesv.avsmd.plist`) and a systemd user unit (`avsmd.service`) that start it
+at login and again if it dies; each file says how to install it. SIGTERM or
+SIGINT stops it cleanly within 10 seconds: no new commands, the work in flight
+finishes, a lever still running is sent SIGTERM and then SIGKILL if it lingers,
+and its outcome is written before avsmd exits 0.
+
+    avsmd -t            # test the config and every adopted mandate, and say what each allows
+    avsmd -T            # print the config in force
+    avsmd -f other.yaml # read another config
+    avsmd -d            # verbose diagnostics on standard error
+    avsm doctor         # check the home, config, ledger, mandates and daemon
+
+`avsm doctor` changes nothing. Each check it fails prints the command that
+fixes it, and it exits with the worst code it found. Both binaries exit as
+sysexits.h says: 64 for bad usage, 65 for input avsmd refused, 69 when no
+avsmd is running, 78 for a config or mandate that does not hold. Records go to
+standard output, diagnostics to standard error, and nothing is in color.
+`avsm tail --since <number>` prints every record after that one, for a script
+that follows the ledger.
 
 ## Ventures from one file
 

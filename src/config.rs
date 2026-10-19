@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,29 @@ use crate::mandate::Cap;
 
 pub const CONFIG_FILE: &str = "config.yaml";
 pub const KEYS_FILE: &str = "keys";
+
+/// The config file `avsmd -f` named, for this process and the warden and
+/// roles processes it starts. Set once, before anything reads the config.
+static CHOSEN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Read the config from `file` instead of the home's `config.yaml`. Only
+/// the first call counts.
+pub fn choose(file: PathBuf) {
+    let _ = CHOSEN.set(file);
+}
+
+/// The file `avsmd -f` named, if it named one.
+pub fn chosen() -> Option<&'static Path> {
+    CHOSEN.get().map(PathBuf::as_path)
+}
+
+/// The config file in force for a home.
+pub fn path(home: &Path) -> PathBuf {
+    CHOSEN
+        .get()
+        .cloned()
+        .unwrap_or_else(|| home.join(CONFIG_FILE))
+}
 
 /// The daemon's settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -286,12 +309,15 @@ fn anthropic_key() -> String {
 }
 
 impl Config {
-    /// Read `config.yaml` in a home directory; a missing file means defaults.
+    /// Read the config: the file `avsmd -f` named, else `config.yaml` in
+    /// a home directory, where a missing file means defaults.
     pub fn load(home: &Path) -> Result<Config, String> {
-        let path = home.join(CONFIG_FILE);
+        let path = path(home);
         match std::fs::read_to_string(&path) {
             Ok(text) => Config::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && CHOSEN.get().is_none() => {
+                Ok(Config::default())
+            }
             Err(e) => Err(format!("cannot read {}: {e}", path.display())),
         }
     }

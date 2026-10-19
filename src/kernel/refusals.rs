@@ -242,7 +242,7 @@ impl Kernel {
                 venture: venture.clone(),
                 action,
                 reason,
-                detail: format!("avsm restarted; refused at least {count} times"),
+                detail: format!("avsmd restarted; refused at least {count} times"),
                 count,
                 closes: Some(seq),
             };

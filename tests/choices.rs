@@ -3,9 +3,9 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Kind, Record};
-use avsm::warden::LocalWarden;
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Kind, Record};
+use avsmd::warden::LocalWarden;
 
 const MANDATE: &str =
     "purpose: Answer the mail.\nmetric: unread\ncontroller: {kind: model}\ncadence: 1h\n\
@@ -16,7 +16,7 @@ const MANDATE: &str =
     forbidden: [close]\n";
 
 /// A venture whose model backend prints `reply`, run through one cycle.
-fn cycle(reply: &str) -> Vec<avsm::record::Entry> {
+fn cycle(reply: &str) -> Vec<avsmd::record::Entry> {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -37,17 +37,17 @@ fn cycle(reply: &str) -> Vec<avsm::record::Entry> {
     std::fs::write(&report, "#!/bin/sh\necho 5\n").unwrap();
     std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o755)).unwrap();
     let warden = LocalWarden::open(&home).unwrap();
-    let mut k = Kernel::with(&home, Box::new(avsm::role::ModelRole), Box::new(warden)).unwrap();
+    let mut k = Kernel::with(&home, Box::new(avsmd::role::ModelRole), Box::new(warden)).unwrap();
     k.add(&dir).unwrap();
     k.cycle("shop");
     k.entries().unwrap()
 }
 
-fn count(entries: &[avsm::record::Entry], kind: Kind) -> usize {
+fn count(entries: &[avsmd::record::Entry], kind: Kind) -> usize {
     entries.iter().filter(|e| e.record.kind() == kind).count()
 }
 
-fn unusable(entries: &[avsm::record::Entry]) -> Vec<String> {
+fn unusable(entries: &[avsmd::record::Entry]) -> Vec<String> {
     entries
         .iter()
         .filter_map(|e| match &e.record {
@@ -65,7 +65,7 @@ fn unusable(entries: &[avsm::record::Entry]) -> Vec<String> {
         .collect()
 }
 
-fn ran_lever(entries: &[avsm::record::Entry], name: &str) -> bool {
+fn ran_lever(entries: &[avsmd::record::Entry], name: &str) -> bool {
     entries
         .iter()
         .any(|e| e.record.kind() == Kind::Intent && e.record.summary().starts_with(name))

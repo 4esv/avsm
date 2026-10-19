@@ -9,8 +9,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Record};
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Record};
 
 fn avsm(home: &Path, args: &[&str]) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_avsm"))
@@ -34,20 +34,19 @@ impl Drop for Daemon {
 }
 
 fn start(home: &Path) -> Daemon {
-    let child = Command::new(env!("CARGO_BIN_EXE_avsm"))
+    let child = Command::new(env!("CARGO_BIN_EXE_avsmd"))
         .arg("--home")
         .arg(home)
-        .arg("start")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn avsm start");
-    let sock = avsm::kernel::socket_path(home);
+        .expect("spawn avsmd");
+    let sock = avsmd::kernel::socket_path(home);
     let began = Instant::now();
-    while !avsm::protocol::alive(&sock) {
+    while !avsmd::protocol::alive(&sock) {
         assert!(
             began.elapsed() < Duration::from_secs(20),
-            "avsm did not start"
+            "avsmd did not start"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -77,7 +76,7 @@ fn says_so_when_not_running() {
     let (ok, text) = avsm(home.path(), &["status"]);
     assert!(!ok);
     assert!(
-        text.contains("avsm is not running; start it with: avsm start"),
+        text.contains("avsmd is not running; start it with: avsmd"),
         "{text}"
     );
 }
@@ -90,8 +89,8 @@ fn help_reads_plainly() {
         .unwrap();
     let help = String::from_utf8_lossy(&out.stdout).to_lowercase();
     for cmd in [
-        "start", "add", "status", "tail", "asks", "approve", "deny", "pause", "resume", "why",
-        "propose", "know", "digest",
+        "add", "status", "tail", "asks", "approve", "deny", "pause", "resume", "why", "propose",
+        "know", "digest", "doctor",
     ] {
         assert!(
             help.contains(&format!("  {cmd} ")),
@@ -104,7 +103,7 @@ fn help_reads_plainly() {
         assert!(!help.contains(word), "help uses jargon {word:?}:\n{help}");
     }
     for cmd in [
-        "add", "tail", "approve", "deny", "pause", "resume", "why", "propose", "know",
+        "add", "tail", "approve", "deny", "pause", "resume", "why", "propose", "know", "doctor",
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_avsm"))
             .args([cmd, "--help"])

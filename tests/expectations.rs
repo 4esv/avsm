@@ -8,10 +8,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Entry, Kind, Record, Seq, Signal, Verdict};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Entry, Kind, Record, Seq, Signal, Verdict};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 
 /// The virtual clock is shared by the whole process: one test at a time.
 static CLOCK: Mutex<()> = Mutex::new(());
@@ -22,7 +22,7 @@ const HOUR: i64 = 3_600;
 
 fn clock() -> MutexGuard<'static, ()> {
     let guard = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
-    avsm::clock::set(T0);
+    avsmd::clock::set(T0);
     guard
 }
 
@@ -94,7 +94,7 @@ impl Fixture {
     /// One report of the metric, an hour after the last.
     fn report(&mut self, value: f64) {
         self.now += HOUR;
-        avsm::clock::set(self.now);
+        avsmd::clock::set(self.now);
         std::fs::write(self.dir.join("value"), format!("{value}\n")).unwrap();
         self.k.report("raiser", false);
     }

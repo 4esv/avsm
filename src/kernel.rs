@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,7 @@ use chrono::{Local, NaiveDate, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::exit::{self, Exit};
 use crate::gate::{self, Adopted, Candidate, Reason, State, DELEGATE, SELF};
 use crate::index::Index;
 use crate::ledger::Ledger;
@@ -141,13 +142,37 @@ pub fn now() -> i64 {
     warden::now()
 }
 
-/// Where avsm keeps its files: `$AVSM_HOME`, else `~/.avsm`.
+/// Where avsmd keeps its files: `$AVSMD_HOME`, else the platform's place
+/// for a daemon's state.
 pub fn default_home() -> PathBuf {
-    if let Some(h) = std::env::var_os("AVSM_HOME") {
-        return PathBuf::from(h);
+    home_for(std::env::consts::OS, |name| std::env::var_os(name))
+}
+
+/// The home on an operating system, with the environment read through
+/// `env`: `$AVSMD_HOME` when set; on macOS
+/// `~/Library/Application Support/avsmd`; elsewhere
+/// `$XDG_STATE_HOME/avsmd`, which defaults to `~/.local/state/avsmd`.
+pub fn home_for(os: &str, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    let set = |name: &str| env(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(h) = set("AVSMD_HOME") {
+        return h;
     }
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".avsm")
+    let home = set("HOME").unwrap_or_else(|| PathBuf::from("."));
+    if os == "macos" {
+        return home.join("Library/Application Support/avsmd");
+    }
+    // XDG says a relative XDG_STATE_HOME is invalid and is ignored.
+    match set("XDG_STATE_HOME").filter(|p| p.is_absolute()) {
+        Some(state) => state.join("avsmd"),
+        None => home.join(".local/state/avsmd"),
+    }
+}
+
+/// Where avsm 1.0 kept its files.
+pub fn old_home(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("HOME")
+        .filter(|v| !v.is_empty())
+        .map(|h| PathBuf::from(h).join(".avsm"))
 }
 
 /// The socket inside a home directory.
@@ -165,7 +190,7 @@ impl Role for NoRole {
         _infer: &mut dyn FnMut(&InferRequest) -> Result<String, String>,
         _drill: &mut dyn FnMut(&str, &str) -> Result<String, String>,
     ) -> Result<Vec<Record>, String> {
-        Err("no roles process; start avsm with: avsm start".to_string())
+        Err("no roles process; start one with: avsmd".to_string())
     }
 }
 
@@ -174,21 +199,21 @@ struct NoWarden;
 
 impl Warden for NoWarden {
     fn execute(&mut self, _candidate: &Candidate) -> Result<Vec<Entry>, Failure> {
-        Err("no warden process; start avsm with: avsm start"
+        Err("no warden process; start one with: avsmd"
             .to_string()
             .into())
     }
 
     fn infer(&mut self, _request: &InferRequest) -> Result<String, String> {
-        Err("no warden process; start avsm with: avsm start".to_string())
+        Err("no warden process; start one with: avsmd".to_string())
     }
 
     fn measure(&mut self, _venture: &str) -> Result<(Option<f64>, String), String> {
-        Err("no warden process; start avsm with: avsm start".to_string())
+        Err("no warden process; start one with: avsmd".to_string())
     }
 
     fn confirm(&mut self, _intent: Seq) -> Result<Option<(bool, String)>, String> {
-        Err("no warden process; start avsm with: avsm start".to_string())
+        Err("no warden process; start one with: avsmd".to_string())
     }
 }
 
@@ -346,6 +371,7 @@ impl Kernel {
             ("add", [dir]) => self.add(Path::new(dir)),
             ("status", []) => self.status(),
             ("tail", []) => self.tail(20),
+            ("tail", ["--since", seq]) => self.tail_since(parse_seq(seq)?),
             ("tail", [n]) => self.tail(
                 n.parse()
                     .map_err(|_| format!("tail takes a count, not {n:?}"))?,
@@ -373,7 +399,7 @@ impl Kernel {
             ("propose", [venture, lever, payload @ ..]) => {
                 self.propose(venture, lever, Some(&payload.join(" ")))
             }
-            _ => Err(format!("avsm does not understand: {}", args.join(" "))),
+            _ => Err(format!("avsmd does not understand: {}", args.join(" "))),
         }
     }
 
@@ -719,6 +745,12 @@ impl Kernel {
         Ok(entries.iter().map(|e| e.line() + "\n").collect())
     }
 
+    /// Every record after `seq`, one line each, oldest first.
+    pub fn tail_since(&self, seq: Seq) -> Result<String, String> {
+        let entries = self.ledger.after(seq).map_err(|e| e.to_string())?;
+        Ok(entries.iter().map(|e| e.line() + "\n").collect())
+    }
+
     /// The questions waiting for a human, one line each, with the payload
     /// the lever would consume under each that carries one.
     pub fn asks(&self) -> Result<String, String> {
@@ -1052,13 +1084,17 @@ impl Kernel {
         let now = now();
         self.close_stale_refusals();
         for (name, paused) in names.iter().zip(paused) {
+            // Draining: what is in flight finishes; nothing new starts.
+            if stopping() {
+                return;
+            }
             self.supervise(name, paused);
             let due = self.runtime.entry(name.clone()).or_default().next_report <= now;
             if due && self.ventures[name].problem.is_none() {
                 self.report(name, halted);
             }
         }
-        if !halted {
+        if !halted && !stopping() {
             self.act_on_decisions();
             for name in &names {
                 if self.capacity_due(name) {
@@ -1717,6 +1753,14 @@ impl Kernel {
                 }
             }
         };
+        if judged.is_ok() && stopping() {
+            // Draining: no lever starts once the daemon is stopping. The
+            // proof stays in the ledger and the next start runs the gate
+            // again.
+            lines.push(format!("{name}: {action} not run: avsmd is stopping"));
+            log(lines.last().map_or("", String::as_str));
+            return lines;
+        }
         match judged {
             Ok(_) => match self.warden.execute(&candidate) {
                 Ok(written) => {
@@ -3031,7 +3075,22 @@ pub fn ago(secs: i64) -> String {
 
 fn log(line: &str) {
     if !QUIET.with(std::cell::Cell::get) {
-        eprintln!("avsm: {line}");
+        eprintln!("avsmd: {line}");
+    }
+}
+
+/// Verbose diagnostics, on with `avsmd -d`.
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+/// Turn verbose diagnostics on, for this process and the ones it starts.
+pub fn set_debug() {
+    DEBUG.store(true, Ordering::SeqCst);
+}
+
+/// A diagnostic only `avsmd -d` prints.
+pub(crate) fn debug(line: &str) {
+    if DEBUG.load(Ordering::Relaxed) {
+        log(line);
     }
 }
 
@@ -3064,20 +3123,26 @@ pub struct Process {
 }
 
 impl Process {
-    /// Spawn `avsm --home <home> <what>` with a clean environment. With
-    /// `drop` and root privileges, the child runs as `nobody`.
+    /// Spawn `avsmd --home <home> <what>` with a clean environment, and
+    /// the config file and debug flag this process was given. With `drop`
+    /// and root privileges, the child runs as `nobody`.
     pub fn spawn(home: &Path, what: &str, drop: bool) -> Result<Process, String> {
-        let exe = std::env::current_exe().map_err(|e| format!("cannot find avsm: {e}"))?;
+        let exe = std::env::current_exe().map_err(|e| format!("cannot find avsmd: {e}"))?;
         Process::spawn_exe(&exe, home, what, drop)
     }
 
-    /// Spawn a given avsm binary; see `spawn`.
+    /// Spawn a given avsmd binary; see `spawn`.
     pub fn spawn_exe(exe: &Path, home: &Path, what: &str, drop: bool) -> Result<Process, String> {
         let build = |drop: bool| {
             let mut cmd = Command::new(exe);
-            cmd.arg("--home")
-                .arg(home)
-                .arg(what)
+            cmd.arg("--home").arg(home);
+            if let Some(file) = crate::config::chosen() {
+                cmd.arg("-f").arg(file);
+            }
+            if DEBUG.load(Ordering::Relaxed) {
+                cmd.arg("-d");
+            }
+            cmd.arg(what)
                 .env_clear()
                 .env(
                     "PATH",
@@ -3102,7 +3167,7 @@ impl Process {
             Ok(c) => c,
             Err(e) if drop && unprivileged().is_some() => {
                 log(&format!(
-                    "cannot start the {what} process as nobody ({e}); running it as root instead.                      Put avsm somewhere nobody can read, like /usr/local/bin."
+                    "cannot start the {what} process as nobody ({e}); running it as root instead.                      Put avsmd somewhere nobody can read, like /usr/local/bin."
                 ));
                 build(false)
                     .spawn()
@@ -3178,7 +3243,7 @@ impl WardenProcess {
         Process::spawn(home, "warden", false).map(WardenProcess)
     }
 
-    /// Spawn from a given avsm binary.
+    /// Spawn from a given avsmd binary.
     pub fn spawn_exe(exe: &Path, home: &Path) -> Result<WardenProcess, String> {
         Process::spawn_exe(exe, home, "warden", false).map(WardenProcess)
     }
@@ -3247,7 +3312,7 @@ impl RolesProcess {
         Process::spawn(home, "roles", true).map(RolesProcess)
     }
 
-    /// Spawn from a given avsm binary.
+    /// Spawn from a given avsmd binary.
     pub fn spawn_exe(exe: &Path, home: &Path) -> Result<RolesProcess, String> {
         Process::spawn_exe(exe, home, "roles", true).map(RolesProcess)
     }
@@ -3290,6 +3355,9 @@ impl Role for RolesProcess {
 
 /// The body of the warden process: answer the kernel until it hangs up.
 pub fn warden_main(home: &Path) -> Result<(), String> {
+    // A stop drains: the run in flight is signalled and waited on, and its
+    // outcome written; the warden then answers until the kernel hangs up.
+    warden::drain_on_signals();
     let mut warden = LocalWarden::open(home)?;
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
@@ -3333,6 +3401,12 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
 /// The body of the roles process: decide when asked, with backend calls
 /// routed back through the kernel to the warden. Holds no keys.
 pub fn roles_main() -> Result<(), String> {
+    // The kernel decides when roles stop: it hangs up.
+    // SAFETY: setting a disposition to SIG_IGN runs no code in the handler.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+    }
     let mut role = ModelRole;
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
@@ -3387,19 +3461,75 @@ pub fn roles_main() -> Result<(), String> {
 
 // ----- start -----
 
+/// How long a stop may take: the tick in flight finishes, and runs and
+/// the lever in flight are signalled and waited on this long.
+pub const DRAIN: Duration = Duration::from_secs(10);
+
 static STOP: AtomicBool = AtomicBool::new(false);
+
+/// The warden process's pid, for the signal handler to pass a stop on to.
+static WARDEN_PID: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
+    let pid = WARDEN_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: kill is async-signal-safe.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
 }
 
-/// Run avsm in the foreground: spawn the warden and the roles process,
-/// answer commands on the socket, and tick once a second until a signal.
-pub fn start(home: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(home).map_err(|e| format!("cannot create {}: {e}", home.display()))?;
-    Config::load(home)?;
+/// Is the daemon draining after SIGTERM or SIGINT?
+pub(crate) fn stopping() -> bool {
+    STOP.load(Ordering::Relaxed)
+}
+
+impl Kernel {
+    /// Stop every venture's `run`: SIGTERM, then SIGKILL for any still
+    /// running at `deadline`.
+    fn drain(&mut self, deadline: Instant) {
+        for (name, rt) in self.runtime.iter() {
+            if let Some(child) = &rt.run {
+                log(&format!("{name}: stopping run"));
+                // SAFETY: kill has no memory preconditions.
+                unsafe {
+                    libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+                }
+            }
+        }
+        for rt in self.runtime.values_mut() {
+            if let Some(child) = rt.run.as_mut() {
+                while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            kill(rt);
+        }
+    }
+}
+
+/// Run avsmd in the foreground: spawn the warden and the roles process,
+/// answer commands on the socket, and tick once a second until SIGTERM or
+/// SIGINT; then drain and return.
+pub fn start(home: &Path) -> Result<(), Exit> {
+    std::fs::create_dir_all(home).map_err(|e| {
+        Exit::new(
+            exit::CANTCREAT,
+            format!("cannot create {}: {e}", home.display()),
+        )
+    })?;
+    let config = load_config(home)?;
     let sock = socket_path(home);
-    let listener = crate::protocol::bind(&sock)?;
+    let listener = crate::protocol::bind(&sock).map_err(|e| {
+        let code = if crate::protocol::alive(&sock) {
+            exit::TEMPFAIL
+        } else {
+            exit::CANTCREAT
+        };
+        Exit::new(code, e)
+    })?;
     let warden = WardenProcess::spawn(home)?;
     let roles = RolesProcess::spawn(home)?;
     log(&format!(
@@ -3407,19 +3537,19 @@ pub fn start(home: &Path) -> Result<(), String> {
         warden.id(),
         roles.id()
     ));
-    let mut kernel = Kernel::with(home, Box::new(roles), Box::new(warden))?;
-    kernel.forecasts = true;
-    kernel.adopt_self()?;
-    let kernel = Arc::new(Mutex::new(kernel));
-    // SAFETY: the handler only stores to an atomic.
+    WARDEN_PID.store(warden.id() as i32, Ordering::SeqCst);
+    // SAFETY: the handler only stores to atomics and calls kill.
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
     }
+    let mut kernel = Kernel::with(home, Box::new(roles), Box::new(warden))?;
+    kernel.forecasts = true;
+    kernel.adopt_self()?;
+    let kernel = Arc::new(Mutex::new(kernel));
     log(&format!("listening at {}", sock.display()));
     let server = Arc::clone(&kernel);
     std::thread::spawn(move || crate::protocol::serve(listener, server));
-    let config = Config::load(home)?;
     match crate::tailscale::start(&config, Arc::clone(&kernel)) {
         Ok(Some(at)) => log(&format!(
             "listening on the tailnet at {at} for {}",
@@ -3428,17 +3558,48 @@ pub fn start(home: &Path) -> Result<(), String> {
         Ok(None) => {}
         Err(e) => log(&e),
     }
-    while !STOP.load(Ordering::SeqCst) {
+    // When the stop came: the tick in flight finishes first.
+    let stopped = loop {
+        if stopping() {
+            break Instant::now();
+        }
         {
             let mut k = kernel.lock().unwrap_or_else(|p| p.into_inner());
+            let began = Instant::now();
             k.tick();
+            debug(&format!("tick took {:?}", began.elapsed()));
         }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    log("stopping");
-    kernel.lock().unwrap_or_else(|p| p.into_inner()).shutdown();
+        // A second between ticks, in short steps so a stop is seen at once.
+        for _ in 0..20 {
+            if stopping() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // No new commands: the socket goes first, and a command already
+    // waiting on the kernel is told the daemon is stopping.
     let _ = std::fs::remove_file(&sock);
+    log("stopping");
+    kernel
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain(stopped + DRAIN - Duration::from_secs(1));
+    log("stopped");
     Ok(())
+}
+
+/// The config in force, or the exit code that says why not: a file
+/// `avsmd -f` named that is not there, or one that does not parse.
+pub fn load_config(home: &Path) -> Result<Config, Exit> {
+    let path = crate::config::path(home);
+    if crate::config::chosen().is_some() && !path.is_file() {
+        return Err(Exit::new(
+            exit::NOINPUT,
+            format!("no config file at {}", path.display()),
+        ));
+    }
+    Config::load(home).map_err(|e| Exit::new(exit::CONFIG, e))
 }
 
 /// The master caution line: which ventures need a human, or that none do.
@@ -3470,5 +3631,62 @@ mod tests {
         assert_eq!(precision([1.0, 2.0].into_iter()), 0);
         assert_eq!(precision(std::iter::empty()), 0);
         assert_eq!(precision([0.1234567891].into_iter()), 6);
+    }
+
+    #[test]
+    fn the_default_home_is_the_platforms_and_avsmd_home_overrides_it() {
+        use super::home_for;
+        use std::path::PathBuf;
+        fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+            let vars: Vec<(String, String)> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        }
+        let home = [("HOME", "/u/ada")];
+        assert_eq!(
+            home_for("macos", env(&home)),
+            PathBuf::from("/u/ada/Library/Application Support/avsmd")
+        );
+        assert_eq!(
+            home_for("linux", env(&home)),
+            PathBuf::from("/u/ada/.local/state/avsmd")
+        );
+        let xdg = [("HOME", "/u/ada"), ("XDG_STATE_HOME", "/var/st")];
+        assert_eq!(home_for("linux", env(&xdg)), PathBuf::from("/var/st/avsmd"));
+        // XDG is a Linux convention; macOS keeps its own place.
+        assert_eq!(
+            home_for("macos", env(&xdg)),
+            PathBuf::from("/u/ada/Library/Application Support/avsmd")
+        );
+        // A relative or empty XDG_STATE_HOME is ignored, as XDG says.
+        for bad in [
+            [("HOME", "/u/ada"), ("XDG_STATE_HOME", "state")],
+            [("HOME", "/u/ada"), ("XDG_STATE_HOME", "")],
+        ] {
+            assert_eq!(
+                home_for("linux", env(&bad)),
+                PathBuf::from("/u/ada/.local/state/avsmd")
+            );
+        }
+        let set = [
+            ("HOME", "/u/ada"),
+            ("XDG_STATE_HOME", "/var/st"),
+            ("AVSMD_HOME", "/srv/avsmd"),
+        ];
+        for os in ["macos", "linux", "freebsd"] {
+            assert_eq!(home_for(os, env(&set)), PathBuf::from("/srv/avsmd"));
+        }
+        // 1.0's variable means nothing now.
+        let old = [("HOME", "/u/ada"), ("AVSM_HOME", "/srv/avsm")];
+        assert_eq!(
+            home_for("linux", env(&old)),
+            PathBuf::from("/u/ada/.local/state/avsmd")
+        );
     }
 }

@@ -6,11 +6,11 @@ use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use avsm::gate::{Candidate, Proof};
-use avsm::kernel::Kernel;
-use avsm::record::{self, Claim, Entry, Kind, Payload, Record, Seq, Signal};
-use avsm::role::{Context, InferRequest, ModelRole, Role};
-use avsm::warden::{LocalWarden, Warden};
+use avsmd::gate::{Candidate, Proof};
+use avsmd::kernel::Kernel;
+use avsmd::record::{self, Claim, Entry, Kind, Payload, Record, Seq, Signal};
+use avsmd::role::{Context, InferRequest, ModelRole, Role};
+use avsmd::warden::{LocalWarden, Warden};
 
 struct FakeRole(VecDeque<Vec<Record>>);
 
@@ -30,7 +30,7 @@ impl Role for FakeRole {
 struct Confirming(LocalWarden);
 
 impl Warden for Confirming {
-    fn execute(&mut self, c: &Candidate) -> Result<Vec<Entry>, avsm::warden::Failure> {
+    fn execute(&mut self, c: &Candidate) -> Result<Vec<Entry>, avsmd::warden::Failure> {
         self.0.execute(c)
     }
     fn infer(&mut self, r: &InferRequest) -> Result<String, String> {

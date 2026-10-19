@@ -4,8 +4,8 @@
 
 use std::path::Path;
 
-use avsm::record::Record;
-use avsm::simulate::{run, Human, Plan};
+use avsmd::record::Record;
+use avsmd::simulate::{run, Human, Plan};
 
 /// The world the simulation runs the vent in: it opens the vent as the
 /// real lever would, writing the time it opened for the report to read.
@@ -42,7 +42,7 @@ fn the_temperature_follows_the_clock_and_the_vent_lowers_it() {
     run(&home, &plan, &mut out).unwrap();
     let text = String::from_utf8(out).unwrap();
 
-    let k = avsm::kernel::Kernel::open(&home).unwrap();
+    let k = avsmd::kernel::Kernel::open(&home).unwrap();
     let entries = k.entries().unwrap();
     let temps: Vec<(i64, f64)> = entries
         .iter()
@@ -72,7 +72,7 @@ fn the_temperature_follows_the_clock_and_the_vent_lowers_it() {
     let vents: Vec<i64> = entries
         .iter()
         .filter(|e| {
-            e.record.action() == Some("vent") && e.record.kind() == avsm::record::Kind::Intent
+            e.record.action() == Some("vent") && e.record.kind() == avsmd::record::Kind::Intent
         })
         .map(|e| e.at - start)
         .collect();
@@ -81,7 +81,7 @@ fn the_temperature_follows_the_clock_and_the_vent_lowers_it() {
     let intent = entries
         .iter()
         .find(|e| {
-            e.record.action() == Some("vent") && e.record.kind() == avsm::record::Kind::Intent
+            e.record.action() == Some("vent") && e.record.kind() == avsmd::record::Kind::Intent
         })
         .unwrap()
         .seq;

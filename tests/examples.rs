@@ -10,10 +10,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Kind, Record};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Kind, Record};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 use common::{imap_stub, ran, route, Stub};
 
 struct Scripted {

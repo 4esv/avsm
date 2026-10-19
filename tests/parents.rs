@@ -10,10 +10,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Kind, Record};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Kind, Record};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 use common::{ran, route, Stub};
 
 /// A role that answers from a script and keeps what it was shown.

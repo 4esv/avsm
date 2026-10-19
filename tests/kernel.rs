@@ -12,11 +12,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use avsm::gate::Candidate;
-use avsm::kernel::{Kernel, RolesProcess, WardenProcess};
-use avsm::record::{Claim, Kind, Payload, Record, Signal};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::{LocalWarden, Warden};
+use avsmd::gate::Candidate;
+use avsmd::kernel::{Kernel, RolesProcess, WardenProcess};
+use avsmd::record::{Claim, Kind, Payload, Record, Signal};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::{LocalWarden, Warden};
 
 /// A role that answers from a script of replies.
 struct FakeRole(VecDeque<Vec<Record>>);
@@ -78,7 +78,7 @@ fn proposal_with(venture: &str, action: &str, text: &str) -> Record {
     }
 }
 
-fn kinds(entries: &[avsm::record::Entry]) -> Vec<(Kind, String)> {
+fn kinds(entries: &[avsmd::record::Entry]) -> Vec<(Kind, String)> {
     entries
         .iter()
         .map(|e| (e.record.kind(), e.record.summary()))
@@ -473,8 +473,8 @@ fn warden_and_roles_run_as_separate_processes() {
     );
     script(&dir, "report", "echo 5");
 
-    // The test binary is not avsm, so point the children at the real one.
-    let exe = Path::new(env!("CARGO_BIN_EXE_avsm"));
+    // The test binary is not avsmd, so point the children at the real one.
+    let exe = Path::new(env!("CARGO_BIN_EXE_avsmd"));
     let warden = WardenProcess::spawn_exe(exe, &home).unwrap();
     let roles = RolesProcess::spawn_exe(exe, &home).unwrap();
     let mut k = Kernel::with(&home, Box::new(roles), Box::new(warden)).unwrap();
@@ -841,7 +841,7 @@ fn network_none_confines_the_run_where_namespaces_exist() {
     std::thread::sleep(Duration::from_millis(100));
     let verdict = std::fs::read_to_string(dir.join("verdict")).unwrap();
     let status = k.status().unwrap();
-    if avsm::kernel::namespaces_available() {
+    if avsmd::kernel::namespaces_available() {
         assert_eq!(verdict.trim(), "failed", "{status}");
         assert!(!status.contains("not enforced"), "{status}");
     } else {
@@ -923,7 +923,7 @@ fn a_cycle_that_yields_nothing_usable_leaves_a_record() {
         script(d, "report", "echo 5");
     }
     let warden = LocalWarden::open(&home).unwrap();
-    let mut k = Kernel::with(&home, Box::new(avsm::role::ModelRole), Box::new(warden)).unwrap();
+    let mut k = Kernel::with(&home, Box::new(avsmd::role::ModelRole), Box::new(warden)).unwrap();
     k.add(&shop).unwrap();
     k.add(&mute).unwrap();
     k.cycle("shop");

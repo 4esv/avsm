@@ -8,10 +8,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Entry, Kind, Payload, Record};
-use avsm::role::{Context, InferRequest, ModelRole, Role};
-use avsm::warden::LocalWarden;
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Entry, Kind, Payload, Record};
+use avsmd::role::{Context, InferRequest, ModelRole, Role};
+use avsmd::warden::LocalWarden;
 
 /// Everything a scenario sets: what each backend prints and how it is
 /// configured.
@@ -301,7 +301,7 @@ fn without_escalate_configured_there_is_no_escalation() {
     assert!(w.escalation().is_none(), "{}", w.lines());
     assert!(w.report("unusable").is_some(), "{}", w.lines());
     // Asking by hand gives nothing either.
-    let request = avsm::role::InferRequest {
+    let request = avsmd::role::InferRequest {
         backend: "primary".into(),
         system: String::new(),
         user: String::new(),
@@ -526,7 +526,7 @@ fn a_ratchet_proposal_cannot_add_escalate_offbox() {
     assert!(
         !entries.iter().any(|e| matches!(
             &e.record,
-            Record::Decision { verdict: avsm::record::Verdict::Adopt { text: Some(t), .. }, .. }
+            Record::Decision { verdict: avsmd::record::Verdict::Adopt { text: Some(t), .. }, .. }
                 if t.contains("offbox")
         )),
         "nothing adopted it"

@@ -8,12 +8,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use avsm::adapter::Metric;
-use avsm::config::Adapters;
-use avsm::kernel::Kernel;
-use avsm::record::{Kind, Record};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::adapter::Metric;
+use avsmd::config::Adapters;
+use avsmd::kernel::Kernel;
+use avsmd::record::{Kind, Record};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 use common::{imap_stub, ran, route, Stub};
 
 /// A role that never says anything.

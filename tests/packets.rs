@@ -7,12 +7,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use avsm::config::{Config, Quotas};
-use avsm::gate::{self, Candidate, Reason};
-use avsm::kernel::Kernel;
-use avsm::record::{Claim, Entry, Kind, Packet, Payload, Record, Seq, Signal, Verdict};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::config::{Config, Quotas};
+use avsmd::gate::{self, Candidate, Reason};
+use avsmd::kernel::Kernel;
+use avsmd::record::{Claim, Entry, Kind, Packet, Payload, Record, Seq, Signal, Verdict};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 
 /// The virtual clock is shared by the whole process: one test at a time.
 static CLOCK: Mutex<()> = Mutex::new(());
@@ -21,7 +21,7 @@ const T0: i64 = 1_800_057_600;
 
 fn clock() -> MutexGuard<'static, ()> {
     let guard = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
-    avsm::clock::set(T0);
+    avsmd::clock::set(T0);
     guard
 }
 
@@ -237,7 +237,7 @@ fn blog_ask(forecasts: bool) -> Packet {
     std::fs::write(dir.join("value"), "100\n").unwrap();
     k.add(&dir).unwrap();
     for v in [1, 2, 3] {
-        avsm::clock::advance(3_600);
+        avsmd::clock::advance(3_600);
         std::fs::write(dir.join("value"), format!("{v}\n")).unwrap();
         k.report("blog", false);
     }
@@ -270,7 +270,7 @@ fn with_forecasts_on_each_option_carries_a_forecast_and_with_them_off_it_says_no
     }
     assert!(!on.render().contains("no forecast"));
 
-    avsm::clock::set(T0);
+    avsmd::clock::set(T0);
     let off = blog_ask(false);
     assert!(off.options.iter().all(|o| o.forecast.is_none()));
     let shown = off.render();
@@ -359,7 +359,7 @@ fn a_canary_ask_can_never_run_even_when_approved() {
         },
         &k.adopted(),
         &Quotas::default(),
-        avsm::clock::now(),
+        avsmd::clock::now(),
     )
     .unwrap_err();
     assert!(

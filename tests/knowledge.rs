@@ -8,10 +8,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use avsm::kernel::{Kernel, RolesProcess, WardenProcess};
-use avsm::record::{Claim, Kind, Record};
-use avsm::role::{Context, InferRequest, Role};
-use avsm::warden::LocalWarden;
+use avsmd::kernel::{Kernel, RolesProcess, WardenProcess};
+use avsmd::record::{Claim, Kind, Record};
+use avsmd::role::{Context, InferRequest, Role};
+use avsmd::warden::LocalWarden;
 
 struct Scripted {
     replies: VecDeque<Vec<Record>>,
@@ -172,7 +172,7 @@ fn past_the_bound_the_older_records_are_summarized_and_leave_the_context() {
     k.propose("shop", "wipe", None).unwrap(); // an open ask, always in context
     k.cycle("shop");
     let ctx = seen.lock().unwrap().pop().unwrap();
-    let seqs = |v: &Vec<avsm::record::Entry>| v.iter().map(|e| e.seq).collect::<Vec<_>>();
+    let seqs = |v: &Vec<avsmd::record::Entry>| v.iter().map(|e| e.seq).collect::<Vec<_>>();
     // #1 adopted, #2..#9 reports, #10 proposal, #11 ask: uncovered are 1..10 (11 is open).
     assert_eq!(
         seqs(&ctx.to_summarize),
@@ -257,7 +257,7 @@ fn a_model_drills_through_the_roles_process_and_each_drill_is_a_record() {
         "purpose: Sell.\nmetric: shell echo 5\ncontroller: {kind: model}\ncadence: 1h\n\
          permitted:\n- {name: tidy, run: touch tidied, cap: 3/day, reversible: true}\n",
     );
-    let exe = Path::new(env!("CARGO_BIN_EXE_avsm"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_avsmd"));
     let warden = WardenProcess::spawn_exe(exe, &home).unwrap();
     let roles = RolesProcess::spawn_exe(exe, &home).unwrap();
     let mut k = Kernel::with(&home, Box::new(roles), Box::new(warden)).unwrap();
@@ -321,7 +321,7 @@ fn a_model_drills_through_the_roles_process_and_each_drill_is_a_record() {
 
 #[test]
 fn the_kernel_computes_a_summarys_facts_and_ignores_the_roles() {
-    use avsm::facts::{Facts, MetricFacts};
+    use avsmd::facts::{Facts, MetricFacts};
     let tmp = tempfile::tempdir().unwrap();
     let home = home(
         tmp.path(),
