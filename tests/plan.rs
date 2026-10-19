@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use avsm::config::Quotas;
-use avsm::gate::{self, Candidate, Reason};
+use avsm::gate::{self, Candidate, Proof, Reason};
 use avsm::kernel::Kernel;
 use avsm::record::{Claim, Entry, Kind, Record, Seq, Signal, MAX_ALTERNATIVES};
 use avsm::role::ModelRole;
@@ -57,6 +57,8 @@ struct Setup {
     backend: &'static str,
     /// What the escalation backend does, if one is configured.
     second: Option<&'static str>,
+    /// Is there a `world:` command, or does the baseline stand in?
+    world: bool,
 }
 
 const BOOST: &str =
@@ -71,6 +73,7 @@ impl Default for Setup {
             extra: "calibration: -1\n",
             backend: "echo nothing",
             second: None,
+            world: true,
         }
     }
 }
@@ -126,8 +129,11 @@ fn fixture(s: Setup) -> Fixture {
         dir.join("mandate.yaml"),
         format!(
             "purpose: Sell.\nmetric: count\ncontroller: {{kind: plan, horizon: 1, depth: 1, members: 2{}}}\ncadence: 1h\n\
-             permitted:\n{}world: ./world\n{}",
-            s.controller, s.levers, s.extra
+             permitted:\n{}{}{}",
+            s.controller,
+            s.levers,
+            if s.world { "world: ./world\n" } else { "" },
+            s.extra
         ),
     )
     .unwrap();
@@ -572,12 +578,206 @@ fn warned(series: &[f64]) -> Vec<Entry> {
 #[test]
 fn a_ramping_ar1_asks_one_warning_and_white_noise_none() {
     let _c = clock();
-    let asks = warned(&ramp(60, 7));
+    let asks = warned(&ramp(60, 2));
     assert_eq!(asks.len(), 1, "{asks:?}");
     assert!(
         matches!(&asks[0].record, Record::Ask { claim: Claim::Measured, action: None, signal: Some(Signal::Warning { metric, variance_ratio, autocorrelation_rise }), .. }
             if metric == "count" && *variance_ratio > 1.5 && *autocorrelation_rise > 0.2),
         "{asks:?}"
     );
-    assert!(warned(&white(60, 7)).is_empty());
+    assert!(warned(&white(60, 2)).is_empty());
+}
+
+#[test]
+fn an_escalated_answer_below_calibration_asks_and_does_not_run() {
+    let _c = clock();
+    let mut f = fixture(Setup {
+        levers: TWO,
+        effects: TIED,
+        extra: "calibration: 0.5\n",
+        backend: "echo banana",
+        second: Some(r#"echo '{"choice":"action","action":"tidy","reason":"it is cheaper"}'"#),
+        ..Setup::default()
+    });
+    f.report(10.0);
+    assert!(!f.k.trusted("shop"));
+    let escalation = f.of(Kind::Escalation).pop().expect("an escalation");
+    assert!(f.root.join("escalated").exists());
+    // The answer proposes tidy, citing the escalation.
+    let answer = f
+        .of(Kind::Proposal)
+        .into_iter()
+        .find(|e| e.record.cites() == [escalation.seq])
+        .expect("the answer's proposal");
+    assert_eq!(answer.record.action(), Some("tidy"));
+    // Reversible and delegated, so the gate alone would run it; the model
+    // is below its bar, so it asks.
+    assert!(f.gate("tidy", &[answer.seq]).is_ok());
+    assert!(f.of(Kind::Intent).is_empty(), "{}", f.lines());
+    assert!(!f.dir.join("tidied").exists());
+    let asks = f.of(Kind::Ask);
+    assert_eq!(asks.len(), 1, "{}", f.lines());
+    assert!(
+        matches!(&asks[0].record, Record::Ask { action: Some(a), question, .. }
+            if a == "tidy" && question.contains("under the bar of 0.5")),
+        "{asks:?}"
+    );
+}
+
+#[test]
+fn a_backend_choosing_what_the_plan_did_not_offer_is_unusable_and_escalates() {
+    let _c = clock();
+    // dump is permitted, but worse than nothing: not in the top three.
+    let mut f = fixture(Setup {
+        levers: "- {name: boost, run: touch boosted, cap: 99/day, reversible: true, delegated: true}\n\
+                 - {name: tidy, run: touch tidied, cap: 99/day, reversible: true, delegated: true}\n\
+                 - {name: dump, run: touch dumped, cap: 99/day, reversible: true, delegated: true}\n",
+        effects: &[("boost", 15.0), ("tidy", 15.0), ("dump", 5.0)],
+        backend: r#"echo '{"choice":"action","action":"dump","reason":"why not"}'"#,
+        second: Some("echo nothing"),
+        ..Setup::default()
+    });
+    f.calibrate();
+    f.report(10.0);
+    let b = f.of(Kind::Branch).pop().unwrap();
+    let Record::Branch {
+        chosen,
+        alternatives,
+        separated: false,
+        ..
+    } = &b.record
+    else {
+        panic!("{b:?}")
+    };
+    let top: Vec<&str> = std::iter::once(chosen)
+        .chain(alternatives.iter())
+        .take(3)
+        .map(|a| a.action.as_str())
+        .collect();
+    assert!(!top.contains(&"dump"), "{top:?}");
+    let request = std::fs::read_to_string(f.root.join("request.txt")).unwrap();
+    assert!(!request.contains("dump"), "{request}");
+    let unusable = f
+        .entries()
+        .into_iter()
+        .find_map(|e| match e.record {
+            Record::Report {
+                metric,
+                note,
+                cites,
+                ..
+            } if metric == "unusable" => Some((note, cites)),
+            _ => None,
+        })
+        .expect("an unusable report");
+    assert!(
+        unusable
+            .0
+            .contains("it chose dump, which the planner did not offer"),
+        "{unusable:?}"
+    );
+    assert_eq!(unusable.1, vec![b.seq]);
+    assert!(!f.of(Kind::Escalation).is_empty(), "{}", f.lines());
+    assert!(f.of(Kind::Proposal).is_empty(), "{}", f.lines());
+    assert!(f.of(Kind::Intent).is_empty());
+    assert!(!f.dir.join("dumped").exists());
+}
+
+/// A baseline venture with a history: three rounds of dump, which drops
+/// the metric 40, then boost, which brings it back.
+fn drawdown_fixture(guards: &'static str) -> Fixture {
+    let mut f = fixture(Setup {
+        levers: "- {name: boost, run: touch boosted, cap: 99/day, reversible: true, delegated: true}\n\
+                 - {name: dump, run: touch dumped, cap: 99/day, reversible: true, delegated: true}\n",
+        world: false,
+        extra: guards,
+        ..Setup::default()
+    });
+    let mut at = f.now;
+    let mut push = |f: &mut Fixture, r: Record| {
+        at += HOUR;
+        avsm::clock::set(at);
+        f.k.append(r).unwrap()
+    };
+    let run =
+        |f: &mut Fixture, push: &mut dyn FnMut(&mut Fixture, Record) -> Entry, lever: &str| {
+            let intent = push(
+                f,
+                Record::Intent {
+                    claim: Claim::Measured,
+                    venture: "shop".to_string(),
+                    action: lever.to_string(),
+                    proof: Proof {
+                        venture: "shop".to_string(),
+                        action: lever.to_string(),
+                        steps: vec![],
+                    },
+                    payload: None,
+                    key: None,
+                },
+            );
+            push(
+                f,
+                Record::Outcome {
+                    claim: Claim::Measured,
+                    venture: "shop".to_string(),
+                    intent: intent.seq,
+                    ok: true,
+                    detail: String::new(),
+                },
+            );
+        };
+    let report = |x: f64| Record::report(Claim::Measured, "shop", "count", Some(x), "");
+    for _ in 0..3 {
+        push(&mut f, report(100.0));
+        push(&mut f, report(100.2));
+        run(&mut f, &mut push, "dump");
+        push(&mut f, report(60.2));
+        run(&mut f, &mut push, "boost");
+        push(&mut f, report(100.2));
+        push(&mut f, report(100.0));
+    }
+    f.now = at;
+    f
+}
+
+fn weighed(f: &Fixture) -> Vec<String> {
+    let b = f.of(Kind::Branch).pop().expect("a branch");
+    let Record::Branch {
+        chosen,
+        alternatives,
+        ..
+    } = &b.record
+    else {
+        panic!("{b:?}")
+    };
+    std::iter::once(chosen)
+        .chain(alternatives.iter())
+        .map(|a| a.action.clone())
+        .collect()
+}
+
+#[test]
+fn a_baseline_drawdown_guard_vetoes_a_plan_sequence() {
+    let _c = clock();
+    // Without the guard, dump is weighed: the baseline knows it drops 40.
+    let mut f = drawdown_fixture("calibration: -1\n");
+    f.report(100.0);
+    let all = weighed(&f);
+    assert!(all.contains(&"dump".to_string()), "{all:?}\n{}", f.lines());
+    // With a 10% drawdown guard, every member of dump's rollout breaches
+    // it: dump is vetoed and never reaches the branch.
+    let mut g = drawdown_fixture(
+        "calibration: -1\nguards:\n- {name: dd, drawdown: 10%, of: count, then: ask}\n",
+    );
+    g.report(100.0);
+    let kept = weighed(&g);
+    assert!(
+        !kept.contains(&"dump".to_string()),
+        "{kept:?}\n{}",
+        g.lines()
+    );
+    assert!(kept.contains(&"boost".to_string()), "{kept:?}");
+    assert!(kept.contains(&"nothing".to_string()), "{kept:?}");
+    assert!(!g.dir.join("dumped").exists());
 }

@@ -252,14 +252,15 @@ pub fn rollout(
     }))
 }
 
-/// Can the best be told apart from the runner-up? Not when the best's
-/// worst member lies within the runner-up's p25 to p75.
+/// Can the best be told apart from the runner-up? Only when the best's
+/// worst member beats the runner-up's p75. At or below it, the best is
+/// within the runner-up's spread or worse than most of it: below its p25
+/// is the least separated case of all.
 pub fn separated(best: &Weighed, runner: &Weighed) -> bool {
     let Some(q) = world::quantiles(&runner.scores) else {
         return true;
     };
-    let w = best.worst();
-    !(q.p25 <= w && w <= q.p75)
+    best.worst() > q.p75
 }
 
 /// One Thompson draw among `eligible` (indices into `ranked`): a member at
@@ -585,6 +586,22 @@ mod tests {
         assert_eq!(plan.choice().action(), "b");
         assert!(!plan.separated, "{plan:?}");
         assert_eq!(plan.top(), vec!["b", "a", NOTHING]);
+        // B's worst, about 4.4, beats A's worst but lies below A's p25:
+        // B ranks first and is the least separated of all.
+        let world = toy(&[("a", 5.0, 1.0), ("b", 4.5, 0.1)]);
+        let ms = members(&world, 3, 16);
+        let plan = search(&ms, &problem(vec![lever("a"), lever("b")], &[])).unwrap();
+        assert_eq!(plan.choice().action(), "b");
+        let (b, a) = (&plan.ranked[0], &plan.ranked[1]);
+        let qa = world::quantiles(&a.scores).unwrap();
+        assert!(b.worst() > a.worst() && b.worst() < qa.p25, "{b:?} {qa:?}");
+        assert!(!plan.separated, "{plan:?}");
+        // Exactly at A's p75 is not separated either; just past it is.
+        let mut at = b.clone();
+        at.scores = vec![qa.p75; 16];
+        assert!(!separated(&at, a));
+        at.scores = vec![qa.p75 + 1e-9; 16];
+        assert!(separated(&at, a));
         // B's worst, about 6.9, is past A's p75.
         let world = toy(&[("a", 5.0, 1.0), ("b", 7.0, 0.1)]);
         let ms = members(&world, 3, 16);

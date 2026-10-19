@@ -33,6 +33,28 @@ impl Kernel {
         why: &str,
         request: &InferRequest,
     ) -> Result<Vec<Entry>, String> {
+        self.escalate_as(venture, why, request, false)
+    }
+
+    /// `escalate`, with the answer's proposals gone through `follow`, so a
+    /// world model below its calibration bar turns them into asks. The
+    /// planner escalates this way: its answer ranks by the same model.
+    pub fn escalate_calibrated(
+        &mut self,
+        venture: &str,
+        why: &str,
+        request: &InferRequest,
+    ) -> Result<Vec<Entry>, String> {
+        self.escalate_as(venture, why, request, true)
+    }
+
+    fn escalate_as(
+        &mut self,
+        venture: &str,
+        why: &str,
+        request: &InferRequest,
+        calibrated: bool,
+    ) -> Result<Vec<Entry>, String> {
         let Some(to) = self.config.escalate.clone() else {
             return Ok(vec![]);
         };
@@ -194,7 +216,11 @@ impl Kernel {
         for p in proposals {
             if let Some(action) = p.record.action() {
                 let action = action.to_string();
-                self.act(venture, &action, vec![p.seq], Claim::Inferred);
+                if calibrated {
+                    self.follow(venture, std::slice::from_ref(&action), vec![p.seq]);
+                } else {
+                    self.act(venture, &action, vec![p.seq], Claim::Inferred);
+                }
             }
         }
         Ok(written)

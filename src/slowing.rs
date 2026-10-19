@@ -1,16 +1,28 @@
 //! Critical slowing down: a system nearing a tipping point recovers more
 //! slowly from small shocks, so its readings wander further and remember
-//! more of the step before. Over the last `2W` plausible reports, compare
-//! the variance and the lag-1 autocorrelation of the first half with the
-//! second. Both rising past their margins is a warning; the first report
-//! of such an episode asks. Pure: numbers in, a verdict out.
+//! more of the step before. Over the last `SPAN` plausible reports, compare
+//! the variance and the lag-1 autocorrelation of the first `W` with the
+//! last `W`. Both rising past their margins is a warning. The first warning
+//! after `QUIET` reports without one starts an episode, and only that
+//! report asks. Pure: numbers in, a verdict out.
+//!
+//! The parameters are calibrated, not guessed: see
+//! `false_alarms_stay_under_two_percent_and_the_ramp_is_caught`, which
+//! bounds the false-alarm rate on white noise and the hit rate on an AR(1)
+//! whose coefficient ramps 0.2 to 0.95 with shocks growing 1 to 3, over
+//! 1000 seeded streams of 60 reports each.
 
-/// The half window, in reports.
+/// How many reports a comparison spans.
+pub const SPAN: usize = 55;
+/// The reports compared at each end of the span.
 pub const W: usize = 20;
-/// The second half's variance must exceed the first's by this factor.
-pub const VARIANCE_RATIO: f64 = 1.5;
-/// The second half's lag-1 autocorrelation must exceed the first's by this.
-pub const AUTOCORRELATION_RISE: f64 = 0.2;
+/// The last `W`'s variance must exceed the first `W`'s by this factor.
+pub const VARIANCE_RATIO: f64 = 3.0;
+/// The last `W`'s lag-1 autocorrelation must exceed the first's by this.
+pub const AUTOCORRELATION_RISE: f64 = 0.1;
+/// Reports without a warning before a warning starts a new episode: an
+/// episode cannot flicker.
+pub const QUIET: usize = W;
 
 /// The variance of a sample about its mean, and its lag-1 autocorrelation.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -19,7 +31,7 @@ pub struct Stats {
     pub autocorrelation: f64,
 }
 
-/// The stats of one half. None for fewer than three values.
+/// The stats of a sample. None for fewer than three values.
 pub fn stats(values: &[f64]) -> Option<Stats> {
     let n = values.len();
     if n < 3 {
@@ -40,7 +52,7 @@ pub fn stats(values: &[f64]) -> Option<Stats> {
     })
 }
 
-/// What a warning says: how the halves compare.
+/// What a warning says: how the two ends of the span compare.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rise {
     pub first: Stats,
@@ -68,27 +80,30 @@ impl Rise {
     }
 }
 
-/// The halves of the last `2W` values, oldest first. None with fewer.
+/// The first and last `W` of the last `SPAN` values, oldest first. None
+/// with fewer.
 pub fn compare(series: &[f64]) -> Option<Rise> {
-    if series.len() < 2 * W {
+    if series.len() < SPAN {
         return None;
     }
-    let last = &series[series.len() - 2 * W..];
+    let last = &series[series.len() - SPAN..];
     Some(Rise {
         first: stats(&last[..W])?,
-        second: stats(&last[W..])?,
+        second: stats(&last[SPAN - W..])?,
     })
 }
 
-/// Does the latest value start an episode: a warning now, and none at the
-/// value before? Returns what warns.
+/// Does the series, as it stood after its first `n` values, warn?
+fn warns_at(series: &[f64], n: usize) -> bool {
+    compare(&series[..n]).is_some_and(|r| r.warns())
+}
+
+/// Does the latest value start an episode: a warning now, and none in the
+/// `QUIET` values before? Returns what warns.
 pub fn starts(series: &[f64]) -> Option<Rise> {
     let now = compare(series).filter(Rise::warns)?;
-    let before = series
-        .len()
-        .checked_sub(1)
-        .and_then(|n| compare(&series[..n]))
-        .is_some_and(|r| r.warns());
+    let n = series.len();
+    let before = (n.saturating_sub(QUIET)..n).any(|k| warns_at(series, k));
     (!before).then_some(now)
 }
 
@@ -132,6 +147,10 @@ pub(crate) mod tests {
             .count()
     }
 
+    /// The streams the rates are measured over: 60 reports each.
+    const STREAM: usize = 60;
+    const SEEDS: u64 = 1000;
+
     #[test]
     fn stats_of_known_values() {
         let s = stats(&[1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -140,80 +159,95 @@ pub(crate) mod tests {
         assert!((s.autocorrelation - 0.25).abs() < 1e-12, "{s:?}");
         assert_eq!(stats(&[5.0; 4]).unwrap().autocorrelation, 0.0);
         assert!(stats(&[1.0, 2.0]).is_none());
-        assert!(compare(&[1.0; 2 * W - 1]).is_none());
+        assert!(compare(&[1.0; SPAN - 1]).is_none());
+    }
+
+    /// The calibration: over 1000 seeds of 60 reports, white noise warns in
+    /// at most 2% of streams, the ramp in at least 80%.
+    #[test]
+    fn false_alarms_stay_under_two_percent_and_the_ramp_is_caught() {
+        let warned = |f: fn(usize, u64) -> Vec<f64>, offset: u64| {
+            (0..SEEDS)
+                .filter(|s| episodes(&f(STREAM, offset + s)) > 0)
+                .count()
+        };
+        let ramp_rate = warned(ramp, 0) as f64 / SEEDS as f64;
+        let white_rate = warned(white, 1_000_000) as f64 / SEEDS as f64;
+        println!("ramp warned in {ramp_rate:.3}, white noise in {white_rate:.3}");
+        assert!(white_rate <= 0.02, "white noise warned in {white_rate}");
+        assert!(ramp_rate >= 0.80, "the ramp warned in {ramp_rate}");
     }
 
     #[test]
     fn a_ramping_ar1_warns_once_and_white_noise_does_not() {
-        let series = ramp(2 * W + 20, 7);
-        let n = episodes(&series);
+        let series = ramp(STREAM, 2);
         let last = compare(&series).unwrap();
         assert_eq!(
-            n,
+            episodes(&series),
             1,
             "variance x{:.2}, autocorrelation {:+.2}",
             last.variance_ratio(),
             last.autocorrelation_rise()
         );
-        let noise = white(2 * W + 20, 7);
-        assert_eq!(episodes(&noise), 0);
+        assert_eq!(episodes(&white(STREAM, 2)), 0);
     }
 
-    /// Over 200 seeds of 60 reports: the ramp warns in nearly every one;
-    /// white noise sometimes does, 2W being a short window.
+    /// An episode is a run of warning reports with gaps shorter than
+    /// `QUIET`; only its first report starts it.
     #[test]
-    fn over_many_seeds_the_ramp_warns_and_noise_mostly_does_not() {
-        let warned = |f: fn(usize, u64) -> Vec<f64>| {
-            (0..200u64)
-                .filter(|s| episodes(&f(2 * W + 20, *s)) > 0)
-                .count()
+    fn an_episode_starts_only_after_quiet_and_cannot_flicker() {
+        // A ramp whose warning comes and goes.
+        let flickers = |s: &Vec<f64>| {
+            let w: Vec<bool> = (1..=s.len()).map(|n| warns_at(s, n)).collect();
+            w.windows(3).any(|x| x[0] && !x[1] && x[2])
         };
-        let (r, w) = (warned(ramp), warned(white));
-        assert!(r >= 180, "ramp warned in {r} of 200");
-        assert!(w <= 60, "white noise warned in {w} of 200");
-    }
-
-    /// An episode is a run of reports that warn; only its first starts it.
-    #[test]
-    fn an_episode_starts_on_its_first_warning_report_only() {
-        let long = (0..50u64)
-            .map(|seed| ramp(2 * W + 40, seed))
-            .find(|s| {
-                let warning = (1..=s.len())
-                    .filter(|&n| compare(&s[..n]).is_some_and(|r| r.warns()))
-                    .count();
-                warning > episodes(s)
-            })
-            .expect("a ramp whose warning lasts more than one report");
-        let warns = |n: usize| compare(&long[..n]).is_some_and(|r| r.warns());
+        let long = (0..500u64)
+            .map(|seed| ramp(STREAM + 20, seed))
+            .find(flickers)
+            .expect("a ramp whose warning comes and goes");
         for n in 1..=long.len() {
+            let quiet = (n.saturating_sub(QUIET)..n).all(|k| !warns_at(&long, k));
             assert_eq!(
                 starts(&long[..n]).is_some(),
-                warns(n) && !warns(n - 1),
+                warns_at(&long, n) && quiet,
                 "report {n}"
             );
         }
+        // The warning that came back did not start a second episode.
+        let rises = (1..=long.len())
+            .filter(|&n| warns_at(&long, n) && !warns_at(&long, n - 1))
+            .count();
+        assert!(rises >= 2, "it flickered");
+        assert!(episodes(&long) < rises, "one episode, not one per flicker");
+    }
+
+    /// A span with `first` at its start, `last` at its end, a still middle.
+    fn span(first: &[f64], last: &[f64]) -> Vec<f64> {
+        let mut s = first.to_vec();
+        s.extend(std::iter::repeat_n(0.0, SPAN - 2 * W));
+        s.extend_from_slice(last);
+        s
     }
 
     #[test]
     fn rising_variance_alone_or_rising_autocorrelation_alone_does_not_warn() {
-        // Variance up fourfold, both halves white: no memory gained.
+        // Variance up ninefold, both ends white: no memory gained.
         let mut rng = 3;
-        let mut louder: Vec<f64> = (0..W).map(|_| normal(&mut rng)).collect();
-        louder.extend((0..W).map(|_| 2.0 * normal(&mut rng)));
-        let r = compare(&louder).unwrap();
+        let quiet: Vec<f64> = (0..W).map(|_| normal(&mut rng)).collect();
+        let loud: Vec<f64> = (0..W).map(|_| 3.0 * normal(&mut rng)).collect();
+        let r = compare(&span(&quiet, &loud)).unwrap();
         assert!(r.variance_ratio() > VARIANCE_RATIO, "{r:?}");
+        assert!(r.autocorrelation_rise() <= AUTOCORRELATION_RISE, "{r:?}");
         assert!(!r.warns(), "{r:?}");
-        // Memory up, variance the same: a smooth wave in the second half
-        // scaled to the first half's variance.
+        // Memory up, variance the same: an alternating start, a smooth
+        // wave at the end scaled to the same variance.
         let first: Vec<f64> = (0..W)
             .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
         let second: Vec<f64> = (0..W)
             .map(|i| (i as f64 * 0.3).sin() * std::f64::consts::SQRT_2)
             .collect();
-        let both: Vec<f64> = first.into_iter().chain(second).collect();
-        let r = compare(&both).unwrap();
+        let r = compare(&span(&first, &second)).unwrap();
         assert!(r.autocorrelation_rise() > AUTOCORRELATION_RISE, "{r:?}");
         assert!(!r.warns(), "{r:?}");
     }

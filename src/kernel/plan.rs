@@ -9,7 +9,9 @@
 //!
 //! When the best cannot be told apart from the runner-up, the backend
 //! chooses among the top three; it also writes the payload of a lever that
-//! takes one. A reply that cannot be used escalates.
+//! takes one. A reply that cannot be used, or that chooses what was not
+//! offered, escalates; the escalation's proposals go through `follow` too,
+//! so below the calibration bar they ask.
 //!
 //! Critical slowing down is checked here too, for plan ventures and any
 //! mandate with `early_warning: true`.
@@ -381,7 +383,7 @@ impl Kernel {
                 Ok(e) => log(&e.line()),
                 Err(e) => log(&format!("{name}: cannot write record: {e}")),
             }
-            if let Err(e) = self.escalate(name, &why, &request) {
+            if let Err(e) = self.escalate_calibrated(name, &why, &request) {
                 log(&format!("{name}: cannot escalate: {e}"));
             }
             return Settled::Done;
@@ -404,7 +406,7 @@ impl Kernel {
             name,
             format!(
                 "{metric} is slowing down: over the last {} reports its variance rose {ratio:.2}x and its lag-1 autocorrelation by {up:+.2}; it may be near a tipping point",
-                2 * slowing::W
+                slowing::SPAN
             ),
             Signal::Warning {
                 metric: metric.to_string(),
