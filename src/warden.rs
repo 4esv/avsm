@@ -26,6 +26,14 @@ use crate::venture;
 pub const ACTION_TIMEOUT: Duration = Duration::from_secs(600);
 /// The most a backend's reply may hold, in bytes.
 pub const MAX_REPLY: usize = 256 * 1024;
+/// What the error of a reply refused for size begins with, so the kernel
+/// can tell it from a backend that failed, whatever the backend printed.
+pub const OVERSIZE: &str = "reply too big: ";
+
+/// Is this the error of a reply refused for size?
+pub fn refused_for_size(error: &str) -> bool {
+    error.starts_with(OVERSIZE)
+}
 
 /// What the kernel asks of the warden.
 pub trait Warden {
@@ -170,6 +178,16 @@ impl Warden for LocalWarden {
                 .map(Payload::text)
                 .ok_or("the proof names no mandate text")?;
             let mandate = Mandate::parse(&text).map_err(|e| format!("the new mandate: {e}"))?;
+            // Escalating off the machine is declared by a human in the
+            // mandate file and adopted with `add`; no proposal, ratchet or
+            // self change gets it.
+            if crate::mandate::adds_offbox(&v.mandate, &mandate) {
+                return Err(
+                    "the new mandate adds escalate: offbox, which only a human declares in the mandate file and adopts with: avsm add"
+                        .to_string()
+                        .into(),
+                );
+            }
             let by = proof
                 .decision()
                 .and_then(|seq| index.get(seq))
@@ -418,7 +436,7 @@ impl Warden for LocalWarden {
                     .map(str::to_string)
                     .ok_or_else(|| format!("backend {name} answered without text: {reply}"))
             }
-            Backend::Command { run } => {
+            Backend::Command { run, .. } => {
                 let stdin = serde_json::to_string(&serde_json::json!({
                     "backend": name,
                     "system": request.system,
@@ -436,7 +454,7 @@ impl Warden for LocalWarden {
                 }
                 if ran.stdout.len() > MAX_REPLY {
                     return Err(format!(
-                        "backend {name} replied with {} bytes; the most a reply may hold is {MAX_REPLY}",
+                        "{OVERSIZE}backend {name} replied with {} bytes; the most a reply may hold is {MAX_REPLY}",
                         ran.stdout.len()
                     ));
                 }
@@ -601,7 +619,7 @@ fn research(
         .as_deref()
         .ok_or("no research backend; name a command backend under research: in config.yaml")?;
     let (_, backend) = config.backend(Some(name))?;
-    let Backend::Command { run: command } = backend else {
+    let Backend::Command { run: command, .. } = backend else {
         return Err(format!("research backend {name} must be kind: command"));
     };
     if question.trim().is_empty() {

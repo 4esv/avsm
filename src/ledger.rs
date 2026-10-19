@@ -371,6 +371,7 @@ mod tests {
                 ),
             (claim(), text(), text(), text(), prop::option::of(payload())).prop_map(
                 |(claim, venture, action, reason, payload)| Record::Proposal {
+                    cites: vec![],
                     claim,
                     venture,
                     action,
@@ -409,6 +410,7 @@ mod tests {
             )
                 .prop_map(
                     |(claim, venture, action, question, refusal, payload, signal)| Record::Ask {
+                        cites: vec![],
                         claim,
                         venture,
                         action,

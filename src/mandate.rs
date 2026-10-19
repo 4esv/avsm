@@ -75,6 +75,26 @@ pub struct Mandate {
     /// The largest plausible change from one report to the next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_step: Option<f64>,
+    /// `offbox` lets the venture's escalation go to a backend that leaves
+    /// the machine. Declared only: no proposal, ratchet or self change
+    /// can add it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalate: Option<Escalate>,
+}
+
+/// Where an escalation may go beyond this machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Escalate {
+    /// A backend that leaves the machine may answer for this venture.
+    Offbox,
+}
+
+/// Does `after` give a venture the right to escalate off the box that
+/// `before` did not? A change of mandate that does is never a proposal's to
+/// make: the field is declared by a human editing the mandate and adding it.
+pub fn adds_offbox(before: &Mandate, after: &Mandate) -> bool {
+    after.escalate == Some(Escalate::Offbox) && before.escalate != Some(Escalate::Offbox)
 }
 
 /// What a guard does past its bound.
@@ -639,6 +659,7 @@ const FIELDS: &[&str] = &[
     "audits",
     "range",
     "max_step",
+    "escalate",
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadband", "hold"];
 const GUARD_FIELDS: &[&str] = &[
@@ -1283,6 +1304,7 @@ impl Mandate {
             audits: vec![],
             range: None,
             max_step: None,
+            escalate: None,
         }
     }
 
@@ -1530,6 +1552,7 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
     }
     check_restart(map.get("restart"))?;
     check_network(map.get("network"))?;
+    check_escalate(map.get("escalate"))?;
     match map.get("children") {
         None | Some(Value::Null) => {}
         Some(Value::Sequence(items)) => {
@@ -1727,6 +1750,17 @@ fn check_allocation(v: Option<&Value>) -> Result<(), MandateError> {
         Some(Value::String(s)) if humantime::parse_duration(s.trim()).is_ok() => Ok(()),
         Some(other) => fail(format!(
             "hold is a length of time, like 1d, not {}",
+            describe(other)
+        )),
+    }
+}
+
+fn check_escalate(v: Option<&Value>) -> Result<(), MandateError> {
+    match v {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) if s.trim() == "offbox" => Ok(()),
+        Some(other) => fail(format!(
+            "escalate is offbox, or left out for escalation on this machine only, not {}",
             describe(other)
         )),
     }
@@ -2451,7 +2485,7 @@ max_step: 5000
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step, escalate"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");
@@ -3368,6 +3402,19 @@ max_step: 5000
         assert!(delegate_text(parent, "resume")
             .unwrap_err()
             .contains("declared-only"));
+    }
+
+    #[test]
+    fn escalate_is_offbox_or_left_out_and_a_change_cannot_add_it() {
+        let plain = Mandate::parse(VALID).unwrap();
+        assert_eq!(plain.escalate, None);
+        let off = Mandate::parse(&format!("{VALID}escalate: offbox\n")).unwrap();
+        assert_eq!(off.escalate, Some(Escalate::Offbox));
+        assert!(fails(&format!("{VALID}escalate: anywhere\n")).contains("escalate is offbox"));
+        assert!(adds_offbox(&plain, &off));
+        assert!(!adds_offbox(&off, &off), "keeping it is not adding it");
+        assert!(!adds_offbox(&off, &plain), "dropping it is not adding it");
+        assert!(!adds_offbox(&plain, &plain));
     }
 
     #[test]

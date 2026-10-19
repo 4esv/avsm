@@ -484,6 +484,7 @@ pub fn read_reply(ctx: &Context, reply: &str) -> Result<Vec<Record>, String> {
         Payload::from_value(takes, value?).ok()
     };
     let proposal = |action: &str, reason: String, payload: Option<Payload>| Record::Proposal {
+        cites: vec![],
         claim: Claim::Inferred,
         venture: venture.clone(),
         action: action.to_string(),
@@ -491,6 +492,7 @@ pub fn read_reply(ctx: &Context, reply: &str) -> Result<Vec<Record>, String> {
         payload,
     };
     let ask = |action: Option<String>, question: String, payload: Option<Payload>| Record::Ask {
+        cites: vec![],
         claim: Claim::Inferred,
         venture: venture.clone(),
         action,
@@ -664,6 +666,7 @@ mod tests {
                 audits: vec![],
                 range: None,
                 max_step: None,
+                escalate: None,
             },
             entries: vec![Entry::new(
                 1,
@@ -695,6 +698,7 @@ mod tests {
         let ask = entry(
             8,
             Record::Ask {
+                cites: vec![],
                 claim: Claim::Measured,
                 venture: "shop".into(),
                 action: None,
@@ -738,6 +742,7 @@ mod tests {
         c.asks = vec![entry(
             11,
             Record::Ask {
+                cites: vec![],
                 claim: Claim::Inferred,
                 venture: "shop".into(),
                 action: Some("refund".into()),

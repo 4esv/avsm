@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""A command backend for avsm that asks Claude through `claude -p`.
+
+The prompt arrives as JSON on standard input, like any command backend:
+
+    {"backend": "<name>", "system": "<system prompt>", "user": "<user prompt>"}
+
+The reply is whatever Claude prints, on standard output. A failure exits
+non-zero with the reason on standard error, and avsm treats that as a backend
+that failed.
+
+Use it as the secondary named by `escalate:` in config.yaml. It sends the
+prompt off the machine, so flag it `offbox: true`; a venture's mandate must
+then say `escalate: offbox` before avsm will ask it. See README.md.
+
+Safe by construction: no tools (it cannot read files or run commands), no
+saved session, no project or user customizations, and every CLAUDE* variable
+dropped from the environment so a surrounding Claude session cannot leak in.
+
+Environment:
+    AVSM_ESCALATE_MODEL   the model to ask; default sonnet
+"""
+import json
+import os
+import subprocess
+import sys
+
+# A little under the 600s the warden gives a command backend.
+TIMEOUT_SECONDS = 540
+
+
+def main() -> int:
+    try:
+        request = json.load(sys.stdin)
+        system, user = request["system"], request["user"]
+    except (ValueError, KeyError, TypeError) as e:
+        sys.stderr.write(f"claude backend: expected JSON with system and user on stdin: {e}\n")
+        return 2
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+    model = os.environ.get("AVSM_ESCALATE_MODEL", "sonnet")
+    command = [
+        "claude", "-p",
+        "--safe-mode",
+        "--model", model,
+        "--tools", "",
+        "--no-session-persistence",
+        "--system-prompt", system,
+        user,
+    ]
+    try:
+        ran = subprocess.run(
+            command, capture_output=True, text=True, env=env, timeout=TIMEOUT_SECONDS
+        )
+    except FileNotFoundError:
+        sys.stderr.write("claude backend: the claude command is not on PATH\n")
+        return 127
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"claude backend: no answer in {TIMEOUT_SECONDS} seconds\n")
+        return 124
+
+    if ran.returncode != 0:
+        sys.stderr.write(ran.stderr[-500:])
+        return 1
+    sys.stdout.write(ran.stdout)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

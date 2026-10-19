@@ -256,6 +256,7 @@ fn approve_and_deny_answer_open_asks() {
     let tmp = tempfile::tempdir().unwrap();
     let mut kernel = Kernel::open(&tmp.path().join("home")).unwrap();
     let ask = |action: &str| Record::Ask {
+        cites: vec![],
         claim: Claim::Inferred,
         venture: "counter".to_string(),
         action: Some(action.to_string()),

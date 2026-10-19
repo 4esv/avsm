@@ -2389,6 +2389,7 @@ mod tests {
             audits: vec![],
             range: None,
             max_step: None,
+            escalate: None,
         }
     }
 
@@ -2412,6 +2413,7 @@ mod tests {
 
     fn proposal(claim: Claim, action: &str) -> Record {
         Record::Proposal {
+            cites: vec![],
             claim,
             venture: V.to_string(),
             action: action.to_string(),
@@ -2422,6 +2424,7 @@ mod tests {
 
     fn proposal_with(claim: Claim, action: &str, payload: Payload) -> Record {
         Record::Proposal {
+            cites: vec![],
             claim,
             venture: V.to_string(),
             action: action.to_string(),
@@ -2432,6 +2435,7 @@ mod tests {
 
     fn ask(claim: Claim, action: &str) -> Record {
         Record::Ask {
+            cites: vec![],
             claim,
             venture: V.to_string(),
             action: Some(action.to_string()),
@@ -2444,6 +2448,7 @@ mod tests {
 
     fn ask_with(claim: Claim, action: &str, payload: Payload) -> Record {
         Record::Ask {
+            cites: vec![],
             claim,
             venture: V.to_string(),
             action: Some(action.to_string()),
@@ -2930,6 +2935,7 @@ mod tests {
                 mandate(model(), vec![permit(name, 9, true, true)], &[]),
             );
             let s = fx.push(Record::Proposal {
+                cites: vec![],
                 claim: Claim::Inferred,
                 venture: SELF.into(),
                 action: name.to_string(),
@@ -2945,6 +2951,7 @@ mod tests {
         perm.run = Some("cat ~/.avsm/keys".to_string());
         fx.adopt(SELF, mandate(model(), vec![perm], &[]));
         let s = fx.push(Record::Proposal {
+            cites: vec![],
             claim: Claim::Inferred,
             venture: SELF.into(),
             action: "rotate".into(),
@@ -2993,6 +3000,7 @@ mod tests {
             assert!(!why(e).is_empty());
         }
         let q = fx.push(Record::Ask {
+            cites: vec![],
             claim: Claim::Inferred,
             venture: V.into(),
             action: Some("deploy".into()),
@@ -3316,6 +3324,7 @@ mod tests {
         assert!(fx2.gate(V, "reset", &[r]).is_ok());
         // The parent's resume needs a declared decision; then the child acts again.
         let s = fx.push(Record::Proposal {
+            cites: vec![],
             claim: Claim::Inferred,
             venture: "portfolio".into(),
             action: "resume".into(),
@@ -3331,6 +3340,7 @@ mod tests {
             "{refusal}"
         );
         let q = fx.push(Record::Ask {
+            cites: vec![],
             claim: Claim::Inferred,
             venture: "portfolio".into(),
             action: Some("resume".into()),
@@ -3423,6 +3433,7 @@ mod tests {
     /// The parent proposes a lever with a payload; the gate decides.
     fn parent_gate(fx: &mut Fx, lever: &str, payload: &str) -> Result<Proof, Refusal> {
         let s = fx.push(Record::Proposal {
+            cites: vec![],
             claim: Claim::Inferred,
             venture: "portfolio".into(),
             action: lever.into(),
@@ -3454,6 +3465,7 @@ mod tests {
         );
         // A human approves the ask. The floor still holds.
         let q = fx.push(Record::Ask {
+            cites: vec![],
             claim: Claim::Inferred,
             venture: "portfolio".into(),
             action: Some("budget".into()),
@@ -3614,6 +3626,7 @@ mod tests {
                 NOW,
                 GENESIS,
                 Record::Ask {
+                    cites: vec![],
                     claim: Claim::Measured,
                     venture: "portfolio".into(),
                     action: Some(lever.into()),
@@ -3867,6 +3880,7 @@ mod tests {
         );
         let new_text = text("purpose: ...\nmetric: count\n");
         let s = fx.push(Record::Proposal {
+            cites: vec![],
             claim: Claim::Measured,
             venture: V.into(),
             action: DELEGATE.into(),
@@ -3888,6 +3902,7 @@ mod tests {
             "{refusal}"
         );
         let q = fx.push(Record::Ask {
+            cites: vec![],
             claim: Claim::Measured,
             venture: V.into(),
             action: Some(DELEGATE.into()),
@@ -3913,6 +3928,7 @@ mod tests {
         );
         // An ask a model wrote cannot carry a mandate change, approved or not.
         let mq = fx.push(Record::Ask {
+            cites: vec![],
             claim: Claim::Inferred,
             venture: V.into(),
             action: Some(DELEGATE.into()),
@@ -3934,6 +3950,7 @@ mod tests {
         let mut fx = Fx::new();
         fx.adopt(SELF, mandate(model(), vec![], &[]));
         let q = fx.push(Record::Ask {
+            cites: vec![],
             claim: Claim::Measured,
             venture: SELF.into(),
             action: Some(DELEGATE.into()),

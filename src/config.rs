@@ -29,6 +29,11 @@ pub struct Config {
     /// question on its standard input, JSON results on its output.
     #[serde(default)]
     pub research: Option<String>,
+    /// The backend asked when the default one's reply cannot be used or
+    /// is too big. One that leaves the machine is asked only for a venture
+    /// whose mandate says `escalate: offbox`.
+    #[serde(default)]
+    pub escalate: Option<String>,
     /// Where the built-in adapters reach, and how mail goes out.
     #[serde(default)]
     pub adapters: Adapters,
@@ -152,6 +157,7 @@ impl Default for Config {
             default: None,
             backends: BTreeMap::new(),
             research: None,
+            escalate: None,
             adapters: Adapters::default(),
             listen: None,
             port: default_port(),
@@ -189,7 +195,23 @@ pub enum Backend {
     },
     /// A local command: the prompt as JSON on stdin, the reply on stdout.
     /// Any classifier, fine-tune or local model fits behind one.
-    Command { run: String },
+    Command {
+        run: String,
+        /// Set when the command sends the prompt off the machine.
+        #[serde(default)]
+        offbox: bool,
+    },
+}
+
+impl Backend {
+    /// Does a prompt sent here leave the machine? The http kinds always do;
+    /// a command does when config says so.
+    pub fn offbox(&self) -> bool {
+        match self {
+            Backend::Anthropic { .. } | Backend::Openai { .. } => true,
+            Backend::Command { offbox, .. } => *offbox,
+        }
+    }
 }
 
 fn anthropic_url() -> String {
@@ -265,6 +287,13 @@ impl Config {
                         "research names a backend that is not listed: {r}; list it under backends"
                     ))
                 }
+            }
+        }
+        if let Some(e) = &config.escalate {
+            if !config.backends.contains_key(e) {
+                return Err(format!(
+                    "escalate names a backend that is not listed: {e}; list it under backends"
+                ));
             }
         }
         for (name, b) in &config.backends {
@@ -465,6 +494,21 @@ mod tests {
                 .unwrap_err()
                 .contains("kind: command")
         );
+    }
+
+    #[test]
+    fn escalate_names_a_listed_backend_and_http_kinds_are_offbox() {
+        let c = Config::parse(
+            "escalate: b\nbackends:\n  a: {kind: command, run: ./a}\n  b: {kind: command, run: ./b, offbox: true}\n  c: {kind: openai, url: 'http://127.0.0.1:1/v1', model: m}\n",
+        )
+        .unwrap();
+        assert_eq!(c.escalate.as_deref(), Some("b"));
+        assert!(!c.backends["a"].offbox());
+        assert!(c.backends["b"].offbox());
+        assert!(c.backends["c"].offbox());
+        assert!(Config::parse("escalate: x\n")
+            .unwrap_err()
+            .contains("not listed"));
     }
 
     #[test]

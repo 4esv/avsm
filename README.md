@@ -144,6 +144,32 @@ Only the warden, the one process avsm starts that may act, ever reads them; the
 process that talks to models holds no keys and runs as `nobody` when avsm runs
 as root.
 
+#### When the model cannot answer
+
+If a reply cannot be used, or is bigger than avsm will read (256 KiB), avsm can
+ask a second backend the same question. Name it with `escalate:` in
+`config.yaml`. Before the call avsm writes a measured `escalation` record (from,
+to, why); the answer comes back as inferred records that cite it, and the
+escalation then gets a measured outcome: the records cited, or `unusable`. An
+answer proposes or asks like any model reply and never authorizes. With no
+`escalate:`, nothing changes.
+
+`examples/backends/claude` is a ready second backend: it runs `claude -p` in
+safe mode with no tools, on `sonnet` unless `AVSM_ESCALATE_MODEL` says
+otherwise. It sends the prompt off the machine, so flag it `offbox: true`:
+
+```yaml
+escalate: claude
+backends:
+  claude: { kind: command, run: /path/to/avsm/examples/backends/claude, offbox: true }
+```
+
+A backend that leaves the machine (every `anthropic` and `openai` one, and a
+command flagged `offbox: true`) is asked only for a venture whose mandate says
+`escalate: offbox`. Only you can add that line: edit `mandate.yaml` and run
+`avsm add`. A mandate change proposed by self or the ratchet that adds it is
+refused.
+
 Before it chooses, the model may look things up with `know` and `why`, a few
 times, and every look is a record. A mandate may also permit `research`, a
 lever that sends a question to a command you name under `research:` in the

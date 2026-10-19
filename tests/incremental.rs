@@ -288,6 +288,7 @@ fn record(op: &Op, n: u64) -> Record {
             implausible: doubt.then(|| "a step too big".to_string()),
         },
         Op::Proposal(venture, action, claim, payload) => Record::Proposal {
+            cites: vec![],
             claim,
             venture,
             action,
@@ -295,6 +296,7 @@ fn record(op: &Op, n: u64) -> Record {
             payload,
         },
         Op::Ask(venture, action, claim, payload) => Record::Ask {
+            cites: vec![],
             claim,
             venture,
             action,
@@ -578,6 +580,7 @@ fn build(case: &Case) -> (Ledger, Index, Vec<Adopted>, i64) {
                 let ask = ledger
                     .append_at(
                         Record::Ask {
+                            cites: vec![],
                             claim: *claim,
                             venture: venture.clone(),
                             action: None,

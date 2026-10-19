@@ -58,6 +58,7 @@ fn kernel(home: &Path, role: Box<dyn Role + Send>) -> Kernel {
 
 fn proposal(venture: &str, action: &str) -> Record {
     Record::Proposal {
+        cites: vec![],
         claim: Claim::Inferred,
         venture: venture.into(),
         action: action.into(),
@@ -68,6 +69,7 @@ fn proposal(venture: &str, action: &str) -> Record {
 
 fn proposal_with(venture: &str, action: &str, text: &str) -> Record {
     Record::Proposal {
+        cites: vec![],
         claim: Claim::Inferred,
         venture: venture.into(),
         action: action.into(),
@@ -103,6 +105,7 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
         proposal("shop", "deploy"),
         proposal("shop", "wipe"),
         Record::Ask {
+            cites: vec![],
             claim: Claim::Inferred,
             venture: "shop".into(),
             action: None,
@@ -653,6 +656,7 @@ fn payload_levers_ask_first_run_with_what_the_human_approved() {
     let replies = VecDeque::from(vec![vec![
         proposal_with("shop", "announce", "Hello all"),
         Record::Proposal {
+            cites: vec![],
             claim: Claim::Inferred,
             venture: "shop".into(),
             action: "label".into(),

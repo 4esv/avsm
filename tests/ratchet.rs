@@ -44,6 +44,7 @@ fn venture(parent: &Path, name: &str, mandate: &str) -> PathBuf {
 
 fn announce(n: usize) -> Vec<Record> {
     vec![Record::Proposal {
+        cites: vec![],
         claim: Claim::Inferred,
         venture: "shop".into(),
         action: "announce".into(),
@@ -445,6 +446,7 @@ fn kernel_with(tmp: &Path, ratchet: u32, replies: Vec<Vec<Record>>) -> Kernel {
 
 fn wipe(n: usize) -> Vec<Record> {
     vec![Record::Proposal {
+        cites: vec![],
         claim: Claim::Inferred,
         venture: "shop".into(),
         action: "wipe".into(),

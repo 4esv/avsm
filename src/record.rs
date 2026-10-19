@@ -365,6 +365,10 @@ pub enum Record {
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<Payload>,
+        /// The records this one answers to: an escalation, for a proposal
+        /// a second backend made.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cites: Vec<Seq>,
     },
     /// An action was taken, with the proof that allowed it and how it went.
     Action {
@@ -391,6 +395,10 @@ pub enum Record {
         /// because a lever needs a decision. Read by code, never by text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<Signal>,
+        /// The records this one answers to: an escalation, for an ask a
+        /// second backend made.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cites: Vec<Seq>,
     },
     /// A human's verdict. `by` names the human when the record came in
     /// over a path that knows who they are.
@@ -524,7 +532,9 @@ impl Record {
     /// The records this one cites, if it cites any.
     pub fn cites(&self) -> &[Seq] {
         match self {
-            Record::Report { cites, .. } => cites,
+            Record::Report { cites, .. }
+            | Record::Proposal { cites, .. }
+            | Record::Ask { cites, .. } => cites,
             _ => &[],
         }
     }
@@ -932,6 +942,7 @@ mod tests {
     #[test]
     fn summaries_show_payloads_and_identities() {
         let p = Record::Proposal {
+            cites: vec![],
             claim: Claim::Inferred,
             venture: "shop".into(),
             action: "announce".into(),

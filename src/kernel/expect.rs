@@ -139,6 +139,7 @@ impl Kernel {
                     "{lever} is ineffective, so it asks each time again: {why}; approve to delegate it again"
                 );
                 match self.append(Record::Ask {
+                    cites: vec![],
                     claim: Claim::Measured,
                     venture: venture.to_string(),
                     action: None,

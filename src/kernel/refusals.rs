@@ -279,6 +279,7 @@ impl Kernel {
             return;
         }
         match self.append(Record::Ask {
+            cites: vec![],
             claim: Claim::Measured,
             venture: venture.to_string(),
             action: None,

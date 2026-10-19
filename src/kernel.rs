@@ -26,6 +26,7 @@ use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role, SUMMA
 use crate::venture::{self, Venture};
 use crate::warden::{self, Failure, FromWarden, LocalWarden, ToWarden, Warden};
 
+mod escalate;
 mod expect;
 mod guards;
 mod refusals;
@@ -605,7 +606,7 @@ impl Kernel {
                     ok,
                     detail: format!("checked after a restart: {found}"),
                 },
-                Ok(None) => Record::Ask {
+                Ok(None) => Record::Ask { cites: vec![],
                         claim: Claim::Measured,
                         venture: venture.clone(),
                         action: None,
@@ -680,6 +681,7 @@ impl Kernel {
             (Some(t), Some(text)) => Some(Payload::parse(t, text)?),
         };
         let entry = self.append(Record::Proposal {
+            cites: vec![],
             claim: Claim::Declared,
             venture: name.to_string(),
             action: lever.to_string(),
@@ -863,6 +865,7 @@ impl Kernel {
                     list.join(", ")
                 );
                 let proposal = match self.append(Record::Proposal {
+                    cites: vec![],
                     claim: Claim::Measured,
                     venture: v.name.clone(),
                     action: DELEGATE.to_string(),
@@ -1322,6 +1325,7 @@ impl Kernel {
                         None => format!("may I {action}? it is irreversible{reason}"),
                     };
                     match self.append(Record::Ask {
+                        cites: vec![],
                         claim,
                         venture: name.to_string(),
                         action: Some(action.to_string()),
@@ -1615,9 +1619,21 @@ impl Kernel {
                     Ok(entry) => log(&entry.line()),
                     Err(e) => log(&format!("{name}: cannot write record: {e}")),
                 }
+                // A reply refused for size is one the primary could not
+                // give; the escalation backend, if any, may answer.
+                if warden::refused_for_size(&e) {
+                    if let Err(e) = self.escalate(name, &first, &role::prompt(&ctx)) {
+                        log(&format!("{name}: cannot escalate: {e}"));
+                    }
+                }
                 return;
             }
         };
+        // A reply that could not be used is the other trigger.
+        let unusable: Option<String> = records.iter().find_map(|r| match r {
+            Record::Report { metric, note, .. } if metric == role::UNUSABLE => Some(note.clone()),
+            _ => None,
+        });
         // A model turn has not happened until its inferred record is
         // stored: a turn that left none still leaves one.
         let records = if records.is_empty() {
@@ -1640,6 +1656,7 @@ impl Kernel {
                 } => {
                     let payload = fit_payload(&v.mandate, &action, payload, name);
                     Record::Proposal {
+                        cites: vec![],
                         claim: Claim::Inferred,
                         venture: name.to_string(),
                         action,
@@ -1658,6 +1675,7 @@ impl Kernel {
                         None => None,
                     };
                     Record::Ask {
+                        cites: vec![],
                         claim: Claim::Inferred,
                         venture: name.to_string(),
                         action,
@@ -1734,6 +1752,11 @@ impl Kernel {
                 self.act(name, action, vec![entry.seq], Claim::Inferred);
             }
         }
+        if let Some(why) = unusable {
+            if let Err(e) = self.escalate(name, &why, &role::prompt(&ctx)) {
+                log(&format!("{name}: cannot escalate: {e}"));
+            }
+        }
     }
 
     /// Write an ask with this question unless one is already open, or the
@@ -1765,6 +1788,7 @@ impl Kernel {
             return;
         }
         match self.append(Record::Ask {
+            cites: vec![],
             claim: Claim::Measured,
             venture: name.to_string(),
             action: None,

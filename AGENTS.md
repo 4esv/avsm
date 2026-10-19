@@ -12,6 +12,7 @@ Use these words and no synonyms.
 - running, asking, paused
 - ledger, gate, proof, adapter, canary, warden, guard, audit
 - parent, child, payload, adapter (built-in metric or lever), digest, know, expects
+- escalate, escalation (the `escalate:` backend asked when the first cannot answer)
 - Commands: start, add, status, tail, asks, approve, deny, pause, resume, why, know, propose, digest
 
 ## Non-negotiables

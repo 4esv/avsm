@@ -121,6 +121,7 @@ fn fields(e: &Entry) -> (&str, &str, u32, Option<Seq>) {
 
 fn spent_ask(venture: &str) -> Record {
     Record::Ask {
+        cites: vec![],
         claim: Claim::Inferred,
         venture: venture.into(),
         action: None,
@@ -290,6 +291,7 @@ fn a_refusal_that_is_not_a_limit_does_not_saturate() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let wipe = Record::Proposal {
+        cites: vec![],
         claim: Claim::Inferred,
         venture: "shop".into(),
         action: "wipe".into(),
