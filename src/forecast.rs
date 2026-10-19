@@ -731,7 +731,7 @@ pub fn run_in(
         .min()
         .unwrap_or(STEP_FLOOR)
         .max(STEP_FLOOR);
-    let start = clock::now().max(index.entries().last().map_or(i64::MIN, |e| e.at)) + step;
+    let start = clock::now().max(index.entries().next_back().map_or(i64::MIN, |e| e.at)) + step;
     let end = start + i64::from(opts.days) * 86_400;
     let scratch = Scratch::new(opts.scratch.as_deref())?;
     let head = scratch.0.join("head.db");
@@ -816,7 +816,7 @@ fn run_branch(home: &Path, b: &Branch, shared: &Shared) -> Result<BTreeMap<Strin
     for (name, text) in &shared.variants[b.variant].mandates {
         k.adopt_text(name, text, BY)?;
     }
-    let head = k.ledger.len().map_err(|e| e.to_string())?;
+    let head = k.index()?.last();
     let human = b.policy.human();
     let mut answered = 0u64;
     while clock::now() < shared.end {

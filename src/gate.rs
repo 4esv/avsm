@@ -496,10 +496,15 @@ ascent! {
 /// later measured or declared fact on the same topic; any fact is
 /// superseded by a later one on the same topic that cites it. The rest is
 /// current.
-pub fn current_facts(ledger: &[Entry]) -> Vec<(Seq, String, String)> {
+pub fn current_facts<'a, I>(ledger: I) -> Vec<(Seq, String, String)>
+where
+    I: IntoIterator<Item = &'a Entry>,
+    I::IntoIter: Clone,
+{
+    let ledger = ledger.into_iter();
     let mut facts: HashMap<Seq, (&str, &str, bool)> = HashMap::new();
     let mut latest: HashMap<(&str, &str), Seq> = HashMap::new();
-    for e in ledger {
+    for e in ledger.clone() {
         if let Record::Report {
             claim,
             venture,

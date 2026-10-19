@@ -733,7 +733,7 @@ proptest! {
     fn the_incremental_gate_agrees_with_the_reference(case in case()) {
         let (ledger, index, mandates, now) = build(&case);
         let entries = ledger.all().unwrap();
-        prop_assert_eq!(index.entries(), &entries[..]);
+        prop_assert_eq!(index.entries().cloned().collect::<Vec<_>>(), entries.clone());
         let quotas = quotas(&case);
         for cand in &case.candidates {
             let candidate = resolve(cand, &entries);

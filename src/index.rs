@@ -9,6 +9,7 @@
 //! those and not the rest.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::ledger::{Ledger, LedgerError};
 use crate::mandate::ParentCall;
@@ -54,7 +55,9 @@ pub struct Adoption {
 /// The ledger as read so far, and what follows from it.
 #[derive(Clone, Default)]
 pub struct Index {
-    entries: Vec<Entry>,
+    /// Shared, so a copy of the index (a forecast branch's) does not copy
+    /// every record.
+    entries: Vec<Arc<Entry>>,
     /// Set when an entry's number is not one more than the last one's, as
     /// in a hand-made ledger; lookups by number then search.
     scattered: bool,
@@ -170,17 +173,19 @@ impl Index {
     }
 
     /// Every entry, oldest first.
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
+    pub fn entries(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &Entry> + ExactSizeIterator + Clone + '_ {
+        self.entries.iter().map(|e| &**e)
     }
 
     /// One entry by number.
     pub fn get(&self, seq: Seq) -> Option<&Entry> {
         if self.scattered {
-            return self.entries.iter().find(|e| e.seq == seq);
+            return self.entries().find(|e| e.seq == seq);
         }
         let i = usize::try_from(seq.checked_sub(1)?).ok()?;
-        self.entries.get(i)
+        self.entries.get(i).map(|e| &**e)
     }
 
     /// Take one more entry in.
@@ -426,7 +431,7 @@ impl Index {
             }
             _ => {}
         }
-        self.entries.push(e);
+        self.entries.push(Arc::new(e));
     }
 
     /// A declared decision on a canary ask, counted once for whoever gave
@@ -880,10 +885,9 @@ mod tests {
         let mut seeded = head.seed_for(&l).unwrap();
         assert_eq!(seeded.last(), 3, "a seed of a prefix is kept");
         seeded.refresh(&l).unwrap();
-        assert_eq!(
-            seeded.entries(),
-            Index::from_entries(&l.all().unwrap()).entries()
-        );
+        assert!(seeded
+            .entries()
+            .eq(Index::from_entries(&l.all().unwrap()).entries()));
         assert_eq!(seeded.series("garden", "level").len(), 4);
     }
 

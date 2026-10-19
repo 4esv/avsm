@@ -2751,9 +2751,9 @@ fn written_on(times: &[i64], today: NaiveDate) -> bool {
 
 /// Asks this week, and incidents this week: failed actions and outcomes,
 /// a broken chain or canary, and stops.
-fn weekly(entries: &[Entry], now: i64) -> (u32, u32) {
+fn weekly<'a>(entries: impl Iterator<Item = &'a Entry>, now: i64) -> (u32, u32) {
     let since = now - 7 * Cap::DAY.as_secs() as i64;
-    let week = entries.iter().filter(|e| e.at > since);
+    let week = entries.filter(|e| e.at > since);
     let mut asks = 0;
     let mut incidents = 0;
     for e in week {
@@ -2799,18 +2799,20 @@ const PRECISION_MAX: usize = 6;
 /// The digest text: since the last digest when there is one this week,
 /// else the last day.
 fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) -> String {
-    let entries = index.entries();
+    let entries: Vec<&Entry> = index.entries().collect();
     let day = Cap::DAY.as_secs() as i64;
     // Since the last digest record when there is one this week, by its
     // place in the ledger; else the last day, by time.
     let last_digest = entries
         .iter()
+        .copied()
         .rev()
         .find(|e| matches!(&e.record, Record::Report { venture, metric, .. } if venture == SELF && metric == "digest"))
         .filter(|e| e.at > now - 7 * day);
     let since = last_digest.map_or(now - day, |e| e.at);
     let window: Vec<&Entry> = entries
         .iter()
+        .copied()
         .filter(|e| match last_digest {
             Some(d) => e.seq > d.seq,
             None => e.at > since,
@@ -2846,7 +2848,7 @@ fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) ->
     );
     let mut names: Vec<&String> = ventures.keys().filter(|n| *n != SELF).collect();
     names.push(&ventures[SELF].name);
-    let (asks_week, incidents_week) = weekly(entries, now);
+    let (asks_week, incidents_week) = weekly(entries.iter().copied(), now);
     for name in names.into_iter().filter(|n| ventures.contains_key(*n)) {
         let v = &ventures[name];
         let metric = v.mandate.metric_name();
@@ -2866,7 +2868,7 @@ fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) ->
             .iter()
             .filter(|e| e.at <= since)
             .rev()
-            .find_map(|e| reading(&e));
+            .find_map(reading);
         let metric_text = match latest {
             Some(value) => {
                 let places = precision(entries.iter().filter_map(|e| match &e.record {
