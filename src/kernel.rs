@@ -2040,6 +2040,27 @@ fn weekly(entries: &[Entry], now: i64) -> (u32, u32) {
     (asks, incidents)
 }
 
+/// The most decimal places a metric's recent measured values use, at most
+/// `PRECISION_MAX`: the precision a delta between two of them is shown in.
+fn precision(values: impl Iterator<Item = f64>) -> usize {
+    let mut recent: Vec<f64> = values.collect();
+    let skip = recent.len().saturating_sub(PRECISION_SEEN);
+    recent
+        .drain(skip..)
+        .map(|v| {
+            let text = v.to_string();
+            text.split_once('.').map_or(0, |(_, frac)| frac.len())
+        })
+        .max()
+        .unwrap_or(0)
+        .min(PRECISION_MAX)
+}
+
+/// How many recent measured values say what precision a metric has.
+const PRECISION_SEEN: usize = 50;
+/// The most decimal places a digest delta shows.
+const PRECISION_MAX: usize = 6;
+
 /// The digest text: since the last digest when there is one this week,
 /// else the last day.
 fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) -> String {
@@ -2113,9 +2134,19 @@ fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) ->
             .find_map(|e| reading(&e));
         let metric_text = match latest {
             Some(value) => {
+                let places = precision(entries.iter().filter_map(|e| match &e.record {
+                    Record::Report {
+                        claim: Claim::Measured,
+                        venture,
+                        metric: m,
+                        value,
+                        ..
+                    } if venture == name && m == metric => *value,
+                    _ => None,
+                }));
                 let delta = match before {
                     Some(b) if (value - b).abs() < f64::EPSILON => " (=)".to_string(),
-                    Some(b) => format!(" ({:+})", value - b),
+                    Some(b) => format!(" ({:+.places$})", value - b),
                     None => String::new(),
                 };
                 format!("{metric}={value}{delta}")
@@ -2755,4 +2786,17 @@ pub fn start(home: &Path) -> Result<(), String> {
     kernel.lock().unwrap_or_else(|p| p.into_inner()).shutdown();
     let _ = std::fs::remove_file(&sock);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::precision;
+
+    #[test]
+    fn precision_is_the_most_places_seen_capped_at_six() {
+        assert_eq!(precision([24.0, 27.6].into_iter()), 1);
+        assert_eq!(precision([1.0, 2.0].into_iter()), 0);
+        assert_eq!(precision(std::iter::empty()), 0);
+        assert_eq!(precision([0.1234567891].into_iter()), 6);
+    }
 }

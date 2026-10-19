@@ -213,3 +213,22 @@ fn the_schema_is_checked_before_the_payload_check() {
     assert_eq!(refusals.len(), 1, "{refusals:?}");
     assert_eq!(refusals[0].0, "PayloadSchema");
 }
+
+#[test]
+fn a_digest_delta_has_the_precision_of_the_metric() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mandate = "purpose: Cool.\nmetric: shell echo 24\ncontroller: {kind: model}\ncadence: 1h\n";
+    let (mut k, _) = kernel(tmp.path(), mandate, vec![]);
+    let now = avsm::kernel::now();
+    k.ledger
+        .append_at(
+            Record::report(Claim::Measured, "shop", "shell", Some(27.6), ""),
+            now - 2 * 86_400,
+        )
+        .unwrap();
+    k.report("shop", false);
+    let text = k.digest().unwrap();
+    let line = text.lines().find(|l| l.starts_with("shop")).unwrap();
+    assert!(line.contains("shell=24 (-3.6)"), "{text}");
+    assert!(!line.contains("0000"), "{text}");
+}
