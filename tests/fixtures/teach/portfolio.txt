@@ -1,0 +1,8 @@
+  purpose "Put attention where the numbers say it is needed."
+  watching shell every 1h through the warden
+  controller model: a backend proposes an action or asks
+  may budget  4/day  reversible, takes text
+  may pause  4/day  reversible, takes text
+  may resume  4/day  reversible, takes text and will ask first
+  may threshold  4/day  reversible, takes text and will ask first
+  parent of stripe-store, mail-inbox

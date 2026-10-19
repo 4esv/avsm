@@ -1,0 +1,4 @@
+  purpose "Keep the greenhouse under thirty degrees."
+  watching temperature every 1m
+  controller threshold: runs vent when temperature is above 30
+  may vent  12/hour  reversible

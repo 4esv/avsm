@@ -308,50 +308,7 @@ impl Kernel {
             kill(&mut rt);
         }
         let mut out = format!("added {name} from {}\n", dir.display());
-        out.push_str(&format!("  {}\n", mandate.purpose.trim()));
-        out.push_str(&format!(
-            "  watching {} every {}{}\n",
-            mandate.metric_name(),
-            humantime::format_duration(mandate.cadence),
-            if mandate.metric_adapter().is_some() {
-                " through the warden"
-            } else {
-                ""
-            }
-        ));
-        for p in &mandate.permitted {
-            out.push_str(&format!(
-                "  may {}  {}  {}{}\n",
-                p.name,
-                p.cap,
-                if p.reversible {
-                    "reversible"
-                } else if p.delegated {
-                    "irreversible, delegated"
-                } else {
-                    "irreversible, will ask first"
-                },
-                match p.takes() {
-                    Some(t) if p.delegated => format!(", takes {t}"),
-                    Some(t) => format!(", takes {t} and will ask first"),
-                    None => String::new(),
-                }
-            ));
-        }
-        if !mandate.children.is_empty() {
-            out.push_str(&format!(
-                "  parent of {}\n",
-                mandate
-                    .children
-                    .iter()
-                    .map(|c| c.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        if let Some(p) = &mandate.parent {
-            out.push_str(&format!("  child of {p}\n"));
-        }
+        out.push_str(&crate::teach::render(&mandate));
         out.push_str(&format!("  {}\n", entry.line()));
         Ok(out)
     }

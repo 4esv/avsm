@@ -19,5 +19,6 @@ pub mod role;
 pub mod selfventure;
 pub mod simulate;
 pub mod tailscale;
+pub mod teach;
 pub mod venture;
 pub mod warden;
