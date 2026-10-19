@@ -118,6 +118,7 @@ pub fn records(venture: &str, findings: &[Finding], action: Seq) -> Vec<Record> 
             confidence: f.confidence,
             cites: vec![action],
             implausible: None,
+            facts: None,
         })
         .collect()
 }

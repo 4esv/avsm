@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::facts::Facts;
 use crate::mandate::{Controller, Mandate};
 use crate::record::{Claim, Entry, Payload, Record, Seq};
 
@@ -143,14 +144,40 @@ fn indent(text: &str) -> String {
         .join("\n")
 }
 
-/// The prompt that asks for a summary of the records past the bound.
+/// Is this record a summary? Its narrative is inferred, and never goes
+/// back into a summary prompt.
+pub fn is_summary(e: &Entry) -> bool {
+    matches!(&e.record, Record::Report { claim: Claim::Inferred, metric, cites, .. }
+        if metric == SUMMARY && !cites.is_empty())
+}
+
+/// The facts of the records a summary stands for, computed by code. Audit
+/// readings are kept out, as they are from every model.
+pub fn summary_facts(span: &[Entry]) -> Facts {
+    let visible: Vec<Entry> = span.iter().filter(|e| !hidden(e)).cloned().collect();
+    Facts::compute(&visible)
+}
+
+/// The prompt that asks for a summary of the records past the bound. It
+/// holds the facts code computed and the leaves; the previous summary's
+/// narrative is never in it, only its facts.
 pub fn summary_prompt(ctx: &Context) -> InferRequest {
     let mut user = format!(
-        "Venture: {}\nPurpose: {}\nRecords to summarize, oldest first:\n",
+        "Venture: {}\nPurpose: {}\nFacts, computed by code (state none other):\n",
         ctx.venture,
         ctx.mandate.purpose.trim()
     );
-    for e in ctx.to_summarize.iter().filter(|e| !hidden(e)) {
+    for line in summary_facts(&ctx.to_summarize).lines() {
+        user.push_str("  ");
+        user.push_str(&line);
+        user.push('\n');
+    }
+    user.push_str("Records to summarize, oldest first:\n");
+    for e in ctx
+        .to_summarize
+        .iter()
+        .filter(|e| !hidden(e) && !is_summary(e))
+    {
         user.push_str("  ");
         user.push_str(&e.line());
         user.push('\n');
@@ -159,17 +186,18 @@ pub fn summary_prompt(ctx: &Context) -> InferRequest {
     InferRequest {
         backend: ctx.backend.clone(),
         system: "You keep the memory of a supervised venture. Summarize these records in at most \
-                 twelve lines of plain facts: what happened, what was decided, what the numbers \
-                 did. Keep record numbers where they matter. Say nothing that is not in the \
-                 records. Reply with the summary and nothing else."
+                 twelve lines of plain facts: what happened and what was decided. The numbers \
+                 are given as facts; do not compute or restate figures of your own. Keep record \
+                 numbers where they matter. Say nothing that is not in the records. Reply with \
+                 the summary and nothing else."
             .to_string(),
         user,
         max_tokens: 1024,
     }
 }
 
-/// The summary as an inferred record citing the leaves, or nothing when
-/// the reply is empty.
+/// The summary as an inferred record citing the leaves, carrying the facts
+/// code computed beside the narrative, or nothing when the reply is empty.
 pub fn summary_record(ctx: &Context, text: &str) -> Option<Record> {
     let text = text.trim();
     if text.is_empty() {
@@ -190,6 +218,7 @@ pub fn summary_record(ctx: &Context, text: &str) -> Option<Record> {
         confidence: None,
         cites: ctx.to_summarize.iter().map(|e| e.seq).collect(),
         implausible: None,
+        facts: Some(summary_facts(&ctx.to_summarize)),
     })
 }
 
@@ -321,12 +350,24 @@ pub fn prompt_with(ctx: &Context, drilled: &str) -> InferRequest {
         user.push_str(&format!("Forbidden: {}\n", m.forbidden.join(", ")));
     }
     for s in ctx.summaries.iter().filter(|e| !hidden(e)) {
-        if let Record::Report { note, cites, .. } = &s.record {
+        if let Record::Report {
+            note, cites, facts, ..
+        } = &s.record
+        {
             user.push_str(&format!(
                 "Summary of records up to #{} (#{}):\n",
                 cites.iter().max().copied().unwrap_or(0),
                 s.seq
             ));
+            if let Some(f) = facts {
+                user.push_str("  Facts, computed by code:\n");
+                for line in f.lines() {
+                    user.push_str("    ");
+                    user.push_str(&line);
+                    user.push('\n');
+                }
+                user.push_str("  Narrative (inferred, may be wrong):\n");
+            }
             for line in note.lines() {
                 user.push_str("  ");
                 user.push_str(line);
@@ -419,6 +460,7 @@ pub fn unusable_record(ctx: &Context, why: &str, reply: &str) -> Record {
         confidence: None,
         cites: vec![],
         implausible: None,
+        facts: None,
     }
 }
 
@@ -454,6 +496,7 @@ pub fn nothing_record(venture: &str, reason: Option<&str>) -> Record {
         confidence: None,
         cites: vec![],
         implausible: None,
+        facts: None,
     }
 }
 
@@ -737,6 +780,7 @@ mod tests {
                 confidence: None,
                 cites: vec![3, 4, 5],
                 implausible: None,
+                facts: None,
             },
         )];
         c.asks = vec![entry(
@@ -1155,6 +1199,94 @@ mod tests {
             trim_to_budget(&entries, 1).len(),
             1,
             "at least one entry is kept"
+        );
+    }
+
+    fn narrative(seq: Seq, cites: Vec<Seq>, note: &str, facts: Option<Facts>) -> Entry {
+        entry(
+            seq,
+            Record::Report {
+                claim: Claim::Inferred,
+                venture: "shop".into(),
+                metric: SUMMARY.into(),
+                value: None,
+                note: note.into(),
+                source: None,
+                confidence: None,
+                cites,
+                implausible: None,
+                facts,
+            },
+        )
+    }
+
+    #[test]
+    fn a_summary_prompt_never_holds_the_previous_narrative() {
+        let mut c = ctx(false);
+        let reading = |seq, v| {
+            entry(
+                seq,
+                Record::report(Claim::Measured, "shop", "orders", Some(v), ""),
+            )
+        };
+        let first = vec![reading(1, 4.0), reading(2, 10.0)];
+        let prev = narrative(
+            3,
+            vec![1, 2],
+            "ZEBRA-MARKER orders peaked at 9000",
+            Some(summary_facts(&first)),
+        );
+        c.to_summarize = vec![prev, reading(4, 6.0)];
+        let p = summary_prompt(&c).user;
+        assert!(!p.contains("ZEBRA-MARKER"), "{p}");
+        assert!(!p.contains("9000"), "{p}");
+        // Its facts do go in, merged with the new span's.
+        assert!(
+            p.contains("orders: last 6, min 4, max 10, 3 readings"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn the_summary_record_carries_facts_whatever_the_narrative_says() {
+        let mut c = ctx(false);
+        c.to_summarize = vec![
+            entry(
+                1,
+                Record::report(Claim::Measured, "shop", "orders", Some(4.0), ""),
+            ),
+            entry(
+                2,
+                Record::report(Claim::Measured, "shop", "orders", Some(10.0), ""),
+            ),
+        ];
+        let honest = summary_record(&c, "Orders ran from 4 to 10.").unwrap();
+        let wrong = summary_record(&c, "Orders hit a min of 1 and a max of 99999.").unwrap();
+        let facts = |r: &Record| match r {
+            Record::Report { facts, .. } => facts.clone().unwrap(),
+            _ => panic!("not a report"),
+        };
+        assert_eq!(facts(&honest), facts(&wrong));
+        let m = &facts(&wrong).metrics["orders"];
+        assert_eq!((m.last, m.min, m.max), (10.0, 4.0, 10.0));
+    }
+
+    #[test]
+    fn the_decision_prompt_labels_the_narrative_inferred() {
+        let mut c = ctx(false);
+        let f = summary_facts(&[entry(
+            1,
+            Record::report(Claim::Measured, "shop", "orders", Some(4.0), ""),
+        )]);
+        c.summaries = vec![narrative(9, vec![1], "orders were fine", Some(f))];
+        let p = prompt(&c).user;
+        assert!(
+            p.contains("Facts, computed by code:\n    orders: last 4, min 4, max 4, 1 readings"),
+            "{p}"
+        );
+        assert!(
+            p.contains("Narrative (inferred, may be wrong):\n  orders were fine"),
+            "{p}"
         );
     }
 }

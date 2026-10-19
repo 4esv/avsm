@@ -98,6 +98,7 @@ fn plausible(e: &Entry) -> Option<f64> {
         Record::Report {
             value: Some(x),
             implausible: None,
+            facts: None,
             ..
         } => Some(*x),
         _ => None,

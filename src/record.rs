@@ -359,6 +359,10 @@ pub enum Record {
         /// is kept, and is never a premise for a crossed threshold.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         implausible: Option<String>,
+        /// On a summary: the numbers of the span, computed by code. The
+        /// narrative in `note` is inferred; these are not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        facts: Option<crate::facts::Facts>,
     },
     /// A model, or a human by hand, suggests an action by name, with the
     /// payload the lever would consume.
@@ -592,6 +596,7 @@ impl Record {
             confidence: None,
             cites: vec![],
             implausible: None,
+            facts: None,
         }
     }
 

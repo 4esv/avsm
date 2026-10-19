@@ -480,6 +480,7 @@ fn the_parents_nightly_call_sees_childrens_records_not_their_raw_input() {
         confidence: Some(0.5),
         cites: vec![],
         implausible: None,
+        facts: None,
     })
     .unwrap();
     k.cycle("portfolio");

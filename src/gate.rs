@@ -3859,6 +3859,7 @@ mod tests {
             confidence: None,
             cites,
             implausible: None,
+            facts: None,
         };
         let f1 = fx.push(finding("rivals charge 9", vec![]));
         let f2 = fx.push(finding("rivals charge 8", vec![]));
@@ -3873,6 +3874,7 @@ mod tests {
             confidence: None,
             cites: vec![a, b, f1, f2],
             implausible: None,
+            facts: None,
         });
         let current: Vec<Seq> = current_facts(&fx.entries)
             .into_iter()

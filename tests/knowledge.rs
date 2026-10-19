@@ -55,6 +55,7 @@ fn finding(venture: &str, topic: &str, note: &str, cites: Vec<u64>) -> Record {
         confidence: Some(0.7),
         cites,
         implausible: None,
+        facts: None,
     }
 }
 
@@ -154,6 +155,7 @@ fn past_the_bound_the_older_records_are_summarized_and_leave_the_context() {
             confidence: None,
             cites: (2..=7).collect(),
             implausible: None,
+            facts: None,
         }]]),
         seen: Arc::clone(&seen),
     };
@@ -315,4 +317,76 @@ fn a_model_drills_through_the_roles_process_and_each_drill_is_a_record() {
             .count(),
         3
     );
+}
+
+#[test]
+fn the_kernel_computes_a_summarys_facts_and_ignores_the_roles() {
+    use avsm::facts::{Facts, MetricFacts};
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(
+        tmp.path(),
+        "nightly: never\ndefault: k\nbackends:\n  k: {kind: command, run: echo nothing}\n",
+    );
+    let seen = Arc::new(Mutex::new(vec![]));
+    let dir = venture(
+        tmp.path(),
+        "shop",
+        "purpose: Sell.\nmetric: shell echo 5\ncontroller: {kind: model}\ncadence: 1h\nsummarize_after: 4\n",
+    );
+    let lie = Facts {
+        metrics: [(
+            "shell echo 5".to_string(),
+            MetricFacts {
+                last: 1.0,
+                min: 1.0,
+                max: 99999.0,
+                readings: 77,
+            },
+        )]
+        .into(),
+        actions: 40,
+        ..Facts::default()
+    };
+    let role = Scripted {
+        replies: VecDeque::from(vec![vec![Record::Report {
+            claim: Claim::Inferred,
+            venture: "shop".into(),
+            metric: "summary".into(),
+            value: None,
+            note: "Orders hit 99999 and the min was 1.".into(),
+            source: None,
+            confidence: None,
+            cites: (2..=7).collect(),
+            implausible: None,
+            facts: Some(lie.clone()),
+        }]]),
+        seen: Arc::clone(&seen),
+    };
+    let mut k = Kernel::with(
+        &home,
+        Box::new(role),
+        Box::new(LocalWarden::open(&home).unwrap()),
+    )
+    .unwrap();
+    k.add(&dir).unwrap();
+    for _ in 0..8 {
+        k.report("shop", false);
+    }
+    k.cycle("shop");
+    let entries = k.entries().unwrap();
+    let summary = entries.last().unwrap();
+    let stored = match &summary.record {
+        Record::Report { facts, .. } => facts.clone().unwrap(),
+        _ => panic!("{}", summary.line()),
+    };
+    let cited: Vec<_> = entries
+        .iter()
+        .filter(|e| (2..=7).contains(&e.seq))
+        .cloned()
+        .collect();
+    assert_eq!(stored, Facts::compute(&cited));
+    assert_ne!(stored, lie);
+    assert_eq!(stored.metrics.len(), 1, "{stored:?}");
+    let m = stored.metrics.values().next().unwrap();
+    assert_eq!((m.last, m.min, m.max, m.readings), (5.0, 5.0, 5.0, 6));
 }

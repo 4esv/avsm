@@ -294,6 +294,7 @@ fn record(op: &Op, n: u64) -> Record {
             confidence: None,
             cites: cites.map(|x| pick(n, x)).into_iter().collect(),
             implausible: doubt.then(|| "a step too big".to_string()),
+            facts: None,
         },
         Op::Proposal(venture, action, claim, payload) => Record::Proposal {
             cites: vec![],

@@ -81,6 +81,7 @@ impl Kernel {
                                         confidence: None,
                                         cites: vec![intent],
                                         implausible: None,
+                                        facts: None,
                                     });
                                 }
                                 Run::Hit

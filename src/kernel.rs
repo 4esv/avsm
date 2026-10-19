@@ -1053,6 +1053,7 @@ impl Kernel {
             confidence: None,
             cites: vec![],
             implausible: implausible.clone(),
+            facts: None,
         }) {
             Ok(e) => e,
             Err(e) => {
@@ -1281,6 +1282,7 @@ impl Kernel {
                         confidence: None,
                         cites: candidate.cites.clone(),
                         implausible: None,
+                        facts: None,
                     };
                     if let Err(e) = self.append(failed) {
                         lines.push(format!("{name}: cannot write record: {e}"));
@@ -1458,10 +1460,7 @@ impl Kernel {
         // it does not stand for, and the open asks. Past the venture's
         // bound, the older records go to the role to be summarized first;
         // the previous summary goes with them so the new one carries it.
-        let is_summary = |e: &Entry| {
-            matches!(&e.record, Record::Report { claim: Claim::Inferred, metric, cites, .. }
-                if metric == SUMMARY && !cites.is_empty())
-        };
+        let is_summary = role::is_summary;
         let summaries: Vec<Entry> = mine.iter().filter(|e| is_summary(e)).cloned().collect();
         let covered: Seq = summaries
             .iter()
@@ -1593,6 +1592,7 @@ impl Kernel {
                         confidence: None,
                         cites: vec![],
                         implausible: None,
+                        facts: None,
                     })
                     .map_err(|e| e.to_string())?;
                 Ok(text.chars().take(6000).collect())
@@ -1614,6 +1614,7 @@ impl Kernel {
                     confidence: None,
                     cites: vec![],
                     implausible: None,
+                    facts: None,
                 };
                 match self.append(failed) {
                     Ok(entry) => log(&entry.line()),
@@ -1707,6 +1708,15 @@ impl Kernel {
                         note: note.chars().take(role::SUMMARY_MAX + 1).collect(),
                         source: None,
                         confidence: None,
+                        // The numbers are computed here from the cited
+                        // records, whatever the role said.
+                        facts: Some(role::summary_facts(
+                            &mine
+                                .iter()
+                                .filter(|e| cites.contains(&e.seq))
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        )),
                         cites,
                         implausible: None,
                     }
@@ -1724,6 +1734,7 @@ impl Kernel {
                     confidence: None,
                     cites: vec![],
                     implausible: None,
+                    facts: None,
                 },
                 other => Record::Report {
                     claim: Claim::Inferred,
@@ -1738,6 +1749,7 @@ impl Kernel {
                     confidence: None,
                     cites: vec![],
                     implausible: None,
+                    facts: None,
                 },
             };
             let entry = match self.append(record) {

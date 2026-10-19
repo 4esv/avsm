@@ -62,6 +62,7 @@ impl Kernel {
             confidence: None,
             cites,
             implausible: None,
+            facts: None,
         };
         let escalation = |refused: Option<String>| Record::Escalation {
             claim: Claim::Measured,
@@ -223,6 +224,7 @@ fn cite(record: Record, seq: Seq) -> Record {
             confidence,
             cites: vec![seq],
             implausible,
+            facts: None,
         },
         other => other,
     }
