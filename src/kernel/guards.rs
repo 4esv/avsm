@@ -53,8 +53,12 @@ pub const AGREE: usize = 3;
 pub const STUCK: usize = 3;
 
 /// How many of the latest readings, plausible or not, a reading is
-/// checked against: enough for STUCK repeats among a few missing ones.
-const RECENT: usize = 8;
+/// checked against for agreeing and flapping.
+const RECENT: usize = 3;
+
+/// How far back a run of exact repeats is followed, to find whether a
+/// lever ran during it.
+const PLATEAU: usize = 256;
 
 /// How many plausible readings say whether a metric varies.
 pub const HISTORY: usize = 20;
@@ -78,14 +82,17 @@ fn median_step(history: &[f64]) -> f64 {
 /// Why a reading is not to be believed, or None when it is. `before`
 /// holds the latest plausible readings, up to HISTORY, oldest first;
 /// `recent` the values of the latest readings, plausible or not, oldest
-/// first. `moved` says a lever whose `expects` moves this metric ran, ok,
-/// since the first of the readings just before that equal this one.
+/// first. `repeats` counts the readings just before that equal this one
+/// exactly, missing ones skipped: a missing reading neither counts as a
+/// repeat nor breaks a run of them. `moved` says a lever whose `expects`
+/// moves this metric ran, ok, since the first of those repeats.
 pub fn implausible(
     value: Option<f64>,
     before: &[f64],
     recent: &[Option<f64>],
     range: Option<[f64; 2]>,
     max_step: Option<f64>,
+    repeats: usize,
     moved: bool,
 ) -> Option<String> {
     let Some(x) = value else {
@@ -109,10 +116,7 @@ pub fn implausible(
     // a declared bound of its range: dry soil reads its floor.
     let varies = median_step(before) > 0.0;
     let bound = |x: f64| range.is_some_and(|[lo, hi]| x == lo || x == hi);
-    // A missing reading says nothing either way: it neither counts as a
-    // repeat nor breaks a run of them.
-    let valued: Vec<f64> = recent.iter().rev().filter_map(|r| *r).collect();
-    if varies && !bound(x) && valued.len() >= STUCK && valued[..STUCK].iter().all(|r| *r == x) {
+    if varies && !bound(x) && repeats >= STUCK {
         return Some(format!(
             "stuck: {x} exactly, as the {STUCK} readings before it, where the metric varies"
         ));
@@ -120,7 +124,7 @@ pub fn implausible(
     // The readings just before are exactly this one, and a lever that is
     // expected to move the metric ran among them. At a bound that is the
     // lever's to answer for (ineffective), not the sensor's.
-    if varies && moved && !bound(x) && valued.first() == Some(&x) {
+    if varies && moved && !bound(x) && repeats >= 1 {
         return Some(format!(
             "stuck: {x} exactly, as the reading before it, though a lever expected to move it ran since"
         ));
@@ -392,17 +396,18 @@ impl Kernel {
         // The first of the readings just before that equal this one
         // exactly, missing ones skipped: did a lever that expects to move
         // this metric run, ok, since?
-        let plateau = value.and_then(|x| {
+        let plateau: Vec<Seq> = value.map_or_else(Vec::new, |x| {
             reports(&index, venture, metric)
                 .filter_map(|e| match &e.record {
                     Record::Report { value: Some(v), .. } => Some((e.seq, *v)),
                     _ => None,
                 })
                 .take_while(|(_, v)| *v == x)
-                .last()
+                .take(PLATEAU)
                 .map(|(seq, _)| seq)
+                .collect()
         });
-        let moved = plateau.is_some_and(|last| {
+        let moved = plateau.last().is_some_and(|&last| {
             self.ventures.get(venture).is_some_and(|v| {
                 v.mandate.metric_name() == metric
                     && v.mandate
@@ -419,7 +424,15 @@ impl Kernel {
                         })
             })
         });
-        let why = implausible(value, &before, &recent, range, max_step, moved);
+        let why = implausible(
+            value,
+            &before,
+            &recent,
+            range,
+            max_step,
+            plateau.len(),
+            moved,
+        );
         let fresh = reports(&index, venture, metric)
             .next()
             .is_none_or(|e| e.record.implausible().is_none());
@@ -712,9 +725,20 @@ mod tests {
         .unwrap()
     }
 
+    /// How many of these readings, newest first, equal `x`, missing ones
+    /// skipped: what `doubt` counts from the ledger.
+    fn reps(x: f64, recent: &[Option<f64>]) -> usize {
+        recent
+            .iter()
+            .rev()
+            .flatten()
+            .take_while(|v| **v == x)
+            .count()
+    }
+
     /// Why a reading of the metric is implausible, with no recent run.
     fn doubted(value: Option<f64>, before: &[f64], m: &Mandate) -> Option<String> {
-        implausible(value, before, &[], m.range, m.max_step, false)
+        implausible(value, before, &[], m.range, m.max_step, 0, false)
     }
 
     #[test]
@@ -722,7 +746,15 @@ mod tests {
         let (range, step) = (Some([0.0, 1000.0]), Some(50.0));
         let anchor = [60.0, 60.0, 60.0];
         let at = |x: f64, recent: &[Option<f64>]| {
-            implausible(Some(x), &anchor, recent, range, step, false)
+            implausible(
+                Some(x),
+                &anchor,
+                recent,
+                range,
+                step,
+                reps(x, recent),
+                false,
+            )
         };
         // Stuck at 60, then the truth near 0: the third agreeing re-anchors.
         assert!(at(2.0, &[Some(60.0), Some(60.0)]).is_some(), "one jump");
@@ -738,7 +770,7 @@ mod tests {
         // Re-anchored, a small wiggle back is no flap.
         let after = [60.0, 60.0, 0.0];
         assert_eq!(
-            implausible(Some(1.0), &after, &[], range, step, false),
+            implausible(Some(1.0), &after, &[], range, step, 0, false),
             None
         );
     }
@@ -748,7 +780,15 @@ mod tests {
         let (range, step) = (Some([0.0, 1000.0]), Some(50.0));
         let varied = [40.0, 42.0, 41.0, 43.0, 41.0];
         let at = |x: f64, recent: &[Option<f64>]| {
-            implausible(Some(x), &varied, recent, range, step, false)
+            implausible(
+                Some(x),
+                &varied,
+                recent,
+                range,
+                step,
+                reps(x, recent),
+                false,
+            )
         };
         let stuck = at(41.0, &[Some(41.0), Some(41.0), Some(41.0)]).unwrap();
         assert!(stuck.starts_with("stuck"), "{stuck}");
@@ -765,7 +805,7 @@ mod tests {
         let flat = [50.0; 10];
         let same = [Some(50.0), Some(50.0), Some(50.0)];
         assert_eq!(
-            implausible(Some(50.0), &flat, &same, range, step, false),
+            implausible(Some(50.0), &flat, &same, range, step, 3, false),
             None
         );
         assert_eq!(median_step(&flat), 0.0);

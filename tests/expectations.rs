@@ -630,7 +630,9 @@ fn a_missing_reading_never_breaks_a_frozen_plateau_after_a_run() {
     f.report(20.0); // crosses: boost runs
     assert_eq!(f.intents(), 1);
     f.report(20.0); // exactly the same after a run: stuck
-    f.report(f64::NAN);
+    for _ in 0..12 {
+        f.report(f64::NAN); // half a day of the sensor gone
+    }
     f.report(20.0);
     f.report(20.0);
     let flags = f.flags();
