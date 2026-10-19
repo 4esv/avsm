@@ -379,12 +379,37 @@ water_asks = {s for s, a, r in recs if kind(r) == "ask" and r.get("venture") == 
               and (r.get("signal") or {}).get("signal") == "ineffective" and (r.get("signal") or {}).get("action") == "water"}
 restored_at = [a for s, a, r in recs if kind(r) == "decision" and (r.get("verdict") or {}).get("verdict") == "approve"
                and (r.get("verdict") or {}).get("ask") in water_asks]
+at_of = {s: a for s, a, _ in recs}
+
+
+def restored_by(r):
+    """The declared approval the proof's restored step cites, when it
+    approves an ask that water is ineffective; else None."""
+    for x in r["proof"]["steps"]:
+        if x.get("step") != "restored" or x.get("ask") not in water_asks: continue
+        d = by_seq.get(x.get("decision")) or {}
+        v = d.get("verdict") or {}
+        if kind(d) == "decision" and d.get("claim") == "declared" and v.get("verdict") == "approve" and v.get("ask") == x.get("ask"):
+            return x.get("decision")
+    return None
+
+
+# The proof's restored step says the human restored the lever; the split
+# prefers it, counting a restoration since death, and cross-checks it
+# against the one inferred from asks and decisions.
 after_by = {"before_evidence": 0, "human_restored": 0, "against_evidence": 0}
-for i, (at_, r) in enumerate((a, r) for _, a, r in recs if dead_at and a >= dead_at and r.get("kind") == "intent"
-                             and r.get("venture") == "tomato" and r.get("action") == "water"):
+restored_disagree = []
+for i, (s_, at_, r) in enumerate((s, a, r) for s, a, r in recs if dead_at and a >= dead_at and r.get("kind") == "intent"
+                                 and r.get("venture") == "tomato" and r.get("action") == "water"):
+    d = restored_by(r)
+    by_proof = d is not None and at_of.get(d, 0) >= dead_at
+    by_asks = any(dead_at <= a <= at_ for a in restored_at)
+    if i > 0 and by_proof != by_asks:
+        restored_disagree.append(f"#{s_} proof {'#' + str(d) if d else 'none'}, asks {by_asks}")
     if i == 0: after_by["before_evidence"] += 1
-    elif any(dead_at <= a <= at_ for a in restored_at): after_by["human_restored"] += 1
+    elif by_proof: after_by["human_restored"] += 1
     else: after_by["against_evidence"] += 1
+after_by["restored_disagree"] = restored_disagree[:5]
 
 # Every cap or budget refusal avsm printed has a refusal record that day.
 printed, unrecorded = None, []

@@ -123,6 +123,11 @@ pub enum Step {
     Quota { what: String, used: u32, cap: Cap },
     /// A declared decision the proof uses.
     Decision { seq: Seq, what: String },
+    /// The lever was found ineffective by the measured `ask`, and the
+    /// declared `decision` approving it restored it: a run of it rests on
+    /// that human word as well as on its own premises. Not an approval of
+    /// this run; that is a `Decision`.
+    Restored { ask: Seq, decision: Seq },
     /// A record cited as the occasion for acting. It authorizes nothing.
     Occasion {
         seq: Seq,
@@ -951,7 +956,12 @@ pub fn gate_in(
     let budget = budget_of_in(index, &adopted, v);
     let spent = || spent_today_in(index, &adopted, v, now);
     let quota = quota_check_in(index, mandates, quotas, v, a, now);
-    let (extra_steps, mut extra_reasons) = limits(&mut p, v, a, &adopted, budget, spent, quota);
+    let (mut extra_steps, mut extra_reasons) = limits(&mut p, v, a, &adopted, budget, spent, quota);
+    extra_steps.extend(
+        index
+            .restored(v, a)
+            .map(|(ask, decision)| Step::Restored { ask, decision }),
+    );
     p.run();
     extra_reasons.extend(allocation_reasons(
         &p,
@@ -1980,6 +1990,10 @@ impl fmt::Display for Step {
             ),
             Step::Quota { what, used, cap } => write!(f, "quota      {what} {cap}, {used} used"),
             Step::Decision { seq, what } => write!(f, "decision   #{seq}  declared  {what}"),
+            Step::Restored { ask, decision } => write!(
+                f,
+                "restored   #{decision}  declared  approved ask #{ask}, which found this lever ineffective"
+            ),
             Step::Occasion {
                 seq,
                 claim,
@@ -2633,7 +2647,10 @@ pub mod reference {
         let budget = budget_of(ledger, &adopted, v);
         let spent = || spent_today(ledger, &adopted, v, now);
         let quota = quota_check(ledger, mandates, quotas, v, a, now);
-        let (extra_steps, mut extra_reasons) = limits(&mut p, v, a, &adopted, budget, spent, quota);
+        let (mut extra_steps, mut extra_reasons) =
+            limits(&mut p, v, a, &adopted, budget, spent, quota);
+        extra_steps
+            .extend(restored(ledger, v, a).map(|(ask, decision)| Step::Restored { ask, decision }));
         p.run();
         extra_reasons.extend(allocation_reasons(
             &p,
@@ -2705,6 +2722,41 @@ pub mod reference {
     /// measured relapse after the latest such ask and after any adoption
     /// suspend it again? An ask or relapse that is void is neither.
     pub fn suspended(ledger: &[Entry], venture: &str, action: &str) -> bool {
+        let (latest, relapsed) = governing(ledger, venture, action);
+        relapsed || latest.is_some_and(|q| approval_of(ledger, venture, q).is_none())
+    }
+
+    /// The ask and declared decision that restored a once-suspended
+    /// lever: the latest non-void ineffective ask after the last adoption
+    /// has a declared approval by the venture, the first of which is
+    /// cited, and no relapse since.
+    pub fn restored(ledger: &[Entry], venture: &str, action: &str) -> Option<(Seq, Seq)> {
+        match governing(ledger, venture, action) {
+            (Some(q), false) => approval_of(ledger, venture, q).map(|d| (q, d)),
+            _ => None,
+        }
+    }
+
+    /// The first declared approval of an ask by this venture.
+    fn approval_of(ledger: &[Entry], venture: &str, ask: Seq) -> Option<Seq> {
+        ledger
+            .iter()
+            .filter(|d| {
+                matches!(&d.record, Record::Decision {
+                    claim: Claim::Declared,
+                    venture: dv,
+                    verdict: Verdict::Approve { ask: q, .. },
+                    ..
+                } if dv == venture && *q == ask)
+            })
+            .map(|d| d.seq)
+            .min()
+    }
+
+    /// The latest non-void ineffective ask after the last adoption, and
+    /// whether a non-void measured relapse after the latest ask and after
+    /// any adoption suspended the lever again.
+    fn governing(ledger: &[Entry], venture: &str, action: &str) -> (Option<Seq>, bool) {
         let is_ask = |e: &Entry| {
             matches!(&e.record, Record::Ask {
                 claim: Claim::Measured,
@@ -2748,17 +2800,7 @@ pub mod reference {
             .filter(|e| is_ask(e) && e.seq > adopted && !voided(ledger, venture, e))
             .map(|e| e.seq)
             .max();
-        relapsed
-            || latest.is_some_and(|q| {
-                !ledger.iter().any(|d| {
-                    matches!(&d.record, Record::Decision {
-                        claim: Claim::Declared,
-                        venture: dv,
-                        verdict: Verdict::Approve { ask, .. },
-                        ..
-                    } if dv == venture && *ask == q)
-                })
-            })
+        (latest, relapsed)
     }
 
     /// Parents and children as facts, and every pause and resume a parent

@@ -548,6 +548,75 @@ fn an_approval_of_an_old_ask_never_answers_a_newer_one() {
     assert!(f.suspended(), "the newest ask is still open");
 }
 
+/// The restored step of each intent of the lever, oldest first.
+fn restored_steps(f: &Fixture) -> Vec<Option<(Seq, Seq)>> {
+    f.entries()
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Intent { action, proof, .. } if action == "boost" => {
+                Some(proof.steps.iter().find_map(|s| match s {
+                    avsmd::gate::Step::Restored { ask, decision } => Some((*ask, *decision)),
+                    _ => None,
+                }))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_run_of_a_restored_lever_cites_the_restoring_approval() {
+    let _c = clock();
+    let (mut f, again) = denied_then_asked_again();
+    let before = restored_steps(&f);
+    assert!(
+        before.iter().all(Option::is_none),
+        "a lever never found ineffective, or held, runs on its own premises: {before:?}"
+    );
+    f.k.approve(again, None).unwrap();
+    let decision = f
+        .entries()
+        .iter()
+        .find(|e| {
+            matches!(&e.record, Record::Decision { verdict: Verdict::Approve { ask, .. }, .. }
+                if *ask == again)
+        })
+        .unwrap()
+        .seq;
+    f.report_tomorrow(4.0);
+    let after = restored_steps(&f);
+    assert_eq!(after.len(), before.len() + 1, "it runs");
+    assert_eq!(
+        after.last().copied().flatten(),
+        Some((again, decision)),
+        "the run cites the ask that found it ineffective and the approval that restored it, not the denied one"
+    );
+    assert_eq!(
+        f.k.index().unwrap().restored("raiser", "boost"),
+        Some((again, decision))
+    );
+    assert_eq!(
+        avsmd::gate::reference::restored(&f.entries(), "raiser", "boost"),
+        Some((again, decision))
+    );
+    let intent = f
+        .entries()
+        .into_iter()
+        .rev()
+        .find(|e| e.record.kind() == Kind::Intent)
+        .unwrap();
+    let why = avsmd::gate::why(&intent);
+    assert!(
+        why.contains(&format!("restored   #{decision}")),
+        "why shows it: {why}"
+    );
+    // A relapse suspends it again: no longer restored.
+    f.report(4.0);
+    f.report(4.0);
+    assert!(f.suspended());
+    assert_eq!(f.k.index().unwrap().restored("raiser", "boost"), None);
+}
+
 #[test]
 fn a_fresh_miss_after_a_restore_suspends_again() {
     let _c = clock();

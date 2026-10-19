@@ -132,8 +132,9 @@ pub struct Index {
     /// Every trusted report code marked implausible, per venture and
     /// metric, by number.
     doubted: HashMap<String, HashMap<String, Vec<Seq>>>,
-    /// The ventures whose declared approval answered an ask.
-    approved_by: HashMap<Seq, HashSet<String>>,
+    /// The ventures whose declared approval answered an ask, each with
+    /// its first such approval.
+    approved_by: HashMap<Seq, HashMap<String, Seq>>,
     /// The highest trusted, plausible value of each venture's metrics: the
     /// peak a drawdown falls from.
     peaks: HashMap<String, HashMap<String, f64>>,
@@ -369,7 +370,8 @@ impl Index {
                                 self.approved_by
                                     .entry(*ask)
                                     .or_default()
-                                    .insert(venture.clone());
+                                    .entry(venture.clone())
+                                    .or_insert(seq);
                             }
                             self.answers.entry(venture).or_default().push(seq);
                             if matches!(verdict, Verdict::Approve { .. })
@@ -691,6 +693,31 @@ impl Index {
     /// decision loosens, but for a miss seen only on stuck readings, which
     /// a plausible reading away from the frozen value voids (`voided`).
     pub fn suspended(&self, venture: &str, action: &str) -> bool {
+        let (latest, relapsed) = self.governing(venture, action);
+        relapsed || latest.is_some_and(|q| self.approval_of(venture, q).is_none())
+    }
+
+    /// The ask and the declared decision that restored this lever: it had
+    /// a measured ineffective ask since the last adoption, and is not
+    /// suspended because a declared approval by the venture answered the
+    /// latest one. A run of it then is the human's word, not code's
+    /// alone, and its proof says so.
+    pub fn restored(&self, venture: &str, action: &str) -> Option<(Seq, Seq)> {
+        match self.governing(venture, action) {
+            (Some(q), false) => self.approval_of(venture, q).map(|d| (q, d)),
+            _ => None,
+        }
+    }
+
+    /// The first declared approval of an ask by this venture.
+    fn approval_of(&self, venture: &str, ask: Seq) -> Option<Seq> {
+        self.approved_by.get(&ask)?.get(venture).copied()
+    }
+
+    /// The latest non-void ineffective ask after the last declared
+    /// adoption, whose answer governs, and whether a measured relapse
+    /// after the latest ask suspended the lever again.
+    fn governing(&self, venture: &str, action: &str) -> (Option<Seq>, bool) {
         // A declared adoption of the mandate after the ask answers it too.
         let adopted = self.adoptions.get(venture).map_or(0, |a| a.seq);
         let key = (venture.to_string(), action.to_string());
@@ -701,18 +728,12 @@ impl Index {
                 .filter(|q| *q > adopted && !self.voided(venture, *q))
                 .max()
         });
-        let unanswered = latest.is_some_and(|q| {
-            !self
-                .approved_by
-                .get(&q)
-                .is_some_and(|by| by.contains(venture))
-        });
         let last_ask = asks.and_then(|a| a.iter().max()).copied().unwrap_or(0);
         let relapsed = self.relapses.get(&key).is_some_and(|r| {
             r.iter()
                 .any(|r| *r > adopted && *r > last_ask && !self.voided(venture, *r))
         });
-        unanswered || relapsed
+        (latest, relapsed)
     }
 
     /// Is this measured ineffective ask or relapse void? It is when the

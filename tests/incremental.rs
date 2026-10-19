@@ -782,6 +782,11 @@ proptest! {
                 reference::suspended(&entries, v, a),
                 "suspended {} {}", v, a
             );
+            prop_assert_eq!(
+                index.restored(v, a),
+                reference::restored(&entries, v, a),
+                "restored {} {}", v, a
+            );
         }
         prop_assert_eq!(index.open_asks(), reference::open_asks(&entries));
         prop_assert_eq!(gate::open_asks(&entries), reference::open_asks(&entries));

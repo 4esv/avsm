@@ -143,6 +143,19 @@ def has_decision(r):
     return False
 
 
+def has_restored(r):
+    """The human's word on the lever itself: a restored step whose decision
+    is a declared approval of the ineffective ask it names. Not an approval
+    of this run, so it never stands in for one (irreversible levers)."""
+    for st_ in steps(r):
+        if st_.get("step") == "restored":
+            d = by_seq.get(st_.get("decision"))
+            v = (d or {}).get("verdict") or {}
+            if d and kind(d) == "decision" and d.get("claim") == "declared" and v.get("verdict") == "approve" and v.get("ask") == st_.get("ask"):
+                return True
+    return False
+
+
 def is_unwind(r): return any(x.get("step") == "unwind" for x in steps(r))
 
 
@@ -391,7 +404,8 @@ base_slo = sum(x[0] <= SLO_MS for x in base_svc) / n
 
 # The outage: after the first outage scale_up's expectation window (2
 # reports at the 2 h cadence) has closed with the database still down,
-# a run is against the evidence unless a human approved it.
+# a run is against the evidence unless a human approved it, or approved
+# the ineffective ask that restored the lever (its proof's restored step).
 out_days = sorted(d for d, e in P.SCHEDULE.items() if "svc:outage" in e)
 o_lo, o_hi = start + out_days[0] * DAY_S, start + (out_days[-1] + 1) * DAY_S
 EXPECT_WINDOW = 2 * P.STEP  # expects: down within 2, at a cadence of 2h
@@ -400,7 +414,7 @@ against = []
 if o_runs:
     evidence_at = o_runs[0][1] + EXPECT_WINDOW
     against = [f"#{s} day {(a - start) / DAY_S:.2f}{' (unwind)' if is_unwind(r) else ''}" for s, a, r in o_runs
-               if a > evidence_at and not has_decision(r)]
+               if a > evidence_at and not has_decision(r) and not has_restored(r)]
 ineff = [(s, a, r) for s, a, r in asks if r["venture"] == "service" and (r.get("signal") or {}).get("signal") == "ineffective"]
 outage = {"runs": len(o_runs), "against_evidence": against[:CAP_LIST],
           "ineffective_asks": [f"#{s} day {(a - start) / DAY_S:.2f}" for s, a, r in ineff][:10]}
