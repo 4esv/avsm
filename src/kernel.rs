@@ -29,6 +29,7 @@ use crate::warden::{self, Failure, FromWarden, LocalWarden, ToWarden, Warden};
 mod escalate;
 mod expect;
 mod guards;
+pub mod predict;
 mod refusals;
 
 /// How long a report may take.
@@ -66,6 +67,9 @@ pub struct Kernel {
     refusals: refusals::Tally,
     /// How each run of a lever with expectations went, once judged.
     judged: BTreeMap<Seq, expect::Run>,
+    /// Set only by `simulate`, when it builds the kernel: lever runs go to
+    /// the simulation world, never to the levers. No config can set it.
+    sim: Option<Arc<crate::simulate::Simulation>>,
 }
 
 /// What the kernel knows about a venture beyond the ledger.
@@ -172,9 +176,22 @@ impl Kernel {
             namespaces: None,
             refusals: refusals::Tally::default(),
             judged: BTreeMap::new(),
+            sim: None,
         };
         kernel.reload()?;
         kernel.recover();
+        Ok(kernel)
+    }
+
+    /// A kernel for a simulation: its warden sends every lever run to the
+    /// simulation, and so does the kernel. Only `simulate` builds one.
+    pub(crate) fn simulated(
+        home: &Path,
+        sim: Arc<crate::simulate::Simulation>,
+    ) -> Result<Kernel, String> {
+        let warden = LocalWarden::simulated(home, sim.clone())?;
+        let mut kernel = Kernel::with(home, Box::new(ModelRole), Box::new(warden))?;
+        kernel.sim = Some(sim);
         Ok(kernel)
     }
 
@@ -996,6 +1013,15 @@ impl Kernel {
             }
         }
         let waiting = rt.restart_at.is_some_and(|t| Instant::now() < t);
+        // A simulation never starts a venture's `run`: what it does is the
+        // real world's, and a simulation only ever touches the world model.
+        if self.sim.is_some() {
+            if !rt.dead && v.run().is_some() {
+                log(&format!("{name}: run is not started in a simulation"));
+            }
+            rt.dead = true;
+            return;
+        }
         if rt.run.is_none() && !paused && !rt.dead && !waiting {
             if let Some(path) = v.run() {
                 // `network: none` means a network namespace of its own,
@@ -1091,6 +1117,12 @@ impl Kernel {
         }
         self.enforce_guards(name, readings);
         self.check_audits(&v);
+        // Forecasts this report resolves are scored, by code, before
+        // anything acts on it.
+        let forecast = name != SELF && predict::predicts(&v.mandate);
+        if forecast {
+            self.resolve(name);
+        }
         if value.is_none() {
             return;
         }
@@ -1105,13 +1137,36 @@ impl Kernel {
             Ok(index) => gate::effective_threshold_in(&index, &self.adopted(), name),
             Err(_) => return,
         };
+        let mut ran = None;
         if let Some(t) = threshold {
             if self.threshold_fires(&v, &t) {
                 self.forget_refusal();
+                let before = self.ledger_last();
                 self.act(name, &t.action, vec![entry.seq], Claim::Measured);
+                if self.intent_since(name, &t.action, before) {
+                    ran = Some(t.action.clone());
+                }
                 self.saturate(name, &t.action, &metric, t.bound);
             }
         }
+        // One step ahead, with the lever that just ran, if any.
+        if forecast {
+            self.predict(name, ran.as_deref());
+        }
+    }
+
+    /// The number of the last record in the ledger, 0 when empty.
+    fn ledger_last(&self) -> Seq {
+        self.index().map_or(0, |i| i.last())
+    }
+
+    /// Did an intent of this lever go into the ledger after `after`?
+    fn intent_since(&self, venture: &str, action: &str, after: Seq) -> bool {
+        self.index().is_ok_and(|i| {
+            i.intents_of(venture, action)
+                .last()
+                .is_some_and(|s| *s > after)
+        })
     }
 
     /// Make sure the built-in self venture is adopted under the mandate
@@ -1137,6 +1192,15 @@ impl Kernel {
     fn measure(&mut self, v: &Venture) -> Option<(Option<f64>, String)> {
         if v.name == SELF && v.path.is_none() {
             return Some(crate::selfventure::measure(&self.ledger));
+        }
+        if let (Some(sim), Some(dir)) = (self.sim.clone(), v.path.as_deref()) {
+            let simulated = {
+                let index = self.index().ok()?;
+                sim.measure(&index, &v.name, &v.mandate, dir)
+            };
+            if simulated.is_some() {
+                return simulated;
+            }
         }
         if v.mandate.metric_adapter().is_some() {
             return Some(match self.warden.measure(&v.name) {

@@ -8,9 +8,9 @@ Use these words and no synonyms.
 
 - mandate, record, action, ask
 - measured, declared, inferred
-- report, proposal, action, ask, decision, intent, outcome, refusal
+- report, proposal, action, ask, decision, intent, outcome, refusal, prediction
 - running, asking, paused
-- ledger, gate, proof, adapter, canary, warden, guard, audit
+- ledger, gate, proof, adapter, canary, warden, guard, audit, world
 - parent, child, payload, adapter (built-in metric or lever), digest, know, expects
 - escalate, escalation (the `escalate:` backend asked when the first cannot answer)
 - Commands: start, add, status, tail, asks, approve, deny, pause, resume, why, know, propose, digest
@@ -30,6 +30,7 @@ Use these words and no synonyms.
 11. Anything that reads the open world is inferred by construction, schema-validated, size-bounded, and stripped of anything that is not a field before it becomes a record.
 12. Self-modification is a proposal. Only a declared decision adopts one.
 13. The only listener is the Tailscale one, off by default, bound to the tailnet interface only, identity from tailscaled, never from the client.
+14. World models, rollouts and forecasts are inferred. They rank, veto and ask, and never authorize.
 
 ## Warden
 

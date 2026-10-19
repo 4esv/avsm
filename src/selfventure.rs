@@ -143,6 +143,8 @@ pub fn canary() -> Result<(), String> {
         range: None,
         max_step: None,
         escalate: None,
+        world: None,
+        calibration: None,
     };
     let mandate_hash = Mandate::hash(&serde_yaml::to_string(&permissive).unwrap_or_default());
     let adopt = Record::Decision {

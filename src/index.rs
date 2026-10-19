@@ -17,6 +17,10 @@ use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Signal, Verdict};
 /// The metric of the reports that say what a run did to the venture's metric.
 pub const EXPECTATION: &str = "expectation";
 
+/// The prefix of the metric of the reports that score a prediction:
+/// `calibration.<model>`.
+pub const CALIBRATION: &str = "calibration.";
+
 /// The latest parent levers one venture pulled on another.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pulled {
@@ -106,6 +110,8 @@ pub struct Index {
     /// The highest trusted, plausible value of each venture's metrics: the
     /// peak a drawdown falls from.
     peaks: HashMap<String, HashMap<String, f64>>,
+    /// Inferred predictions no measured score cites yet, per venture.
+    predictions: HashMap<String, BTreeSet<Seq>>,
 }
 
 impl Index {
@@ -155,7 +161,8 @@ impl Index {
         let r = &e.record;
         let venture = r.venture().to_string();
         self.of.entry(venture.clone()).or_default().push(seq);
-        if r.claim() == Claim::Inferred {
+        // A forecast is not the nightly cycle: it does not say the cycle ran.
+        if r.claim() == Claim::Inferred && r.kind() != Kind::Prediction {
             by_time(
                 self.inferred_at.entry(venture.clone()).or_default(),
                 at,
@@ -217,6 +224,13 @@ impl Index {
                 }
                 if metric == EXPECTATION && *claim == Claim::Measured {
                     self.expected.extend(cites.iter().copied());
+                }
+                if metric.starts_with(CALIBRATION) && *claim == Claim::Measured {
+                    if let Some(open) = self.predictions.get_mut(&venture) {
+                        for c in cites {
+                            open.remove(c);
+                        }
+                    }
                 }
                 if value.is_some() && claim.authorizes() {
                     latest(
@@ -317,6 +331,12 @@ impl Index {
                 self.pending.insert(seq, (venture, action.clone()));
                 let cited = cited_decisions(&proof.steps);
                 self.cite(cited);
+            }
+            Record::Prediction {
+                claim: Claim::Inferred,
+                ..
+            } => {
+                self.predictions.entry(venture).or_default().insert(seq);
             }
             Record::Refusal { closes, .. } => match closes {
                 None => {
@@ -430,7 +450,15 @@ impl Index {
             .map_or(&[], Vec::as_slice)
     }
 
-    /// Every intent of a lever, oldest first.
+    /// A venture's predictions no score has resolved yet, oldest first.
+    pub fn open_predictions(&self, venture: &str) -> Vec<Seq> {
+        self.predictions
+            .get(venture)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every intent of a venture's lever, by number.
     pub fn intents_of(&self, venture: &str, action: &str) -> &[Seq] {
         self.intents_of
             .get(&(venture.to_string(), action.to_string()))

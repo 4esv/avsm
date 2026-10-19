@@ -130,6 +130,7 @@ pub fn enforced(m: &Mandate) -> Vec<f64> {
         v.push(hi);
     }
     v.extend(m.max_step);
+    v.extend(m.calibration);
     v
 }
 
@@ -297,6 +298,18 @@ pub fn render(m: &Mandate) -> String {
             "max step: {} moving more than {} between reports is implausible",
             m.metric_name(),
             num(s)
+        ));
+    }
+    if let Some(w) = &m.world {
+        line(format!(
+            "world model: {w} forecasts {}; it ranks, vetoes and asks, and never authorizes",
+            m.metric_name()
+        ));
+    }
+    if let Some(c) = m.calibration {
+        line(format!(
+            "calibration: the world model's rankings run only once its mean skill over the last 20 scores is at least {}; until then they ask",
+            num(c)
         ));
     }
     match &m.network {

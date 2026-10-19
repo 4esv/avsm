@@ -1979,6 +1979,24 @@ pub fn why(entry: &Entry) -> String {
             text.push_str("  the inferred records it cites authorize nothing\n");
             text
         }
+        Record::Prediction {
+            model,
+            quantiles: q,
+            events,
+            made_at,
+            resolves_at,
+            ..
+        } => {
+            let mut text = format!(
+                "{head}\n  inferred by the {model} world model at {made_at}, resolving at {resolves_at}\n  quantiles  p5 {} p10 {} p25 {} p50 {} p75 {} p90 {} p95 {}\n",
+                q.p5, q.p10, q.p25, q.p50, q.p75, q.p90, q.p95
+            );
+            for e in events {
+                text.push_str(&format!("  event      {} p={}\n", e.name, e.p));
+            }
+            text.push_str("  ranks, vetoes and asks; authorizes nothing\n");
+            text
+        }
     }
 }
 
@@ -2420,6 +2438,8 @@ mod tests {
             range: None,
             max_step: None,
             escalate: None,
+            world: None,
+            calibration: None,
         }
     }
 

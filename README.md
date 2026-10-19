@@ -121,6 +121,20 @@ once until a plausible report comes. On a threshold, `deadband: 2` acts once
 and again only after the metric comes back past the bound by 2; `hold: 3` acts
 after three crossed reports in a row.
 
+### World models
+
+`world: ./world` names a command that steps the venture's world: a JSON
+state, a lever or none, a seed, the time and the last 200 trusted reports in;
+a state, the metric and any guard readings out, bounded to 64 KiB, with
+everything that is not a field dropped. Without one, the built-in baseline
+resamples the metric's own drift and each lever's measured effect from the
+ledger. With `world:` or `calibration: 0.1`, every report brings a one-step
+prediction, an inferred record; the next trusted, plausible report resolves
+it, and code scores it as a measured `calibration.<model>` report (CRPS and its
+skill against persistence, Brier for guard events, 80% coverage). Below the
+`calibration:` bar over the last 20 scores, or with fewer than 5, a ranking
+from the model asks and never runs. A prediction never authorizes anything.
+
 ### Letting a model choose
 
 With `controller: {kind: model}` (or `kind: classifier`, which answers with one

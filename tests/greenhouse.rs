@@ -7,6 +7,11 @@ use std::path::Path;
 use avsm::record::Record;
 use avsm::simulate::{run, Human, Plan};
 
+/// The world the simulation runs the vent in: it opens the vent as the
+/// real lever would, writing the time it opened for the report to read.
+const WORLD: &str = "[ \"$AVSM_LEVER\" = greenhouse/vent ] || exit 0; \
+     echo \"$AVSM_NOW\" > vented; echo \"vent opened at $AVSM_NOW\"";
+
 fn copy_example(to: &Path) {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/greenhouse");
     std::fs::create_dir_all(to).unwrap();
@@ -31,7 +36,7 @@ fn the_temperature_follows_the_clock_and_the_vent_lowers_it() {
         human: Human::ApproveAll,
         start: Some(start),
         add: vec![dir.clone()],
-        world: None,
+        world: Some(WORLD.to_string()),
     };
     let mut out = Vec::new();
     run(&home, &plan, &mut out).unwrap();
@@ -89,6 +94,9 @@ fn the_temperature_follows_the_clock_and_the_vent_lowers_it() {
         "vented at {first}s: {text}"
     );
     assert!(dir.join("vented").is_file(), "the vent left no state");
+    // The vent ran in the world, never as the lever.
+    let outcome = format!("#{intent} done  simulated: world  vent opened at");
+    assert!(text.contains(&outcome), "{text}");
 
     // The reading after the vent is lower than the one before it, by more
     // than the clock alone would have moved it.

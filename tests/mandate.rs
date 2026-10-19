@@ -85,6 +85,8 @@ fn valid_fixture_parses_field_by_field() {
         range: None,
         max_step: None,
         escalate: None,
+        world: None,
+        calibration: None,
     };
     assert_eq!(m.purpose, expected.purpose);
     assert_eq!(m.metric, expected.metric);

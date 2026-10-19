@@ -9,6 +9,11 @@ use std::os::unix::fs::PermissionsExt;
 
 use avsm::simulate::{run, Human, Plan, BY};
 
+/// The world the simulation runs levers in: the post a run would write
+/// lands in posts/, as the real lever would have written it.
+const WORLD: &str = "[ \"$AVSM_LEVER\" = blog/post ] || exit 0; \
+     cat > posts/$(ls posts | wc -l | tr -d ' ').md && echo posted";
+
 #[test]
 fn four_days_in_moments_end_with_the_lever_delegated() {
     // Nightly is local time; pin local to UTC so the nights fall at 03:00Z.
@@ -46,7 +51,7 @@ fn four_days_in_moments_end_with_the_lever_delegated() {
         human: Human::ApproveAll,
         start: Some(start),
         add: vec![blog.clone()],
-        world: None,
+        world: Some(WORLD.to_string()),
     };
     let began = std::time::Instant::now();
     let mut out = Vec::new();
@@ -97,6 +102,8 @@ fn four_days_in_moments_end_with_the_lever_delegated() {
         .unwrap();
     let later = &lines[adopted_at..];
     assert!(ran(&later.join("\n"), "post", ""), "{text}");
+    // Every run went to the world, never to the lever.
+    assert!(ran(&text, "post", "simulated: world  posted"), "{text}");
     assert!(
         !later.iter().any(|l| l.contains("ask       post?")),
         "{text}"

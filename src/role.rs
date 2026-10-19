@@ -711,6 +711,8 @@ mod tests {
                 range: None,
                 max_step: None,
                 escalate: None,
+                world: None,
+                calibration: None,
             },
             entries: vec![Entry::new(
                 1,

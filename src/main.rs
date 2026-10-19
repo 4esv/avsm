@@ -105,7 +105,10 @@ enum Command {
         #[arg(long, default_value = "all")]
         approve: String,
         /// A command run before every step to move the world on; it gets
-        /// the simulated time in AVSM_NOW and the day in AVSM_DAY
+        /// the simulated time in AVSM_NOW and the day in AVSM_DAY. Every
+        /// lever run goes to it instead of the lever, with AVSM_LEVER,
+        /// AVSM_KEY and the payload on stdin; without it, levers step the
+        /// venture's world model
         #[arg(long)]
         world: Option<String>,
         /// Unix seconds to start at on an empty ledger, so two runs see

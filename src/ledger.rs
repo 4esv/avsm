@@ -340,7 +340,7 @@ mod tests {
         })
     }
 
-    /// Any record: all eight kinds, all three claims, every optional field
+    /// Any record: all nine kinds, all three claims, every optional field
     /// present or absent.
     fn record() -> impl Strategy<Value = Record> {
         prop_oneof![
@@ -513,6 +513,33 @@ mod tests {
                         ok,
                         cites,
                         detail,
+                    }
+                }),
+            (
+                claim(),
+                text(),
+                text(),
+                prop::option::of(text()),
+                any::<i64>(),
+                prop::collection::vec(finite(), 7),
+                prop::collection::vec((text(), finite()), 0..3),
+            )
+                .prop_map(|(claim, venture, metric, action, made_at, q, events)| {
+                    Record::Prediction {
+                        claim,
+                        venture,
+                        model: "baseline".to_string(),
+                        metric,
+                        action,
+                        made_at,
+                        resolves_at: made_at / 2,
+                        quantiles: crate::record::Quantiles::from_values([
+                            q[0], q[1], q[2], q[3], q[4], q[5], q[6],
+                        ]),
+                        events: events
+                            .into_iter()
+                            .map(|(name, p)| crate::record::Event { name, p })
+                            .collect(),
                     }
                 }),
         ]

@@ -6,15 +6,20 @@
 //! did. Runs in one process with its own warden; never on a home a daemon
 //! is serving, and never on the default home.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use serde_json::Value;
 
 use crate::clock;
+use crate::index::Index;
 use crate::kernel::{default_home, socket_path, Kernel};
+use crate::mandate::{same_command, Mandate};
 use crate::protocol;
-use crate::record::Seq;
-use crate::role::ModelRole;
-use crate::warden::LocalWarden;
+use crate::record::{Payload, Seq};
+use crate::world::{self, Action};
 
 /// Who answers the asks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +55,122 @@ pub struct Plan {
     /// simulated time in `AVSM_NOW` (Unix seconds) and `AVSM_DAY` (from
     /// 0). What it prints is shown as the world's; if it fails, the
     /// simulation stops. The world is not avsm's: it leaves no record.
+    ///
+    /// Every lever run goes to it too, never to the lever: it is called
+    /// in the venture directory with `AVSM_LEVER=<venture>/<action>`,
+    /// `AVSM_KEY` and the payload on standard input; its output is the
+    /// outcome's detail and its exit code whether the run was ok. Without
+    /// one, a lever run steps the venture's world model, and the reports
+    /// come from the model's state.
     pub world: Option<String>,
+}
+
+/// Where a simulation sends lever runs instead of the levers. Built only
+/// by `run`, and handed to the kernel and the warden as they are made: no
+/// configuration and no command can set it, so a running daemon never
+/// routes a lever anywhere but to the lever.
+pub(crate) struct Simulation {
+    /// The `--world` command, if one was given.
+    world: Option<String>,
+    /// Each venture's world-model state, and when it was stepped last.
+    states: Mutex<BTreeMap<String, (Value, i64)>>,
+}
+
+impl Simulation {
+    pub(crate) fn new(world: Option<String>) -> Simulation {
+        Simulation {
+            world,
+            states: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Run a lever in the simulation: through the `--world` command, or a
+    /// step of the venture's world model. Returns whether it was ok and
+    /// the outcome's detail, which names where it went.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pull(
+        &self,
+        index: &Index,
+        venture: &str,
+        mandate: &Mandate,
+        dir: &Path,
+        action: &str,
+        key: &str,
+        payload: Option<&Payload>,
+    ) -> (bool, String) {
+        let now = clock::now();
+        if let Some(cmd) = &self.world {
+            // The time is in AVSM_NOW, as for every command the warden runs.
+            let lever = format!("{venture}/{action}");
+            let mut env = vec![("AVSM_LEVER", lever.as_str()), ("AVSM_KEY", key)];
+            let shape = payload.map(|p| p.takes().to_string());
+            if let Some(s) = &shape {
+                env.push(("AVSM_PAYLOAD", s.as_str()));
+            }
+            let stdin = payload.map(Payload::text).unwrap_or_default();
+            let timeout = crate::warden::ACTION_TIMEOUT;
+            let ran = crate::warden::run_with(dir, "sh", &["-c", cmd], &env, &stdin, timeout);
+            let detail = ran.detail(timeout);
+            return (
+                ran.ok,
+                format!("simulated: world  {detail}").trim().to_string(),
+            );
+        }
+        let model = world::model_for(index, venture, mandate, Some(dir));
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let state = states.get(venture).map_or(Value::Null, |(s, _)| s.clone());
+        let act = Action {
+            name: action.to_string(),
+            payload: payload.map(Payload::text),
+        };
+        match model.step(&state, Some(&act), world::seed_of(key), now, 0) {
+            Ok(next) => {
+                states.insert(venture.to_string(), (next.state, now));
+                (
+                    true,
+                    format!(
+                        "simulated: {}  {}={}",
+                        model.name(),
+                        mandate.metric_name(),
+                        next.metric
+                    ),
+                )
+            }
+            Err(e) => (false, format!("simulated: {}  {e}", model.name())),
+        }
+    }
+
+    /// Read a venture's metric from its world model's state, when there
+    /// is no `--world` to move the real files. None means read it for
+    /// real: there is a `--world`, or the baseline has nothing yet to
+    /// start from, so the first reading seeds it.
+    pub(crate) fn measure(
+        &self,
+        index: &Index,
+        venture: &str,
+        mandate: &Mandate,
+        dir: &Path,
+    ) -> Option<(Option<f64>, String)> {
+        if self.world.is_some() {
+            return None;
+        }
+        let now = clock::now();
+        let model = world::model_for(index, venture, mandate, Some(dir));
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, at) = states
+            .get(venture)
+            .cloned()
+            .unwrap_or((Value::Null, now - mandate.cadence.as_secs() as i64));
+        let seed = world::mix(world::seed_of(venture), now as u64);
+        match model.step(&state, None, seed, now, now - at) {
+            Ok(next) => {
+                states.insert(venture.to_string(), (next.state, now));
+                Some((Some(next.metric), format!("simulated: {}", model.name())))
+            }
+            Err(_) if model.name() == world::BASELINE && state.is_null() => None,
+            Err(e) => Some((None, format!("simulated: {}  {e}", model.name()))),
+        }
+    }
 }
 
 /// Run the plan, writing what happens to `out`: every new record as a
@@ -74,6 +194,26 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
     // Open on real time to read where the ledger stands, then set the clock.
     let probe = Kernel::open(home)?;
     let last = probe.entries()?.last().map(|e| e.at);
+    // The simulation world stands in for every lever; a venture's world
+    // model only forecasts. The two are never the same command.
+    if let Some(cmd) = &plan.world {
+        let mut worlds: Vec<(String, String)> = probe
+            .ventures
+            .values()
+            .filter_map(|v| Some((v.name.clone(), v.mandate.world.clone()?)))
+            .collect();
+        for dir in &plan.add {
+            let (m, _, _) = crate::venture::read_mandate(dir)?;
+            if let Some(w) = m.world {
+                worlds.push((dir.display().to_string(), w));
+            }
+        }
+        if let Some((who, _)) = worlds.iter().find(|(_, w)| same_command(w, cmd)) {
+            return Err(format!(
+                "--world {cmd:?} is {who}'s world model; the simulation world stands in for the levers and must be another command"
+            ));
+        }
+    }
     drop(probe);
     let start = match (plan.start, last) {
         (Some(t), Some(l)) if t <= l => {
@@ -87,8 +227,8 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
         }
     };
     clock::set(start);
-    let warden = LocalWarden::open(home)?;
-    let mut kernel = Kernel::with(home, Box::new(ModelRole), Box::new(warden))?;
+    let sim = Arc::new(Simulation::new(plan.world.clone()));
+    let mut kernel = Kernel::simulated(home, sim)?;
     kernel.adopt_self()?;
     for dir in &plan.add {
         let name = crate::venture::name_of(

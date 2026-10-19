@@ -77,6 +77,16 @@ pub struct Mandate {
     /// The largest plausible change from one report to the next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_step: Option<f64>,
+    /// A world model: a command run in the venture directory that steps
+    /// the venture's world forward, a JSON state in and a JSON state with
+    /// the metric out. What it says is inferred: it ranks, vetoes and
+    /// asks, and never authorizes. Left out, the built-in baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world: Option<String>,
+    /// The CRPS skill score against persistence the world model's rolling
+    /// mean must reach before its rankings may run; below it, they ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<f64>,
     /// `offbox` lets the venture's escalation go to a backend that leaves
     /// the machine. Declared only: no proposal, ratchet or self change
     /// can add it.
@@ -789,6 +799,8 @@ const FIELDS: &[&str] = &[
     "range",
     "max_step",
     "escalate",
+    "world",
+    "calibration",
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadband", "hold"];
 const GUARD_FIELDS: &[&str] = &[
@@ -1214,6 +1226,29 @@ impl Mandate {
                 return fail(format!("max_step must be a number above 0, not {s}"));
             }
         }
+        if let Some(world) = &self.world {
+            if world.trim().is_empty() {
+                return fail("world is a command like ./world; it is empty");
+            }
+            // A world model only says what would happen: it is never a
+            // lever, so it can never be what a lever runs.
+            if let Some(p) = self.permitted.iter().find(|p| {
+                p.run.as_deref().is_some_and(|r| same_command(r, world))
+                    || p.adapter.as_deref().is_some_and(|a| same_command(a, world))
+            }) {
+                return fail(format!(
+                    "world runs {world:?}, the command of lever {:?}; a world model only says what would happen and is never a lever",
+                    p.name
+                ));
+            }
+        }
+        if let Some(c) = self.calibration {
+            if !c.is_finite() || c > 1.0 {
+                return fail(format!(
+                    "calibration is a skill score of at most 1, like 0.1, not {c}"
+                ));
+            }
+        }
         if let Some(hosts) = &self.network {
             for h in hosts {
                 let ok = !h.is_empty()
@@ -1442,6 +1477,8 @@ impl Mandate {
             range: None,
             max_step: None,
             escalate: None,
+            world: None,
+            calibration: None,
         }
     }
 
@@ -1607,7 +1644,7 @@ impl Permitted {
 
 /// Do two commands run the same thing: the same words, a leading `./`
 /// aside?
-fn same_command(a: &str, b: &str) -> bool {
+pub(crate) fn same_command(a: &str, b: &str) -> bool {
     let words = |c: &str| -> Vec<String> {
         c.split_whitespace()
             .map(|w| w.strip_prefix("./").unwrap_or(w).to_string())
@@ -1753,9 +1790,27 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
         }
     }
     match map.get("max_step") {
+        None | Some(Value::Null) | Some(Value::Number(_)) => {}
+        Some(other) => {
+            return fail(format!(
+                "max_step is a number like 50, the largest plausible change between two reports, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match map.get("world") {
+        None | Some(Value::Null) | Some(Value::String(_)) => {}
+        Some(other) => {
+            return fail(format!(
+                "world is a command like ./world, run in the venture directory, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match map.get("calibration") {
         None | Some(Value::Null) | Some(Value::Number(_)) => Ok(()),
         Some(other) => fail(format!(
-            "max_step is a number like 50, the largest plausible change between two reports, not {}",
+            "calibration is a skill score like 0.1, the bar the world model must reach, not {}",
             describe(other)
         )),
     }
@@ -2678,7 +2733,7 @@ max_step: 5000
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step, escalate"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step, escalate, world, calibration"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");

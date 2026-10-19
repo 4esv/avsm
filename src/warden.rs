@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ use crate::record::Verdict;
 use crate::record::{self, Claim, Entry, Payload, Record, Seq};
 use crate::research;
 use crate::role::InferRequest;
+use crate::simulate::Simulation;
 use crate::venture;
 
 /// How long an action or a report may run.
@@ -102,6 +104,9 @@ pub struct LocalWarden {
     index: Index,
     config: Config,
     keys: BTreeMap<String, String>,
+    /// Set only by `simulate`: every lever run goes to the simulation,
+    /// never to the lever.
+    sim: Option<Arc<Simulation>>,
 }
 
 impl LocalWarden {
@@ -114,7 +119,16 @@ impl LocalWarden {
             index: Index::default(),
             config: Config::load(home)?,
             keys: config::load_keys(home)?,
+            sim: None,
         })
+    }
+
+    /// A warden for a simulation: it gates, writes the intent and the
+    /// outcome as ever, and sends the run itself to the simulation.
+    pub(crate) fn simulated(home: &Path, sim: Arc<Simulation>) -> Result<LocalWarden, String> {
+        let mut warden = LocalWarden::open(home)?;
+        warden.sim = Some(sim);
+        Ok(warden)
     }
 }
 
@@ -338,7 +352,11 @@ impl Warden for LocalWarden {
             payload_check(&self.home, &dir, check, p, index, &venture)?;
         }
         let proof_text = proof.to_string();
+        let sim = self.sim.as_deref();
         let pull = |payload: Option<&Payload>| -> (bool, String) {
+            if let Some(sim) = sim {
+                return sim.pull(index, &venture, &v.mandate, &dir, &action, &key, payload);
+            }
             match (perm.lever_adapter(), &perm.run, payload) {
                 (Some(lever), _, Some(p)) => lever.run(
                     &dir,

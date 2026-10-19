@@ -1,8 +1,8 @@
 //! Records: what the ledger holds.
 //!
 //! A record is one enum. Its claim (measured, declared, inferred) and its
-//! kind (report, proposal, action, ask, decision, intent, outcome, refusal) are
-//! typed, never strings.
+//! kind (report, proposal, action, ask, decision, intent, outcome, refusal,
+//! prediction) are typed, never strings.
 
 use std::fmt;
 
@@ -65,6 +65,7 @@ pub enum Kind {
     Refusal,
     Escalation,
     Answer,
+    Prediction,
 }
 
 impl Kind {
@@ -80,6 +81,7 @@ impl Kind {
             Kind::Refusal => "refusal",
             Kind::Escalation => "escalation",
             Kind::Answer => "answer",
+            Kind::Prediction => "prediction",
         }
     }
 }
@@ -480,7 +482,80 @@ pub enum Record {
         cites: Vec<Seq>,
         detail: String,
     },
+    /// What a world model says the venture's metric will read at
+    /// `resolves_at`, after `action` if one is about to run. Always
+    /// inferred: it ranks, vetoes and asks, and never authorizes. The
+    /// first trusted, plausible report of the metric at or after
+    /// `resolves_at` resolves it, and code scores it.
+    Prediction {
+        claim: Claim,
+        venture: String,
+        /// `baseline` or `world`.
+        model: String,
+        metric: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
+        made_at: i64,
+        resolves_at: i64,
+        quantiles: Quantiles,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        events: Vec<Event>,
+    },
 }
+
+/// The quantiles of a forecast: the 5th to the 95th percentile.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Quantiles {
+    pub p5: f64,
+    pub p10: f64,
+    pub p25: f64,
+    pub p50: f64,
+    pub p75: f64,
+    pub p90: f64,
+    pub p95: f64,
+}
+
+impl Quantiles {
+    /// The levels, in the order of `values`.
+    pub const LEVELS: [f64; 7] = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95];
+
+    /// The values, lowest level first.
+    pub fn values(&self) -> [f64; 7] {
+        [
+            self.p5, self.p10, self.p25, self.p50, self.p75, self.p90, self.p95,
+        ]
+    }
+
+    /// From seven values, lowest level first.
+    pub fn from_values(v: [f64; 7]) -> Quantiles {
+        Quantiles {
+            p5: v[0],
+            p10: v[1],
+            p25: v[2],
+            p50: v[3],
+            p75: v[4],
+            p90: v[5],
+            p95: v[6],
+        }
+    }
+
+    /// Every value finite and none below the one before.
+    pub fn valid(&self) -> bool {
+        let v = self.values();
+        v.iter().all(|x| x.is_finite()) && v.windows(2).all(|w| w[0] <= w[1])
+    }
+}
+
+/// The chance a forecast gives a named event, like `guard.spend` breaching.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Event {
+    pub name: String,
+    pub p: f64,
+}
+
+/// The most events a prediction may carry, and the longest name.
+pub const MAX_EVENTS: usize = 16;
+pub const MAX_EVENT_NAME: usize = 64;
 
 /// The idempotency key of a lever run: sha256 over the venture, the
 /// action, the cited records in order, and the payload text. The same run
@@ -506,7 +581,8 @@ impl Record {
             | Record::Outcome { claim, .. }
             | Record::Refusal { claim, .. }
             | Record::Escalation { claim, .. }
-            | Record::Answer { claim, .. } => *claim,
+            | Record::Answer { claim, .. }
+            | Record::Prediction { claim, .. } => *claim,
         }
     }
 
@@ -521,7 +597,8 @@ impl Record {
             | Record::Outcome { venture, .. }
             | Record::Refusal { venture, .. }
             | Record::Escalation { venture, .. }
-            | Record::Answer { venture, .. } => venture,
+            | Record::Answer { venture, .. }
+            | Record::Prediction { venture, .. } => venture,
         }
     }
 
@@ -537,6 +614,7 @@ impl Record {
             Record::Refusal { .. } => Kind::Refusal,
             Record::Escalation { .. } => Kind::Escalation,
             Record::Answer { .. } => Kind::Answer,
+            Record::Prediction { .. } => Kind::Prediction,
         }
     }
 
@@ -745,6 +823,24 @@ impl Record {
             } => format!(
                 "#{escalation} answer {}  {detail}",
                 if *ok { "usable" } else { "unusable" }
+            ),
+            Record::Prediction {
+                model,
+                metric,
+                action,
+                resolves_at,
+                quantiles: q,
+                ..
+            } => format!(
+                "{model}: {metric} p50 {} (p10 {} to p90 {}){} by {}",
+                q.p50,
+                q.p10,
+                q.p90,
+                match action {
+                    Some(a) => format!(" after {a}"),
+                    None => String::new(),
+                },
+                resolves_at
             ),
         }
     }

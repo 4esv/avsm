@@ -6,8 +6,11 @@ use std::os::unix::fs::PermissionsExt;
 
 use avsm::simulate::{run, Human, Plan, BY, EDIT};
 
-/// A world that says when each simulated day begins.
-const WORLD: &str = "[ $((AVSM_NOW % 86400)) -eq 0 ] && echo \"day $AVSM_DAY begins\"; true";
+/// A world that says when each simulated day begins, and takes the
+/// lever runs: a post lands in posts/ as the real lever would write it.
+const WORLD: &str =
+    "if [ -n \"$AVSM_LEVER\" ]; then cat > posts/$(ls posts | wc -l | tr -d ' ').md; exit; fi; \
+     [ $((AVSM_NOW % 86400)) -eq 0 ] && echo \"day $AVSM_DAY begins\"; true";
 
 #[test]
 fn the_mixed_human_denies_every_third_ask_and_edits_what_runs() {
@@ -54,6 +57,8 @@ fn the_mixed_human_denies_every_third_ask_and_edits_what_runs() {
     assert_eq!(text.matches("ask       post?").count(), 3, "{text}");
     assert_eq!(text.matches("denied #").count(), 1, "{text}");
     assert!(text.contains(&format!("by {BY}")), "{text}");
+    // Both approved runs went to the world, never to the lever.
+    assert_eq!(text.matches(" done  simulated: world").count(), 2, "{text}");
     // What ran is what the human saved, not what the model proposed.
     let mut posts: Vec<_> = std::fs::read_dir(blog.join("posts"))
         .unwrap()

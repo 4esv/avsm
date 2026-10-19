@@ -204,6 +204,9 @@ enum Op {
     /// The answer to a record already written, by any claim, citing
     /// perhaps another.
     Answer(String, Claim, u64, bool, Option<u64>),
+    /// A world model's prediction of what a lever would do, by any claim:
+    /// never a premise.
+    Prediction(String, String, Claim),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -255,6 +258,7 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (name(), claim(), any::<bool>()).prop_map(|(v, c, r)| Op::Escalation(v, c, r)),
         2 => (name(), claim(), seq(), any::<bool>(), prop::option::of(seq()))
             .prop_map(|(v, c, e, ok, cite)| Op::Answer(v, c, e, ok, cite)),
+        2 => (lever(), claim()).prop_map(|((v, a), c)| Op::Prediction(v, a, c)),
     ]
 }
 
@@ -378,6 +382,19 @@ fn record(op: &Op, n: u64) -> Record {
             detail: String::new(),
         },
         Op::Outcome(..) | Op::Run(..) | Op::Ineffective(..) => unreachable!("written by build"),
+        Op::Prediction(venture, action, claim) => Record::Prediction {
+            claim,
+            venture,
+            model: "baseline".to_string(),
+            metric: "count".to_string(),
+            action: Some(action),
+            made_at: START,
+            resolves_at: START + HOUR,
+            quantiles: avsm::record::Quantiles::from_values([
+                1.0, 2.0, 3.0, 12.0, 13.0, 14.0, 15.0,
+            ]),
+            events: vec![],
+        },
         Op::Pull(venture, action, ok, text) => Record::Action {
             claim: Claim::Measured,
             proof: proof(&venture, &action, None),
