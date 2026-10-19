@@ -11,7 +11,7 @@
 use crate::expect::{self, Judgement};
 use crate::index::EXPECTATION;
 use crate::record::{Claim, Record, Seq, Signal};
-use crate::world::Baseline;
+use crate::world;
 
 use super::{log, Kernel};
 
@@ -66,8 +66,8 @@ impl Kernel {
                         let after: Vec<f64> = series[a..].iter().map(|(_, x)| *x).collect();
                         // The counterfactual: what the metric would have
                         // moved on its own from the last report before the
-                        // run to the one judged, by the drift learned from
-                        // the history before the run.
+                        // run to the one judged, by the recent drift before
+                        // the run.
                         let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
                         let span = match (
                             b.checked_sub(1).map(|i| series[i].0),
@@ -77,8 +77,7 @@ impl Kernel {
                             _ => None,
                         };
                         let (drift, noise) = span.map_or((0.0, 0.0), |(t0, dt)| {
-                            let base = Baseline::drift_before(&index, venture, &v.mandate, intent);
-                            (base.integrate(t0, dt), base.spread(dt))
+                            world::counterfactual(&index, venture, &v.mandate, intent, t0, dt)
                         });
                         match expect::judge(expects, &before, &after, drift, noise) {
                             Judgement::Waiting => break,

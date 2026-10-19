@@ -255,6 +255,65 @@ pub fn drift_steps(
         .collect()
 }
 
+/// How many recent lever-free steps make the local drift a run is judged
+/// against.
+pub const RECENT: usize = 6;
+
+/// The median of these numbers; None when there are none.
+fn median(mut xs: Vec<f64>) -> Option<f64> {
+    if xs.is_empty() {
+        return None;
+    }
+    xs.sort_by(f64::total_cmp);
+    let n = xs.len();
+    Some(if n % 2 == 1 {
+        xs[n / 2]
+    } else {
+        (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+    })
+}
+
+/// What the metric would have moved on its own over `dt` seconds from
+/// `t0`, and how far it strays from that: the counterfactual a run of a
+/// lever is judged against. It is local: the median rate of the latest
+/// `RECENT` lever-free steps within the day before `upto`, and the spread
+/// of those same steps, so a regime that has changed (a heat wave that
+/// ended in a dead plant) does not stand in for now. With fewer than
+/// `MIN_SAMPLES` such steps, the baseline's drift from all the history
+/// before `upto`.
+pub fn counterfactual(
+    index: &Index,
+    venture: &str,
+    mandate: &Mandate,
+    upto: Seq,
+    t0: i64,
+    dt: i64,
+) -> (f64, f64) {
+    let steps = drift_steps(index, venture, mandate, Some(upto));
+    let now = index.get(upto).map_or(0, |e| e.at);
+    let local: Vec<Drift> = steps
+        .iter()
+        .rev()
+        .filter(|d| d.gap > 0)
+        .take_while(|d| d.at >= now - DAY)
+        .take(RECENT)
+        .copied()
+        .collect();
+    if local.len() >= MIN_SAMPLES {
+        let rate = median(local.iter().map(|d| d.change / d.gap as f64).collect()).unwrap_or(0.0);
+        let spread = median(
+            local
+                .iter()
+                .map(|d| ((d.change - rate * d.gap as f64) / (d.gap as f64).sqrt()).abs())
+                .collect(),
+        )
+        .unwrap_or(0.0);
+        return (rate * dt as f64, spread * (dt.max(0) as f64).sqrt());
+    }
+    let base = Baseline::drift_before(index, venture, mandate, upto);
+    (base.integrate(t0, dt), base.spread(dt))
+}
+
 impl Baseline {
     /// The drift alone, learned from the history before `upto`: what the
     /// metric does on its own, the counterfactual a lever run is judged

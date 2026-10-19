@@ -433,6 +433,49 @@ fn a_run_is_judged_net_of_the_drift_it_fights() {
 }
 
 #[test]
+fn a_long_heat_wave_with_the_plant_alive_still_meets() {
+    let _c = clock();
+    let mut f = fixture(
+        "delegated: true, expects: up 15 within 1",
+        "echo boost >> boosts",
+    );
+    // Thirty hours falling 10 an hour, then a boost that shows +4.5.
+    for i in 0..30 {
+        f.report(304.0 - 10.0 * f64::from(i));
+    }
+    f.report(4.0);
+    assert_eq!(f.intents(), 1);
+    f.report(8.5);
+    assert!(f.ineffective().is_empty(), "{:?}", f.ineffective());
+    assert!(!f.suspended());
+}
+
+#[test]
+fn after_a_heat_wave_a_dead_plant_is_no_effect_within_two_runs() {
+    let _c = clock();
+    let mut f = fixture(TEST_DELEGATED, "echo boost >> boosts");
+    // A day and more of heat: 10 an hour lost.
+    for i in 0..30 {
+        f.report(305.0 - 10.0 * f64::from(i));
+    }
+    // Then dead: flat at 0, an hour apart. The boost runs once a day.
+    for _ in 0..60 {
+        f.report(0.0);
+        if f.suspended() {
+            break;
+        }
+    }
+    assert!(f.intents() <= 2, "within two runs: {}", f.intents());
+    assert!(f.suspended(), "a dead plant is no effect");
+    let asks = f.ineffective();
+    assert!(
+        matches!(&asks[0].record, Record::Ask { signal: Some(Signal::Ineffective { why, .. }), .. }
+            if why.contains("no effect")),
+        "{asks:?}"
+    );
+}
+
+#[test]
 fn a_dead_metric_with_no_drift_is_no_effect() {
     let _c = clock();
     let mut f = fixture(TEST_DELEGATED, "echo boost >> boosts");
