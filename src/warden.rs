@@ -228,6 +228,23 @@ impl Warden for LocalWarden {
                         .into(),
                 );
             }
+            // The improving loop never edits limits: unless a human amended
+            // the payload at approve, which was validated there and is
+            // theirs, the only change is a lever turning delegated on.
+            let amended = proof
+                .payload_from()
+                .and_then(|seq| index.get(seq))
+                .is_some_and(|e| e.record.kind() == crate::record::Kind::Decision);
+            if !amended {
+                if let Some(field) = crate::mandate::edits_limits(&v.mandate, &mandate) {
+                    return Err(Failure::Refused {
+                        reason_key: EDITS_LIMITS.to_string(),
+                        detail: format!(
+                            "the new mandate changes {field}, which is not the improving loop's to edit; only a delegated lever turning on is; a human amends the payload at approve to change it"
+                        ),
+                    });
+                }
+            }
             let by = proof
                 .decision()
                 .and_then(|seq| index.get(seq))
@@ -825,6 +842,9 @@ fn payload_schema(fields: &BTreeMap<String, FieldType>, payload: &Payload) -> Re
 
 /// What a refusal by a payload check is called in its reason key.
 pub const PAYLOAD_CHECK: &str = "PayloadCheck";
+
+/// The improving loop never edits limits.
+pub const EDITS_LIMITS: &str = "EditsLimits";
 /// The most reports a check sees.
 pub const CHECK_REPORTS: usize = 500;
 /// The most of a check's stdout that is read, and the most of it that

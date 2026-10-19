@@ -119,6 +119,73 @@ pub fn adds_offbox(before: &Mandate, after: &Mandate) -> bool {
     after.escalate == Some(Escalate::Offbox) && before.escalate != Some(Escalate::Offbox)
 }
 
+/// Where `after` differs from `before` in anything but a lever turning
+/// `delegated` from false to true: the path of the first field that
+/// changed, like `permitted.announce.cap` or `guards.load`. None when the
+/// only changes are the ones the improving loop may make. Parsed mandates
+/// are compared, not their text.
+pub fn edits_limits(before: &Mandate, after: &Mandate) -> Option<String> {
+    let (Ok(b), Ok(a)) = (serde_json::to_value(before), serde_json::to_value(after)) else {
+        return Some("mandate".to_string());
+    };
+    first_difference("", &b, &a)
+}
+
+fn first_difference(
+    path: &str,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Option<String> {
+    use serde_json::Value;
+    let at = |key: &str| {
+        if path.is_empty() {
+            key.to_string()
+        } else {
+            format!("{path}.{key}")
+        }
+    };
+    match (before, after) {
+        (Value::Object(b), Value::Object(a)) => {
+            let mut keys: Vec<&String> = b.keys().chain(a.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            keys.into_iter().find_map(|k| {
+                let (x, y) = (b.get(k), a.get(k));
+                // A lever turning delegated on is the ratchet's one move.
+                if k == "delegated"
+                    && x == Some(&Value::Bool(false))
+                    && y == Some(&Value::Bool(true))
+                {
+                    return None;
+                }
+                match (x, y) {
+                    (Some(x), Some(y)) => first_difference(&at(k), x, y),
+                    _ => Some(at(k)),
+                }
+            })
+        }
+        (Value::Array(b), Value::Array(a)) => {
+            let name = |v: &Value| v.get("name").and_then(Value::as_str).map(str::to_string);
+            let named = b.iter().chain(a.iter()).all(|v| name(v).is_some());
+            if !named {
+                return (b != a).then(|| path.to_string());
+            }
+            if b.len() != a.len() {
+                return Some(path.to_string());
+            }
+            // Order is part of the mandate; levers are matched by name.
+            b.iter().zip(a.iter()).find_map(|(x, y)| {
+                let n = name(x)?;
+                if name(y).as_deref() != Some(n.as_str()) {
+                    return Some(path.to_string());
+                }
+                first_difference(&format!("{path}.{n}"), x, y)
+            })
+        }
+        _ => (before != after).then(|| path.to_string()),
+    }
+}
+
 /// What a guard does past its bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
