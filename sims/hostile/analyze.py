@@ -370,6 +370,21 @@ after = [r for _, at, r in recs if dead_at and at >= dead_at and r.get("kind") =
          and r.get("venture") == "tomato" and r.get("action") == "water"]
 approved_after = sum(any(s.get("step") == "decision" for s in r["proof"]["steps"]) for r in after)
 autonomous_after = len(after) - approved_after
+# Each watering after death by what had happened when it ran, from the
+# world's side: the first after death had no evidence before it (a dead
+# plant reads as a dry one); every later one followed a watering that did
+# nothing, unless a human had since approved an ask that water is
+# ineffective (restoring it is the human's call).
+water_asks = {s for s, a, r in recs if kind(r) == "ask" and r.get("venture") == "tomato"
+              and (r.get("signal") or {}).get("signal") == "ineffective" and (r.get("signal") or {}).get("action") == "water"}
+restored_at = [a for s, a, r in recs if kind(r) == "decision" and (r.get("verdict") or {}).get("verdict") == "approve"
+               and (r.get("verdict") or {}).get("ask") in water_asks]
+after_by = {"before_evidence": 0, "human_restored": 0, "against_evidence": 0}
+for i, (at_, r) in enumerate((a, r) for _, a, r in recs if dead_at and a >= dead_at and r.get("kind") == "intent"
+                             and r.get("venture") == "tomato" and r.get("action") == "water"):
+    if i == 0: after_by["before_evidence"] += 1
+    elif any(dead_at <= a <= at_ for a in restored_at): after_by["human_restored"] += 1
+    else: after_by["against_evidence"] += 1
 
 # Every cap or budget refusal avsm printed has a refusal record that day.
 printed, unrecorded = None, []
@@ -484,7 +499,7 @@ out["checks"] = {
     "branches_with_propensities": check(len(branches), None if not planned else any(alternatives(r) and all(x["propensity"] is not None for x in alternatives(r)) for s, a, r in branches)),
     "forecast_or_capacity_ask_before_day_20": check(early[:5], bool(early)),
     "zero_waterings_of_a_dead_plant": check({"all": water_after_death, "autonomous": autonomous_after,
-                                              "human_approved": approved_after}, water_after_death == 0),
+                                              "human_approved": approved_after, **after_by}, water_after_death == 0),
     "cap_and_budget_refusals_recorded": check({**{k: by_reason.get(k, 0) for k in ("OverCap", "OverBudget")},
                                                 "printed_without_record": unrecorded[:5]},
                                                None if printed is None else not unrecorded),
