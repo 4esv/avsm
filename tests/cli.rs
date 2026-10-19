@@ -258,6 +258,7 @@ fn approve_and_deny_answer_open_asks() {
         action: Some(action.to_string()),
         question: format!("may I {action}?"),
         refusal: None,
+        signal: None,
         payload: None,
     };
     let first = kernel.append(ask("deploy")).unwrap().seq;

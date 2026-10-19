@@ -296,6 +296,16 @@ pub enum Verdict {
     },
 }
 
+/// Why the kernel asked on its own: the algedonic channel. An ask carrying
+/// one is recognised from this field, never from its question.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "signal", rename_all = "lowercase")]
+pub enum Signal {
+    /// A threshold was crossed while its lever was refused for a cap, a
+    /// budget or a quota.
+    Saturated { action: String, reason: String },
+}
+
 /// One ledger record. Every variant carries its claim and its venture.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -348,6 +358,10 @@ pub enum Record {
         refusal: Option<Refusal>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<Payload>,
+        /// Set when the kernel asks because a limit cannot keep up, not
+        /// because a lever needs a decision. Read by code, never by text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<Signal>,
     },
     /// A human's verdict. `by` names the human when the record came in
     /// over a path that knows who they are.

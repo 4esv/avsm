@@ -261,6 +261,7 @@ fn record(op: &Op, n: u64) -> Record {
             action,
             question: "may I?".to_string(),
             refusal: None,
+            signal: None,
             payload,
         },
         Op::Approve(venture, claim, q, payload) => Record::Decision {

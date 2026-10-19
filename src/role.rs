@@ -440,6 +440,7 @@ pub fn read_reply(ctx: &Context, reply: &str) -> Result<Vec<Record>, String> {
         action,
         question,
         refusal: None,
+        signal: None,
         payload,
     };
     if let Some(json) = text
@@ -644,6 +645,7 @@ mod tests {
                 action: Some("refund".into()),
                 question: "refund order 7?".into(),
                 refusal: None,
+                signal: None,
                 payload: None,
             },
         )];

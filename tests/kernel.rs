@@ -105,6 +105,7 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
             action: None,
             question: "should we hire?".into(),
             refusal: None,
+            signal: None,
             payload: None,
         },
     ]]);

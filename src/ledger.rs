@@ -403,18 +403,23 @@ mod tests {
                 prop::option::of(text()),
                 text(),
                 prop::option::of(refusal()),
-                prop::option::of(payload())
+                prop::option::of(payload()),
+                prop::option::of((text(), text()))
             )
-                .prop_map(|(claim, venture, action, question, refusal, payload)| {
-                    Record::Ask {
+                .prop_map(
+                    |(claim, venture, action, question, refusal, payload, signal)| Record::Ask {
                         claim,
                         venture,
                         action,
                         question,
                         refusal,
                         payload,
+                        signal: signal.map(|(action, reason)| crate::record::Signal::Saturated {
+                            action,
+                            reason,
+                        }),
                     }
-                }),
+                ),
             (claim(), text(), verdict(), prop::option::of(text())).prop_map(
                 |(claim, venture, verdict, by)| Record::Decision {
                     claim,

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ledger::{Ledger, LedgerError};
 use crate::mandate::ParentCall;
-use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Verdict};
+use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Signal, Verdict};
 
 /// The latest parent levers one venture pulled on another.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -333,6 +333,20 @@ impl Index {
     /// Asks with no trusted decision yet, oldest first.
     pub fn open_asks(&self) -> Vec<Seq> {
         self.open.iter().copied().collect()
+    }
+
+    /// Open asks that carry a signal, oldest first, with the signal.
+    pub fn open_signals(&self) -> Vec<(&Entry, &Signal)> {
+        self.open
+            .iter()
+            .filter_map(|s| self.get(*s))
+            .filter_map(|e| match &e.record {
+                Record::Ask {
+                    signal: Some(sig), ..
+                } => Some((e, sig)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A venture's open asks, oldest first.

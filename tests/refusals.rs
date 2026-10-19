@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use avsm::kernel::Kernel;
-use avsm::record::{Claim, Entry, Kind, Record, Seq};
+use avsm::record::{Claim, Entry, Kind, Record, Seq, Signal};
 use avsm::role::{Context, InferRequest, Role};
 use avsm::warden::LocalWarden;
 
@@ -94,7 +94,15 @@ fn saturation_asks(k: &Kernel) -> Vec<Entry> {
     k.entries()
         .unwrap()
         .into_iter()
-        .filter(|e| matches!(&e.record, Record::Ask { question, .. } if question.ends_with("the limits cannot keep up")))
+        .filter(|e| {
+            matches!(
+                &e.record,
+                Record::Ask {
+                    signal: Some(Signal::Saturated { .. }),
+                    ..
+                }
+            )
+        })
         .collect()
 }
 
@@ -118,6 +126,7 @@ fn spent_ask(venture: &str) -> Record {
         action: None,
         question: "should we hire?".into(),
         refusal: None,
+        signal: None,
         payload: None,
     }
 }
@@ -244,6 +253,13 @@ fn saturation_asks_once_even_with_the_asks_quota_used() {
     };
     assert_eq!(*claim, Claim::Measured);
     assert_eq!(*action, None, "an approval must not run a lever");
+    let signals = k.index().unwrap().open_signals().len();
+    assert_eq!(signals, 1);
+    assert!(
+        matches!(&got[0].record, Record::Ask { signal: Some(Signal::Saturated { action, reason }), .. }
+            if action == "reset" && reason.contains("the cap is 1/day")),
+        "{got:?}"
+    );
     assert!(
         question.starts_with("count is past 10 and reset is refused: "),
         "{question}"

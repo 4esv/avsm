@@ -1174,6 +1174,7 @@ impl Kernel {
                         question,
                         refusal: Some(refusal),
                         payload,
+                        signal: None,
                     }) {
                         Ok(e) => lines.push(e.line()),
                         Err(e) => lines.push(format!("{name}: cannot write ask: {e}")),
@@ -1483,6 +1484,7 @@ impl Kernel {
                         action,
                         question,
                         refusal: None,
+                        signal: None,
                         payload,
                     }
                 }
@@ -1577,6 +1579,7 @@ impl Kernel {
             action: None,
             question: question.to_string(),
             refusal: None,
+            signal: None,
             payload: None,
         }) {
             Ok(e) => log(&e.line()),

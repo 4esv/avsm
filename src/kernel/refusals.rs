@@ -13,13 +13,13 @@ use chrono::NaiveDate;
 
 use super::{log, Kernel};
 use crate::gate::Reason;
-use crate::record::{Claim, Record, Seq};
+use crate::record::{Claim, Record, Seq, Signal};
 
 /// What the asks quota refusing a lever is called in a reason key.
 const ASKS_SPENT: &str = "AsksQuotaSpent";
 /// What a question already open is called in a reason key.
 const ALREADY_ASKED: &str = "AlreadyAsked";
-/// How a saturation ask ends: it is how such an ask is told from others.
+/// How a saturation question ends. Code never reads it; the signal field does.
 const SATURATED: &str = "; the limits cannot keep up";
 
 /// One refusal record not yet closed, and what is known of it.
@@ -257,15 +257,12 @@ impl Kernel {
             "{metric} is past {bound} and {lever} is refused: {}{SATURATED}",
             last.detail
         );
-        let marker = format!(" and {lever} is refused: ");
         let already = {
             let Ok(index) = self.index() else { return };
-            let found = index.open_of(venture).any(|q| {
-                index.get(q).is_some_and(|e| {
-                    e.record.claim() == Claim::Measured
-                        && matches!(&e.record, Record::Ask { action: None, question, .. }
-                            if question.contains(&marker) && question.ends_with(SATURATED))
-                })
+            let found = index.open_signals().into_iter().any(|(e, s)| {
+                e.record.venture() == venture
+                    && e.record.claim() == Claim::Measured
+                    && matches!(s, Signal::Saturated { action, .. } if action == lever)
             });
             found
         };
@@ -279,6 +276,10 @@ impl Kernel {
             question,
             refusal: None,
             payload: None,
+            signal: Some(Signal::Saturated {
+                action: lever.to_string(),
+                reason: last.detail,
+            }),
         }) {
             Ok(e) => log(&e.line()),
             Err(e) => log(&format!("{venture}: cannot write ask: {e}")),

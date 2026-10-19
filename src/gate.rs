@@ -1982,6 +1982,7 @@ mod tests {
             action: Some(action.to_string()),
             question: format!("may I {action}?"),
             refusal: None,
+            signal: None,
             payload: None,
         }
     }
@@ -1993,6 +1994,7 @@ mod tests {
             action: Some(action.to_string()),
             question: format!("may I {action}?"),
             refusal: None,
+            signal: None,
             payload: Some(payload),
         }
     }
@@ -2549,6 +2551,7 @@ mod tests {
                 }],
             }),
             payload: None,
+            signal: None,
         });
         let text = why(&fx.entries[(q - 1) as usize]);
         assert!(text.contains("because    deploy is irreversible"), "{text}");
@@ -2877,6 +2880,7 @@ mod tests {
             action: Some("resume".into()),
             question: "resume?".into(),
             refusal: None,
+            signal: None,
             payload: Some(text(V)),
         });
         let d = fx.push(Record::Decision {
@@ -3167,6 +3171,7 @@ mod tests {
             action: Some(DELEGATE.into()),
             question: "delegate announce?".into(),
             refusal: None,
+            signal: None,
             payload: Some(new_text.clone()),
         });
         let fake = fx.push(decision(Claim::Inferred, approve(q)));
@@ -3191,6 +3196,7 @@ mod tests {
             action: Some(DELEGATE.into()),
             question: "delegate everything?".into(),
             refusal: None,
+            signal: None,
             payload: Some(new_text.clone()),
         });
         let md = fx.push(decision(Claim::Declared, approve(mq)));
@@ -3211,6 +3217,7 @@ mod tests {
             action: Some(DELEGATE.into()),
             question: "delegate?".into(),
             refusal: None,
+            signal: None,
             payload: Some(new_text),
         });
         let d = fx.push(Record::Decision {
