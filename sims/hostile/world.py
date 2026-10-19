@@ -87,12 +87,17 @@ def lever(s):
         os.makedirs(p("outbox"), exist_ok=True)
         name = f"{NOW}-{len(os.listdir(p('outbox')))}.txt"
         write(p("outbox", name), payload)
-        n = re.search(r"re mail (\d+)", payload)
-        if n:
-            src = p("inbox", f"{int(n[1]):05d}.json")
-            if os.path.exists(src):
+        # A reply answers the mails it names ("re mail <n>") and every mail
+        # from the address on its first line, as replying in a mail client
+        # does. The mandate never states the "re mail" convention, so a
+        # reply without it would otherwise answer nothing.
+        to = payload.strip().splitlines()[0].strip().lower() if payload.strip() else ""
+        answered = {int(m) for m in re.findall(r"re mail (\d+)", payload)}
+        for f in sorted(os.listdir(p("inbox"))) if os.path.isdir(p("inbox")) else []:
+            with open(p("inbox", f)) as fh: m = json.load(fh)
+            if m["id"] in answered or (to and m["from"].lower() == to):
                 os.makedirs(p("archive"), exist_ok=True)
-                os.replace(src, p("archive", f"{int(n[1]):05d}.json"))
+                os.replace(p("inbox", f), p("archive", f))
         detail = f"sent {name}"
     elif action == "archive":
         # `mail <n>` names the mail; a payload that is only a number is one.
