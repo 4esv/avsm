@@ -132,6 +132,7 @@ pub fn canary() -> Result<(), String> {
         network: None,
         children: vec![],
         parent: None,
+        allocation: None,
     };
     let mandate_hash = Mandate::hash(&serde_yaml::to_string(&permissive).unwrap_or_default());
     let adopt = Record::Decision {

@@ -71,6 +71,7 @@ fn valid_fixture_parses_field_by_field() {
         network: None,
         children: vec![],
         parent: None,
+        allocation: None,
     };
     assert_eq!(m.purpose, expected.purpose);
     assert_eq!(m.metric, expected.metric);

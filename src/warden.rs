@@ -220,7 +220,7 @@ impl Warden for LocalWarden {
             let child = ventures
                 .get(call.child())
                 .ok_or_else(|| format!("{} is not a venture", call.child()))?;
-            if !v.mandate.children.iter().any(|c| c == call.child())
+            if v.mandate.child(call.child()).is_none()
                 || child.mandate.parent.as_deref() != Some(venture.as_str())
             {
                 return Err(format!(

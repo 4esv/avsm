@@ -332,7 +332,15 @@ impl Kernel {
             ));
         }
         if !mandate.children.is_empty() {
-            out.push_str(&format!("  parent of {}\n", mandate.children.join(", ")));
+            out.push_str(&format!(
+                "  parent of {}\n",
+                mandate
+                    .children
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         if let Some(p) = &mandate.parent {
             out.push_str(&format!("  child of {p}\n"));
@@ -344,7 +352,7 @@ impl Kernel {
     /// Refuse a mandate whose parent and children do not agree with the
     /// mandates already adopted, or that would make a loop.
     fn check_family(&self, name: &str, mandate: &crate::mandate::Mandate) -> Result<(), String> {
-        if mandate.children.iter().any(|c| c == name) {
+        if mandate.child(name).is_some() {
             return Err(format!("{name} cannot be its own child"));
         }
         if mandate.parent.as_deref() == Some(name) {
@@ -357,17 +365,14 @@ impl Kernel {
             .collect();
         if let Some(p) = &mandate.parent {
             if let Some(parent) = adopted.iter().find(|v| v.name == *p) {
-                if !parent.mandate.children.iter().any(|c| c == name) {
+                if parent.mandate.child(name).is_none() {
                     return Err(format!(
                         "{name} names {p} as its parent, but {p} does not list {name} under children; add it there and run avsm add on {p} first"
                     ));
                 }
             }
         }
-        for parent in adopted
-            .iter()
-            .filter(|v| v.mandate.children.iter().any(|c| c == name))
-        {
+        for parent in adopted.iter().filter(|v| v.mandate.child(name).is_some()) {
             match mandate.parent.as_deref() {
                 Some(q) if q == parent.name => {}
                 Some(q) => {
@@ -388,14 +393,14 @@ impl Kernel {
             .iter()
             .filter(|v| v.mandate.parent.as_deref() == Some(name))
         {
-            if !mandate.children.contains(&child.name) {
+            if mandate.child(&child.name).is_none() {
                 return Err(format!(
                     "{} names {name} as its parent, but {name} does not list {} under children; remove parent from {} first",
                     child.name, child.name, child.name
                 ));
             }
         }
-        for c in &mandate.children {
+        for c in mandate.children.iter().map(|c| &c.name) {
             if let Some(child) = adopted.iter().find(|v| v.name == *c) {
                 match child.mandate.parent.as_deref() {
                     Some(q) if q == name => {}
@@ -416,7 +421,7 @@ impl Kernel {
         // from this venture back to itself is a loop.
         let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut add_edges = |who: &str, m: &crate::mandate::Mandate| {
-            for c in &m.children {
+            for c in m.children.iter().map(|c| &c.name) {
                 edges.entry(who.to_string()).or_default().insert(c.clone());
             }
             if let Some(p) = &m.parent {
@@ -1450,6 +1455,7 @@ impl Kernel {
             .mandate
             .children
             .iter()
+            .map(|c| &c.name)
             .filter_map(|c| {
                 let child = self.ventures.get(c)?;
                 if child.mandate.parent.as_deref() != Some(name) {

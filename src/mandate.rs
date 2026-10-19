@@ -53,10 +53,94 @@ pub struct Mandate {
     /// The ventures this one allocates to. A parent sets their budgets and
     /// thresholds and pauses them; it never runs their levers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub children: Vec<String>,
+    pub children: Vec<Child>,
     /// The venture that allocates to this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// How steadily a parent may move its children's budgets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation: Option<Allocation>,
+}
+
+/// A child as its parent lists it: a name, or a name with the order budgets
+/// are cut in and the least a budget may be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Child {
+    pub name: String,
+    /// Higher is cut last: a child is not cut while a lower-priority
+    /// sibling sits above its floor.
+    pub priority: i32,
+    /// No budget below this is set for the child.
+    pub floor: u32,
+}
+
+impl Child {
+    /// A child with no priority and no floor.
+    pub fn named(name: &str) -> Child {
+        Child {
+            name: name.to_string(),
+            priority: 0,
+            floor: 0,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChildText {
+    Name(String),
+    Terms(ChildTerms),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildTerms {
+    name: String,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default)]
+    floor: u32,
+}
+
+impl Serialize for Child {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.priority == 0 && self.floor == 0 {
+            return s.serialize_str(&self.name);
+        }
+        ChildTerms {
+            name: self.name.clone(),
+            priority: self.priority,
+            floor: self.floor,
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Child {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Child, D::Error> {
+        Ok(match ChildText::deserialize(d)? {
+            ChildText::Name(name) => Child::named(&name),
+            ChildText::Terms(t) => Child {
+                name: t.name,
+                priority: t.priority,
+                floor: t.floor,
+            },
+        })
+    }
+}
+
+/// `allocation:` on a parent: the deadband and hold that keep it from
+/// thrashing its children's budgets.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Allocation {
+    /// A budget change smaller than this is refused.
+    #[serde(default)]
+    pub deadband: u32,
+    /// Inside this long after a child's budget moved, moving it back the
+    /// other way is refused. Left out, no reversal is refused.
+    #[serde(default, with = "duration")]
+    pub hold: Duration,
 }
 
 /// `network:` as `none`, or a list of hosts.
@@ -278,6 +362,7 @@ const FIELDS: &[&str] = &[
     "network",
     "children",
     "parent",
+    "allocation",
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action"];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
@@ -634,7 +719,8 @@ impl Mandate {
         if self.summarize_after < 2 {
             return fail(format!("{SUMMARIZE}, not {}", self.summarize_after));
         }
-        for c in &self.children {
+        for child in &self.children {
+            let c = &child.name;
             if !is_word(c) {
                 return fail(format!("children names ventures, one word each, not {c:?}"));
             }
@@ -649,7 +735,7 @@ impl Mandate {
             if p == "self" {
                 return fail("self cannot be a parent; it allocates nothing".to_string());
             }
-            if self.children.contains(p) {
+            if self.child(p).is_some() {
                 return fail(format!(
                     "{p} cannot be both this venture's parent and its child"
                 ));
@@ -707,7 +793,13 @@ impl Mandate {
             network: None,
             children: vec![],
             parent: None,
+            allocation: None,
         }
+    }
+
+    /// The child of this name, if it is listed.
+    pub fn child(&self, name: &str) -> Option<&Child> {
+        self.children.iter().find(|c| c.name == name)
     }
 
     /// The permitted action with this name, if any.
@@ -929,11 +1021,15 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
         None | Some(Value::Null) => {}
         Some(Value::Sequence(items)) => {
             for item in items {
-                if !matches!(item, Value::String(_)) {
-                    return fail(format!(
-                        "children names ventures, one word each, not {}",
-                        describe(item)
-                    ));
+                match item {
+                    Value::String(_) => {}
+                    Value::Mapping(terms) => check_child(terms)?,
+                    other => {
+                        return fail(format!(
+                            "children names ventures, one word each, not {}",
+                            describe(other)
+                        ))
+                    }
                 }
             }
         }
@@ -945,9 +1041,86 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
         }
     }
     match map.get("parent") {
-        None | Some(Value::Null) | Some(Value::String(_)) => Ok(()),
+        None | Some(Value::Null) | Some(Value::String(_)) => {}
+        Some(other) => {
+            return fail(format!(
+                "parent is the name of a venture, not {}",
+                describe(other)
+            ))
+        }
+    }
+    check_allocation(map.get("allocation"))
+}
+
+const CHILD_FIELDS: &[&str] = &["name", "priority", "floor"];
+
+/// A child written as `{name: shop, priority: 2, floor: 3}`.
+fn check_child(terms: &Mapping) -> Result<(), MandateError> {
+    if let Some(field) = unknown_field(terms, CHILD_FIELDS)? {
+        return fail(format!(
+            "unknown child field {field:?}; a child has these fields: {}",
+            CHILD_FIELDS.join(", ")
+        ));
+    }
+    match terms.get("name") {
+        Some(Value::String(_)) => {}
+        _ => return fail("a child written with terms needs a name, like {name: shop, floor: 3}"),
+    }
+    match terms.get("priority") {
+        None | Some(Value::Null) => {}
+        Some(v) if v.as_i64().is_some_and(|n| i32::try_from(n).is_ok()) => {}
+        Some(other) => {
+            return fail(format!(
+                "priority is a whole number, higher first, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match terms.get("floor") {
+        None | Some(Value::Null) => Ok(()),
+        Some(v) if v.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => Ok(()),
         Some(other) => fail(format!(
-            "parent is the name of a venture, not {}",
+            "floor is a whole number, the least budget, not {}",
+            describe(other)
+        )),
+    }
+}
+
+const ALLOCATION_FIELDS: &[&str] = &["deadband", "hold"];
+
+/// `allocation: {deadband: 2, hold: 1d}`.
+fn check_allocation(v: Option<&Value>) -> Result<(), MandateError> {
+    let terms = match v {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Mapping(m)) => m,
+        Some(other) => {
+            return fail(format!(
+                "allocation is {{deadband: 2, hold: 1d}}, not {}",
+                describe(other)
+            ))
+        }
+    };
+    if let Some(field) = unknown_field(terms, ALLOCATION_FIELDS)? {
+        return fail(format!(
+            "unknown allocation field {field:?}; allocation has: {}",
+            ALLOCATION_FIELDS.join(", ")
+        ));
+    }
+    match terms.get("deadband") {
+        None | Some(Value::Null) => {}
+        Some(v) if v.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => {}
+        Some(other) => {
+            return fail(format!(
+                "deadband is a whole number, the smallest budget change, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match terms.get("hold") {
+        None => Ok(()),
+        Some(Value::String(s)) if humantime::parse_duration(s.trim()).is_ok() => Ok(()),
+        Some(other) => fail(format!(
+            "hold is a length of time, like 1d, not {}",
             describe(other)
         )),
     }
@@ -1523,7 +1696,7 @@ forbidden: [rm]
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");
@@ -2137,6 +2310,100 @@ forbidden: [rm]
     }
 
     #[test]
+    fn children_are_names_or_names_with_terms() {
+        let with = |children: &str| format!("{VALID}children: {children}\n");
+        let m = Mandate::parse(&with("[a, b]")).unwrap();
+        assert_eq!(m.children, vec![Child::named("a"), Child::named("b")]);
+        let m = Mandate::parse(&with("[{name: a, priority: 2, floor: 3}, b]")).unwrap();
+        assert_eq!(
+            m.children,
+            vec![
+                Child {
+                    name: "a".into(),
+                    priority: 2,
+                    floor: 3
+                },
+                Child::named("b")
+            ]
+        );
+        let m = Mandate::parse(&with("[{name: a}, {name: b, floor: 1}]")).unwrap();
+        assert_eq!(m.child("a"), Some(&Child::named("a")));
+        assert_eq!(m.child("b").map(|c| (c.priority, c.floor)), Some((0, 1)));
+        // The terms survive being written out and read again; a bare name
+        // is written bare.
+        let m = Mandate::parse(&with("[{name: a, priority: -1, floor: 3}, b]")).unwrap();
+        let text = serde_yaml::to_string(&m).unwrap();
+        assert!(text.contains("- b\n"), "{text}");
+        assert_eq!(Mandate::parse(&text).unwrap(), m);
+
+        assert_eq!(
+            fails(&with("[{priority: 2}]")),
+            "a child written with terms needs a name, like {name: shop, floor: 3}"
+        );
+        assert_eq!(
+            fails(&with("[{name: a, flor: 3}]")),
+            "unknown child field \"flor\"; a child has these fields: name, priority, floor"
+        );
+        assert_eq!(
+            fails(&with("[{name: a, floor: -1}]")),
+            "floor is a whole number, the least budget, not the number -1"
+        );
+        assert_eq!(
+            fails(&with("[{name: a, priority: high}]")),
+            "priority is a whole number, higher first, not the text \"high\""
+        );
+        assert_eq!(
+            fails(&with("[{name: self}]")),
+            "self cannot be a child; it belongs to no one"
+        );
+        assert_eq!(
+            fails(&with("[{name: two words}]")),
+            "children names ventures, one word each, not \"two words\""
+        );
+        assert_eq!(
+            fails(&with("[3]")),
+            "children names ventures, one word each, not the number 3"
+        );
+    }
+
+    #[test]
+    fn allocation_is_a_deadband_and_a_hold() {
+        let with = |allocation: &str| format!("{VALID}allocation: {allocation}\n");
+        let m = Mandate::parse(&with("{deadband: 2, hold: 1d}")).unwrap();
+        assert_eq!(
+            m.allocation,
+            Some(Allocation {
+                deadband: 2,
+                hold: Duration::from_secs(86_400)
+            })
+        );
+        let m = Mandate::parse(&with("{deadband: 2}")).unwrap();
+        assert_eq!(m.allocation.unwrap().hold, Duration::ZERO);
+        assert_eq!(Mandate::parse(VALID).unwrap().allocation, None);
+        let m = Mandate::parse(&with("{deadband: 2, hold: 90m}")).unwrap();
+        assert_eq!(
+            Mandate::parse(&serde_yaml::to_string(&m).unwrap()).unwrap(),
+            m
+        );
+        assert_eq!(
+            fails(&with("{deadbnd: 2}")),
+            "unknown allocation field \"deadbnd\"; allocation has: deadband, hold"
+        );
+        assert_eq!(
+            fails(&with("{deadband: -2}")),
+            "deadband is a whole number, the smallest budget change, not the number -2"
+        );
+        assert_eq!(
+            fails(&with("{hold: soon}")),
+            "hold is a length of time, like 1d, not the text \"soon\""
+        );
+        assert_eq!(
+            fails(&with("3")),
+            "allocation is {deadband: 2, hold: 1d}, not the number 3"
+        );
+    }
+
+    #[test]
     fn parents_list_children_and_pull_parent_levers() {
         let parent =
             "purpose: Allocate.\nmetric: shell echo 1\ncontroller: {kind: model}\ncadence: 1h\n\
@@ -2147,7 +2414,7 @@ forbidden: [rm]
                       - {name: resume, cap: 9/day, reversible: true}\n\
                       - {name: threshold, cap: 9/day, reversible: true}\n";
         let m = Mandate::parse(parent).unwrap();
-        assert_eq!(m.children, vec!["shop", "farm"]);
+        assert_eq!(m.children, vec![Child::named("shop"), Child::named("farm")]);
         for lever in PARENT_LEVERS {
             let p = m.permitted(lever).unwrap();
             assert!(p.is_parent_lever());

@@ -638,6 +638,7 @@ mod tests {
                 network: None,
                 children: vec![],
                 parent: None,
+                allocation: None,
             },
             entries: vec![Entry::new(
                 1,
@@ -989,7 +990,7 @@ mod tests {
     #[test]
     fn a_parent_sees_its_children() {
         let mut c = ctx(false);
-        c.mandate.children = vec!["shop".to_string()];
+        c.mandate.children = vec![crate::mandate::Child::named("shop")];
         c.mandate.permitted.push(Permitted {
             name: "budget".to_string(),
             run: None,

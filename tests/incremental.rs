@@ -41,7 +41,8 @@ fn mandate_text(venture: &str) -> &'static str {
 metric: total
 controller: {kind: model}
 cadence: 1h
-children: [child]
+children: [{name: child, priority: 1, floor: 4}]
+allocation: {deadband: 2, hold: 1h}
 permitted:
   - {name: pause, cap: 9/day, reversible: true}
   - {name: resume, cap: 9/day, reversible: true}
@@ -140,6 +141,12 @@ fn text() -> impl Strategy<Value = Payload> {
         "solo",
         "child 4",
         "child 40",
+        "child 3",
+        "child 5",
+        "child 6",
+        "orphan 7",
+        "self",
+        "self 4",
         "child above 3",
         "child below 20",
         "orphan below 2",

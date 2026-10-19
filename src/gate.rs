@@ -192,6 +192,36 @@ pub enum Reason {
     Pending {
         intent: Seq,
     },
+    /// A parent lever names a venture that is not this parent's child.
+    NotAChild {
+        venture: String,
+        child: String,
+    },
+    /// A budget under the child's floor.
+    BelowFloor {
+        child: String,
+        budget: u32,
+        floor: u32,
+    },
+    /// A cut to a child while a lower-priority child sits above its floor.
+    Priority {
+        child: String,
+        spared: String,
+        budget: u32,
+        floor: u32,
+    },
+    /// A budget change smaller than the deadband.
+    InDeadband {
+        child: String,
+        change: u32,
+        deadband: u32,
+    },
+    /// A budget change that reverses the last one inside the hold.
+    Reversal {
+        child: String,
+        last: Seq,
+        hold: Duration,
+    },
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -481,7 +511,7 @@ pub struct Threshold {
 fn is_child_of(mandates: &[&Adopted], child: &str, parent: &str) -> bool {
     mandates
         .iter()
-        .any(|m| m.venture == parent && m.mandate.children.iter().any(|c| c == child))
+        .any(|m| m.venture == parent && m.mandate.child(child).is_some())
         && mandates
             .iter()
             .any(|m| m.venture == child && m.mandate.parent.as_deref() == Some(parent))
@@ -795,8 +825,16 @@ pub fn gate_in(
     let budget = budget_of_in(index, &adopted, v);
     let spent = || spent_today_in(index, &adopted, v, now);
     let quota = quota_check_in(index, mandates, quotas, v, a, now);
-    let (extra_steps, extra_reasons) = limits(&mut p, v, a, &adopted, budget, spent, quota);
+    let (extra_steps, mut extra_reasons) = limits(&mut p, v, a, &adopted, budget, spent, quota);
     p.run();
+    extra_reasons.extend(allocation_reasons(
+        &p,
+        &|s| index.get(s),
+        (v, a),
+        &adopted,
+        &|child| index.budgets(child, v).to_vec(),
+        now,
+    ));
     assemble(
         &p,
         candidate,
@@ -920,7 +958,7 @@ fn limits(
 /// may resume.
 fn load_family_mandates(p: &mut Rules, adopted: &[&Adopted]) {
     for m in adopted {
-        for c in &m.mandate.children {
+        for c in m.mandate.children.iter().map(|c| &c.name) {
             if is_child_of(adopted, c, &m.venture) {
                 p.child_of.push((c.clone(), m.venture.clone()));
             }
@@ -1299,21 +1337,7 @@ fn assemble<'a>(
     // human changed it, else from the ask the approval answers, else from
     // the proposal. A lever that takes one and gets none is refused.
     if let Some(takes) = permitted.and_then(Permitted::takes) {
-        let with_payload = |seq: Seq| find(seq).filter(|e| e.record.payload().is_some());
-        let mut source = None;
-        for (_, _, d, q) in p.approved.iter().filter(|(x, y, _, _)| x == v && y == a) {
-            source = with_payload(*d).or_else(|| with_payload(*q));
-            if source.is_some() {
-                break;
-            }
-        }
-        if source.is_none() {
-            source = p
-                .proposed
-                .iter()
-                .filter(|(x, y, _)| x == v && y == a)
-                .find_map(|(_, _, s)| with_payload(*s));
-        }
+        let source = payload_entry(p, find, v, a);
         match source.and_then(|e| e.record.payload().map(|pl| (e, pl))) {
             Some((e, payload)) => {
                 steps.push(Step::Payload {
@@ -1378,6 +1402,141 @@ fn assemble<'a>(
         steps.push(Step::Running { venture: v.clone() });
     }
     finish(allowed, v, a, steps, reasons)
+}
+
+/// The record a lever's payload comes from: the amended approval if the
+/// human changed it, else the ask the approval answers, else the proposal.
+fn payload_entry<'a>(
+    p: &Rules,
+    find: &dyn Fn(Seq) -> Option<&'a Entry>,
+    v: &str,
+    a: &str,
+) -> Option<&'a Entry> {
+    let with_payload = |seq: Seq| find(seq).filter(|e| e.record.payload().is_some());
+    let mut source = None;
+    for (_, _, d, q) in p.approved.iter().filter(|(x, y, _, _)| x == v && y == a) {
+        source = with_payload(*d).or_else(|| with_payload(*q));
+        if source.is_some() {
+            break;
+        }
+    }
+    if source.is_none() {
+        source = p
+            .proposed
+            .iter()
+            .filter(|(x, y, _)| x == v && y == a)
+            .find_map(|(_, _, s)| with_payload(*s));
+    }
+    source
+}
+
+/// A budget a parent set: the record, when, and the amount.
+type Budgeted = (Seq, i64, u32);
+
+/// What a parent lever, about to be pulled, would break: a venture that is
+/// not the parent's child, a budget under a floor, a cut that spares a
+/// lower-priority child above its floor, a change inside the deadband, a
+/// reversal inside the hold. These hold whatever the proof rests on,
+/// declared approvals included. `budgets` lists what the parent has set for
+/// a child: seq, when, amount; oldest first.
+fn allocation_reasons<'a>(
+    p: &Rules,
+    find: &dyn Fn(Seq) -> Option<&'a Entry>,
+    candidate: (&str, &str),
+    adopted: &[&Adopted],
+    budgets: &dyn Fn(&str) -> Vec<Budgeted>,
+    now: i64,
+) -> Vec<Reason> {
+    let (v, a) = candidate;
+    let Some(parent) = adopted.iter().find(|m| m.venture == v) else {
+        return vec![];
+    };
+    if !parent
+        .mandate
+        .permitted(a)
+        .is_some_and(Permitted::is_parent_lever)
+    {
+        return vec![];
+    }
+    let Some(Payload::Text { text }) =
+        payload_entry(p, find, v, a).and_then(|e| e.record.payload())
+    else {
+        return vec![];
+    };
+    let Ok(call) = ParentCall::parse(a, text) else {
+        return vec![];
+    };
+    let child = call.child();
+    if !is_child_of(adopted, child, v) {
+        return vec![Reason::NotAChild {
+            venture: v.to_string(),
+            child: child.to_string(),
+        }];
+    }
+    let ParentCall::Budget { amount, .. } = call else {
+        return vec![];
+    };
+    let mut reasons = Vec::new();
+    let Some(terms) = parent.mandate.child(child) else {
+        return reasons;
+    };
+    if amount < terms.floor {
+        reasons.push(Reason::BelowFloor {
+            child: child.to_string(),
+            budget: amount,
+            floor: terms.floor,
+        });
+    }
+    let history = budgets(child);
+    let Some(&(last, last_at, current)) = history.last() else {
+        return reasons;
+    };
+    if amount < current {
+        // A cut: not while a lower-priority child sits above its floor.
+        for other in &parent.mandate.children {
+            if other.name == child
+                || other.priority >= terms.priority
+                || !is_child_of(adopted, &other.name, v)
+            {
+                continue;
+            }
+            if let Some(&(_, _, theirs)) = budgets(&other.name).last() {
+                if theirs > other.floor {
+                    reasons.push(Reason::Priority {
+                        child: child.to_string(),
+                        spared: other.name.clone(),
+                        budget: theirs,
+                        floor: other.floor,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(alloc) = &parent.mandate.allocation {
+        let change = amount.abs_diff(current);
+        if change < alloc.deadband {
+            reasons.push(Reason::InDeadband {
+                child: child.to_string(),
+                change,
+                deadband: alloc.deadband,
+            });
+        }
+        let before = history.len().checked_sub(2).map(|i| history[i].2);
+        if let Some(before) = before {
+            let went = current.cmp(&before);
+            let goes = amount.cmp(&current);
+            let inside = now - last_at < alloc.hold.as_secs() as i64;
+            if inside && went.is_ne() && goes.is_ne() && went != goes {
+                reasons.push(Reason::Reversal {
+                    child: child.to_string(),
+                    last,
+                    hold: alloc.hold,
+                });
+            }
+        }
+    }
+    reasons
 }
 
 fn finish(
@@ -1556,6 +1715,40 @@ impl fmt::Display for Reason {
             Reason::Pending { intent } => write!(
                 f,
                 "intent #{intent} has no outcome; until it is known whether it happened, it does not run again"
+            ),
+            Reason::NotAChild { venture, child } => write!(
+                f,
+                "{child} is not a child of {venture}: both mandates must say so"
+            ),
+            Reason::BelowFloor {
+                child,
+                budget,
+                floor,
+            } => write!(
+                f,
+                "a budget of {budget} is below {child}'s floor of {floor}"
+            ),
+            Reason::Priority {
+                child,
+                spared,
+                budget,
+                floor,
+            } => write!(
+                f,
+                "{child} is not cut while {spared}, of lower priority, sits at {budget} above its floor of {floor}"
+            ),
+            Reason::InDeadband {
+                child,
+                change,
+                deadband,
+            } => write!(
+                f,
+                "a change of {change} to {child}'s budget is inside the deadband of {deadband}"
+            ),
+            Reason::Reversal { child, last, hold } => write!(
+                f,
+                "{child}'s budget moved the other way in #{last}, and the hold is {}",
+                humantime::format_duration(*hold)
             ),
         }
     }
@@ -1798,6 +1991,20 @@ pub mod reference {
         calls
     }
 
+    /// The budgets set for `child` by its parent: seq, when, amount; oldest first.
+    fn budgets_set(ledger: &[Entry], mandates: &[&Adopted], child: &str) -> Vec<(Seq, i64, u32)> {
+        parent_calls(ledger, mandates, child)
+            .into_iter()
+            .filter_map(|(seq, call)| match call {
+                ParentCall::Budget { amount, .. } => {
+                    let at = ledger.iter().find(|e| e.seq == seq).map_or(0, |e| e.at);
+                    Some((seq, at, amount))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The threshold that applies to a venture now, if its controller is one.
     pub fn effective_threshold(
         ledger: &[Entry],
@@ -1925,8 +2132,16 @@ pub mod reference {
         let budget = budget_of(ledger, &adopted, v);
         let spent = || spent_today(ledger, &adopted, v, now);
         let quota = quota_check(ledger, mandates, quotas, v, a, now);
-        let (extra_steps, extra_reasons) = limits(&mut p, v, a, &adopted, budget, spent, quota);
+        let (extra_steps, mut extra_reasons) = limits(&mut p, v, a, &adopted, budget, spent, quota);
         p.run();
+        extra_reasons.extend(allocation_reasons(
+            &p,
+            &|s| ledger.iter().find(|e| e.seq == s),
+            (v, a),
+            &adopted,
+            &|child| budgets_set(ledger, &adopted, child),
+            now,
+        ));
         assemble(
             &p,
             candidate,
@@ -1985,7 +2200,7 @@ pub mod reference {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mandate::Restart;
+    use crate::mandate::{Allocation, Child, Restart};
     use crate::record::{Payload, GENESIS};
     use std::time::Duration;
 
@@ -2024,6 +2239,7 @@ mod tests {
             network: None,
             children: vec![],
             parent: None,
+            allocation: None,
         }
     }
 
@@ -2879,7 +3095,7 @@ mod tests {
     /// A parent with one child, both adopted and agreeing.
     fn family(fx: &mut Fx, parent_levers: Vec<Permitted>, child: Mandate) -> (Seq, Seq) {
         let mut pm = mandate(model(), parent_levers, &[]);
-        pm.children = vec![V.to_string()];
+        pm.children = vec![Child::named(V)];
         let p = fx.adopt("portfolio", pm);
         let mut cm = child;
         cm.parent = Some("portfolio".to_string());
@@ -3020,6 +3236,261 @@ mod tests {
         fx.push(parent_action("portfolio", "budget", &format!("{V} 30")));
         let s = fx.push(proposal(Claim::Inferred, "spend"));
         assert!(fx.gate(V, "spend", &[s]).is_ok());
+    }
+
+    /// A parent with two children, shop and farm, and the terms it lists
+    /// them under.
+    fn siblings(fx: &mut Fx, shop: Child, farm: Child, allocation: Option<Allocation>) {
+        let mut pm = mandate(model(), vec![parent_lever("budget", true)], &[]);
+        pm.children = vec![shop, farm];
+        pm.allocation = allocation;
+        fx.adopt("portfolio", pm);
+        for name in ["shop", "farm"] {
+            let mut cm = mandate(model(), vec![], &[]);
+            cm.parent = Some("portfolio".to_string());
+            fx.adopt(name, cm);
+        }
+    }
+
+    fn term(name: &str, priority: i32, floor: u32) -> Child {
+        Child {
+            name: name.to_string(),
+            priority,
+            floor,
+        }
+    }
+
+    fn set_budget(fx: &mut Fx, child: &str, amount: u32) {
+        fx.push(parent_action(
+            "portfolio",
+            "budget",
+            &format!("{child} {amount}"),
+        ));
+    }
+
+    /// The parent proposes a lever with a payload; the gate decides.
+    fn parent_gate(fx: &mut Fx, lever: &str, payload: &str) -> Result<Proof, Refusal> {
+        let s = fx.push(Record::Proposal {
+            claim: Claim::Inferred,
+            venture: "portfolio".into(),
+            action: lever.into(),
+            reason: "it seemed right".into(),
+            payload: Some(text(payload)),
+        });
+        fx.gate("portfolio", lever, &[s])
+    }
+
+    fn has(r: &Refusal, f: impl Fn(&Reason) -> bool) -> bool {
+        r.reasons.iter().any(f)
+    }
+
+    #[test]
+    fn a_budget_below_the_floor_is_refused_even_with_a_declared_approval() {
+        let mut fx = Fx::new();
+        siblings(&mut fx, term("shop", 0, 3), Child::named("farm"), None);
+        let refusal = parent_gate(&mut fx, "budget", "shop 2").unwrap_err();
+        assert!(
+            has(
+                &refusal,
+                |r| matches!(r, Reason::BelowFloor { child, budget: 2, floor: 3 } if child == "shop")
+            ),
+            "{refusal}"
+        );
+        assert!(
+            reasons(&refusal).contains(&"a budget of 2 is below shop's floor of 3".to_string()),
+            "{refusal}"
+        );
+        // A human approves the ask. The floor still holds.
+        let q = fx.push(Record::Ask {
+            claim: Claim::Inferred,
+            venture: "portfolio".into(),
+            action: Some("budget".into()),
+            question: "budget shop 2?".into(),
+            refusal: None,
+            signal: None,
+            payload: Some(text("shop 2")),
+        });
+        let d = fx.push(Record::Decision {
+            claim: Claim::Declared,
+            venture: "portfolio".into(),
+            verdict: approve(q),
+            by: None,
+        });
+        let refusal = fx.gate("portfolio", "budget", &[d]).unwrap_err();
+        assert!(
+            has(&refusal, |r| matches!(r, Reason::BelowFloor { .. })),
+            "{refusal}"
+        );
+        // At the floor, and for a child with no floor, it passes.
+        assert!(parent_gate(&mut fx, "budget", "shop 3").is_ok());
+        assert!(parent_gate(&mut fx, "budget", "farm 0").is_ok());
+    }
+
+    #[test]
+    fn a_high_priority_child_is_not_cut_while_a_lower_one_is_above_its_floor() {
+        let mut fx = Fx::new();
+        siblings(&mut fx, term("shop", 2, 0), term("farm", 0, 1), None);
+        set_budget(&mut fx, "shop", 10);
+        set_budget(&mut fx, "farm", 5);
+        let refusal = parent_gate(&mut fx, "budget", "shop 8").unwrap_err();
+        assert!(
+            has(
+                &refusal,
+                |r| matches!(r, Reason::Priority { child, spared, budget: 5, floor: 1 } if child == "shop" && spared == "farm")
+            ),
+            "{refusal}"
+        );
+        // Raising the high-priority child is no cut; cutting the low one is
+        // allowed, down to its floor.
+        assert!(parent_gate(&mut fx, "budget", "shop 12").is_ok());
+        assert!(parent_gate(&mut fx, "budget", "farm 1").is_ok());
+        // With the farm at its floor, the shop may be cut.
+        set_budget(&mut fx, "farm", 1);
+        assert!(parent_gate(&mut fx, "budget", "shop 8").is_ok());
+    }
+
+    fn allocation(deadband: u32, hold: Duration) -> Option<Allocation> {
+        Some(Allocation { deadband, hold })
+    }
+
+    #[test]
+    fn a_budget_change_inside_the_deadband_is_refused() {
+        let mut fx = Fx::new();
+        siblings(
+            &mut fx,
+            Child::named("shop"),
+            Child::named("farm"),
+            allocation(3, Duration::ZERO),
+        );
+        // The first budget is no change.
+        assert!(parent_gate(&mut fx, "budget", "shop 10").is_ok());
+        set_budget(&mut fx, "shop", 10);
+        for n in [9, 10, 12] {
+            let refusal = parent_gate(&mut fx, "budget", &format!("shop {n}")).unwrap_err();
+            assert!(
+                has(&refusal, |r| matches!(
+                    r,
+                    Reason::InDeadband { deadband: 3, .. }
+                )),
+                "{n}: {refusal}"
+            );
+        }
+        assert!(parent_gate(&mut fx, "budget", "shop 13").is_ok());
+        assert!(parent_gate(&mut fx, "budget", "shop 7").is_ok());
+    }
+
+    #[test]
+    fn reversing_a_budget_inside_the_hold_is_refused() {
+        let mut fx = Fx::new();
+        siblings(
+            &mut fx,
+            Child::named("shop"),
+            Child::named("farm"),
+            allocation(1, Duration::from_secs(DAY as u64)),
+        );
+        set_budget(&mut fx, "shop", 3);
+        set_budget(&mut fx, "shop", 6);
+        // 3 -> 6 -> 3 inside the hold.
+        let refusal = parent_gate(&mut fx, "budget", "shop 3").unwrap_err();
+        assert!(
+            has(
+                &refusal,
+                |r| matches!(r, Reason::Reversal { child, .. } if child == "shop")
+            ),
+            "{refusal}"
+        );
+        // Going on the same way is no reversal.
+        assert!(parent_gate(&mut fx, "budget", "shop 8").is_ok());
+        // The other child has no history.
+        assert!(parent_gate(&mut fx, "budget", "farm 1").is_ok());
+
+        // Once the hold has passed, the reverse is allowed.
+        let mut fx = Fx::new();
+        siblings(
+            &mut fx,
+            Child::named("shop"),
+            Child::named("farm"),
+            allocation(1, Duration::from_secs(DAY as u64)),
+        );
+        let long_ago = NOW - 2 * DAY;
+        for amount in [3, 6] {
+            fx.push_at(
+                long_ago,
+                parent_action("portfolio", "budget", &format!("shop {amount}")),
+            );
+        }
+        assert!(parent_gate(&mut fx, "budget", "shop 3").is_ok());
+    }
+
+    #[test]
+    fn a_parent_lever_naming_a_non_child_is_refused_and_shown_in_why() {
+        let mut fx = Fx::new();
+        let mut pm = mandate(
+            model(),
+            vec![
+                parent_lever("pause", true),
+                parent_lever("budget", true),
+                parent_lever("threshold", true),
+            ],
+            &[],
+        );
+        pm.children = vec![Child::named("shop")];
+        fx.adopt("portfolio", pm);
+        let mut sm = mandate(model(), vec![], &[]);
+        sm.parent = Some("portfolio".to_string());
+        fx.adopt("shop", sm);
+        fx.adopt(SELF, mandate(model(), vec![], &[]));
+        fx.adopt("stranger", mandate(model(), vec![], &[]));
+        for (lever, payload) in [
+            ("pause", "self"),
+            ("pause", "stranger"),
+            ("pause", "nobody"),
+            ("budget", "self 5"),
+            ("threshold", "stranger above 3"),
+        ] {
+            let refusal = parent_gate(&mut fx, lever, payload).unwrap_err();
+            let child = payload.split_whitespace().next().unwrap();
+            assert!(
+                has(
+                    &refusal,
+                    |r| matches!(r, Reason::NotAChild { venture, child: c } if venture == "portfolio" && c == child)
+                ),
+                "{lever} {payload}: {refusal}"
+            );
+            let shown = why(&Entry::new(
+                1,
+                NOW,
+                GENESIS,
+                Record::Ask {
+                    claim: Claim::Measured,
+                    venture: "portfolio".into(),
+                    action: Some(lever.into()),
+                    question: String::new(),
+                    refusal: Some(refusal),
+                    signal: None,
+                    payload: None,
+                },
+            ));
+            assert!(
+                shown.contains(&format!(
+                    "because    {child} is not a child of portfolio: both mandates must say so"
+                )),
+                "{shown}"
+            );
+        }
+        // A child is a child.
+        assert!(parent_gate(&mut fx, "pause", "shop").is_ok());
+        // A child only the parent lists is not one: both mandates must say so.
+        let mut fx = Fx::new();
+        let mut pm = mandate(model(), vec![parent_lever("pause", true)], &[]);
+        pm.children = vec![Child::named("shop")];
+        fx.adopt("portfolio", pm);
+        fx.adopt("shop", mandate(model(), vec![], &[]));
+        let refusal = parent_gate(&mut fx, "pause", "shop").unwrap_err();
+        assert!(
+            has(&refusal, |r| matches!(r, Reason::NotAChild { .. })),
+            "{refusal}"
+        );
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub struct Pulled {
     pub threshold: Option<(Seq, bool, f64)>,
     /// seq, amount
     pub budget: Option<(Seq, u32)>,
+    /// Every budget set: seq, when, amount; oldest first.
+    pub budgets: Vec<(Seq, i64, u32)>,
 }
 
 /// A venture's latest declared adoption: the record, the hash of the
@@ -243,7 +245,7 @@ impl Index {
                     latest(self.stopped.entry(venture.clone()).or_insert(seq), seq);
                 }
                 if *ok {
-                    self.pull(venture, seq, action, payload.as_ref());
+                    self.pull(venture, seq, at, action, payload.as_ref());
                 }
                 let cited = cited_decisions(&proof.steps);
                 self.cite(cited);
@@ -280,7 +282,8 @@ impl Index {
                 if let Some((action, payload)) = of {
                     self.pending.remove(intent);
                     if *ok && self.done.insert(*intent) {
-                        self.pull(venture, *intent, &action, payload.as_ref());
+                        let started = self.get(*intent).map_or(at, |i| i.at);
+                        self.pull(venture, *intent, started, &action, payload.as_ref());
                     }
                 }
             }
@@ -291,7 +294,14 @@ impl Index {
 
     /// A parent lever done: an ok action, or an intent with an ok outcome,
     /// known by its number.
-    fn pull(&mut self, venture: String, seq: Seq, action: &str, payload: Option<&Payload>) {
+    fn pull(
+        &mut self,
+        venture: String,
+        seq: Seq,
+        at: i64,
+        action: &str,
+        payload: Option<&Payload>,
+    ) {
         let Some(Payload::Text { text }) = payload else {
             return;
         };
@@ -314,6 +324,9 @@ impl Index {
                 }
             }
             ParentCall::Budget { amount, .. } => {
+                if let Err(i) = pulled.budgets.binary_search_by_key(&seq, |b| b.0) {
+                    pulled.budgets.insert(i, (seq, at, amount));
+                }
                 if pulled.budget.is_none_or(|(s, _)| s < seq) {
                     pulled.budget = Some((seq, amount))
                 }
@@ -387,6 +400,11 @@ impl Index {
     /// The levers `parent` pulled on `child`, the latest of each.
     pub fn pulled(&self, child: &str, parent: &str) -> Option<&Pulled> {
         self.pulled.get(child)?.get(parent)
+    }
+
+    /// The budgets `parent` set for `child`: seq, when, amount; oldest first.
+    pub fn budgets(&self, child: &str, parent: &str) -> &[(Seq, i64, u32)] {
+        self.pulled(child, parent).map_or(&[], |p| &p.budgets)
     }
 
     /// Asks with no trusted decision yet, oldest first.

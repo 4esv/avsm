@@ -162,13 +162,15 @@ fn a_budget_moves_between_two_children() {
     let out = lines_of(&mut k, "portfolio", "budget", "loner 5");
     assert!(
         out.contains(
-            "budget did not run: loner is not a child of portfolio: both mandates must say so"
+            "budget refused: loner is not a child of portfolio: both mandates must say so"
         ),
         "{out}"
     );
     let out = lines_of(&mut k, "portfolio", "budget", "stranger 5");
     assert!(
-        out.contains("budget did not run: stranger is not a venture"),
+        out.contains(
+            "budget refused: stranger is not a child of portfolio: both mandates must say so"
+        ),
         "{out}"
     );
     let out = lines_of(&mut k, "portfolio", "budget", "shop lots");
@@ -507,4 +509,85 @@ fn the_parents_nightly_call_sees_childrens_records_not_their_raw_input() {
         shop.lines
     );
     assert_eq!(ctx.children[1].metric, "no report yet");
+}
+
+/// The sequence number a propose line opens with.
+fn first_seq(out: &str) -> u64 {
+    out.trim_start_matches('#')
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn the_gate_refuses_a_parent_lever_on_a_non_child_and_why_shows_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path(), "nightly: never\n");
+    let (role, _) = quiet();
+    let mut k = kernel(&home, role);
+    k.add(&venture(tmp.path(), "shop", &child("shop", "")))
+        .unwrap();
+    k.add(&venture(tmp.path(), "farm", &child("farm", "")))
+        .unwrap();
+    k.add(&venture(tmp.path(), "portfolio", PORTFOLIO)).unwrap();
+    let out = lines_of(&mut k, "portfolio", "pause", "self");
+    assert!(
+        out.contains("pause refused: self is not a child of portfolio: both mandates must say so"),
+        "{out}"
+    );
+    let why = k.why(first_seq(&out)).unwrap();
+    assert!(
+        why.contains("because    self is not a child of portfolio: both mandates must say so"),
+        "{why}"
+    );
+    assert!(
+        k.entries()
+            .unwrap()
+            .iter()
+            .all(|e| !e.line().contains("intent") || !e.line().contains("pause")),
+        "no pause intent was written"
+    );
+    // A child still pauses.
+    let out = lines_of(&mut k, "portfolio", "pause", "shop");
+    assert!(ran(&out, "pause", "shop is paused"), "{out}");
+}
+
+#[test]
+fn children_with_terms_bound_the_budgets_a_parent_sets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path(), "nightly: never\n");
+    let (role, _) = quiet();
+    let mut k = kernel(&home, role);
+    k.add(&venture(tmp.path(), "shop", &child("shop", "")))
+        .unwrap();
+    k.add(&venture(tmp.path(), "farm", &child("farm", "")))
+        .unwrap();
+    let parent = PORTFOLIO.replace(
+        "children: [shop, farm]\n",
+        "children: [{name: shop, priority: 2, floor: 3}, farm]\nallocation: {deadband: 2, hold: 1d}\n",
+    );
+    k.add(&venture(tmp.path(), "portfolio", &parent)).unwrap();
+    let out = lines_of(&mut k, "portfolio", "budget", "shop 2");
+    assert!(
+        out.contains("budget refused: a budget of 2 is below shop's floor of 3"),
+        "{out}"
+    );
+    let out = lines_of(&mut k, "portfolio", "budget", "shop 3");
+    assert!(ran(&out, "budget", "shop may spend 3 a day"), "{out}");
+    let out = lines_of(&mut k, "portfolio", "budget", "shop 4");
+    assert!(
+        out.contains("a change of 1 to shop's budget is inside the deadband of 2"),
+        "{out}"
+    );
+    let out = lines_of(&mut k, "portfolio", "budget", "shop 6");
+    assert!(ran(&out, "budget", "shop may spend 6 a day"), "{out}");
+    let out = lines_of(&mut k, "portfolio", "budget", "shop 3");
+    assert!(
+        out.contains("shop's budget moved the other way in #"),
+        "{out}"
+    );
+    let why = k.why(first_seq(&out)).unwrap();
+    assert!(why.contains("because    shop's budget moved"), "{why}");
 }
