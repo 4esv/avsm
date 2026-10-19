@@ -1438,8 +1438,75 @@ pub const SPENT_WINDOWS: i64 = 2;
 /// The days a metric must worsen, each worse than the one before, before
 /// what held its levers back is named.
 pub const HELD_DAYS: i64 = 7;
+/// The days before those `HELD_DAYS` whose daily means give the metric's
+/// own noise, and the fewest day-to-day changes among them that may.
+pub const PRIOR_DAYS: i64 = 28;
+pub const MIN_PRIOR_CHANGES: usize = 7;
+/// The `HELD_DAYS` change must exceed this many units of the metric's own
+/// noise: the median absolute deviation, about their median, of the
+/// day-to-day changes of its daily means over the `PRIOR_DAYS` before.
+/// About a steady trend the deviation is small, so a trend that keeps on
+/// is still caught; on a driftless random walk the floor holds the false
+/// alarms to about 1% a nightly check. Calibrated, not guessed: see
+/// `a_driftless_walk_rarely_reads_as_held_back_and_a_steady_rise_does`.
+pub const NOISE_FLOOR: f64 = 10.0;
 /// The most records a gap cites.
 const MAX_CITES: usize = 8;
+
+/// The middle value of `xs`, which it sorts. None when empty.
+fn median(xs: &mut [f64]) -> Option<f64> {
+    xs.sort_by(f64::total_cmp);
+    let n = xs.len();
+    match n {
+        0 => None,
+        _ if n % 2 == 1 => Some(xs[n / 2]),
+        _ => Some((xs[n / 2 - 1] + xs[n / 2]) / 2.0),
+    }
+}
+
+/// Is the metric worse each of the last `HELD_DAYS` days than the day
+/// before, by more than `NOISE_FLOOR` units of its noise over the
+/// `PRIOR_DAYS` before them? `readings` are (time, value), oldest first;
+/// the days end at `now`. Some((first, last)) daily means when it is.
+pub fn worsening(readings: &[(i64, f64)], now: i64, toward: Direction) -> Option<(f64, f64)> {
+    let (first, last, noise) = trend(readings, now, toward)?;
+    ((last - first).abs() > NOISE_FLOOR * noise).then_some((first, last))
+}
+
+/// `worsening` before the floor: the first and last daily means of a
+/// metric worse each day, and its noise.
+pub fn trend(readings: &[(i64, f64)], now: i64, toward: Direction) -> Option<(f64, f64, f64)> {
+    let worse = |a: f64, b: f64| {
+        if toward == Direction::Down {
+            b > a
+        } else {
+            b < a
+        }
+    };
+    let total = HELD_DAYS + PRIOR_DAYS;
+    let start = now - total * DAY_SECS;
+    let mut days = vec![(0.0, 0u32); total as usize];
+    for (at, x) in readings.iter().filter(|(at, _)| *at > start && *at <= now) {
+        let d = ((at - start - 1) / DAY_SECS).clamp(0, total - 1) as usize;
+        days[d].0 += x;
+        days[d].1 += 1;
+    }
+    let mean = |(t, n): &(f64, u32)| (*n > 0).then(|| t / f64::from(*n));
+    let (prior, held) = days.split_at(PRIOR_DAYS as usize);
+    let means: Vec<f64> = held.iter().map(mean).collect::<Option<_>>()?;
+    let (first, last) = (means[0], means[means.len() - 1]);
+    if !worse(first, last) || means.windows(2).any(|w| worse(w[1], w[0])) {
+        return None;
+    }
+    let prior: Vec<f64> = prior.iter().filter_map(mean).collect();
+    let mut changes: Vec<f64> = prior.windows(2).map(|w| w[1] - w[0]).collect();
+    if changes.len() < MIN_PRIOR_CHANGES {
+        return None;
+    }
+    let mid = median(&mut changes)?;
+    let mut spread: Vec<f64> = changes.iter().map(|c| (c - mid).abs()).collect();
+    Some((first, last, median(&mut spread)?))
+}
 /// What the asks quota refusing a lever is called in a refusal's reason.
 const ASKS_SPENT: &str = "AsksQuotaSpent";
 const DAY_SECS: i64 = 86_400;
@@ -1553,33 +1620,14 @@ struct Held {
 /// it too seldom, each with its count.
 pub fn held_back(index: &Index, venture: &str, mandate: &Mandate, now: i64) -> Option<Gap> {
     let toward = target(mandate)?;
-    let worse = |a: f64, b: f64| {
-        if toward == Direction::Down {
-            b > a
-        } else {
-            b < a
-        }
-    };
     let metric = mandate.metric_name();
     let span = HELD_DAYS * DAY_SECS;
     let start = now - span;
     let series = index.series(venture, metric);
     let at = |s: Seq| index.get(s).map_or(i64::MIN, |e| e.at);
-    let lo = series.partition_point(|(s, _)| at(*s) <= start);
-    let mut days = vec![(0.0, 0u32); HELD_DAYS as usize];
-    for (s, x) in &series[lo..] {
-        let d = ((at(*s) - start - 1) / DAY_SECS).clamp(0, HELD_DAYS - 1) as usize;
-        days[d].0 += x;
-        days[d].1 += 1;
-    }
-    if days.iter().any(|(_, n)| *n == 0) {
-        return None;
-    }
-    let means: Vec<f64> = days.iter().map(|(t, n)| t / f64::from(*n)).collect();
-    let (first, last) = (means[0], means[means.len() - 1]);
-    if !worse(first, last) || means.windows(2).any(|w| worse(w[1], w[0])) {
-        return None;
-    }
+    let lo = series.partition_point(|(s, _)| at(*s) <= now - (HELD_DAYS + PRIOR_DAYS) * DAY_SECS);
+    let readings: Vec<(i64, f64)> = series[lo..].iter().map(|(s, x)| (at(*s), *x)).collect();
+    let (first, last) = worsening(&readings, now, toward)?;
     // A threshold is the target: on its right side, nothing is held back.
     match &mandate.controller {
         Controller::Threshold { above: Some(b), .. } if last <= *b => return None,
@@ -1759,6 +1807,74 @@ fn effect_of(base: &Baseline, p: &crate::mandate::Permitted) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::slowing::tests::normal;
+
+    /// Days a calibration stream runs, and the first night it is checked:
+    /// once the prior window is full.
+    const STREAM_DAYS: i64 = 91;
+    const FIRST_NIGHT: i64 = HELD_DAYS + PRIOR_DAYS;
+
+    /// A stream sampled every `every` seconds: `at(day)` the value's mean
+    /// path, plus a driftless random walk of unit steps when `walk`, plus
+    /// unit white noise otherwise.
+    fn stream(seed: u64, every: i64, walk: bool, path: impl Fn(f64) -> f64) -> Vec<(i64, f64)> {
+        let mut rng = seed;
+        let mut x = 0.0;
+        (1..=STREAM_DAYS * DAY_SECS / every)
+            .map(|i| {
+                let at = i * every;
+                let e = normal(&mut rng);
+                let noise = if walk {
+                    x += e;
+                    x
+                } else {
+                    e
+                };
+                (at, path(at as f64 / DAY_SECS as f64) + noise)
+            })
+            .collect()
+    }
+
+    /// Each nightly check's ratio of the held change to the noise, when
+    /// the metric (toward Down) was worse each day; and the checks run.
+    fn ratios(s: &[(i64, f64)]) -> (Vec<f64>, usize) {
+        let mut out = Vec::new();
+        let mut checks = 0;
+        for night in FIRST_NIGHT..=STREAM_DAYS {
+            checks += 1;
+            if let Some((first, last, noise)) = trend(s, night * DAY_SECS, Direction::Down) {
+                out.push((last - first).abs() / noise.max(1e-12));
+            }
+        }
+        (out, checks)
+    }
+
+    /// The share of nightly checks over `seeds` streams that pass the floor.
+    fn rate(seeds: u64, make: impl Fn(u64) -> Vec<(i64, f64)>) -> f64 {
+        let (mut hits, mut checks) = (0, 0);
+        for seed in 0..seeds {
+            let (r, c) = ratios(&make(seed));
+            hits += r.iter().filter(|r| **r > NOISE_FLOOR).count();
+            checks += c;
+        }
+        hits as f64 / checks as f64
+    }
+
+    /// The calibration of `NOISE_FLOOR`. Over 1000 seeded driftless random
+    /// walks of unit steps, 91 days each, checked every night from day 35:
+    /// worse each of 7 days alone is 1.6% to 3.1% of checks, by cadence;
+    /// with the floor at 10 it is 0.81% (6h), 0.91% (1h), 0.96% (2h) and
+    /// 0.31% (1d). A steady rise of 2.4 a day under unit noise, read every
+    /// 6h (the quarter's inbox), passes 99.8% of checks; 1 a day, 50%.
+    #[test]
+    fn a_driftless_walk_rarely_reads_as_held_back_and_a_steady_rise_does() {
+        for every in [3_600, 7_200, 21_600, 86_400] {
+            let r = rate(1000, |seed| stream(seed, every, true, |_| 0.0));
+            assert!(r <= 0.011, "a walk read every {every}s: {r}");
+        }
+        let r = rate(200, |seed| stream(seed, 21_600, false, |d| 2.4 * d));
+        assert!(r >= 0.95, "a steady rise: {r}");
+    }
 
     const MANDATE: &str = "purpose: p\nmetric: count\ncontroller: {kind: model}\ncadence: 1h\n\
         permitted:\n- {name: water, run: ./water, cap: 2/day, reversible: true}\n";

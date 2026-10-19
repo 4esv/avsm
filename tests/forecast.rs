@@ -1320,7 +1320,12 @@ fn quota_refusal(f: &mut Fixture, count: u32) {
 }
 
 /// Unread rising 3 a day, four reports a day, `each` run once a day.
+/// From day 0, eight flat days come first: the history the metric's noise
+/// is read from.
 fn inbox_days(f: &mut Fixture, days: std::ops::Range<usize>, mut each: impl FnMut(&mut Fixture)) {
+    if days.start == 0 {
+        f.history("inbox", &[10.0; 32], 6 * HOUR);
+    }
     for d in days {
         let base = 10.0 + 3.0 * d as f64;
         f.history(
@@ -1407,33 +1412,112 @@ fn a_metric_not_worse_every_day_gets_no_held_back_ask() {
     let _c = clock();
     let mut f = fixture("");
     f.venture("inbox", "unread", INBOX);
-    // Three days rising: too short a history to say.
-    for d in 0..3 {
+    // Three flat days, then seven rising: too short a history before the
+    // week to know the metric's noise.
+    f.history("inbox", &[10.0; 12], 6 * HOUR);
+    for d in 1..8 {
         f.history("inbox", &[10.0 + 3.0 * d as f64; 4], 6 * HOUR);
         let a = reply_ask(&mut f);
         f.k.deny(a, "not now").unwrap();
         f.k.check_capacity("inbox");
     }
     assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+    // Ten flat days: a history for the noise, and nothing worse.
+    f.history("inbox", &[20.0; 40], 6 * HOUR);
+    f.k.check_capacity("inbox");
+    assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
     // Rising each day it was read, but one day of the week unread: not
     // known to be worse each day.
-    for d in 3..10 {
-        if d == 6 {
+    for d in 1..8 {
+        if d == 4 {
             f.now += DAY;
             continue;
         }
-        f.history("inbox", &[10.0 + 3.0 * d as f64; 4], 6 * HOUR);
+        f.history("inbox", &[20.0 + 3.0 * d as f64; 4], 6 * HOUR);
     }
     f.k.check_capacity("inbox");
     assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
-    // Worse over the week, but up two and down one: not worse each day.
-    for x in [16.0, 20.0, 18.0, 22.0, 26.0, 24.0, 28.0] {
+    // Worse over the week by far more than its noise, but up two and down
+    // one: not worse each day.
+    for x in [40.0, 60.0, 50.0, 70.0, 90.0, 80.0, 100.0] {
         f.history("inbox", &[x; 4], 6 * HOUR);
         let a = reply_ask(&mut f);
         f.k.deny(a, "not now").unwrap();
     }
     f.k.check_capacity("inbox");
     assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+}
+
+#[test]
+fn a_threshold_metric_worsening_on_the_right_side_of_its_bound_gets_no_held_back_ask() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture(
+        "inbox",
+        "unread",
+        "controller: {kind: threshold, above: 900, action: reply}\ncadence: 6h\n\
+         permitted:\n- {name: reply, run: echo ran >> invoked, cap: 5/day, reversible: true, delegated: true}\n",
+    );
+    // Rising a week past its flat history, but far below 900.
+    inbox_days(&mut f, 0..8, |_| {});
+    f.k.check_capacity("inbox");
+    assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+}
+
+/// A paper trader whose equity swings up to 40 a day for a month, then falls
+/// `by` over a week, each day lower, while its trade asks are denied.
+fn trader_week(by: f64) -> Fixture {
+    let mut f = fixture("");
+    f.venture(
+        "trader",
+        "equity",
+        "controller: {kind: model}\ncadence: 6h\nbetter: up\n\
+         permitted:\n- {name: trade, run: echo ran >> invoked, cap: 3/day, reversible: false, takes: text}\n",
+    );
+    // Spread over -40..40 in no regular order.
+    let mut rng = 7;
+    for _ in 0..30 {
+        let x = 10_000.0 + (avsmd::world::splitmix64(&mut rng) % 81) as f64 - 40.0;
+        f.history("trader", &[x; 4], 6 * HOUR);
+    }
+    for d in 0..7 {
+        f.history("trader", &[10_000.0 - by * d as f64 / 6.0; 4], 6 * HOUR);
+        let a =
+            f.k.append(Record::Ask {
+                claim: Claim::Inferred,
+                venture: "trader".to_string(),
+                action: Some("trade".to_string()),
+                question: "buy?".to_string(),
+                refusal: None,
+                payload: Some(Payload::Text {
+                    text: "buy 1".to_string(),
+                }),
+                signal: None,
+                cites: vec![],
+                packet: None,
+            })
+            .unwrap()
+            .seq;
+        f.k.deny(a, "not now").unwrap();
+    }
+    f.k.check_capacity("trader");
+    f
+}
+
+#[test]
+fn a_dip_inside_the_metrics_own_noise_gets_no_held_back_ask() {
+    let _c = clock();
+    // Half a percent over the week, each day lower, against daily swings
+    // of up to 40 either way before: a few units of noise, no ask.
+    let f = trader_week(50.0);
+    assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
+    // 3.5 percent: past the floor, it asks.
+    let f = trader_week(350.0);
+    let asks = capacity_asks(&f);
+    assert_eq!(asks.len(), 1, "{:#?}", f.entries());
+    let q = question(&asks[0]);
+    assert!(q.contains("equity fell from 10000 to 9650"), "{q}");
+    assert!(q.contains("7 of 7 asks denied"), "{q}");
 }
 
 #[test]
