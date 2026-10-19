@@ -619,6 +619,26 @@ fn an_approved_implausible_reading_never_makes_its_repeats_plausible() {
 }
 
 #[test]
+fn a_missing_reading_never_breaks_a_frozen_plateau_after_a_run() {
+    let _c = clock();
+    // The hostile quarter: the tomato died at 6.9 after a watering; a NaN
+    // later made the next 6.9 look fresh, and the water ran again.
+    let mut f = tomato();
+    for v in [40.0, 42.0, 41.0, 43.0, 40.0] {
+        f.report(v);
+    }
+    f.report(20.0); // crosses: boost runs
+    assert_eq!(f.intents(), 1);
+    f.report(20.0); // exactly the same after a run: stuck
+    f.report(f64::NAN);
+    f.report(20.0);
+    f.report(20.0);
+    let flags = f.flags();
+    assert!(flags[6..].iter().all(Option::is_some), "{flags:?}");
+    assert_eq!(f.intents(), 1, "never a premise for another run");
+}
+
+#[test]
 fn a_sensor_that_recovers_never_suspends_a_lever_that_ran_while_it_was_stuck() {
     let _c = clock();
     let mut f = tomato();

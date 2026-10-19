@@ -52,6 +52,10 @@ pub const AGREE: usize = 3;
 /// stuck, where the metric's plausible history varies.
 pub const STUCK: usize = 3;
 
+/// How many of the latest readings, plausible or not, a reading is
+/// checked against: enough for STUCK repeats among a few missing ones.
+const RECENT: usize = 8;
+
 /// How many plausible readings say whether a metric varies.
 pub const HISTORY: usize = 20;
 
@@ -75,7 +79,7 @@ fn median_step(history: &[f64]) -> f64 {
 /// holds the latest plausible readings, up to HISTORY, oldest first;
 /// `recent` the values of the latest readings, plausible or not, oldest
 /// first. `moved` says a lever whose `expects` moves this metric ran, ok,
-/// since the reading before.
+/// since the first of the readings just before that equal this one.
 pub fn implausible(
     value: Option<f64>,
     before: &[f64],
@@ -105,21 +109,20 @@ pub fn implausible(
     // a declared bound of its range: dry soil reads its floor.
     let varies = median_step(before) > 0.0;
     let bound = |x: f64| range.is_some_and(|[lo, hi]| x == lo || x == hi);
-    if varies
-        && !bound(x)
-        && recent.len() >= STUCK
-        && recent[recent.len() - STUCK..].iter().all(|r| *r == Some(x))
-    {
+    // A missing reading says nothing either way: it neither counts as a
+    // repeat nor breaks a run of them.
+    let valued: Vec<f64> = recent.iter().rev().filter_map(|r| *r).collect();
+    if varies && !bound(x) && valued.len() >= STUCK && valued[..STUCK].iter().all(|r| *r == x) {
         return Some(format!(
             "stuck: {x} exactly, as the {STUCK} readings before it, where the metric varies"
         ));
     }
-    // A lever that is expected to move the metric ran, and the reading is
-    // exactly the one before. At a bound that is the lever's to answer
-    // for (ineffective), not the sensor's.
-    if varies && moved && !bound(x) && recent.last() == Some(&Some(x)) {
+    // The readings just before are exactly this one, and a lever that is
+    // expected to move the metric ran among them. At a bound that is the
+    // lever's to answer for (ineffective), not the sensor's.
+    if varies && moved && !bound(x) && valued.first() == Some(&x) {
         return Some(format!(
-            "stuck: {x} exactly, as the reading before it, though a lever expected to move it ran between"
+            "stuck: {x} exactly, as the reading before it, though a lever expected to move it ran since"
         ));
     }
     // A flap in the raw readings, whatever was believed: the last three
@@ -385,11 +388,21 @@ impl Kernel {
             return (None, false);
         };
         let before = anchored_before(&index, venture, metric, HISTORY);
-        let recent = recent(&index, venture, metric, STUCK.max(AGREE - 1).max(3));
-        // Did a lever that expects to move this metric run, ok, since the
-        // last reading of it?
-        let last = reports(&index, venture, metric).next().map(|e| e.seq);
-        let moved = last.is_some_and(|last| {
+        let recent = recent(&index, venture, metric, RECENT);
+        // The first of the readings just before that equal this one
+        // exactly, missing ones skipped: did a lever that expects to move
+        // this metric run, ok, since?
+        let plateau = value.and_then(|x| {
+            reports(&index, venture, metric)
+                .filter_map(|e| match &e.record {
+                    Record::Report { value: Some(v), .. } => Some((e.seq, *v)),
+                    _ => None,
+                })
+                .take_while(|(_, v)| *v == x)
+                .last()
+                .map(|(seq, _)| seq)
+        });
+        let moved = plateau.is_some_and(|last| {
             self.ventures.get(venture).is_some_and(|v| {
                 v.mandate.metric_name() == metric
                     && v.mandate
