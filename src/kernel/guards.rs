@@ -393,13 +393,15 @@ impl Kernel {
         };
         let before = anchored_before(&index, venture, metric, HISTORY);
         let recent = recent(&index, venture, metric, RECENT);
-        // The first of the readings just before that equal this one
-        // exactly, missing ones skipped: did a lever that expects to move
-        // this metric run, ok, since?
+        // The readings just before that equal this one exactly. A missing
+        // or out-of-range reading says nothing about the value and is
+        // skipped. Did a lever that expects to move this metric run, ok,
+        // since the first of them?
+        let inside = |v: f64| v.is_finite() && range.is_none_or(|[lo, hi]| v >= lo && v <= hi);
         let plateau: Vec<Seq> = value.map_or_else(Vec::new, |x| {
             reports(&index, venture, metric)
                 .filter_map(|e| match &e.record {
-                    Record::Report { value: Some(v), .. } => Some((e.seq, *v)),
+                    Record::Report { value: Some(v), .. } if inside(*v) => Some((e.seq, *v)),
                     _ => None,
                 })
                 .take_while(|(_, v)| *v == x)

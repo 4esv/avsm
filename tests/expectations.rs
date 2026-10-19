@@ -634,6 +634,10 @@ fn a_missing_reading_never_breaks_a_frozen_plateau_after_a_run() {
         f.report(f64::NAN); // half a day of the sensor gone
     }
     f.report(20.0);
+    for _ in 0..12 {
+        f.report(250.0); // then absurd, out of range
+    }
+    f.report(20.0);
     f.report(20.0);
     let flags = f.flags();
     assert!(flags[6..].iter().all(Option::is_some), "{flags:?}");
