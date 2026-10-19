@@ -282,7 +282,8 @@ fn without_tailscaled_the_daemon_says_so_and_keeps_its_socket() {
     let began = Instant::now();
     while !avsm::protocol::alive(&sock) {
         assert!(
-            began.elapsed() < Duration::from_secs(20),
+            // NOTE: it starts in about 0.1 s; 60 s only covers a loaded machine.
+            began.elapsed() < Duration::from_secs(60),
             "avsm did not start"
         );
         std::thread::sleep(Duration::from_millis(50));
