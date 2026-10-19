@@ -1,7 +1,7 @@
 //! Records: what the ledger holds.
 //!
 //! A record is one enum. Its claim (measured, declared, inferred) and its
-//! kind (report, proposal, action, ask, decision, intent, outcome) are
+//! kind (report, proposal, action, ask, decision, intent, outcome, refusal) are
 //! typed, never strings.
 
 use std::fmt;
@@ -62,6 +62,7 @@ pub enum Kind {
     Decision,
     Intent,
     Outcome,
+    Refusal,
 }
 
 impl Kind {
@@ -74,6 +75,7 @@ impl Kind {
             Kind::Decision => "decision",
             Kind::Intent => "intent",
             Kind::Outcome => "outcome",
+            Kind::Refusal => "refusal",
         }
     }
 }
@@ -366,6 +368,23 @@ pub enum Record {
         ok: bool,
         detail: String,
     },
+    /// The gate, a quota or the asks quota said no. The first refusal of a
+    /// lever for a reason opens one; repeats are counted in memory; a
+    /// changed reason, a new day or a restart closes it with the count,
+    /// and the closing record names the opening one in `closes`. It
+    /// authorizes nothing and counts toward nothing.
+    Refusal {
+        claim: Claim,
+        venture: String,
+        action: String,
+        /// A stable key: the reason without its counters.
+        reason: String,
+        /// The reasons in words.
+        detail: String,
+        count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        closes: Option<Seq>,
+    },
 }
 
 impl Record {
@@ -377,7 +396,8 @@ impl Record {
             | Record::Ask { claim, .. }
             | Record::Decision { claim, .. }
             | Record::Intent { claim, .. }
-            | Record::Outcome { claim, .. } => *claim,
+            | Record::Outcome { claim, .. }
+            | Record::Refusal { claim, .. } => *claim,
         }
     }
 
@@ -389,7 +409,8 @@ impl Record {
             | Record::Ask { venture, .. }
             | Record::Decision { venture, .. }
             | Record::Intent { venture, .. }
-            | Record::Outcome { venture, .. } => venture,
+            | Record::Outcome { venture, .. }
+            | Record::Refusal { venture, .. } => venture,
         }
     }
 
@@ -402,6 +423,7 @@ impl Record {
             Record::Decision { .. } => Kind::Decision,
             Record::Intent { .. } => Kind::Intent,
             Record::Outcome { .. } => Kind::Outcome,
+            Record::Refusal { .. } => Kind::Refusal,
         }
     }
 
@@ -556,6 +578,20 @@ impl Record {
                     format!("  {detail}")
                 }
             ),
+            Record::Refusal {
+                action,
+                detail,
+                count,
+                closes: None,
+                ..
+            } => format!("{action} refused ({count}): {detail}"),
+            Record::Refusal {
+                action,
+                detail,
+                count,
+                closes: Some(open),
+                ..
+            } => format!("#{open} {action} refused {count} times: {detail}"),
         }
     }
 }

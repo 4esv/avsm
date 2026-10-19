@@ -1606,6 +1606,19 @@ pub fn why(entry: &Entry) -> String {
         } => format!("{head}\n  {claim} by {who}, over the tailnet\n"),
         Record::Decision { claim, .. } => format!("{head}\n  {claim} by {}\n", by(*claim)),
         Record::Outcome { intent, .. } => format!("{head}\n  outcome of intent #{intent}\n"),
+        Record::Refusal {
+            reason,
+            detail,
+            closes,
+            ..
+        } => {
+            let mut text = format!("{head}\n  reason     {reason}\n  detail     {detail}\n");
+            if let Some(open) = closes {
+                text.push_str(&format!("  closes     #{open}\n"));
+            }
+            text.push_str("  authorizes nothing and counts toward nothing\n");
+            text
+        }
     }
 }
 

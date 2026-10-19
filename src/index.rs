@@ -64,6 +64,8 @@ pub struct Index {
     inferred_at: HashMap<String, Vec<i64>>,
     /// When each of self's digests was written, oldest first.
     digests_at: Vec<i64>,
+    /// Refusals written and not yet closed.
+    refusals_open: BTreeSet<Seq>,
     /// The latest declared adoption per venture: seq, mandate hash, path.
     adoptions: BTreeMap<String, (Seq, String, String)>,
 }
@@ -243,6 +245,14 @@ impl Index {
                 let cited = cited_decisions(&proof.steps);
                 self.cite(cited);
             }
+            Record::Refusal { closes, .. } => match closes {
+                None => {
+                    self.refusals_open.insert(seq);
+                }
+                Some(open) => {
+                    self.refusals_open.remove(open);
+                }
+            },
             _ => {}
         }
         self.entries.push(e);
@@ -307,6 +317,11 @@ impl Index {
             .get(venture)
             .into_iter()
             .flat_map(|s| s.iter().copied())
+    }
+
+    /// Refusals no closing record names yet, oldest first.
+    pub fn open_refusals(&self) -> Vec<Seq> {
+        self.refusals_open.iter().copied().collect()
     }
 
     /// Is this ask open?

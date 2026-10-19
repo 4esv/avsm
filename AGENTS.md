@@ -8,7 +8,7 @@ Use these words and no synonyms.
 
 - mandate, record, action, ask
 - measured, declared, inferred
-- report, proposal, action, ask, decision, intent, outcome
+- report, proposal, action, ask, decision, intent, outcome, refusal
 - running, asking, paused
 - ledger, gate, proof, adapter, canary, warden
 - parent, child, payload, adapter (built-in metric or lever), digest, know

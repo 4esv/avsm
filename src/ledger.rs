@@ -334,7 +334,7 @@ mod tests {
         })
     }
 
-    /// Any record: all seven kinds, all three claims, every optional field
+    /// Any record: all eight kinds, all three claims, every optional field
     /// present or absent.
     fn record() -> impl Strategy<Value = Record> {
         prop_oneof![
@@ -440,6 +440,26 @@ mod tests {
                     detail,
                 }
             ),
+            (
+                claim(),
+                text(),
+                text(),
+                text(),
+                text(),
+                any::<u32>(),
+                prop::option::of(any::<Seq>())
+            )
+                .prop_map(|(claim, venture, action, reason, detail, count, closes)| {
+                    Record::Refusal {
+                        claim,
+                        venture,
+                        action,
+                        reason,
+                        detail,
+                        count,
+                        closes,
+                    }
+                }),
         ]
     }
 

@@ -26,6 +26,8 @@ use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role, SUMMA
 use crate::venture::{self, Venture};
 use crate::warden::{self, FromWarden, LocalWarden, ToWarden, Warden};
 
+mod refusals;
+
 /// How long a report may take.
 pub const REPORT_TIMEOUT: Duration = Duration::from_secs(60);
 /// The longest wait before restarting a dead `run`.
@@ -57,6 +59,8 @@ pub struct Kernel {
     /// Can a `run` be put in a network namespace of its own here? Found
     /// out once, the first time one needs it.
     namespaces: Option<bool>,
+    /// Refusals written and not yet closed, with their counts.
+    refusals: refusals::Tally,
 }
 
 /// What the kernel knows about a venture beyond the ledger.
@@ -155,6 +159,7 @@ impl Kernel {
             digested: None,
             by: None,
             namespaces: None,
+            refusals: refusals::Tally::default(),
         };
         kernel.reload()?;
         Ok(kernel)
@@ -667,6 +672,7 @@ impl Kernel {
             (halted, paused)
         };
         let now = now();
+        self.close_stale_refusals();
         for (name, paused) in names.iter().zip(paused) {
             self.supervise(name, paused);
             let due = self.runtime.entry(name.clone()).or_default().next_report <= now;
@@ -959,7 +965,9 @@ impl Kernel {
         if let Some(t) = threshold {
             let crossed = (t.above && val > t.bound) || (!t.above && val < t.bound);
             if crossed {
+                self.forget_refusal();
                 self.act(name, &t.action, vec![entry.seq], Claim::Measured);
+                self.saturate(name, &t.action, v.mandate.metric_name(), t.bound);
             }
         }
     }
@@ -977,6 +985,7 @@ impl Kernel {
             log(&entry.line());
             self.reload()?;
         }
+        self.recover_refusals();
         Ok(())
     }
 
@@ -1025,6 +1034,26 @@ impl Kernel {
             cites,
         };
         let adopted = self.adopted();
+        // The shared quotas come first: past one, the gate is not asked.
+        let over = match self.index() {
+            Ok(index) => {
+                gate::quota_check_in(&index, &adopted, &self.config.quotas, name, action, now()).1
+            }
+            Err(e) => {
+                lines.push(format!("{name}: cannot read the ledger: {e}"));
+                log(&lines[0]);
+                return lines;
+            }
+        };
+        if !over.is_empty() {
+            let (key, detail, limit) = refusals::describe(&over, &[]);
+            lines.push(format!(
+                "{name}: {action} refused before the gate: {detail}"
+            ));
+            log(&lines[0]);
+            self.refuse(name, action, key, detail, limit);
+            return lines;
+        }
         // What the gate says, and what an ask would carry, as the ledger
         // stands now.
         let judged = {
@@ -1036,18 +1065,6 @@ impl Kernel {
                     return lines;
                 }
             };
-            // The shared quotas come first: past one, the gate is not asked.
-            let (_, over) =
-                gate::quota_check_in(&index, &adopted, &self.config.quotas, name, action, now());
-            if !over.is_empty() {
-                let why: Vec<String> = over.iter().map(|r| r.to_string()).collect();
-                lines.push(format!(
-                    "{name}: {action} refused before the gate: {}",
-                    why.join("; ")
-                ));
-                log(&lines[0]);
-                return lines;
-            }
             match gate::gate_in(&index, &candidate, &adopted, &self.config.quotas, now()) {
                 Ok(proof) => Ok(proof),
                 Err(refusal) => {
@@ -1137,6 +1154,9 @@ impl Kernel {
                     lines.push(format!(
                         "{name}: {action} needs a decision, but the asks quota is used up; not asking"
                     ));
+                    let (key, detail, limit) =
+                        refusals::describe_gate(&refusal.reasons, false, true);
+                    self.refuse(name, action, key, detail, limit);
                 } else if needs_human && !already {
                     let question = match &payload {
                         Some(_) => format!("may I {action} with this?{reason}"),
@@ -1155,9 +1175,13 @@ impl Kernel {
                     }
                 } else if needs_human {
                     lines.push(format!("{name}: {action} is already asked; see: avsm asks"));
+                    let (key, detail, limit) =
+                        refusals::describe_gate(&refusal.reasons, true, false);
+                    self.refuse(name, action, key, detail, limit);
                 } else {
-                    let why: Vec<String> = refusal.reasons.iter().map(|r| r.to_string()).collect();
-                    lines.push(format!("{name}: {action} refused: {}", why.join("; ")));
+                    let (key, detail, limit) = refusals::describe(&refusal.reasons, &[]);
+                    lines.push(format!("{name}: {action} refused: {detail}"));
+                    self.refuse(name, action, key, detail, limit);
                 }
             }
         }
@@ -1533,6 +1557,13 @@ impl Kernel {
             log(&format!(
                 "{name}: the asks quota is used up; not asking: {question}"
             ));
+            self.refuse(
+                name,
+                "ask",
+                "AsksQuotaSpent".to_string(),
+                format!("the asks quota is used up; not asking: {question}"),
+                false,
+            );
             return;
         }
         match self.append(Record::Ask {
@@ -1845,6 +1876,13 @@ fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) ->
                     .sum::<u32>()
             ));
         }
+    }
+    let refused = window
+        .iter()
+        .filter(|e| matches!(&e.record, Record::Refusal { closes: None, .. }))
+        .count();
+    if refused > 0 {
+        out.push_str(&format!("refusals: {refused} opened\n"));
     }
     let open = index.open_asks().len();
     out.push_str(&format!(
