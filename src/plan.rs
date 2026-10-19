@@ -470,6 +470,8 @@ mod tests {
             then: Then::Pause,
             drawdown: None,
             of: None,
+            range: None,
+            max_step: None,
         }
     }
 

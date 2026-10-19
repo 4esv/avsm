@@ -147,6 +147,12 @@ pub struct Guard {
     /// The metric a drawdown is computed over: the venture's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub of: Option<String>,
+    /// The values its readings can plausibly take, low and high.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<[f64; 2]>,
+    /// The largest plausible change from one reading to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_step: Option<f64>,
 }
 
 impl Guard {
@@ -208,6 +214,12 @@ pub struct Audit {
     /// How many audit readings the window spans, the latest included.
     #[serde(default = "default_window")]
     pub window: u32,
+    /// The values its readings can plausibly take, low and high.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<[f64; 2]>,
+    /// The largest plausible change from one reading to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_step: Option<f64>,
 }
 
 fn is_up(w: &Worse) -> bool {
@@ -239,6 +251,28 @@ impl Audit {
             Worse::Down => -delta,
         }
     }
+}
+
+/// A range is low then high, and a max_step is above 0. `who` prefixes
+/// the message for a guard or an audit.
+fn check_plausibility(
+    who: &str,
+    range: Option<[f64; 2]>,
+    max_step: Option<f64>,
+) -> Result<(), MandateError> {
+    if let Some([lo, hi]) = range {
+        if !lo.is_finite() || !hi.is_finite() || lo >= hi {
+            return fail(format!(
+                "{who}range is low then high, like [0, 1000], not [{lo}, {hi}]"
+            ));
+        }
+    }
+    if let Some(s) = max_step {
+        if !s.is_finite() || s <= 0.0 {
+            return fail(format!("{who}max_step must be a number above 0, not {s}"));
+        }
+    }
+    Ok(())
 }
 
 /// The prefix of an audit's readings: never shown to a model.
@@ -854,7 +888,7 @@ const FIELDS: &[&str] = &[
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadband", "hold"];
 const GUARD_FIELDS: &[&str] = &[
-    "name", "run", "adapter", "above", "below", "then", "drawdown", "of",
+    "name", "run", "adapter", "above", "below", "then", "drawdown", "of", "range", "max_step",
 ];
 const AUDIT_FIELDS: &[&str] = &[
     "name",
@@ -864,6 +898,8 @@ const AUDIT_FIELDS: &[&str] = &[
     "better",
     "tolerance",
     "window",
+    "range",
+    "max_step",
 ];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
 const PLAN_FIELDS: &[&str] = &[
@@ -1289,18 +1325,7 @@ impl Mandate {
         }
         self.check_guards()?;
         self.check_audits()?;
-        if let Some([lo, hi]) = self.range {
-            if !lo.is_finite() || !hi.is_finite() || lo >= hi {
-                return fail(format!(
-                    "range is low then high, like [0, 1000], not [{lo}, {hi}]"
-                ));
-            }
-        }
-        if let Some(s) = self.max_step {
-            if !s.is_finite() || s <= 0.0 {
-                return fail(format!("max_step must be a number above 0, not {s}"));
-            }
-        }
+        check_plausibility("", self.range, self.max_step)?;
         if let Some(world) = &self.world {
             if world.trim().is_empty() {
                 return fail("world is a command like ./world; it is empty");
@@ -1425,6 +1450,7 @@ impl Mandate {
             if let Some(cmd) = g.run.as_deref().or(g.adapter.as_deref()) {
                 self.apart(&who, cmd)?;
             }
+            check_plausibility(&format!("{who}: "), g.range, g.max_step)?;
         }
         Ok(())
     }
@@ -1481,6 +1507,7 @@ impl Mandate {
                     ))
                 }
             }
+            check_plausibility(&format!("{who}: "), a.range, a.max_step)?;
             if !a.tolerance.is_finite() || a.tolerance < 0.0 {
                 return fail(format!(
                     "{who}: tolerance is a number 0 or more, not {}",
@@ -2807,6 +2834,14 @@ max_step: 5000
                 "window",
             ),
             ("range: [5, 1]\n", "low then high"),
+            (
+                "guards:\n  - {name: g, run: ./g, above: 1, range: [5, 1]}\n",
+                "guard \"g\": range is low then high",
+            ),
+            (
+                "audits:\n  - {name: a, run: ./a, worse: up, max_step: 0}\n",
+                "audit \"a\": max_step must be a number above 0",
+            ),
             ("range: 5\n", "two numbers"),
             ("max_step: 0\n", "above 0"),
             ("max_step: big\n", "max_step is a number"),

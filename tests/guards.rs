@@ -760,3 +760,195 @@ fn an_audit_knows_which_way_the_target_improves() {
     // Unread mail rising is the target getting worse: no audit ask.
     assert!(inbox_audit_asks(&[("20", "1"), ("30", "2"), ("40", "4")]).is_empty());
 }
+
+/// The plausibility flag of each of the venture's reports of `metric`.
+fn flags(k: &Kernel, venture: &str, metric: &str) -> Vec<Option<String>> {
+    k.entries()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Report {
+                venture: v,
+                metric: m,
+                implausible,
+                ..
+            } if v == venture && m == metric => Some(implausible.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_stuck_sensor_then_the_truth_re_anchors_on_the_third_agreeing_reading() {
+    // The hostile sim: moisture stuck at 60 while the truth fell to 0.
+    let water = "{kind: threshold, below: 20, action: reset}";
+    let (mut k, dir, _tmp) = plausibility(water, &["60", "60", "60", "2", "1"]);
+    let f = flags(&k, "counter", "count");
+    assert!(f[..3].iter().all(Option::is_none), "{f:?}");
+    assert!(f[3..].iter().all(Option::is_some), "a jump from 60: {f:?}");
+    assert_eq!(count(&k, Kind::Intent, "reset"), 0, "not yet");
+    // The third reading that agrees with the two before it is plausible.
+    report(&mut k, &dir, "counter", "0");
+    let f = flags(&k, "counter", "count");
+    assert_eq!(f[5], None, "re-anchored on the third: {f:?}");
+    assert_eq!(count(&k, Kind::Intent, "reset"), 1, "and it can act");
+    // The ask stays as the record of the jump; the episode is over.
+    let asks = signals(&k, |s| matches!(s, Signal::Implausible { .. }));
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    // Re-anchored, the next readings are plausible, a small wiggle too.
+    report(&mut k, &dir, "counter", "1");
+    report(&mut k, &dir, "counter", "0");
+    let f = flags(&k, "counter", "count");
+    assert!(f[6..].iter().all(Option::is_none), "{f:?}");
+}
+
+#[test]
+fn a_flap_never_re_anchors() {
+    let water = "{kind: threshold, below: 20, action: reset}";
+    let (k, _dir, _tmp) = plausibility(
+        water,
+        &["100", "100", "0", "200", "0", "200", "0", "200", "0", "200"],
+    );
+    let f = flags(&k, "counter", "count");
+    assert!(f[2..].iter().all(Option::is_some), "{f:?}");
+    assert_eq!(count(&k, Kind::Intent, "reset"), 0);
+}
+
+#[test]
+fn a_single_absurd_spike_stays_implausible() {
+    let above = "{kind: threshold, above: 200, action: reset}";
+    let (k, _dir, _tmp) = plausibility(above, &["100", "100", "100", "900", "100"]);
+    let f = flags(&k, "counter", "count");
+    assert!(
+        f[3].as_deref().is_some_and(|w| w.contains("max_step")),
+        "{f:?}"
+    );
+    assert_eq!(f[4], None, "{f:?}");
+    assert_eq!(count(&k, Kind::Intent, "reset"), 0);
+}
+
+/// A shop with an asking soil guard below 20, range [0, 100], max_step 30.
+fn soil(first: &str) -> (Kernel, PathBuf, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = venture(
+        tmp.path(),
+        "shop",
+        &format!(
+            "{SHOP}permitted:\n- {{name: tidy, run: touch tidied, cap: 99/day, reversible: true}}\n\
+             guards:\n- {{name: soil, run: cat soil, below: 20, then: ask, range: [0, 100], max_step: 30}}\n"
+        ),
+    );
+    set(&dir, "soil", first);
+    let mut k = kernel(&home, Box::new(Silent));
+    k.add(&dir).unwrap();
+    report(&mut k, &dir, "shop", "5");
+    (k, dir, tmp)
+}
+
+fn guard_asks(k: &Kernel) -> usize {
+    signals(k, |s| matches!(s, Signal::Guard { .. })).len()
+}
+
+fn implausible_asks(k: &Kernel, metric: &str) -> usize {
+    signals(
+        k,
+        |s| matches!(s, Signal::Implausible { metric: m, .. } if m == metric),
+    )
+    .len()
+}
+
+#[test]
+fn an_implausible_guard_reading_never_trips_a_breach() {
+    let (mut k, dir, _tmp) = soil("50");
+    for bad in ["nan", "-5", "150"] {
+        set(&dir, "soil", bad);
+        report(&mut k, &dir, "shop", "5");
+        assert_ne!(state(&k, "shop"), State::Guarded, "{bad}");
+        assert_eq!(guard_asks(&k), 0, "{bad}");
+    }
+    let f = flags(&k, "shop", "guard.soil");
+    assert_eq!(f[0], None);
+    // The warden reads "nan" as no number at all.
+    assert!(
+        f[1].as_deref()
+            .is_some_and(|w| w == "NaN" || w == "missing"),
+        "{f:?}"
+    );
+    assert!(
+        f[2].as_deref()
+            .is_some_and(|w| w.contains("negative") || w.contains("out of range")),
+        "{f:?}"
+    );
+    assert!(f[3].is_some(), "{f:?}");
+    assert!(k.entries().unwrap().iter().any(|e| matches!(&e.record,
+        Record::Report { metric, claim: Claim::Measured, implausible: Some(_), .. } if metric == "guard.soil")));
+    assert_eq!(implausible_asks(&k, "guard.soil"), 1, "one ask an episode");
+    k.propose("shop", "tidy", None).unwrap();
+    assert!(dir.join("tidied").exists(), "never guarded");
+}
+
+#[test]
+fn an_implausible_guard_reading_never_clears_a_breach() {
+    let (mut k, dir, _tmp) = soil("10");
+    assert_eq!(guard_asks(&k), 1);
+    // Answered, so only the reading holds the venture guarded.
+    let ask = signals(&k, |s| matches!(s, Signal::Guard { .. }))[0].seq;
+    k.deny(ask, "seen").unwrap();
+    assert_eq!(state(&k, "shop"), State::Guarded);
+    for bad in ["nan", "500", "90"] {
+        set(&dir, "soil", bad);
+        report(&mut k, &dir, "shop", "5");
+        assert_eq!(state(&k, "shop"), State::Guarded, "{bad}");
+        k.propose("shop", "tidy", None).unwrap();
+        assert!(!dir.join("tidied").exists(), "{bad}: still guarded");
+    }
+    assert_eq!(implausible_asks(&k, "guard.soil"), 1);
+    // Back inside, plausibly: the breach clears, and no second guard ask.
+    set(&dir, "soil", "30");
+    report(&mut k, &dir, "shop", "5");
+    k.propose("shop", "tidy", None).unwrap();
+    assert!(dir.join("tidied").exists(), "back inside, the lever runs");
+    assert_ne!(state(&k, "shop"), State::Guarded);
+    assert_eq!(guard_asks(&k), 1);
+}
+
+#[test]
+fn an_implausible_guard_reading_never_pauses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = venture(
+        tmp.path(),
+        "shop",
+        &format!(
+            "{SHOP}guards:\n- {{name: spend, run: cat spend, above: 100, range: [0, 1000]}}\n"
+        ),
+    );
+    set(&dir, "spend", "5000");
+    let mut k = kernel(&home, Box::new(Silent));
+    k.add(&dir).unwrap();
+    report(&mut k, &dir, "shop", "5");
+    assert_ne!(state(&k, "shop"), State::Paused);
+    assert_eq!(count(&k, Kind::Action, "stop"), 0);
+}
+
+#[test]
+fn an_implausible_audit_reading_never_feeds_its_delta() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = venture(
+        tmp.path(),
+        "shop",
+        &format!(
+            "{SHOP}audits:\n- {{name: refunds, run: cat refunds, worse: up, tolerance: 1, range: [0, 100]}}\n"
+        ),
+    );
+    let mut k = kernel(&home, Box::new(Silent));
+    k.add(&dir).unwrap();
+    for (target, refunds) in [("10", "1"), ("11", "1"), ("12", "5000")] {
+        set(&dir, "refunds", refunds);
+        report(&mut k, &dir, "shop", target);
+    }
+    assert!(signals(&k, |s| matches!(s, Signal::Audit { .. })).is_empty());
+    assert_eq!(implausible_asks(&k, "audit.refunds"), 1);
+}

@@ -1315,8 +1315,9 @@ impl Kernel {
         };
         // A reading code does not believe is kept, marked, and never a
         // premise; the first of an episode asks.
-        let (implausible, fresh) = self.doubt(&v, value);
         let metric = v.mandate.metric_name().to_string();
+        let (implausible, fresh) =
+            self.doubt(name, &metric, value, v.mandate.range, v.mandate.max_step);
         let entry = match self.append(Record::Report {
             claim: Claim::Measured,
             venture: name.to_string(),
@@ -1335,10 +1336,11 @@ impl Kernel {
                 return;
             }
         };
-        let readings = self.read_guards(&v);
+        let (readings, doubts) = self.read_guards(&v);
         if halted {
             return;
         }
+        self.doubt_readings(name, doubts);
         if let (Some(why), true) = (&implausible, fresh) {
             self.signal(
                 name,

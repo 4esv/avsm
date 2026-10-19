@@ -429,12 +429,18 @@ ascent! {
     relation open_ask(Seq, String);
     open_ask(q, v) <-- asked(q, v), !decided(q);
 
-    // A guard's latest trusted reading past its bound guards the venture.
+    // A guard's latest trusted, plausible reading past its bound guards
+    // the venture. An implausible reading neither trips nor clears it.
     // No score, approval or proposal gets a lever past a guard; only stop.
+    relation superseded(Seq);
+    superseded(s) <--
+        guard(v, g, _, _, _),
+        report(s, v, g, _), report(t, v, g, _), trusted(t), !implausible(t),
+        if t > s;
     relation breached(String, String, Seq);
     breached(v, g, s) <--
         guard(v, g, above, bound, at),
-        report(s, v, g, val), trusted(s), !stale(s),
+        report(s, v, g, val), trusted(s), !implausible(s), !superseded(s),
         if (*above && (val.0 > bound.0 || (*at && val.0 >= bound.0))) || (!*above && val.0 < bound.0);
     relation guarded(String);
     guarded(v) <-- breached(v, _, _);
@@ -837,10 +843,12 @@ pub fn gate_in(
         }
     }
     seqs.extend(index.pause_sources(v));
-    // The latest reading of each of the venture's guards.
+    // The latest reading of each of the venture's guards, and the latest
+    // plausible one.
     for m in mandates.iter().filter(|m| m.venture == v) {
         for g in &m.mandate.guards {
             seqs.extend(index.latest_report(v, &g.metric()));
+            seqs.extend(index.series(v, &g.metric()).last().map(|(s, _)| *s));
         }
     }
     for s in seqs {
@@ -1186,7 +1194,7 @@ impl Holds {
 }
 
 /// Is a guard of the venture reading past its bound now? `reading` gives
-/// the latest trusted value of a metric.
+/// the latest trusted, plausible value of a metric.
 fn guard_out(mandates: &[Adopted], venture: &str, reading: &dyn Fn(&str) -> Option<f64>) -> bool {
     mandates
         .iter()
@@ -1219,11 +1227,7 @@ pub fn state_in(index: &Index, mandates: &[Adopted], venture: &str) -> State {
     let mut h = Holds {
         paused: p.paused.iter().any(|(v,)| v == venture),
         guarded: guard_out(mandates, venture, &|metric| {
-            let e = index.get(index.latest_report(venture, metric)?)?;
-            match &e.record {
-                Record::Report { value, .. } => *value,
-                _ => None,
-            }
+            index.series(venture, metric).last().map(|(_, x)| *x)
         }),
         implausible: index.implausible_now(venture),
         ineffective: index.any_suspended(venture),
@@ -2550,8 +2554,15 @@ pub mod reference {
         let mut h = Holds {
             paused: p.paused.iter().any(|(v,)| v == venture),
             guarded: guard_out(mandates, venture, &|metric| {
-                latest_report(ledger, venture, metric, true).and_then(|e| match &e.record {
-                    Record::Report { value, .. } => *value,
+                ledger.iter().rev().find_map(|e| match &e.record {
+                    Record::Report {
+                        claim,
+                        venture: v,
+                        metric: m,
+                        value: Some(x),
+                        implausible: None,
+                        ..
+                    } if v == venture && m == metric && claim.authorizes() => Some(*x),
                     _ => None,
                 })
             }),
