@@ -177,7 +177,7 @@ bank = s["bank"]
 for amount in pend["transfers"]:
     bank["checking"] -= amount; bank["savings"] += amount; bank["last"] = amount; bank["transfers"] += 1
     say(f"EVENT day {DAY}: posted transfer {amount:.2f}")
-if HOUR == 9:
+if HOUR == 8:  # NOTE: an even hour; a 2h step from midnight never reaches 9
     if DAY % 30 == 0:
         bank["checking"] += 2500; say(f"EVENT day {DAY}: salary 2500")
     if DAY % 30 == 3:
