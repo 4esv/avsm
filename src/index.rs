@@ -133,6 +133,8 @@ pub struct Index {
     canaries: BTreeMap<String, (u32, u32)>,
     /// Decisions already counted.
     canaried: HashSet<Seq>,
+    /// The baseline's drift steps worked out so far (`world::drift_steps`).
+    drift: crate::world::DriftMemo,
 }
 
 impl Index {
@@ -577,6 +579,11 @@ impl Index {
             .get(venture)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// The baseline's drift steps worked out so far, for `world`.
+    pub(crate) fn drift_memo(&self) -> &crate::world::DriftMemo {
+        &self.drift
     }
 
     /// Every intent of a venture's lever, by number.

@@ -225,7 +225,83 @@ const DAY: i64 = 86_400;
 
 /// The drift steps of a venture's metric: each change from one plausible
 /// report to the next with no lever run between, before `upto` when given.
+///
+/// Each step is worked out once per index and kept (`DriftMemo`): a step
+/// between two reports already in the index never changes, since a run
+/// that comes later has a later number than both.
 pub fn drift_steps(
+    index: &Index,
+    venture: &str,
+    mandate: &Mandate,
+    upto: Option<Seq>,
+) -> Vec<Drift> {
+    let metric = mandate.metric_name();
+    let series = index.series(venture, metric);
+    let end = upto.map_or(series.len(), |u| series.partition_point(|(s, _)| *s < u));
+    let mut levers: Vec<&str> = mandate.permitted.iter().map(|p| p.name.as_str()).collect();
+    levers.sort_unstable();
+    levers.dedup();
+    let key = (venture.to_string(), metric.to_string(), levers.join("\n"));
+    let mut memos = index.drift_memo().lock().unwrap_or_else(|e| e.into_inner());
+    // The memo lives with the index, whose series only ever grow.
+    let memo = memos.entry(key).or_default();
+    let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
+    let want = end.saturating_sub(1);
+    for i in memo.windows..want {
+        let (w0, w1) = (series[i].0, series[i + 1].0);
+        // No run of a permitted lever between the two reports.
+        let quiet = levers.iter().all(|l| {
+            let runs = index.intents_of(venture, l);
+            let j = runs.partition_point(|s| *s <= w0);
+            runs.get(j).is_none_or(|s| *s >= w1)
+        });
+        if quiet {
+            memo.steps.push((
+                i,
+                Drift {
+                    at: at(w0),
+                    gap: at(w1) - at(w0),
+                    change: series[i + 1].1 - series[i].1,
+                },
+            ));
+        }
+        memo.windows = i + 1;
+    }
+    let n = memo.steps.partition_point(|(i, _)| *i < want);
+    memo.steps[..n].iter().map(|(_, d)| *d).collect()
+}
+
+/// The drift steps worked out so far for one venture, metric and set of
+/// permitted levers: how many windows of the series (pairs of reports in
+/// a row) were looked at, and the steps among them, each with its window.
+#[derive(Clone, Debug, Default)]
+pub struct Memo {
+    windows: usize,
+    steps: Vec<(usize, Drift)>,
+}
+
+/// Every venture's drift steps worked out so far, kept with an index.
+/// A copy of the index copies them.
+#[derive(Debug, Default)]
+pub struct DriftMemo(std::sync::Mutex<std::collections::HashMap<(String, String, String), Memo>>);
+
+impl std::ops::Deref for DriftMemo {
+    type Target = std::sync::Mutex<std::collections::HashMap<(String, String, String), Memo>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Clone for DriftMemo {
+    fn clone(&self) -> DriftMemo {
+        let memos = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        DriftMemo(std::sync::Mutex::new(memos.clone()))
+    }
+}
+
+/// `drift_steps` worked out from the whole series every time: the
+/// reference the memo is tested against.
+pub fn drift_steps_whole(
     index: &Index,
     venture: &str,
     mandate: &Mandate,
@@ -1065,6 +1141,79 @@ mod tests {
         let still = ensemble(&b, &Value::from(x), None, 1, 5000, 3600, 200).unwrap();
         let q = quantiles(&still.iter().map(|n| n.metric).collect::<Vec<_>>()).unwrap();
         assert!((q.p50 - x).abs() <= noise, "{q:?}");
+    }
+
+    /// One thing that happens to the ledger, or a look at the drift.
+    #[derive(Clone, Debug)]
+    enum Op {
+        Report(f64),
+        Implausible(f64),
+        Run(&'static str),
+        Look(Option<u8>),
+        Copy,
+    }
+
+    fn op() -> impl proptest::strategy::Strategy<Value = Op> {
+        use proptest::prelude::*;
+        prop_oneof![
+            4 => (-5.0..5.0f64).prop_map(Op::Report),
+            1 => (-5.0..5.0f64).prop_map(Op::Implausible),
+            2 => prop::sample::select(vec!["boost", "other"]).prop_map(Op::Run),
+            2 => prop::option::of(any::<u8>()).prop_map(Op::Look),
+            1 => Just(Op::Copy),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(300))]
+
+        /// The drift steps kept with an index are the ones worked out
+        /// from the whole series, however the index grew, whichever
+        /// levers the mandate permits, up to any report, in any copy.
+        #[test]
+        fn kept_drift_steps_are_the_whole_series_drift_steps(
+            ops in proptest::collection::vec(op(), 1..80),
+        ) {
+            let both = Mandate::parse(
+                "purpose: p\nmetric: count\ncontroller: {kind: model}\ncadence: 1h\n\
+                 permitted:\n- {name: boost, run: ./boost, cap: 9/day, reversible: true}\n\
+                 - {name: other, run: ./other, cap: 9/day, reversible: true}\n",
+            )
+            .unwrap();
+            let mandates = [mandate(), both];
+            let mut l = Ledger { entries: vec![], at: 1_800_000_000 };
+            let mut index = Index::default();
+            let mut x = 0.0;
+            for op in ops {
+                match op {
+                    Op::Report(d) => {
+                        x += d;
+                        l.report(x);
+                    }
+                    Op::Implausible(d) => {
+                        let mut r = Record::report(Claim::Measured, V, "count", Some(x + d), "");
+                        if let Record::Report { implausible, .. } = &mut r {
+                            *implausible = Some("a test".to_string());
+                        }
+                        l.push(r);
+                    }
+                    Op::Run(lever) => l.run(lever),
+                    Op::Copy => index = index.clone(),
+                    Op::Look(upto) => {
+                        for e in &l.entries[index.last() as usize..] {
+                            index.apply(e.clone());
+                        }
+                        let upto = upto.map(|u| Seq::from(u) % (index.last() + 2));
+                        for m in &mandates {
+                            proptest::prop_assert_eq!(
+                                drift_steps(&index, V, m, upto),
+                                drift_steps_whole(&index, V, m, upto)
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
