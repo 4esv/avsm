@@ -770,7 +770,15 @@ fn injection_an_approved_reply_to_an_address_seen_only_in_inferred_records_is_re
     // The phishing case: a finding a model produced names a sender.
     note(&mut k, Claim::Inferred, "phish@evil.example");
 
-    approve(&mut k, "phish@evil.example\nWire the money.");
+    // The check runs before any ask is written: a refusal and no ask.
+    let out = k
+        .propose(
+            "mail-inbox",
+            "reply",
+            Some("phish@evil.example\nWire the money."),
+        )
+        .unwrap();
+    assert!(!out.contains(" reply? "), "{out}");
     assert_eq!(calls(), 0, "the mail command ran for an inferred address");
     assert_eq!(intents(&k, "mail-inbox", "reply"), 0);
     let refusals: Vec<String> = of_kind(&k, Kind::Refusal)

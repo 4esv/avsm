@@ -249,7 +249,17 @@ impl Kernel {
             let already = super::asked_already(&index, venture, best, payload.as_ref());
             (already, self.may_ask(&index), payload)
         };
-        let line = if already {
+        // An approval of this run cannot cure a suspended lever, a guard, a
+        // cap or a payload the lever's check refuses: no ask, a refusal.
+        let refused =
+            self.unaskable(venture, best, &cites)
+                .or_else(|| match (&payload, already, may_ask) {
+                    (Some(p), false, true) => self.precheck(venture, best, p),
+                    _ => None,
+                });
+        let line = if let Some(line) = refused {
+            line
+        } else if already {
             format!("{venture}: {best} is already asked; see: avsm asks")
         } else if !may_ask {
             format!("{venture}: {best} would ask, but the asks quota is used up; not asking")

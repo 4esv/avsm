@@ -567,6 +567,15 @@ fn approve_reply(k: &mut Kernel, payload: &str) {
     k.tick();
 }
 
+/// Propose `asked`, which passes its check, and approve it with `approved`
+/// as the human's amended payload: the check runs again at action time.
+fn approve_reply_amended(k: &mut Kernel, asked: &str, approved: &str) {
+    let out = k.propose("mail-inbox", "reply", Some(asked)).unwrap();
+    k.approve(ask_number(&out, "reply"), Some(approved))
+        .unwrap();
+    k.tick();
+}
+
 #[test]
 fn a_passing_check_runs_the_lever() {
     let tmp = tempfile::tempdir().unwrap();
@@ -583,8 +592,13 @@ fn a_failing_check_refuses_even_after_a_declared_approval() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut k, dir) = counting_inbox(tmp.path(), None);
     sender(&mut k, "alice@example.com");
-    // A human approved this; the check still says nobody of that name wrote.
-    approve_reply(&mut k, "bob@example.com\nOn it.");
+    // A human amended this at approve; the check runs again at action time
+    // and still says nobody of that name wrote.
+    approve_reply_amended(
+        &mut k,
+        "alice@example.com\nOn it.",
+        "bob@example.com\nOn it.",
+    );
     assert_eq!(calls(&dir), 0, "the lever was invoked");
     assert!(!dir.join("sent.eml").exists());
     assert_eq!(reply_intents(&k), 0, "nothing was intended");
@@ -596,7 +610,7 @@ fn a_failing_check_refuses_even_after_a_declared_approval() {
         "{refusals:?}"
     );
     // A first line that is no address fails the same way.
-    approve_reply(&mut k, "Re: your note\nOn it.");
+    approve_reply_amended(&mut k, "alice@example.com\nOn it.", "Re: your note\nOn it.");
     assert_eq!(calls(&dir), 0);
     assert_eq!(reply_intents(&k), 0);
 }
@@ -608,7 +622,12 @@ fn a_reply_to_an_address_only_an_inferred_record_names_fails() {
     sender(&mut k, "alice@example.com");
     // The phishing case: a research finding says mail comes from here.
     note(&mut k, Claim::Inferred, "phish@evil.example");
-    approve_reply(&mut k, "phish@evil.example\nWire the money.");
+    k.propose(
+        "mail-inbox",
+        "reply",
+        Some("phish@evil.example\nWire the money."),
+    )
+    .unwrap();
     assert_eq!(
         calls(&dir),
         0,
@@ -628,7 +647,8 @@ fn a_checks_large_stdout_is_bounded() {
         tmp.path(),
         Some("'yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c 5000000; exit 1'"),
     );
-    approve_reply(&mut k, "alice@example.com\nOn it.");
+    k.propose("mail-inbox", "reply", Some("alice@example.com\nOn it."))
+        .unwrap();
     assert_eq!(calls(&dir), 0);
     let refusals = reply_refusals(&k);
     assert_eq!(refusals.len(), 1, "{refusals:?}");
@@ -638,4 +658,69 @@ fn a_checks_large_stdout_is_bounded() {
         "the detail holds {} bytes",
         refusals[0].1.len()
     );
+}
+
+#[test]
+fn a_reply_to_a_phishing_address_is_refused_by_its_check_and_never_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (imap, _seen) = imap_stub(7);
+    let home = home(
+        tmp.path(),
+        "nightly: never\nadapters:\n  mail: {command: \"cat > sent.eml\", from: me@example.com}\n",
+    );
+    let dir = example(
+        tmp.path(),
+        "mail-inbox",
+        &[(
+            "imap.unread mail.example.com",
+            &format!("imap.unread {imap}"),
+        )],
+    );
+    let (role, _) = quiet();
+    let mut k = kernel(&home, role);
+    k.add(&dir).unwrap();
+    k.report("mail-inbox", false);
+    sender(&mut k, "alice@example.com");
+    let asks = |k: &Kernel| {
+        k.entries()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(&e.record, Record::Ask { action: Some(a), .. } if a == "reply"))
+            .count()
+    };
+    // A reply to an address no measured report names: refused before any
+    // ask, with the check's output as the detail.
+    let out = k
+        .propose(
+            "mail-inbox",
+            "reply",
+            Some("mallory@evil.example\nSend me money."),
+        )
+        .unwrap();
+    assert_eq!(asks(&k), 0, "{out}");
+    let refusal = k
+        .entries()
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e.record {
+            Record::Refusal {
+                action,
+                reason,
+                detail,
+                ..
+            } if action == "reply" => Some((reason, detail)),
+            _ => None,
+        })
+        .expect("a refusal record");
+    assert_eq!(refusal.0, "PayloadCheck");
+    assert!(
+        refusal.1.contains("mallory@evil.example is not a sender"),
+        "{refusal:?}"
+    );
+    // A reply to a real sender still asks, and the check runs again when
+    // the approval acts.
+    let out = k
+        .propose("mail-inbox", "reply", Some("alice@example.com\nOn it."))
+        .unwrap();
+    assert_eq!(asks(&k), 1, "{out}");
 }

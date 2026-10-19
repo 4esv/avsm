@@ -781,3 +781,88 @@ fn a_baseline_drawdown_guard_vetoes_a_plan_sequence() {
     assert!(kept.contains(&"nothing".to_string()), "{kept:?}");
     assert!(!g.dir.join("dumped").exists());
 }
+
+/// A measured ask saying `boost` is ineffective and nothing has answered
+/// it: the lever is suspended.
+fn suspend(f: &mut Fixture) {
+    f.k.append(Record::Ask {
+        cites: vec![],
+        claim: Claim::Measured,
+        venture: "shop".into(),
+        action: None,
+        question: "boost did not move the metric".into(),
+        refusal: None,
+        payload: None,
+        signal: Some(Signal::Ineffective {
+            action: "boost".into(),
+            why: "it did not".into(),
+        }),
+        packet: None,
+    })
+    .unwrap();
+    assert!(f.k.index().unwrap().suspended("shop", "boost"));
+}
+
+fn lever_asks(f: &Fixture) -> Vec<Entry> {
+    f.of(Kind::Ask)
+        .into_iter()
+        .filter(|e| e.record.action() == Some("boost"))
+        .collect()
+}
+
+fn suspended_refusals(f: &Fixture) -> usize {
+    f.of(Kind::Refusal)
+        .iter()
+        .filter(
+            |e| matches!(&e.record, Record::Refusal { reason, .. } if reason.contains("Suspended")),
+        )
+        .count()
+}
+
+#[test]
+fn the_plan_writes_no_ask_for_a_suspended_lever() {
+    let _c = clock();
+    let mut f = fixture(Setup {
+        extra: "calibration: 0.5\n",
+        ..Setup::default()
+    });
+    suspend(&mut f);
+    for _ in 0..3 {
+        f.report(10.0);
+    }
+    assert!(!f.k.trusted("shop"));
+    assert!(lever_asks(&f).is_empty(), "{}", f.lines());
+    assert!(suspended_refusals(&f) > 0, "{}", f.lines());
+    assert!(f.of(Kind::Intent).is_empty(), "{}", f.lines());
+}
+
+#[test]
+fn an_approved_ask_for_a_lever_suspended_since_is_refused_and_recorded() {
+    let _c = clock();
+    let mut f = fixture(Setup {
+        extra: "calibration: 0.5\n",
+        ..Setup::default()
+    });
+    f.report(10.0);
+    let ask = lever_asks(&f).pop().expect("the plan asked").seq;
+    suspend(&mut f);
+    f.k.approve(ask, None).unwrap();
+    f.k.tick();
+    assert!(f.of(Kind::Intent).is_empty(), "{}", f.lines());
+    assert!(!f.dir.join("boosted").exists());
+    assert!(suspended_refusals(&f) > 0, "{}", f.lines());
+}
+
+#[test]
+fn an_approved_ask_for_a_lever_not_suspended_still_runs() {
+    let _c = clock();
+    let mut f = fixture(Setup {
+        extra: "calibration: 0.5\n",
+        ..Setup::default()
+    });
+    f.report(10.0);
+    let ask = lever_asks(&f).pop().expect("the plan asked").seq;
+    f.k.approve(ask, None).unwrap();
+    f.k.tick();
+    assert!(f.dir.join("boosted").exists(), "{}", f.lines());
+}

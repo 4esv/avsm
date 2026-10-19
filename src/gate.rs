@@ -247,6 +247,26 @@ pub enum Reason {
     },
 }
 
+impl Reason {
+    /// Would a declared approval of this one run cure the refusal? Only a
+    /// missing decision, a missing premise or a payload a human supplies
+    /// at approve. Everything else (a suspended lever, a guard, a pause, a
+    /// cap, a budget, a quota, a floor, a rule, an intent with no outcome)
+    /// stands after the approval, so no ask is written for it.
+    pub fn cured_by_approval(&self) -> bool {
+        matches!(
+            self,
+            Reason::NeedsDecision {
+                suspended: false,
+                ..
+            } | Reason::NotJustified { .. }
+                | Reason::OnlyInferred { .. }
+                | Reason::NoPayload { .. }
+                | Reason::WrongPayload { .. }
+        )
+    }
+}
+
 fn is_zero(n: &u32) -> bool {
     *n == 0
 }

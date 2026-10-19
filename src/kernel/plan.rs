@@ -327,7 +327,20 @@ impl Kernel {
                                 });
                                 (already, self.may_ask(&index))
                             };
-                            if already {
+                            let refused = action
+                                .as_deref()
+                                .and_then(|a| self.unaskable(name, a, &[branch]))
+                                .or_else(|| {
+                                    match (action.as_deref(), &payload, already, may_ask) {
+                                        (Some(a), Some(p), false, true) => {
+                                            self.precheck(name, a, p)
+                                        }
+                                        _ => None,
+                                    }
+                                });
+                            if refused.is_some() {
+                                // The refusal is the record; no ask.
+                            } else if already {
                                 log(&format!("{name}: the plan's ask is already open"));
                             } else if !may_ask {
                                 log(&format!(

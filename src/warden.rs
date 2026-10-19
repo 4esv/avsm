@@ -51,6 +51,13 @@ pub trait Warden {
     fn confirm(&mut self, _intent: Seq) -> Result<Option<(bool, String)>, String> {
         Ok(None)
     }
+    /// Run the check of a payload lever on a payload now, as `execute` will
+    /// at action time, so a payload that would fail it is never asked
+    /// about. `Ok` when the lever has no check, or the check passes;
+    /// `Failure::Refused` when it says no.
+    fn check(&mut self, _venture: &str, _action: &str, _payload: &Payload) -> Result<(), Failure> {
+        Ok(())
+    }
     /// Send a prompt to a backend with its key and return the reply text.
     fn infer(&mut self, request: &InferRequest) -> Result<String, String>;
     /// Measure a venture's metric through its adapter, with the key the
@@ -166,6 +173,29 @@ impl LocalWarden {
 }
 
 impl Warden for LocalWarden {
+    fn check(&mut self, venture: &str, action: &str, payload: &Payload) -> Result<(), Failure> {
+        if self.keyless {
+            return Ok(());
+        }
+        self.index
+            .refresh(&self.ledger)
+            .map_err(|e| e.to_string())?;
+        let index = &self.index;
+        let ventures = venture::from_adoptions(index.adoptions());
+        let v = ventures
+            .get(venture)
+            .ok_or_else(|| format!("no venture named {venture}"))?;
+        let perm = v
+            .mandate
+            .permitted(action)
+            .ok_or_else(|| format!("{venture} does not permit {action}"))?;
+        let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
+        match &perm.check {
+            Some(check) => payload_check(&self.home, &dir, check, payload, index, venture),
+            None => Ok(()),
+        }
+    }
+
     fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, Failure> {
         self.index
             .refresh(&self.ledger)
@@ -1228,6 +1258,8 @@ pub enum ToWarden {
     Confirm(Seq),
     /// A venture and a guard's or an audit's metric.
     Read(String, String),
+    /// A venture, a lever and a payload: run the lever's check.
+    Check(String, String, Payload),
 }
 
 /// What a warden process answers.
@@ -1243,6 +1275,8 @@ pub enum FromWarden {
     Text(String),
     Measured(Option<f64>, String),
     Confirmed(Option<(bool, String)>),
+    /// The check passed, or the lever has none.
+    Checked,
     Err(String),
 }
 

@@ -154,25 +154,35 @@ impl Kernel {
                     question,
                     payload,
                     ..
-                } => Record::Ask {
-                    packet: self.packet(
-                        venture,
-                        action.as_deref(),
-                        &[started.seq],
-                        Some(question.clone()),
-                        payload.is_some(),
-                    ),
-                    cites: vec![started.seq],
-                    claim: Claim::Inferred,
-                    venture: venture.to_string(),
-                    payload: action
-                        .as_deref()
-                        .and_then(|a| fit_payload(&v.mandate, a, payload, venture)),
-                    action,
-                    question,
-                    refusal: None,
-                    signal: None,
-                },
+                } if action.as_deref().is_none_or(|a| {
+                    self.unaskable(venture, a, &[started.seq]).is_none()
+                        && fit_payload(&v.mandate, a, payload.clone(), venture)
+                            .is_none_or(|p| self.precheck(venture, a, &p).is_none())
+                }) =>
+                {
+                    Record::Ask {
+                        packet: self.packet(
+                            venture,
+                            action.as_deref(),
+                            &[started.seq],
+                            Some(question.clone()),
+                            payload.is_some(),
+                        ),
+                        cites: vec![started.seq],
+                        claim: Claim::Inferred,
+                        venture: venture.to_string(),
+                        payload: action
+                            .as_deref()
+                            .and_then(|a| fit_payload(&v.mandate, a, payload, venture)),
+                        action,
+                        question,
+                        refusal: None,
+                        signal: None,
+                    }
+                }
+                // An ask the gate would refuse for a reason no approval
+                // cures is not written.
+                Record::Ask { .. } => continue,
                 Record::Report { metric, note, .. } if metric == role::NOTHING => {
                     let nothing = role::nothing_record(venture, Some(&note));
                     cite(nothing, started.seq)

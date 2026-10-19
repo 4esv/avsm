@@ -1853,14 +1853,22 @@ impl Kernel {
                 }
             },
             Err((refusal, already, may_ask, payload, reason)) => {
-                // A paused or guarded venture is not asked about: an
-                // approval could not run until a human resumes it, or the
-                // guard is back inside, anyway.
-                let paused = refusal
-                    .reasons
-                    .iter()
-                    .any(|r| matches!(r, Reason::Paused { .. } | Reason::Guarded { .. }));
-                let needs_human = !paused
+                // No ask is written for a lever the gate refuses for a
+                // reason an approval of this run does not cure: a pause, a
+                // guard, a cap, a budget, a floor. An approval could not
+                // run it anyway. A suspended lever is the one exception
+                // handled below: refused, and asked about once an episode.
+                let blocked = refusal.reasons.iter().any(|r| {
+                    !r.cured_by_approval()
+                        && !matches!(
+                            r,
+                            Reason::NeedsDecision {
+                                suspended: true,
+                                ..
+                            }
+                        )
+                });
+                let needs_human = !blocked
                     && refusal
                         .reasons
                         .iter()
@@ -1877,12 +1885,21 @@ impl Kernel {
                         }
                     )
                 });
+                // A payload lever's check runs before its ask is written: a
+                // payload it refuses is a refusal record and no ask. It
+                // runs again at action time.
+                let checked = match (&payload, needs_human && !suspended && !already && may_ask) {
+                    (Some(p), true) => self.precheck(name, action, p),
+                    _ => None,
+                };
                 if needs_human && suspended {
                     let (key, detail, limit) =
                         refusals::describe(&refusal.reasons, &[refusals::SUSPENDED]);
                     lines.push(format!("{name}: {action} refused: {detail}"));
                     self.refuse(name, action, key, detail, limit);
                     self.reask_ineffective(name, action);
+                } else if let Some(line) = checked {
+                    lines.push(line);
                 } else if needs_human && !already && !may_ask {
                     lines.push(format!(
                         "{name}: {action} needs a decision, but the asks quota is used up; not asking"
@@ -2056,6 +2073,83 @@ impl Kernel {
         Some(packet::signal_packet(&index, venture, signal, &metric))
     }
 
+    /// Run a payload lever's check on the payload an ask would carry. When
+    /// it says no, write the PayloadCheck refusal with the check's output
+    /// as its detail and return the line: no ask is written. A check that
+    /// cannot run is not a refusal; the ask goes on, and the check runs
+    /// again at action time.
+    pub(crate) fn precheck(
+        &mut self,
+        name: &str,
+        action: &str,
+        payload: &Payload,
+    ) -> Option<String> {
+        match self.warden.check(name, action, payload) {
+            Err(Failure::Refused { reason_key, detail }) => {
+                let line = format!("{name}: {action} refused: {detail}; not asking");
+                log(&line);
+                self.refuse(name, action, reason_key, detail, false);
+                Some(line)
+            }
+            Err(Failure::Error(e)) => {
+                log(&format!("{name}: cannot run the check of {action}: {e}"));
+                None
+            }
+            Ok(()) => None,
+        }
+    }
+
+    /// Would the gate refuse `action` for a reason an approval of this run
+    /// does not cure? Then the refusal is recorded and no ask is written;
+    /// the line says so. The one place every writer of a ranked or backend
+    /// ask asks first.
+    pub(crate) fn unaskable(&mut self, name: &str, action: &str, cites: &[Seq]) -> Option<String> {
+        let refusal = {
+            let index = self.index().ok()?;
+            let adopted = self.adopted();
+            let candidate = Candidate {
+                venture: name.to_string(),
+                action: action.to_string(),
+                cites: cites.to_vec(),
+            };
+            let t = now();
+            let over =
+                gate::quota_check_in(&index, &adopted, &self.config.quotas, name, action, t).1;
+            if over.is_empty() {
+                gate::gate_in(&index, &candidate, &adopted, &self.config.quotas, t)
+                    .err()?
+                    .reasons
+            } else {
+                over
+            }
+        };
+        let suspended = refusal.iter().any(|r| {
+            matches!(
+                r,
+                Reason::NeedsDecision {
+                    suspended: true,
+                    ..
+                }
+            )
+        });
+        if !suspended && refusal.iter().all(Reason::cured_by_approval) {
+            return None;
+        }
+        let extra: &[&str] = if suspended {
+            &[refusals::SUSPENDED]
+        } else {
+            &[]
+        };
+        let (key, detail, limit) = refusals::describe(&refusal, extra);
+        let line = format!("{name}: {action} refused: {detail}; not asking");
+        log(&line);
+        self.refuse(name, action, key, detail, limit);
+        if suspended {
+            self.reask_ineffective(name, action);
+        }
+        Some(line)
+    }
+
     /// Is there room under the asks quota for one more ask?
     fn may_ask(&self, index: &Index) -> bool {
         match self.config.quotas.asks {
@@ -2066,7 +2160,7 @@ impl Kernel {
 
     /// Act on declared approvals not yet acted on.
     fn act_on_decisions(&mut self) {
-        let pending: Vec<(Seq, String, String)> = {
+        let pending: Vec<(Seq, String, String, bool)> = {
             let Ok(index) = self.index() else { return };
             index
                 .unacted()
@@ -2078,17 +2172,36 @@ impl Kernel {
                         ..
                     } => {
                         let action = index.get(*ask)?.record.action()?.to_string();
-                        Some((d, venture.clone(), action))
+                        // An approval written before the lever was suspended
+                        // vouched for a run the lever was still trusted
+                        // for; it is not a decision to run it now.
+                        let stale = index.suspended(venture, &action)
+                            && index.last_suspension(venture, &action) > Some(*ask);
+                        Some((d, venture.clone(), action, stale))
                     }
                     _ => None,
                 })
                 // A lever whose last run has no outcome waits: its approval
                 // is not spent, and runs on the tick after it is settled.
-                .filter(|(_, venture, action)| index.pending_of(venture, action).is_none())
+                .filter(|(_, venture, action, _)| index.pending_of(venture, action).is_none())
                 .collect()
         };
-        for (seq, venture, action) in pending {
+        for (seq, venture, action, stale) in pending {
             self.handled.insert(seq);
+            if stale {
+                let (key, detail, limit) = refusals::describe(
+                    &[Reason::NeedsDecision {
+                        action: action.clone(),
+                        suspended: true,
+                    }],
+                    &[refusals::SUSPENDED],
+                );
+                log(&format!(
+                    "{venture}: {action} refused: approved #{seq} predates the suspension; {detail}"
+                ));
+                self.refuse(&venture, &action, key, detail, limit);
+                continue;
+            }
             self.act(&venture, &action, vec![seq], Claim::Declared);
         }
     }
@@ -2388,6 +2501,19 @@ impl Kernel {
                         Some(a) => fit_payload(&v.mandate, a, payload, name),
                         None => None,
                     };
+                    // No ask for a lever the gate refuses for a reason an
+                    // approval does not cure, nor for a payload its check
+                    // refuses: the refusal is the record.
+                    if let Some(a) = &action {
+                        if self.unaskable(name, a, &[]).is_some()
+                            || payload
+                                .as_ref()
+                                .and_then(|p| self.precheck(name, a, p))
+                                .is_some()
+                        {
+                            continue;
+                        }
+                    }
                     let packet = self.packet(
                         name,
                         action.as_deref(),
@@ -3303,6 +3429,22 @@ impl WardenProcess {
 }
 
 impl Warden for WardenProcess {
+    fn check(&mut self, venture: &str, action: &str, payload: &Payload) -> Result<(), Failure> {
+        self.0.send(&ToWarden::Check(
+            venture.to_string(),
+            action.to_string(),
+            payload.clone(),
+        ))?;
+        match self.0.recv::<FromWarden>()? {
+            FromWarden::Checked => Ok(()),
+            FromWarden::Refused { reason_key, detail } => {
+                Err(Failure::Refused { reason_key, detail })
+            }
+            FromWarden::Err(e) => Err(e.into()),
+            _ => Err("the warden answered the wrong question".to_string().into()),
+        }
+    }
+
     fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, Failure> {
         self.0.send(&ToWarden::Execute(candidate.clone()))?;
         match self.0.recv::<FromWarden>()? {
@@ -3415,6 +3557,13 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
         let reply = match serde_json::from_str::<ToWarden>(line.trim()) {
             Ok(ToWarden::Execute(c)) => match warden.execute(&c) {
                 Ok(e) => FromWarden::Done(e),
+                Err(Failure::Refused { reason_key, detail }) => {
+                    FromWarden::Refused { reason_key, detail }
+                }
+                Err(Failure::Error(e)) => FromWarden::Err(e),
+            },
+            Ok(ToWarden::Check(v, a, p)) => match warden.check(&v, &a, &p) {
+                Ok(()) => FromWarden::Checked,
                 Err(Failure::Refused { reason_key, detail }) => {
                     FromWarden::Refused { reason_key, detail }
                 }
