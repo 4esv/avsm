@@ -780,7 +780,7 @@ pub fn asks_used(ledger: &[Entry], cap: Cap, now: i64) -> u32 {
 /// How many asks were written inside the asks quota's window, from the
 /// index.
 pub fn asks_used_in(index: &Index, cap: Cap, now: i64) -> u32 {
-    index.asks_after(now - cap.per.as_secs() as i64)
+    index.quota_asks_after(now - cap.per.as_secs() as i64)
 }
 
 /// Decide whether an action may happen, given the ledger so far and the
@@ -2440,7 +2440,12 @@ pub mod reference {
         ledger
             .iter()
             .filter(|e| e.at > now - cap.per.as_secs() as i64)
-            .filter(|e| e.record.kind() == Kind::Ask)
+            .filter(|e| match &e.record {
+                Record::Ask { claim, signal, .. } => {
+                    crate::index::counts_toward_quota(*claim, signal.as_ref())
+                }
+                _ => false,
+            })
             .count() as u32
     }
 

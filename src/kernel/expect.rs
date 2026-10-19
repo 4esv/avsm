@@ -11,6 +11,7 @@
 use crate::expect::{self, Judgement};
 use crate::index::EXPECTATION;
 use crate::record::{Claim, Record, Seq, Signal};
+use crate::world::Baseline;
 
 use super::{log, Kernel};
 
@@ -63,10 +64,26 @@ impl Kernel {
                         let a = series.partition_point(|(s, _)| *s <= outcome);
                         let before: Vec<f64> = series[..b].iter().map(|(_, x)| *x).collect();
                         let after: Vec<f64> = series[a..].iter().map(|(_, x)| *x).collect();
-                        match expect::judge(expects, &before, &after) {
+                        // The counterfactual: what the metric would have
+                        // moved on its own from the last report before the
+                        // run to the one judged, by the drift learned from
+                        // the history before the run.
+                        let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
+                        let span = match (
+                            b.checked_sub(1).map(|i| series[i].0),
+                            series.get(a + expects.within as usize - 1).map(|p| p.0),
+                        ) {
+                            (Some(s0), Some(s1)) => Some((at(s0), at(s1) - at(s0))),
+                            _ => None,
+                        };
+                        let (drift, noise) = span.map_or((0.0, 0.0), |(t0, dt)| {
+                            let base = Baseline::drift_before(&index, venture, &v.mandate, intent);
+                            (base.integrate(t0, dt), base.spread(dt))
+                        });
+                        match expect::judge(expects, &before, &after, drift, noise) {
                             Judgement::Waiting => break,
                             Judgement::Unknown | Judgement::Met => Run::Hit,
-                            Judgement::WrongSize { observed, noise } => {
+                            Judgement::WrongSize { observed, noise, .. } => {
                                 if !index.expectation_reported(intent) {
                                     records.push(Record::Report {
                                         claim: Claim::Measured,
@@ -86,16 +103,22 @@ impl Kernel {
                                 }
                                 Run::Hit
                             }
-                            Judgement::NoEffect { observed, noise } => Run::Ineffective(format!(
-                                "no effect: {} expects {expects}; {metric} moved {observed:+} against noise {noise}",
+                            Judgement::NoEffect {
+                                observed,
+                                effect,
+                                noise,
+                            } => Run::Ineffective(format!(
+                                "no effect: {} expects {expects}; {metric} moved {observed:+}, {effect:+} net of drift, against noise {noise}",
                                 perm.name
                             )),
-                            Judgement::WrongDirection { observed, noise } => {
-                                Run::Ineffective(format!(
-                                    "wrong direction: {} expects {expects}; {metric} moved {observed:+} against noise {noise}",
-                                    perm.name
-                                ))
-                            }
+                            Judgement::WrongDirection {
+                                observed,
+                                effect,
+                                noise,
+                            } => Run::Ineffective(format!(
+                                "wrong direction: {} expects {expects}; {metric} moved {observed:+}, {effect:+} net of drift, against noise {noise}",
+                                perm.name
+                            )),
                         }
                     } else {
                         Run::Hit

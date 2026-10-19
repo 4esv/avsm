@@ -272,7 +272,7 @@ fn saturation_asks_once_even_with_the_asks_quota_used() {
 }
 
 #[test]
-fn saturation_asks_again_once_the_first_is_answered() {
+fn saturation_asks_again_only_after_a_cap_window_without_the_limit() {
     let _c = clock();
     let (_tmp, mut k) = counter("");
     for _ in 0..3 {
@@ -282,8 +282,73 @@ fn saturation_asks_again_once_the_first_is_answered() {
     assert_eq!(first.len(), 1);
     k.handle(&["deny".into(), first[0].seq.to_string(), "noted".into()])
         .unwrap();
+    // Answered, but still refused for its limit: the same episode.
     k.report("counter", false);
+    assert_eq!(saturation_asks(&k).len(), 1);
+    // A full cap window with no refusal for the limit ends it; the next
+    // saturation is a new episode.
+    avsm::clock::set(T0 + 2 * DAY);
+    k.report("counter", false); // reset runs: the cap allows it
+    k.report("counter", false); // refused again
     assert_eq!(saturation_asks(&k).len(), 2);
+}
+
+#[test]
+fn a_three_day_saturation_answered_every_time_asks_once() {
+    let _c = clock();
+    let (_tmp, mut k) = counter("");
+    for hour in 0..72 {
+        avsm::clock::set(T0 + hour * 3_600);
+        k.report("counter", false);
+        for ask in saturation_asks(&k) {
+            if k.index().unwrap().is_open(ask.seq) {
+                k.handle(&["deny".into(), ask.seq.to_string(), "noted".into()])
+                    .unwrap();
+            }
+        }
+    }
+    assert!(k
+        .entries()
+        .unwrap()
+        .iter()
+        .any(|e| e.record.action() == Some("reset")));
+    let asks = saturation_asks(&k);
+    assert_eq!(asks.len(), 1, "{asks:?}");
+}
+
+#[test]
+fn signal_asks_never_spend_the_asks_quota() {
+    let _c = clock();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = kernel_with(&tmp.path().join("home"), "asks: 2/day", vec![]);
+    let dir = venture(tmp.path(), "wiper", WIPER);
+    k.add(&dir).unwrap();
+    for i in 0..10 {
+        k.append(Record::Ask {
+            packet: None,
+            cites: vec![],
+            claim: Claim::Measured,
+            venture: "wiper".into(),
+            action: None,
+            question: format!("signal {i}"),
+            refusal: None,
+            signal: Some(Signal::Saturated {
+                action: format!("lever{i}"),
+                reason: "the cap".into(),
+            }),
+            payload: None,
+        })
+        .unwrap();
+    }
+    // The threshold crosses; wipe must ask first, and the quota has room.
+    k.report("wiper", false);
+    let plain = k
+        .entries()
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(&e.record, Record::Ask { action: Some(a), .. } if a == "wipe"))
+        .count();
+    assert_eq!(plain, 1, "the plain lever ask is written");
 }
 
 #[test]

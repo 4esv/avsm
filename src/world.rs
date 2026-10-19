@@ -223,30 +223,75 @@ pub struct Baseline {
 const HOUR: i64 = 3_600;
 const DAY: i64 = 86_400;
 
+/// The drift steps of a venture's metric: each change from one plausible
+/// report to the next with no lever run between, before `upto` when given.
+pub fn drift_steps(
+    index: &Index,
+    venture: &str,
+    mandate: &Mandate,
+    upto: Option<Seq>,
+) -> Vec<Drift> {
+    let series = index.series(venture, mandate.metric_name());
+    let end = upto.map_or(series.len(), |u| series.partition_point(|(s, _)| *s < u));
+    let series = &series[..end];
+    let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
+    let mut runs: Vec<Seq> = mandate
+        .permitted
+        .iter()
+        .flat_map(|p| index.intents_of(venture, &p.name).iter().copied())
+        .collect();
+    runs.sort_unstable();
+    series
+        .windows(2)
+        .filter(|w| {
+            let i = runs.partition_point(|s| *s <= w[0].0);
+            runs.get(i).is_none_or(|s| *s >= w[1].0)
+        })
+        .map(|w| Drift {
+            at: at(w[0].0),
+            gap: at(w[1].0) - at(w[0].0),
+            change: w[1].1 - w[0].1,
+        })
+        .collect()
+}
+
 impl Baseline {
+    /// The drift alone, learned from the history before `upto`: what the
+    /// metric does on its own, the counterfactual a lever run is judged
+    /// against.
+    pub fn drift_before(index: &Index, venture: &str, mandate: &Mandate, upto: Seq) -> Baseline {
+        let mut b = Baseline {
+            range: mandate.range,
+            ..Baseline::default()
+        };
+        b.set_drift(drift_steps(index, venture, mandate, Some(upto)));
+        b
+    }
+
+    /// How far the metric strays from its drift over `dt` seconds,
+    /// typically: the median residual, scaled as a random walk spreads.
+    /// 0 with fewer than `MIN_SAMPLES` steps.
+    pub fn spread(&self, dt: i64) -> f64 {
+        if self.noise.len() < MIN_SAMPLES || dt <= 0 {
+            return 0.0;
+        }
+        let mut r: Vec<f64> = self.noise.iter().map(|x| x.abs()).collect();
+        r.sort_by(f64::total_cmp);
+        let n = r.len();
+        let median = if n % 2 == 1 {
+            r[n / 2]
+        } else {
+            (r[n / 2 - 1] + r[n / 2]) / 2.0
+        };
+        median * (dt as f64).sqrt()
+    }
+
     /// Learn the drift and the effects from the ledger.
     pub fn from_index(index: &Index, venture: &str, mandate: &Mandate) -> Baseline {
         let metric = mandate.metric_name();
         let series = index.series(venture, metric);
         let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
-        let mut runs: Vec<Seq> = mandate
-            .permitted
-            .iter()
-            .flat_map(|p| index.intents_of(venture, &p.name).iter().copied())
-            .collect();
-        runs.sort_unstable();
-        let steps: Vec<Drift> = series
-            .windows(2)
-            .filter(|w| {
-                let i = runs.partition_point(|s| *s <= w[0].0);
-                runs.get(i).is_none_or(|s| *s >= w[1].0)
-            })
-            .map(|w| Drift {
-                at: at(w[0].0),
-                gap: at(w[1].0) - at(w[0].0),
-                change: w[1].1 - w[0].1,
-            })
-            .collect();
+        let steps = drift_steps(index, venture, mandate, None);
         let mut gaps: Vec<i64> = series
             .windows(2)
             .map(|w| at(w[1].0) - at(w[0].0))

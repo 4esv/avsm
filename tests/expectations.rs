@@ -413,3 +413,40 @@ fn a_fresh_miss_after_a_restore_suspends_again() {
     assert!(f.suspended());
     assert_eq!(f.ineffective().len(), 2);
 }
+
+#[test]
+fn a_run_is_judged_net_of_the_drift_it_fights() {
+    let _c = clock();
+    // Evaporation pulls 10 an hour; a boost shows +4.5, so it added 14.5.
+    let mut f = fixture(
+        "delegated: true, expects: up 15 within 1",
+        "echo boost >> boosts",
+    );
+    for v in [65.0, 55.0, 45.0, 35.0, 25.0, 15.0, 4.0] {
+        f.report(v);
+    }
+    assert_eq!(f.intents(), 1, "4 crossed: boost ran");
+    f.report(8.5);
+    assert!(f.ineffective().is_empty(), "{:?}", f.ineffective());
+    assert!(f.expectations().is_empty(), "met, net of the drift");
+    assert!(!f.suspended());
+}
+
+#[test]
+fn a_dead_metric_with_no_drift_is_no_effect() {
+    let _c = clock();
+    let mut f = fixture(TEST_DELEGATED, "echo boost >> boosts");
+    for _ in 0..4 {
+        f.report(0.0);
+    }
+    f.report_tomorrow(0.0); // runs again, with a history of no drift
+    f.report(0.0);
+    f.report(0.0);
+    assert!(f.suspended(), "{:?}", f.entries());
+    let asks = f.ineffective();
+    assert!(
+        matches!(&asks[0].record, Record::Ask { signal: Some(Signal::Ineffective { why, .. }), .. }
+            if why.contains("no effect")),
+        "{asks:?}"
+    );
+}

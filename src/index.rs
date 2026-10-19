@@ -74,6 +74,9 @@ pub struct Index {
     open_of: HashMap<String, BTreeSet<Seq>>,
     /// When each ask was written, oldest first.
     asks_at: Vec<i64>,
+    /// When each ask the asks quota counts was written, oldest first: all
+    /// but the measured asks carrying a signal.
+    quota_asks_at: Vec<i64>,
     /// Actions and intents: (at, venture, action), oldest first; and the
     /// same per venture, and per venture and action.
     runs: Vec<(i64, String, String)>,
@@ -331,6 +334,9 @@ impl Index {
                         .push(seq);
                 }
                 by_time(&mut self.asks_at, at, |t| *t);
+                if counts_toward_quota(*claim, signal.as_ref()) {
+                    by_time(&mut self.quota_asks_at, at, |t| *t);
+                }
                 if !self.decided.contains(&seq) {
                     self.open.insert(seq);
                     self.open_of.entry(venture).or_default().insert(seq);
@@ -732,6 +738,12 @@ impl Index {
         after(&self.asks_at, since, |t| *t).len() as u32
     }
 
+    /// Asks the asks quota counts written after `since`: signal asks sit
+    /// outside it.
+    pub fn quota_asks_after(&self, since: i64) -> u32 {
+        after(&self.quota_asks_at, since, |t| *t).len() as u32
+    }
+
     /// Actions and intents after `since`, as (at, venture, action).
     pub fn runs_after(&self, since: i64) -> &[(i64, String, String)] {
         after(&self.runs, since, |r| r.0)
@@ -803,6 +815,13 @@ fn cited_decisions(steps: &[crate::gate::Step]) -> Vec<Seq> {
             _ => None,
         })
         .collect()
+}
+
+/// Does the asks quota count this ask? A measured ask carrying a signal
+/// is the algedonic channel and sits outside it, so it can never starve
+/// the plain asks; any other ask counts.
+pub fn counts_toward_quota(claim: Claim, signal: Option<&Signal>) -> bool {
+    !(claim == Claim::Measured && signal.is_some())
 }
 
 /// Keep the larger sequence number.

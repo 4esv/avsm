@@ -5,7 +5,9 @@
 //!
 //! Saturation is the algedonic channel: a threshold crossed while its lever
 //! is refused for a cap, a budget or a quota writes a measured ask at once,
-//! past the asks quota, one open per venture and lever.
+//! past the asks quota, once an episode per venture and lever. The episode
+//! ends only when the lever goes one full cap window without being refused
+//! for its limit; answering the ask does not end it.
 
 use std::collections::BTreeMap;
 
@@ -36,6 +38,9 @@ struct Open {
 pub(super) struct Tally {
     open: BTreeMap<(String, String), Open>,
     last: Option<Last>,
+    /// Per venture and lever: when it was last refused for its limit with
+    /// its threshold crossed, while a saturation episode is on.
+    saturated: BTreeMap<(String, String), i64>,
 }
 
 /// The latest refusal: whether a limit, not a rule, said no.
@@ -266,7 +271,39 @@ impl Kernel {
             "{metric} is past {bound} and {lever} is refused: {}{SATURATED}",
             last.detail
         );
-        let already = {
+        let now = super::now();
+        let window = self
+            .ventures
+            .get(venture)
+            .and_then(|v| v.mandate.permitted(lever))
+            .map_or(86_400, |p| p.cap.per.as_secs() as i64)
+            .max(1);
+        let id = (venture.to_string(), lever.to_string());
+        // When the episode was last seen: in memory, or after a restart
+        // the latest saturation ask the ledger holds for this lever.
+        let seen = match self.refusals.saturated.get(&id) {
+            Some(t) => Some(*t),
+            None => {
+                let Ok(index) = self.index() else { return };
+                let at = index
+                    .of(venture)
+                    .rev()
+                    .find(|e| {
+                        e.record.claim() == Claim::Measured
+                            && matches!(&e.record, Record::Ask {
+                                signal: Some(Signal::Saturated { action, .. }), ..
+                            } if action == lever)
+                    })
+                    .map(|e| e.at);
+                at
+            }
+        };
+        self.refusals.saturated.insert(id, now);
+        if seen.is_some_and(|t| now - t < window) {
+            return;
+        }
+        // A new episode, and still one open ask at most.
+        let open = {
             let Ok(index) = self.index() else { return };
             let found = index.open_signals().into_iter().any(|(e, s)| {
                 e.record.venture() == venture
@@ -275,7 +312,7 @@ impl Kernel {
             });
             found
         };
-        if already {
+        if open {
             return;
         }
         let signal = Signal::Saturated {
