@@ -818,28 +818,31 @@ fn a_stuck_sensor_then_the_truth_re_anchors_on_the_third_agreeing_reading() {
 fn a_stuck_value_never_anchors_and_the_truth_re_anchors_on_three_that_agree() {
     let none = "{kind: threshold, above: 900, action: reset}";
     let values = [
-        "60", "62", "61", "63", "60", "200", "200", "200", "200", "300", "302", "301",
+        "60", "62", "61", "63", "60", "200", "200", "200", "200", "200", "300", "302", "301",
     ];
     let (_k, _dir, _tmp) = plausibility(none, &values);
     let f = flags(&_k, "counter", "count");
     assert!(f[..5].iter().all(Option::is_none), "{f:?}");
-    assert!(f[5..11].iter().all(Option::is_some), "never 200: {f:?}");
+    assert!(f[5..12].iter().all(Option::is_some), "never 200: {f:?}");
+    // After 0 repeats in 4 steps, a run of 3 has chance 1/6 * 2/7 * 3/8 =
+    // 0.018 and one of 4 0.0079: the fifth 200 is stuck.
     assert!(
-        f[8].as_deref().is_some_and(|w| w.starts_with("stuck")),
-        "the fourth 200 is stuck: {f:?}"
+        f[9].as_deref().is_some_and(|w| w.starts_with("stuck")),
+        "the fifth 200 is stuck: {f:?}"
     );
-    assert_eq!(f[11], None, "re-anchored on 301: {f:?}");
+    assert_eq!(f[12], None, "re-anchored on 301: {f:?}");
 }
 
 #[test]
-fn a_sensor_stuck_at_its_last_value_is_stuck_from_the_fourth() {
+fn a_sensor_stuck_at_its_last_value_is_stuck_from_the_fourth_repeat() {
+    // After 0 repeats in 4 steps, a run of 3 has chance 0.018, of 4 0.0079.
     let none = "{kind: threshold, above: 900, action: reset}";
-    let values = ["60", "62", "61", "63", "60", "60", "60", "60", "60"];
+    let values = ["60", "62", "61", "63", "60", "60", "60", "60", "60", "60"];
     let (k, _dir, _tmp) = plausibility(none, &values);
     let f = flags(&k, "counter", "count");
-    assert!(f[..7].iter().all(Option::is_none), "{f:?}");
+    assert!(f[..8].iter().all(Option::is_none), "{f:?}");
     assert!(
-        f[7..]
+        f[8..]
             .iter()
             .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
         "{f:?}"
@@ -865,13 +868,14 @@ fn a_reading_at_its_range_floor_is_never_stuck_and_can_act() {
     assert_eq!(count(&k, Kind::Intent, "reset"), 3, "the floor acts");
 }
 
-/// A metric stuck mid-range at 60: flagged from the fourth repeat.
+/// A metric stuck mid-range at 60: flagged from the fourth repeat (after
+/// 0 repeats in 4 steps, a run of 4 has chance 0.0079).
 fn stuck_at_60() -> (Kernel, PathBuf, tempfile::TempDir, Seq) {
     let none = "{kind: threshold, above: 900, action: reset}";
     let values = ["60", "62", "61", "63", "60", "60", "60", "60", "60"];
     let (k, dir, tmp) = plausibility_in("[0, 100]", none, &values);
     let f = flags(&k, "counter", "count");
-    assert!(f[7..].iter().all(Option::is_some), "{f:?}");
+    assert!(f[8..].iter().all(Option::is_some), "{f:?}");
     let ask = signals(&k, |s| matches!(s, Signal::Implausible { .. }))[0].seq;
     (k, dir, tmp, ask)
 }

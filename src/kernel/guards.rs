@@ -58,14 +58,17 @@ fn subject(s: &Signal) -> String {
 pub const AGREE: usize = 3;
 
 /// The significance level of the stuck test: a run of exact repeats is
-/// stuck when the metric's history makes it less likely than this. With
-/// p the chance of a repeat, a reading is flagged only when p^r < ALPHA
-/// for its run of r repeats, so a sensor that is not stuck, with p told
-/// right by its history, is flagged on fewer than one reading in 1/ALPHA
-/// = 100, whatever its p. On a continuous sensor with 21 clean steps (p
-/// = 1/23) that makes the third identical reading stuck (p^2 = 0.0019)
-/// and not the second (0.043); on a metric that repeats one step in two,
-/// the eighth (0.0078).
+/// stuck when the metric's history makes it less likely than this. The
+/// chance of a repeat is not known, only how often one has happened: with
+/// z repeats in n steps and no prior belief (uniform), the chance of a run
+/// of r more is the posterior predictive, prod_{i<r} (z+1+i)/(n+2+i),
+/// Laplace's rule of succession applied once per repeat. Each repeat in
+/// the run is evidence for the next, so a thin history never makes a run
+/// look rarer than it can say. A sensor that is not stuck is flagged on
+/// fewer than one reading in 1/ALPHA = 100. On a continuous sensor with 21
+/// clean steps that makes the third identical reading stuck (1/23 * 2/24 =
+/// 0.0036) and not the second (0.043); on a metric that repeated in one of
+/// two steps, the 23rd repeat, not the eighth.
 pub const ALPHA: f64 = 0.01;
 
 /// How many of the latest steps of the plausible history say how often
@@ -73,7 +76,8 @@ pub const ALPHA: f64 = 0.01;
 /// enter it, and a repeat at a bound of the range says nothing of the
 /// sensor and is no step of it, so a metric frozen for weeks, or dry at
 /// its floor, is still judged by the history from when it varied. 256
-/// steps let a clean history bring p below ALPHA by itself (it needs 99)
+/// steps let a clean history make one repeat less likely than ALPHA by
+/// itself (it needs 99)
 /// and keep the check one pass over at most 257 stretches.
 pub const WINDOW: usize = 256;
 
@@ -116,18 +120,15 @@ fn two_figures(p: f64) -> String {
 
 /// What the history before a run of `repeats` exact repeats of `x` says
 /// of how often the metric repeats: of its latest WINDOW steps between
-/// consecutive readings, how many there are, how many are exactly zero,
-/// and the smoothed chance of a repeat they give, (zero + 1) / (steps +
-/// 2). The run's own repeats are what is judged, so they are not
-/// evidence; the step into it is. A repeat at a bound is no step. A
-/// history with no step but zero ones has not been seen to vary, and
-/// gives no chance: nothing to judge the run against.
-fn repeat_chance(
+/// consecutive readings, how many there are and how many are exactly
+/// zero. The run's own repeats are what is judged, so they are not
+/// evidence; the step into it is. A repeat at a bound is no step.
+fn repeat_history(
     history: &[(f64, usize)],
     x: f64,
     repeats: usize,
     bound: impl Fn(f64) -> bool,
-) -> (usize, usize, Option<f64>) {
+) -> (usize, usize) {
     let (mut steps, mut zero) = (0, 0);
     let last = history.len().saturating_sub(1);
     for (i, &(v, n)) in history.iter().enumerate().rev() {
@@ -148,8 +149,27 @@ fn repeat_chance(
             break;
         }
     }
-    let p = (zero < steps).then(|| (zero + 1) as f64 / (steps + 2) as f64);
-    (steps, zero, p)
+    (steps, zero)
+}
+
+/// The chance of a run of `repeats` exact repeats after `zero` of `steps`
+/// steps were repeats, under a uniform prior on the chance of one: the
+/// posterior predictive prod_{i<repeats} (zero+1+i)/(steps+2+i). It stops
+/// once below ALPHA, the only question asked of it, so what it returns is
+/// at most the chance and the work at most one term per repeat. A history with no step but zero ones has not been seen to
+/// vary, and gives no chance: nothing to judge the run against.
+fn run_chance(steps: usize, zero: usize, repeats: usize) -> Option<f64> {
+    if zero >= steps {
+        return None;
+    }
+    let mut chance = 1.0;
+    for i in 0..repeats {
+        chance *= (zero + 1 + i) as f64 / (steps + 2 + i) as f64;
+        if chance < ALPHA {
+            break;
+        }
+    }
+    Some(chance)
 }
 
 /// The median absolute step between consecutive readings, or 0 with
@@ -206,8 +226,8 @@ pub fn implausible(
     let varies = median_step(before) > 0.0;
     let bound = |x: f64| range.is_some_and(|[lo, hi]| x == lo || x == hi);
     if repeats >= 1 && !bound(x) {
-        let (steps, zero, p) = repeat_chance(plateau.history, x, repeats, bound);
-        let chance = p.map(|p| p.powi(i32::try_from(repeats).unwrap_or(i32::MAX)));
+        let (steps, zero) = repeat_history(plateau.history, x, repeats, bound);
+        let chance = run_chance(steps, zero, repeats);
         if let Some(chance) = chance.filter(|c| *c < ALPHA) {
             let before = if repeats == 1 {
                 "the reading before it".to_string()
@@ -215,7 +235,7 @@ pub fn implausible(
                 format!("the {repeats} readings before it")
             };
             return Some(format!(
-                "stuck: {x} exactly, as {before}; a repeat has happened in {zero} of {steps} steps (p {} < {ALPHA})",
+                "stuck: {x} exactly, as {before}; after {zero} repeats in {steps} steps, a run of {repeats} has chance at most {} < {ALPHA}",
                 two_figures(chance)
             ));
         }
@@ -1033,7 +1053,10 @@ mod tests {
                 run(reps(x, recent), &history),
             )
         };
-        let stuck = at(41.0, &[Some(41.0), Some(41.0), Some(41.0)]).unwrap();
+        // Four clean steps: three repeats have chance 1/6 * 2/7 * 3/8 =
+        // 0.018, four 0.0079.
+        assert_eq!(at(41.0, &[Some(41.0), Some(41.0), Some(41.0)]), None);
+        let stuck = at(41.0, &[Some(41.0), Some(41.0), Some(41.0), Some(41.0)]).unwrap();
         assert!(stuck.starts_with("stuck"), "{stuck}");
         assert_eq!(
             at(41.0, &[Some(43.0), Some(41.0), Some(41.0)]),
@@ -1113,7 +1136,9 @@ mod tests {
         let stuck = why[23].as_deref().unwrap();
         assert!(stuck.starts_with("stuck"), "{stuck}");
         assert!(
-            stuck.contains("a repeat has happened in 0 of 21 steps (p 0.0019 < 0.01)"),
+            stuck.contains(
+                "after 0 repeats in 21 steps, a run of 2 has chance at most 0.0036 < 0.01"
+            ),
             "{stuck}"
         );
     }
@@ -1152,7 +1177,7 @@ mod tests {
         // enough: p 1/258.
         let second = frozen[1].as_deref().unwrap();
         assert!(
-            second.contains("in 0 of 256 steps (p 0.0039 < 0.01)"),
+            second.contains("in 256 steps, a run of 1 has chance at most 0.0039 < 0.01"),
             "{second}"
         );
 
@@ -1181,12 +1206,50 @@ mod tests {
     fn a_metric_that_never_varied_is_never_stuck_and_one_that_did_is() {
         assert!(feed(&[50.0; 300]).iter().all(Option::is_none));
         // Once varied, always varies: a few steps, then one value for good,
-        // is stuck once the run is unlikely by those steps (p 1/5).
+        // is stuck once the run is unlikely by those steps: after 0
+        // repeats in 3, a run of 4 has chance 1/5 * 2/6 * 3/7 * 4/8 =
+        // 0.014, of 5 0.0079.
         let mut r = vec![47.0, 48.0, 49.0, 50.0];
         r.extend([50.0; 100]);
         let why = feed(&r);
-        assert!(why[..6].iter().all(Option::is_none), "{why:?}");
-        assert!(why[6..].iter().all(Option::is_some), "{why:?}");
+        assert!(why[..8].iter().all(Option::is_none), "{why:?}");
+        assert!(why[8..].iter().all(Option::is_some), "{why:?}");
+    }
+
+    #[test]
+    fn a_quiet_metric_that_changed_once_is_not_stuck_on_a_short_run() {
+        // The held-out savings: one change in two steps says little of how
+        // often it repeats. A run of r has chance 2/4 * 3/5 * ... =
+        // 6/((r+2)(r+3)): 7 is 0.067, not the 0.0078 of (1/2)^7; 22 is
+        // 0.010 and 23 the first below ALPHA, 0.0092.
+        let mut r = vec![50.0, 50.0, 53.0];
+        r.extend([53.0; 30]);
+        let why = feed(&r);
+        assert!(why[..2 + 23].iter().all(Option::is_none), "{why:?}");
+        let stuck = why[2 + 23].as_deref().unwrap();
+        assert!(
+            stuck.contains(
+                "after 1 repeats in 2 steps, a run of 23 has chance at most 0.0092 < 0.01"
+            ),
+            "{stuck}"
+        );
+    }
+
+    #[test]
+    fn a_run_is_judged_by_the_posterior_predictive() {
+        let close = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() < 1e-4);
+        assert!(
+            close(run_chance(2, 1, 7), 0.0667),
+            "{:?}",
+            run_chance(2, 1, 7)
+        );
+        assert!(close(run_chance(20, 0, 1), 1.0 / 22.0));
+        assert!(close(run_chance(20, 0, 2), 1.0 / 22.0 * 2.0 / 23.0));
+        assert!(close(run_chance(256, 0, 1), 1.0 / 258.0));
+        assert_eq!(run_chance(5, 5, 3), None, "never varied");
+        assert_eq!(run_chance(0, 0, 3), None, "no history");
+        assert!(run_chance(2, 1, 22).is_some_and(|c| c >= ALPHA));
+        assert!(run_chance(2, 1, 23).is_some_and(|c| c < ALPHA));
     }
 
     #[test]
