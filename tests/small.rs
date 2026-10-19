@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use avsm::kernel::Kernel;
-use avsm::record::{Claim, Payload, Record};
+use avsm::record::{Claim, Kind, Payload, Record};
 use avsm::role::{Context, InferRequest, Role};
 use avsm::warden::LocalWarden;
 
@@ -117,4 +117,99 @@ fn a_payload_given_at_approval_carries_a_payloadless_ask_through() {
         std::fs::read_to_string(dir.join("announced")).unwrap(),
         "hello"
     );
+}
+
+fn order_refusals(k: &Kernel) -> Vec<(String, String)> {
+    k.entries()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Refusal {
+                action,
+                reason,
+                detail,
+                closes: None,
+                ..
+            } if action == "order" => Some((reason.clone(), detail.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn order_intents(k: &Kernel) -> usize {
+    k.entries()
+        .unwrap()
+        .iter()
+        .filter(|e| e.record.kind() == Kind::Intent && e.record.action() == Some("order"))
+        .count()
+}
+
+/// A payload goes through the schema; the lever is `cat > ordered`.
+fn order(payload: &str, check: &str) -> (Vec<(String, String)>, usize, bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mandate = format!(
+        "{HEAD}  - name: order\n    run: \"cat > ordered\"\n    cap: 9/day\n    reversible: false\n    takes: json\n    fields: {{qty: integer, sku: string, rush: bool, w: number}}\n{check}"
+    );
+    let (mut k, dir) = kernel(tmp.path(), &mandate, vec![]);
+    let out = k.propose("shop", "order", Some(payload)).unwrap();
+    let ask = out
+        .lines()
+        .find(|l| l.contains(" order? "))
+        .unwrap()
+        .trim_start_matches('#')
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    k.approve(ask, None).unwrap();
+    k.tick();
+    (
+        order_refusals(&k),
+        order_intents(&k),
+        dir.join("ordered").exists(),
+    )
+}
+
+#[test]
+fn a_payload_that_fits_its_fields_runs() {
+    let (refusals, intents, ran) = order(r#"{"qty": 3, "sku": "a", "rush": false, "w": 1.5}"#, "");
+    assert!(refusals.is_empty(), "{refusals:?}");
+    assert_eq!(intents, 1);
+    assert!(ran);
+}
+
+#[test]
+fn a_payload_that_misses_the_fields_is_a_typed_refusal_before_the_intent() {
+    for (payload, says) in [
+        (
+            r#"{"quantity": 3, "sku": "a", "rush": false, "w": 1}"#,
+            "qty",
+        ),
+        (
+            r#"{"qty": 3, "sku": "a", "rush": false, "w": 1, "extra": 1}"#,
+            "extra",
+        ),
+        (r#"{"qty": "3", "sku": "a", "rush": false, "w": 1}"#, "qty"),
+        (
+            r#"{"qty": 3.5, "sku": "a", "rush": false, "w": 1}"#,
+            "integer",
+        ),
+        (r#"[1, 2]"#, "object"),
+    ] {
+        let (refusals, intents, ran) = order(payload, "");
+        assert_eq!(refusals.len(), 1, "{payload}: {refusals:?}");
+        assert_eq!(refusals[0].0, "PayloadSchema", "{payload}");
+        assert!(refusals[0].1.contains(says), "{payload}: {refusals:?}");
+        assert_eq!(intents, 0, "{payload}: an intent was written");
+        assert!(!ran, "{payload}: the lever ran");
+    }
+}
+
+#[test]
+fn the_schema_is_checked_before_the_payload_check() {
+    // The check would fail too; the schema is what is said.
+    let (refusals, _, _) = order(r#"{"quantity": 3}"#, "    check: \"exit 1\"\n");
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "PayloadSchema");
 }

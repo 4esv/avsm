@@ -15,7 +15,7 @@ use crate::config::{self, Backend, Config};
 use crate::gate::{self, Candidate, DELEGATE, RESUME, STOP};
 use crate::index::Index;
 use crate::ledger::Ledger;
-use crate::mandate::{Mandate, ParentCall};
+use crate::mandate::{FieldType, Mandate, ParentCall};
 use crate::record::Verdict;
 use crate::record::{self, Claim, Entry, Payload, Record, Seq};
 use crate::research;
@@ -326,6 +326,11 @@ impl Warden for LocalWarden {
                     .into());
                 }
             }
+        }
+        // The payload's fields come first: a payload of the wrong shape
+        // reaches neither the check nor the lever.
+        if let (Some(fields), Some(p)) = (&perm.fields, payload.as_ref()) {
+            payload_schema(fields, p)?;
         }
         // A payload check runs after the gate, so after any approval, and
         // before the intent: a failure runs nothing and writes no intent.
@@ -646,6 +651,50 @@ fn fallbacks_apply(model: &str) -> bool {
     ]
     .iter()
     .any(|p| model.starts_with(p))
+}
+
+/// What a refusal by a payload's fields is called in its reason key.
+pub const PAYLOAD_SCHEMA: &str = "PayloadSchema";
+
+/// Check a json payload against the fields its lever names: an object
+/// with exactly those fields, each of its type.
+fn payload_schema(fields: &BTreeMap<String, FieldType>, payload: &Payload) -> Result<(), Failure> {
+    let refused = |detail: String| Failure::Refused {
+        reason_key: PAYLOAD_SCHEMA.to_string(),
+        detail,
+    };
+    let Payload::Json { json } = payload else {
+        return Err(refused(format!(
+            "the lever takes a json object with fields, not {}",
+            payload.takes()
+        )));
+    };
+    let Some(object) = json.as_object() else {
+        return Err(refused("the payload must be a json object".to_string()));
+    };
+    let mut problems = Vec::new();
+    for (name, ty) in fields {
+        match object.get(name) {
+            None => problems.push(format!("{name} is missing ({ty})", ty = ty.as_str())),
+            Some(v) if !ty.holds(v) => problems.push(format!("{name} must be {}", ty.as_str())),
+            Some(_) => {}
+        }
+    }
+    for name in object.keys().filter(|k| !fields.contains_key(*k)) {
+        problems.push(format!("{name} is not a field of this lever"));
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    let wanted: Vec<String> = fields
+        .iter()
+        .map(|(n, t)| format!("{n}: {}", t.as_str()))
+        .collect();
+    Err(refused(format!(
+        "{}; the fields are {{{}}}",
+        problems.join(", "),
+        wanted.join(", ")
+    )))
 }
 
 /// What a refusal by a payload check is called in its reason key.

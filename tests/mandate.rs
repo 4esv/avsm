@@ -51,6 +51,7 @@ fn valid_fixture_parses_field_by_field() {
                 check: None,
                 expects: None,
                 revoke_after: None,
+                fields: None,
             },
             Permitted {
                 name: "deploy".into(),
@@ -67,6 +68,7 @@ fn valid_fixture_parses_field_by_field() {
                 check: None,
                 expects: None,
                 revoke_after: None,
+                fields: None,
             },
         ],
         forbidden: vec!["rm".into()],

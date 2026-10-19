@@ -677,6 +677,7 @@ mod tests {
             check: None,
             expects: None,
             revoke_after: None,
+            fields: None,
         };
         Context {
             venture: "shop".to_string(),
@@ -1114,6 +1115,7 @@ mod tests {
             check: None,
             expects: None,
             revoke_after: None,
+            fields: None,
         });
         c.children = vec![ChildView {
             name: "shop".to_string(),

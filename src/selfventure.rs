@@ -126,6 +126,7 @@ pub fn canary() -> Result<(), String> {
                 check: None,
                 expects: None,
                 revoke_after: None,
+                fields: None,
             })
             .collect(),
         forbidden: vec![],

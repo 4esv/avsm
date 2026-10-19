@@ -1,6 +1,7 @@
 //! Mandates: what a venture is for, what number to watch, what it may do,
 //! what it may not.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
@@ -455,6 +456,44 @@ pub struct Permitted {
     /// delegation until a human approves the ask it raises.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoke_after: Option<u32>,
+    /// On a lever that takes json: the fields its payload must have, by
+    /// name and type. The warden refuses a payload with a missing, extra
+    /// or mistyped field before the check and the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<BTreeMap<String, FieldType>>,
+}
+
+/// The type of one field of a json payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldType {
+    String,
+    Number,
+    Integer,
+    Bool,
+}
+
+impl FieldType {
+    pub const ALL: &'static str = "string, number, integer or bool";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FieldType::String => "string",
+            FieldType::Number => "number",
+            FieldType::Integer => "integer",
+            FieldType::Bool => "bool",
+        }
+    }
+
+    /// Is this value of that type?
+    pub fn holds(self, v: &serde_json::Value) -> bool {
+        match self {
+            FieldType::String => v.is_string(),
+            FieldType::Number => v.is_number(),
+            FieldType::Integer => v.is_i64() || v.is_u64(),
+            FieldType::Bool => v.is_boolean(),
+        }
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -687,6 +726,7 @@ const ACTION_FIELDS: &[&str] = &[
     "check",
     "expects",
     "revoke_after",
+    "fields",
 ];
 
 /// Names no permitted action may take: they are built in.
@@ -2054,6 +2094,38 @@ fn check_action(position: usize, item: &Value) -> Result<(), MandateError> {
             ))
         }
     }
+    match map.get("fields") {
+        None | Some(Value::Null) => {}
+        Some(Value::Mapping(fields)) => {
+            if map.get("takes").and_then(Value::as_str).map(str::trim) != Some("json") {
+                return fail(format!(
+                    "{who} fields describe a json payload, so the lever must say takes: json"
+                ));
+            }
+            if fields.is_empty() {
+                return fail(format!(
+                    "{who} fields is empty; name each field and its type, like qty: integer, or leave fields out"
+                ));
+            }
+            for (name, ty) in fields {
+                let ok = matches!(ty.as_str(), Some("string" | "number" | "integer" | "bool"));
+                if !ok || name.as_str().is_none() {
+                    return fail(format!(
+                        "{who} fields: {} is {}, not {}",
+                        name.as_str().unwrap_or("a field"),
+                        describe(ty),
+                        FieldType::ALL
+                    ));
+                }
+            }
+        }
+        Some(other) => {
+            return fail(format!(
+                "{who} fields is a map of field name to type, like {{qty: integer}}, not {}",
+                describe(other)
+            ))
+        }
+    }
     match map.get("check") {
         None | Some(Value::Null) => {}
         Some(Value::String(c)) if !c.trim().is_empty() => {}
@@ -2587,6 +2659,36 @@ max_step: 5000
     }
 
     #[test]
+    fn fields_describe_a_json_payload() {
+        let text = VALID.replace(
+            "    delegated: false\n",
+            "    delegated: false\n    takes: json\n    fields: {qty: integer, note: string, ok: bool, w: number}\n",
+        );
+        let m = Mandate::parse(&text).unwrap();
+        let f = m.permitted("deploy").unwrap().fields.clone().unwrap();
+        assert_eq!(f["qty"], FieldType::Integer);
+        assert_eq!(f.len(), 4);
+        let bad = |fields: &str, takes: &str| {
+            fails(&VALID.replace(
+                "    delegated: false\n",
+                &format!("    delegated: false\n{takes}    fields: {fields}\n"),
+            ))
+        };
+        assert!(bad("{qty: integer}", "").contains("must say takes: json"));
+        assert!(bad("{qty: integer}", "    takes: text\n").contains("must say takes: json"));
+        assert!(bad("{qty: int}", "    takes: json\n").contains("string, number, integer or bool"));
+        assert!(bad("{}", "    takes: json\n").contains("fields is empty"));
+        assert!(bad("[qty]", "    takes: json\n").contains("map of field name to type"));
+        // Old mandates parse unchanged.
+        assert!(Mandate::parse(VALID)
+            .unwrap()
+            .permitted("deploy")
+            .unwrap()
+            .fields
+            .is_none());
+    }
+
+    #[test]
     fn metric_must_be_one_word() {
         let msg = fails(&edit("metric: count", "metric: request count"));
         assert_eq!(
@@ -2776,7 +2878,7 @@ max_step: 5000
         ));
         assert_eq!(
             msg,
-            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes, cost, check, expects, revoke_after"
+            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes, cost, check, expects, revoke_after, fields"
         );
     }
 

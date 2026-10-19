@@ -2396,6 +2396,7 @@ mod tests {
             check: None,
             expects: None,
             revoke_after: None,
+            fields: None,
         }
     }
 
