@@ -874,7 +874,8 @@ fn stuck_at_60() -> (Kernel, PathBuf, tempfile::TempDir, Seq) {
 }
 
 #[test]
-fn a_declared_approval_re_anchors_a_stuck_reading_and_a_denial_does_not() {
+fn a_declared_approval_vouches_for_one_reading_and_a_denial_for_none() {
+    // Approving a stuck reading accepts that reading, not its repeats.
     let (mut k, dir, _tmp, ask) = stuck_at_60();
     report(&mut k, &dir, "counter", "60");
     assert!(
@@ -886,7 +887,28 @@ fn a_declared_approval_re_anchors_a_stuck_reading_and_a_denial_does_not() {
         report(&mut k, &dir, "counter", "60");
     }
     let f = flags(&k, "counter", "count");
-    assert!(f[f.len() - 5..].iter().all(Option::is_none), "{f:?}");
+    assert!(
+        f[f.len() - 5..]
+            .iter()
+            .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
+        "{f:?}"
+    );
+
+    // Approving a jump anchors the next step on it.
+    let none = "{kind: threshold, above: 900, action: reset}";
+    let jump = ["60", "62", "61", "63", "60", "200"];
+    for approve in [true, false] {
+        let (mut k, dir, _tmp) = plausibility_in("[0, 1000]", none, &jump);
+        let ask = signals(&k, |s| matches!(s, Signal::Implausible { .. }))[0].seq;
+        if approve {
+            k.approve(ask, None).unwrap();
+        } else {
+            k.deny(ask, "not real").unwrap();
+        }
+        report(&mut k, &dir, "counter", "201");
+        let f = flags(&k, "counter", "count");
+        assert_eq!(f[6].is_none(), approve, "approved {approve}: {f:?}");
+    }
 
     let (mut k, dir, _tmp, ask) = stuck_at_60();
     k.deny(ask, "not real").unwrap();
@@ -984,6 +1006,26 @@ fn a_flap_never_re_anchors() {
     let f = flags(&k, "counter", "count");
     assert!(f[2..].iter().all(Option::is_some), "{f:?}");
     assert_eq!(count(&k, Kind::Intent, "reset"), 0);
+}
+
+#[test]
+fn every_flap_reading_is_flagged_though_a_human_approves_the_asks() {
+    // The hostile sim's flap: 5 and 95 alternating, the human approving
+    // each implausible ask as it comes. An approval vouches for one
+    // reading; it never makes the next one that equals it plausible.
+    let none = "{kind: threshold, above: 900, action: reset}";
+    let (mut k, dir, _tmp) = plausibility_in("[0, 100]", none, &["40", "42", "41", "43", "40"]);
+    for i in 0..12 {
+        report(&mut k, &dir, "counter", if i % 2 == 0 { "95" } else { "5" });
+        for ask in signals(&k, |s| matches!(s, Signal::Implausible { .. })) {
+            if k.index().unwrap().is_open(ask.seq) {
+                k.approve(ask.seq, None).unwrap();
+            }
+        }
+    }
+    let f = flags(&k, "counter", "count");
+    assert!(f[..5].iter().all(Option::is_none), "{f:?}");
+    assert!(f[5..].iter().all(Option::is_some), "all 12 flagged: {f:?}");
 }
 
 #[test]

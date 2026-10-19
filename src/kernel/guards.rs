@@ -11,11 +11,19 @@
 //! Plausibility: a reading of the metric, a guard or an audit that is
 //! NaN, missing, out of range, too big a step or a flap is kept, marked
 //! implausible, and is never a premise: not for a crossed threshold, not
-//! for a guard's breach either way, not for an audit's delta. The first of
-//! an episode asks. A step is measured from the last plausible reading,
-//! until three readings in a row agree within max_step: the third
-//! re-anchors, so a sensor that was stuck and then reads the truth is not
-//! locked out forever.
+//! for a guard's breach either way, not for an audit's delta, not for what
+//! a lever did. The first of an episode asks. A step is measured from the
+//! last plausible reading, until three readings in a row agree within
+//! max_step: the third re-anchors, so a sensor that was stuck and then
+//! reads the truth is not locked out forever. A declared approval of the
+//! ask vouches for one reading, the anchor; its repeats are still checked.
+//!
+//! Stuck, where the metric varies and away from a bound of its range: a
+//! reading exactly equal to the three before it, or to the one before it
+//! when a lever expected to move the metric ran between. At a bound, a
+//! repeat is dry soil, and a lever that does not move it is ineffective.
+//! A flap is three steps in a row past max_step, each the other way, in
+//! the raw readings whatever was believed.
 //!
 //! Deadband and hold keep a threshold from thrashing: it acts after `hold`
 //! crossed reports in a row, and once it has acted it acts again only
@@ -66,13 +74,15 @@ fn median_step(history: &[f64]) -> f64 {
 /// Why a reading is not to be believed, or None when it is. `before`
 /// holds the latest plausible readings, up to HISTORY, oldest first;
 /// `recent` the values of the latest readings, plausible or not, oldest
-/// first.
+/// first. `moved` says a lever whose `expects` moves this metric ran, ok,
+/// since the reading before.
 pub fn implausible(
     value: Option<f64>,
     before: &[f64],
     recent: &[Option<f64>],
     range: Option<[f64; 2]>,
     max_step: Option<f64>,
+    moved: bool,
 ) -> Option<String> {
     let Some(x) = value else {
         return Some("missing".to_string());
@@ -103,6 +113,32 @@ pub fn implausible(
         return Some(format!(
             "stuck: {x} exactly, as the {STUCK} readings before it, where the metric varies"
         ));
+    }
+    // A lever that is expected to move the metric ran, and the reading is
+    // exactly the one before. At a bound that is the lever's to answer
+    // for (ineffective), not the sensor's.
+    if varies && moved && !bound(x) && recent.last() == Some(&Some(x)) {
+        return Some(format!(
+            "stuck: {x} exactly, as the reading before it, though a lever expected to move it ran between"
+        ));
+    }
+    // A flap in the raw readings, whatever was believed: the last three
+    // steps, this one included, each past max_step and each the other way.
+    // An approval vouches for one reading; it never lets a flap back in.
+    if recent.len() >= 3 {
+        let raw: Vec<f64> = recent[recent.len() - 3..]
+            .iter()
+            .filter_map(|r| r.filter(|v| v.is_finite()))
+            .chain([x])
+            .collect();
+        if raw.len() == 4 {
+            let d: Vec<f64> = raw.windows(2).map(|w| w[1] - w[0]).collect();
+            if d.iter().all(|d| d.abs() > s) && d[0] * d[1] < 0.0 && d[1] * d[2] < 0.0 {
+                return Some(format!(
+                    "flapping: the last three steps each past max_step {s}, each the other way"
+                ));
+            }
+        }
     }
     let n = before.len();
     if let Some(prev) = before.last() {
@@ -213,12 +249,16 @@ fn vouches(index: &Index, e: &Entry, venture: &str, metric: &str) -> bool {
 }
 
 /// The latest `n` readings a step is measured from, oldest first: the
-/// plausible ones, back to a declared approval of an implausible ask about
-/// the metric, where the latest reading before that approval is the
-/// anchor, plausible or not.
+/// plausible ones, where the latest reading before the latest declared
+/// approval of an implausible ask about the metric counts as one of them,
+/// plausible or not. The approval vouches for that one reading only: the
+/// plausible history before it still says whether the metric varies.
 fn anchored_before(index: &Index, venture: &str, metric: &str, n: usize) -> Vec<f64> {
     let mut out: Vec<f64> = Vec::new();
+    // Searching for the approval; then for the reading it vouches for;
+    // then the plausible ones before that.
     let mut vouched = false;
+    let mut anchored = false;
     for e in index.of(venture).rev() {
         if out.len() >= n {
             break;
@@ -239,10 +279,10 @@ fn anchored_before(index: &Index, venture: &str, metric: &str, n: usize) -> Vec<
         if m != metric || !claim.authorizes() {
             continue;
         }
-        if vouched {
+        if vouched && !anchored {
             if let Some(x) = value.filter(|x| x.is_finite()) {
                 out.push(x);
-                break;
+                anchored = true;
             }
         } else if let Some(x) = plausible(e) {
             out.push(x);
@@ -345,8 +385,28 @@ impl Kernel {
             return (None, false);
         };
         let before = anchored_before(&index, venture, metric, HISTORY);
-        let recent = recent(&index, venture, metric, STUCK.max(AGREE - 1));
-        let why = implausible(value, &before, &recent, range, max_step);
+        let recent = recent(&index, venture, metric, STUCK.max(AGREE - 1).max(3));
+        // Did a lever that expects to move this metric run, ok, since the
+        // last reading of it?
+        let last = reports(&index, venture, metric).next().map(|e| e.seq);
+        let moved = last.is_some_and(|last| {
+            self.ventures.get(venture).is_some_and(|v| {
+                v.mandate.metric_name() == metric
+                    && v.mandate
+                        .permitted
+                        .iter()
+                        .filter(|p| p.expects.is_some())
+                        .any(|p| {
+                            index
+                                .intents_of(venture, &p.name)
+                                .iter()
+                                .rev()
+                                .take_while(|i| **i > last)
+                                .any(|i| index.settled(*i).is_some_and(|(_, ok)| ok))
+                        })
+            })
+        });
+        let why = implausible(value, &before, &recent, range, max_step, moved);
         let fresh = reports(&index, venture, metric)
             .next()
             .is_none_or(|e| e.record.implausible().is_none());
@@ -641,15 +701,16 @@ mod tests {
 
     /// Why a reading of the metric is implausible, with no recent run.
     fn doubted(value: Option<f64>, before: &[f64], m: &Mandate) -> Option<String> {
-        implausible(value, before, &[], m.range, m.max_step)
+        implausible(value, before, &[], m.range, m.max_step, false)
     }
 
     #[test]
     fn three_agreeing_readings_re_anchor_and_nothing_less_does() {
         let (range, step) = (Some([0.0, 1000.0]), Some(50.0));
         let anchor = [60.0, 60.0, 60.0];
-        let at =
-            |x: f64, recent: &[Option<f64>]| implausible(Some(x), &anchor, recent, range, step);
+        let at = |x: f64, recent: &[Option<f64>]| {
+            implausible(Some(x), &anchor, recent, range, step, false)
+        };
         // Stuck at 60, then the truth near 0: the third agreeing re-anchors.
         assert!(at(2.0, &[Some(60.0), Some(60.0)]).is_some(), "one jump");
         assert!(at(1.0, &[Some(60.0), Some(2.0)]).is_some(), "two agree");
@@ -663,15 +724,19 @@ mod tests {
         assert!(at(0.0, &[Some(80.0), Some(40.0)]).is_some(), "a drift");
         // Re-anchored, a small wiggle back is no flap.
         let after = [60.0, 60.0, 0.0];
-        assert_eq!(implausible(Some(1.0), &after, &[], range, step), None);
+        assert_eq!(
+            implausible(Some(1.0), &after, &[], range, step, false),
+            None
+        );
     }
 
     #[test]
     fn exact_repeats_are_stuck_where_the_metric_varies_and_never_agree() {
         let (range, step) = (Some([0.0, 1000.0]), Some(50.0));
         let varied = [40.0, 42.0, 41.0, 43.0, 41.0];
-        let at =
-            |x: f64, recent: &[Option<f64>]| implausible(Some(x), &varied, recent, range, step);
+        let at = |x: f64, recent: &[Option<f64>]| {
+            implausible(Some(x), &varied, recent, range, step, false)
+        };
         let stuck = at(41.0, &[Some(41.0), Some(41.0), Some(41.0)]).unwrap();
         assert!(stuck.starts_with("stuck"), "{stuck}");
         assert_eq!(
@@ -686,7 +751,10 @@ mod tests {
         // A metric that never varies is never stuck, and its repeats agree.
         let flat = [50.0; 10];
         let same = [Some(50.0), Some(50.0), Some(50.0)];
-        assert_eq!(implausible(Some(50.0), &flat, &same, range, step), None);
+        assert_eq!(
+            implausible(Some(50.0), &flat, &same, range, step, false),
+            None
+        );
         assert_eq!(median_step(&flat), 0.0);
         assert_eq!(median_step(&varied), 2.0);
     }
