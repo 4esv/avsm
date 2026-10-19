@@ -287,7 +287,17 @@ pub fn render(m: &Mandate) -> String {
             Then::Pause => "it pauses the venture",
             Then::Ask => "it asks, and refuses every lever but stop until it is back inside",
         };
-        line(format!("guard {}: when {what}, {then}", g.name));
+        let unwind = match &g.unwind {
+            Some(u) => format!(
+                "; first it runs {} with {} once",
+                u.action,
+                u.payload
+                    .as_ref()
+                    .map_or_else(|| "no payload".to_string(), |p| p.to_string())
+            ),
+            None => String::new(),
+        };
+        line(format!("guard {}: when {what}, {then}{unwind}", g.name));
     }
     for a in &m.audits {
         line(format!(

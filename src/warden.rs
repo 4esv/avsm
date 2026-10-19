@@ -224,9 +224,18 @@ impl Warden for LocalWarden {
             .is_some_and(crate::mandate::Permitted::is_parent_lever);
         // The payload comes from the record the proof names, never from
         // the request: the gate chose the record, the warden only reads it.
-        let payload = match proof.payload_from() {
-            Some(seq) => index.get(seq).and_then(|e| e.record.payload().cloned()),
-            None => None,
+        // A tripped guard's unwind takes the payload its adopted mandate
+        // declares, and no other.
+        let payload = match (proof.unwind(), proof.payload_from()) {
+            (Some(guard), _) => ventures.get(&venture).and_then(|v| {
+                let unwind = v.mandate.guard(guard)?.unwind.as_ref()?;
+                unwind
+                    .payload_for(v.mandate.permitted(&action)?)
+                    .ok()
+                    .flatten()
+            }),
+            (None, Some(seq)) => index.get(seq).and_then(|e| e.record.payload().cloned()),
+            (None, None) => None,
         };
         let key = record::key(&venture, &action, &candidate.cites, payload.as_ref());
         // Recorded, then done: every lever run stores its intent before it

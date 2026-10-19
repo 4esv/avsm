@@ -14,6 +14,7 @@ Use these words and no synonyms.
 - running, asking, saturated, ineffective, guarded, implausible, paused (the states, computed from records only)
 - ledger, gate, proof, adapter, canary, warden, guard, audit, world, plan
 - parent, child, payload, adapter (built-in metric or lever), digest, know, expects
+- unwind (the one lever and payload a guard declares, run when it trips)
 - escalate, escalation (the `escalate:` backend asked when the first cannot answer)
 - packet (premises, options, reason: what an ask carries for the human, built by code)
 - canary is the self venture's check that the gate still refuses what it must. A canary ask is a different thing: an ask that can never run, written every n asks (`canary_asks`) to measure whether the human reads what they approve. Say "canary ask", never "canary" alone, for it.

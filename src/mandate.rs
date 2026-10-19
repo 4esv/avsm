@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 pub use crate::record::Takes;
 
+use crate::record::Payload;
+
 use crate::adapter;
 
 /// A parsed mandate.yaml.
@@ -63,8 +65,8 @@ pub struct Mandate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocation: Option<Allocation>,
     /// Readings the warden takes beside the metric; past its bound a
-    /// guard pauses the venture or asks, and no lever but stop passes
-    /// until it is back inside.
+    /// guard pauses the venture or asks, and no lever but stop, and a
+    /// tripped guard's declared unwind, passes until it is back inside.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guards: Vec<Guard>,
     /// Readings that check the metric is not being gamed. A model never
@@ -151,8 +153,14 @@ fn first_difference(
             keys.dedup();
             keys.into_iter().find_map(|k| {
                 let (x, y) = (b.get(k), a.get(k));
-                // A lever turning delegated on is the ratchet's one move.
+                // A lever turning delegated on is the ratchet's one move:
+                // `permitted.<lever>.delegated`, never the same word inside
+                // a payload or anywhere else.
+                let lever = path
+                    .strip_prefix("permitted.")
+                    .is_some_and(|name| !name.is_empty() && !name.contains('.'));
                 if k == "delegated"
+                    && lever
                     && x == Some(&Value::Bool(false))
                     && y == Some(&Value::Bool(true))
                 {
@@ -225,6 +233,76 @@ pub struct Guard {
     /// The largest plausible change from one reading to the next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_step: Option<f64>,
+    /// The one lever, with the one payload, the kernel runs when the guard
+    /// trips: a delegation of exactly that payload, declared here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unwind: Option<Unwind>,
+}
+
+/// What a tripped guard runs: a permitted lever and the payload it takes,
+/// declared in the mandate. It is the one lever besides stop a tripped
+/// guard lets through, and only with exactly this payload.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Unwind {
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+}
+
+impl Unwind {
+    /// The payload as the lever takes it, checked against its takes and
+    /// fields: None for a lever that takes none.
+    pub fn payload_for(&self, perm: &Permitted) -> Result<Option<Payload>, String> {
+        let lever = &self.action;
+        let Some(takes) = perm.takes() else {
+            return match &self.payload {
+                None => Ok(None),
+                Some(_) => Err(format!("{lever} takes no payload; leave payload out")),
+            };
+        };
+        let Some(value) = &self.payload else {
+            return Err(format!(
+                "{lever} takes {takes}; give the payload it runs with"
+            ));
+        };
+        let payload = match (takes, value) {
+            (Takes::Json, serde_json::Value::Object(_)) => Payload::Json {
+                json: value.clone(),
+            },
+            (Takes::Json, _) => {
+                return Err(format!(
+                    "{lever} takes json; the payload is a json object like {{side: sell, qty: 10}}"
+                ))
+            }
+            (t, serde_json::Value::String(text)) => Payload::parse(t, text)?,
+            (t, _) => return Err(format!("{lever} takes {t}; the payload is text")),
+        };
+        if payload.text().len() > Payload::MAX {
+            return Err(format!("the payload is more than {} bytes", Payload::MAX));
+        }
+        if let (Some(fields), Payload::Json { json }) = (&perm.fields, &payload) {
+            let empty = serde_json::Map::new();
+            let object = json.as_object().unwrap_or(&empty);
+            let mut problems = Vec::new();
+            for (name, ty) in fields {
+                match object.get(name) {
+                    None => problems.push(format!("{name} is missing ({})", ty.as_str())),
+                    Some(v) if !ty.holds(v) => {
+                        problems.push(format!("{name} must be {}", ty.as_str()))
+                    }
+                    Some(_) => {}
+                }
+            }
+            for name in object.keys().filter(|k| !fields.contains_key(*k)) {
+                problems.push(format!("{name} is not a field of {lever}"));
+            }
+            if !problems.is_empty() {
+                return Err(problems.join(", "));
+            }
+        }
+        Ok(Some(payload))
+    }
 }
 
 impl Guard {
@@ -962,7 +1040,9 @@ const FIELDS: &[&str] = &[
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadband", "hold"];
 const GUARD_FIELDS: &[&str] = &[
     "name", "run", "adapter", "above", "below", "then", "drawdown", "of", "range", "max_step",
+    "unwind",
 ];
+const UNWIND_FIELDS: &[&str] = &["action", "payload"];
 const AUDIT_FIELDS: &[&str] = &[
     "name",
     "run",
@@ -1539,8 +1619,39 @@ impl Mandate {
                 self.apart(&who, cmd)?;
             }
             check_plausibility(&format!("{who}: "), g.range, g.max_step)?;
+            if let Some(u) = &g.unwind {
+                self.check_unwind(&who, u)?;
+            }
         }
         Ok(())
+    }
+
+    /// An unwind names a permitted, unforbidden lever of the venture's own
+    /// and the payload it takes, exactly as its takes and fields say.
+    fn check_unwind(&self, who: &str, u: &Unwind) -> Result<(), MandateError> {
+        let lever = u.action.as_str();
+        if lever == STOP {
+            return fail(format!(
+                "{who}: stop always passes; a guard that stops says then: pause, not unwind"
+            ));
+        }
+        let Some(perm) = self.permitted(lever) else {
+            return fail(format!(
+                "{who}: unwind names {lever:?}, which is not a permitted action"
+            ));
+        };
+        if self.forbidden.iter().any(|f| f == lever) {
+            return fail(format!("{who}: unwind names {lever:?}, which is forbidden"));
+        }
+        if perm.is_parent_lever() || perm.is_research() || perm.is_forecast() || lever == "delegate"
+        {
+            return fail(format!(
+                "{who}: unwind names {lever:?}, a built-in lever; an unwind runs a lever of the venture's own"
+            ));
+        }
+        u.payload_for(perm)
+            .map(|_| ())
+            .map_err(|e| MandateError(format!("{who}: unwind: {e}")))
     }
 
     /// Refuse a guard that reads what a lever runs or what the metric
@@ -1987,6 +2098,7 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
         GUARD_FIELDS,
         "name, run or adapter, above or below, then: pause or ask",
     )?;
+    check_unwinds(map.get("guards"))?;
     check_list(
         map.get("audits"),
         "audits",
@@ -2050,6 +2162,44 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
             describe(other)
         )),
     }
+}
+
+/// A guard's `unwind` is `{action: <lever>, payload: <what it takes>}`.
+fn check_unwinds(v: Option<&Value>) -> Result<(), MandateError> {
+    let Some(Value::Sequence(items)) = v else {
+        return Ok(());
+    };
+    for item in items {
+        let Some(unwind) = item.get("unwind") else {
+            continue;
+        };
+        let who = match item.get("name") {
+            Some(Value::String(n)) => format!("guard {n:?}"),
+            _ => "a guard".to_string(),
+        };
+        let terms = match unwind {
+            Value::Null => continue,
+            Value::Mapping(m) => m,
+            other => {
+                return fail(format!(
+                    "{who}: unwind is {{action: <lever>, payload: <what it takes>}}, like {{action: trade, payload: {{side: sell, qty: 10}}}}; not {}",
+                    describe(other)
+                ))
+            }
+        };
+        if let Some(f) = unknown_field(terms, UNWIND_FIELDS)? {
+            return fail(format!(
+                "{who}: unknown field {f:?} in unwind; an unwind has these fields: {}",
+                UNWIND_FIELDS.join(", ")
+            ));
+        }
+        if !matches!(terms.get("action"), Some(Value::String(_))) {
+            return fail(format!(
+                "{who}: unwind needs action, the permitted lever it runs"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// An audit's `worse` and `better` are up or down.

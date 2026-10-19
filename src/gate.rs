@@ -136,6 +136,15 @@ pub enum Step {
     Running { venture: String },
     /// A rule that needs no premise.
     Axiom { text: String },
+    /// A tripped guard's declared unwind: the measured reading past the
+    /// bound, and the adopted mandate whose text names this lever with
+    /// this payload. The payload is the mandate's, never a record's.
+    Unwind {
+        guard: String,
+        report: Seq,
+        mandate: Seq,
+        summary: String,
+    },
 }
 
 /// Why an action is refused.
@@ -288,6 +297,14 @@ impl Proof {
         })
     }
 
+    /// The guard whose declared unwind this is, when it is one.
+    pub fn unwind(&self) -> Option<&str> {
+        self.steps.iter().find_map(|s| match s {
+            Step::Unwind { guard, .. } => Some(guard.as_str()),
+            _ => None,
+        })
+    }
+
     /// The declared decision the proof rests on, if any.
     pub fn decision(&self) -> Option<Seq> {
         self.steps.iter().find_map(|s| match s {
@@ -374,6 +391,9 @@ ascent! {
     relation implausible(Seq);
     // venture, guard metric, trips above, bound, trips at the bound too
     relation guard(String, String, bool, Num, bool);
+    // venture, guard metric, action: the guard declares that lever its
+    // unwind; loaded only for a candidate that cites one record
+    relation unwind(String, String, String);
 
     // Non-negotiable 2: only measured and declared records can authorize.
     relation trusted(Seq);
@@ -479,6 +499,22 @@ ascent! {
     relation guarded(String);
     guarded(v) <-- breached(v, _, _);
 
+    // A tripped guard's declared unwind: the candidate cites the guard's
+    // latest plausible reading past its bound, and nothing else, so the
+    // payload can only be the one the adopted mandate declares. That
+    // declaration delegates exactly that payload: no ask, irreversible or
+    // not. It is the one lever besides stop a tripped guard lets through;
+    // caps, budgets, quotas, a pending intent and a pause still hold it.
+    relation unwinds(String, String, Seq);
+    unwinds(v, a, s) <-- candidate(v, a), unwind(v, g, a), breached(v, g, s), cites(s);
+    relation unwinding(String, String);
+    unwinding(v, a) <-- unwinds(v, a, _);
+    justified(v, a) <-- unwinding(v, a);
+    irreversible_ok(v, a) <-- permitted(v, a, _, false, _), unwinding(v, a);
+    payload_ok(v, a) <-- takes(v, a), unwinding(v, a);
+    relation held(String, String);
+    held(v, a) <-- candidate(v, a), guarded(v), !unwinding(v, a);
+
     relation hard(String, String);
     hard(v, a) <-- hardwired(v, a, _);
     relation under_cap(String, String);
@@ -514,7 +550,7 @@ ascent! {
         under_cap(v, a),
         !over_budget(v, a),
         !over_quota(v, a),
-        !guarded(v),
+        !held(v, a),
         !paused(v);
 }
 
@@ -990,6 +1026,8 @@ fn load_mandates(
         for f in &m.mandate.forbidden {
             p.forbidden.push((venture.clone(), f.clone()));
         }
+        // An unwind is an occasion for one candidate citing one record.
+        let single = p.cites.len() == 1;
         for g in &m.mandate.guards {
             let (above, bound) = g.bound();
             p.guard.push((
@@ -999,6 +1037,16 @@ fn load_mandates(
                 Num(bound),
                 g.drawdown.is_some(),
             ));
+            if let Some(u) = &g.unwind {
+                let candidate = p
+                    .candidate
+                    .iter()
+                    .any(|(v, a)| *v == venture && *a == u.action);
+                if single && candidate {
+                    p.unwind
+                        .push((venture.clone(), g.metric(), u.action.clone()));
+                }
+            }
         }
         if let Some(t) = threshold(&venture) {
             p.threshold.push((
@@ -1518,6 +1566,46 @@ fn assemble<'a>(
             cited.insert(*s);
         }
     }
+    // A tripped guard's declared unwind: the measured reading, then what
+    // the adopted mandate declares for it.
+    let unwinding = p.unwinding.iter().any(|(x, y)| x == v && y == a);
+    for (_, _, s) in p.unwinds.iter().filter(|(x, y, _)| x == v && y == a) {
+        let Some(e) = find(*s) else { continue };
+        let Record::Report {
+            metric,
+            value: Some(value),
+            ..
+        } = &e.record
+        else {
+            continue;
+        };
+        steps.push(Step::Report {
+            seq: e.seq,
+            claim: e.record.claim(),
+            metric: metric.clone(),
+            value: *value,
+        });
+        let guard = metric.strip_prefix("guard.").unwrap_or(metric).to_string();
+        if let Some(m) = mandate {
+            let declared = m
+                .mandate
+                .guard(&guard)
+                .and_then(|g| g.unwind.as_ref())
+                .zip(permitted)
+                .and_then(|(u, perm)| u.payload_for(perm).ok());
+            let summary = match declared {
+                Some(Some(payload)) => payload.summary(),
+                _ => "no payload".to_string(),
+            };
+            steps.push(Step::Unwind {
+                guard,
+                report: e.seq,
+                mandate: m.seq,
+                summary,
+            });
+        }
+        cited.insert(*s);
+    }
     for (_, _, d, q) in p.approved.iter().filter(|(x, y, _, _)| x == v && y == a) {
         let by = find(*d)
             .and_then(|e| match &e.record {
@@ -1552,8 +1640,9 @@ fn assemble<'a>(
 
     // The payload a lever consumes comes from the amended approval if the
     // human changed it, else from the ask the approval answers, else from
-    // the proposal. A lever that takes one and gets none is refused.
-    if let Some(takes) = permitted.and_then(Permitted::takes) {
+    // the proposal. A lever that takes one and gets none is refused. An
+    // unwind's payload is the mandate's, named in its step above.
+    if let Some(takes) = permitted.and_then(Permitted::takes).filter(|_| !unwinding) {
         let source = payload_entry(p, find, v, a);
         match source.and_then(|e| e.record.payload().map(|pl| (e, pl))) {
             Some((e, payload)) => {
@@ -1616,7 +1705,9 @@ fn assemble<'a>(
     }
     steps.extend(extra_steps);
     reasons.extend(extra_reasons);
-    reasons.extend(guarded(p, v, find));
+    if !unwinding {
+        reasons.extend(guarded(p, v, find));
+    }
     if p.paused.iter().any(|(x,)| x == v) {
         reasons.push(Reason::Paused { venture: v.clone() });
     } else {
@@ -1906,6 +1997,15 @@ impl fmt::Display for Step {
             Step::Cap { used, cap } => write!(f, "cap        {used} of {cap} used"),
             Step::Running { venture } => write!(f, "running    {venture} is not paused"),
             Step::Axiom { text } => write!(f, "axiom      {text}"),
+            Step::Unwind {
+                guard,
+                report,
+                mandate,
+                summary,
+            } => write!(
+                f,
+                "unwind     guard {guard} past its bound at #{report}; mandate #{mandate} declares this lever with {summary}: a delegation of exactly this payload, so no ask"
+            ),
         }
     }
 }

@@ -2,7 +2,10 @@
 //!
 //! Guards are readings the warden takes, each with a bound. Past it, a
 //! guard pauses the venture or asks once; either way the gate refuses
-//! every lever but stop until the reading is back inside.
+//! every lever but stop until the reading is back inside. A guard's
+//! declared unwind is the one exception: on the reading that trips it,
+//! and on later ones past the bound until a run of it is ok, the kernel
+//! runs that lever with that payload, once an episode.
 //!
 //! Audits are readings that should not worsen while the target improves.
 //! When the target rises over an audit's window and the audit worsens past
@@ -551,6 +554,13 @@ impl Kernel {
             if !g.breached(value) {
                 continue;
             }
+            // The declared unwind first: with then: pause, the stop after
+            // it would hold it.
+            if let Some(u) = &g.unwind {
+                if self.unwind_due(name, &g, e.seq) {
+                    self.act(name, &u.action, vec![e.seq], Claim::Measured);
+                }
+            }
             let (above, bound) = g.bound();
             match g.then {
                 Then::Pause => {
@@ -595,6 +605,41 @@ impl Kernel {
                 }
             }
         }
+    }
+
+    /// Is a guard's unwind to be tried on this reading past its bound? The
+    /// rule: once per episode, an episode being the readings since the
+    /// last plausible one inside the bound. It is tried on the reading
+    /// that trips the guard and on each later one past it, until one run
+    /// of it in the episode has an ok outcome. Not while the venture is
+    /// paused (nothing but stop runs then), and not while a run of it has
+    /// an intent and no outcome (never rerun blindly).
+    fn unwind_due(&self, name: &str, g: &Guard, reading: Seq) -> bool {
+        let Some(u) = &g.unwind else { return false };
+        let Ok(index) = self.index() else {
+            return false;
+        };
+        if crate::gate::state_in(&index, &self.adopted(), name) == crate::gate::State::Paused {
+            return false;
+        }
+        let metric = g.metric();
+        let start = reports(&index, name, &metric)
+            .filter(|r| r.seq < reading)
+            .find(|r| plausible(r).is_some_and(|x| !g.breached(x)))
+            .map_or(0, |r| r.seq);
+        let ran = index
+            .intents_of(name, &u.action)
+            .iter()
+            .rev()
+            .take_while(|i| **i > start)
+            .filter(|i| {
+                index.get(**i).is_some_and(|e| {
+                    matches!(&e.record, Record::Intent { proof, .. }
+                        if proof.unwind() == Some(g.name.as_str()))
+                })
+            })
+            .any(|i| index.settled(*i).is_none_or(|(_, ok)| ok));
+        !ran
     }
 
     /// Ask when the target rose over an audit's window while the audit

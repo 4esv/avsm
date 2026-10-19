@@ -887,3 +887,72 @@ fn model_error_the_plan_picks_the_better_worst_member_not_the_better_mean() {
     assert_eq!(chosen.action, "steady", "{chosen:?}");
     assert_eq!(chosen.worst, 14.0);
 }
+
+/// FAILURE: a tripped guard holds a losing position. A guard past its
+/// bound refuses every lever but stop, so the lever that would cut the
+/// loss is refused with the rest, and the book rides the fall.
+///
+/// COUNTERMEASURE: a guard's declared `unwind` (`src/mandate.rs`). When
+/// the guard's measured reading is past its bound, the kernel runs that
+/// one lever with that one payload, once an episode, recorded then done
+/// (`unwind_due` in `src/kernel/guards.rs`); the gate lets it, and only
+/// it, past the guard, its proof the reading and the adopted mandate
+/// (`unwinds` in `src/gate.rs`). Caps, budgets and the payload check
+/// still hold it.
+///
+/// SHOWN: 70 shares at 100 fall to 50. Without an unwind the tripped
+/// guard holds them all the way down, equity 6500; with one the book sells
+/// at the reading that trips the guard and keeps 8460.
+#[test]
+fn a_tripped_guard_holds_a_losing_position_unless_it_declares_an_unwind() {
+    let _c = clock();
+    let equity = |unwind: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut k = open(&tmp.path().join("home"), "", Box::new(Quiet));
+        let dir = venture(
+            tmp.path(),
+            "book",
+            &format!(
+                "purpose: Grow.\nmetric: equity\ncontroller: {{kind: model}}\ncadence: 1h\n\
+                 permitted:\n- {{name: trade, run: ./trade, cap: 3/day, reversible: false, takes: json, fields: {{side: string, qty: integer}}}}\n\
+                 guards:\n- {{name: dd, drawdown: 15%, of: equity, then: ask{unwind}}}\n"
+            ),
+        );
+        script(
+            &dir,
+            "report",
+            "echo $(( $(cat cash) + $(cat shares) * $(cat price) ))",
+        );
+        // A sell sells what is held, at the price now.
+        script(
+            &dir,
+            "trade",
+            "case \"$(cat)\" in *sell*) echo $(( $(cat cash) + $(cat shares) * $(cat price) )) > cash; echo 0 > shares ;; esac",
+        );
+        std::fs::write(dir.join("cash"), "3000").unwrap();
+        std::fs::write(dir.join("shares"), "70").unwrap();
+        k.add(&dir).unwrap();
+        for price in ["100", "90", "78", "65", "50"] {
+            std::fs::write(dir.join("price"), price).unwrap();
+            k.report("book", false);
+            avsmd::clock::advance(HOUR);
+        }
+        let last = of_kind(&k, Kind::Report)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.record {
+                Record::Report {
+                    metric,
+                    value: Some(v),
+                    ..
+                } if metric == "equity" => Some(*v),
+                _ => None,
+            })
+            .unwrap();
+        (last, intents(&k, "book", "trade"))
+    };
+    let (held, runs) = equity("");
+    assert_eq!((held, runs), (6500.0, 0), "the guard held the book down");
+    let (unwound, runs) = equity(", unwind: {action: trade, payload: {side: sell, qty: 100000}}");
+    assert_eq!((unwound, runs), (8460.0, 1), "sold once, at the trip");
+}

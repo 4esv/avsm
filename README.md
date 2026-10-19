@@ -101,13 +101,17 @@ A guard is a reading of its own that the warden takes beside the metric, with
 a bound. Past it, the guard pauses the venture (`then: pause`, the default) or
 asks once (`then: ask`); either way no lever but stop runs until the reading is
 back inside, whatever approves it. A guard may not read a lever's command or
-the metric's. A drawdown guard falls from the metric's peak:
+the metric's. A drawdown guard falls from the metric's peak. A guard may
+declare an `unwind`: one permitted lever and the exact payload it takes, which
+the kernel runs once per episode when the guard trips (and on later readings
+past the bound until it has run ok), under the lever's cap, budget and check;
+the same lever with any other payload stays refused:
 
 ```yaml
 guards:
   - {name: spend, run: ./spend, above: 100}
   - {name: errors, adapter: http.status https://example.com/health, above: 299, then: ask}
-  - {name: dd, drawdown: 15%, of: equity}
+  - {name: dd, drawdown: 15%, of: equity, unwind: {action: trade, payload: {side: sell, qty: 100000}}}
 audits:
   - {name: refunds, run: ./refunds, worse: up, tolerance: 2}
 range: [0, 100000]
