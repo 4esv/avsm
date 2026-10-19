@@ -71,6 +71,12 @@ fn start(tmp: &Path, args: &[&str], env: &[(&str, &str)], sock: &Path) -> Daemon
     Daemon(child)
 }
 
+/// A config that never refuses a run for the night. Forecasts stay on but
+/// small: the default, 30 days x 16 seeds, runs in the tick before the
+/// first lever and takes tens of seconds in a debug build on a loaded CI
+/// runner; these tests time the daemon, not forecast throughput.
+const NEVER: &str = "nightly: never\nforecast: {days: 2, seeds: 2}\n";
+
 /// A venture whose lever is `lever` and whose report always reads 11,
 /// above its threshold of 10, so the lever runs at once.
 fn venture(parent: &Path, lever: &str) -> PathBuf {
@@ -99,7 +105,7 @@ fn venture(parent: &Path, lever: &str) -> PathBuf {
 fn adopted_home(tmp: &Path) -> (PathBuf, PathBuf) {
     let home = tmp.join("home");
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(home.join("config.yaml"), "nightly: never\n").unwrap();
+    std::fs::write(home.join("config.yaml"), NEVER).unwrap();
     let dir = venture(tmp, "exit 0");
     Kernel::open(&home).unwrap().add(&dir).unwrap();
     (home, dir)
@@ -242,7 +248,7 @@ fn f_reaches_the_warden() {
     // The home's config would refuse every run; the chosen one allows it.
     std::fs::write(home.join("config.yaml"), "nightly: banana\n").unwrap();
     let other = tmp.path().join("other.yaml");
-    std::fs::write(&other, "nightly: never\n").unwrap();
+    std::fs::write(&other, NEVER).unwrap();
     let sock = avsmd::kernel::socket_path(&home);
     let h = home.to_str().unwrap();
     let _d = start(
@@ -270,7 +276,7 @@ fn sigterm_during_a_lever_drains_within_the_bound_and_writes_its_outcome() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(home.join("config.yaml"), "nightly: never\n").unwrap();
+    std::fs::write(home.join("config.yaml"), NEVER).unwrap();
     let sock = avsmd::kernel::socket_path(&home);
     let h = home.to_str().unwrap();
     let mut daemon = start(tmp.path(), &["--home", h], &[], &sock);
@@ -299,7 +305,8 @@ fn sigterm_during_a_lever_drains_within_the_bound_and_writes_its_outcome() {
         }
         assert!(
             signalled.elapsed() < Duration::from_secs(20),
-            "avsmd still running 20 s after SIGTERM"
+            "avsmd still running 20 s after SIGTERM: {}",
+            std::fs::read_to_string(tmp.path().join("daemon.log")).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -399,7 +406,7 @@ fn doctor_passes_a_healthy_home_fails_a_broken_config_and_writes_nothing() {
         "{stdout}"
     );
     same(&before, &snapshot(tmp.path()));
-    std::fs::write(home.join("config.yaml"), "nightly: never\n").unwrap();
+    std::fs::write(home.join("config.yaml"), NEVER).unwrap();
 
     // Healthy and running.
     {
@@ -439,7 +446,7 @@ fn doctor_passes_a_healthy_home_fails_a_broken_config_and_writes_nothing() {
     }
 
     // A 1.0 home left behind is named, with the command that moves it.
-    std::fs::write(home.join("config.yaml"), "nightly: never\n").unwrap();
+    std::fs::write(home.join("config.yaml"), NEVER).unwrap();
     std::fs::create_dir_all(tmp.path().join(".avsm")).unwrap();
     let out = avsm(tmp.path(), &["--home", h, "doctor"]);
     let (stdout, _) = text(&out);

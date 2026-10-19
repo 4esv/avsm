@@ -24,6 +24,15 @@ fn avsm(home: &Path, args: &[&str]) -> (bool, String) {
     (out.status.success(), text)
 }
 
+/// A config that never refuses a run for the night. Forecasts stay on but
+/// small: the default, 30 days x 16 seeds, runs in the tick before the
+/// first lever and takes tens of seconds in a debug build on a loaded CI
+/// runner; these tests time the daemon, not forecast throughput.
+const NEVER: &str = "nightly: never\nforecast: {days: 2, seeds: 2}\n";
+
+/// Forecasts small, as in `NEVER`, the night left as it is.
+const SMALL_FORECASTS: &str = "forecast: {days: 2, seeds: 2}\n";
+
 struct Daemon(Child);
 
 impl Drop for Daemon {
@@ -38,7 +47,7 @@ fn start(home: &Path) -> Daemon {
         .arg("--home")
         .arg(home)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(home.with_extension("log")).unwrap())
         .spawn()
         .expect("spawn avsmd");
     let sock = avsmd::kernel::socket_path(home);
@@ -46,7 +55,8 @@ fn start(home: &Path) -> Daemon {
     while !avsmd::protocol::alive(&sock) {
         assert!(
             began.elapsed() < Duration::from_secs(20),
-            "avsmd did not start"
+            "avsmd did not start: {}",
+            std::fs::read_to_string(home.with_extension("log")).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -125,6 +135,8 @@ fn help_reads_plainly() {
 fn every_command_against_a_temp_ledger() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.yaml"), SMALL_FORECASTS).unwrap();
     let _daemon = start(&home);
     let run = |args: &[&str]| avsm(&home, args);
     let seq_of = |line: &str| -> String {
@@ -345,6 +357,8 @@ fn examples_counter_end_to_end() {
         std::fs::copy(src.join(name), dir.join(name)).unwrap();
     }
     std::fs::write(dir.join("count"), "10\n").unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.yaml"), SMALL_FORECASTS).unwrap();
     let _daemon = start(&home);
     let (ok, text) = avsm(&home, &["add", dir.to_str().unwrap()]);
     assert!(ok, "{text}");
@@ -402,7 +416,7 @@ fn propose_asks_and_approve_edit_over_the_socket() {
     std::fs::write(dir.join("report"), "#!/bin/sh\necho 3\n").unwrap();
     std::fs::set_permissions(dir.join("report"), std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(home.join("config.yaml"), "nightly: never\n").unwrap();
+    std::fs::write(home.join("config.yaml"), NEVER).unwrap();
     let _daemon = start(&home);
     let run = |args: &[&str]| avsm(&home, args);
     let (ok, text) = run(&["add", dir.to_str().unwrap()]);
