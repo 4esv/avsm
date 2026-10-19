@@ -866,3 +866,46 @@ fn an_approved_ask_for_a_lever_not_suspended_still_runs() {
     f.k.tick();
     assert!(f.dir.join("boosted").exists(), "{}", f.lines());
 }
+
+const DEPLOY: &str = "- {name: deploy, run: touch deployed, cap: 1/day, reversible: false}\n";
+
+fn deploy_asks(f: &Fixture) -> usize {
+    f.of(Kind::Ask)
+        .iter()
+        .filter(|e| e.record.action() == Some("deploy"))
+        .count()
+}
+
+/// Ask once, approve, run: the cap of one a day is then spent.
+fn spend_the_cap(f: &mut Fixture) {
+    f.report(10.0);
+    assert_eq!(deploy_asks(f), 1, "{}", f.lines());
+    let ask = f.of(Kind::Ask).pop().unwrap().seq;
+    f.k.approve(ask, None).unwrap();
+    f.k.tick();
+    assert!(f.dir.join("deployed").exists(), "{}", f.lines());
+}
+
+fn cap_refusals(f: &Fixture) -> usize {
+    f.of(Kind::Refusal)
+        .iter()
+        .filter(
+            |e| matches!(&e.record, Record::Refusal { reason, .. } if reason.contains("OverCap")),
+        )
+        .count()
+}
+
+#[test]
+fn a_proposal_for_a_lever_past_its_cap_is_refused_and_never_asked() {
+    let _c = clock();
+    let mut f = fixture(Setup {
+        levers: DEPLOY,
+        effects: &[("deploy", 20.0)],
+        extra: "calibration: 0.5\n",
+        ..Setup::default()
+    });
+    spend_the_cap(&mut f);
+    f.k.propose("shop", "deploy", None).unwrap();
+    assert_eq!(deploy_asks(&f), 1, "{}", f.lines());
+    assert!(cap_refusals(&f) > 0, "{}", f.lines());
+}
