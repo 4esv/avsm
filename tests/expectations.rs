@@ -308,6 +308,12 @@ fn a_reversible_lever_that_does_nothing_is_suspended_after_one_miss() {
     assert_eq!(f.intents(), 1, "50 more crossings, no more runs");
     assert_eq!(f.lever_asks().len(), 1, "one open ask, not fifty");
     assert_eq!(f.ineffective().len(), 1);
+    let asked = format!("{:?}", f.lever_asks()[0].record);
+    assert!(
+        asked.contains("suspended: true"),
+        "the refusal says why: {asked}"
+    );
+    assert!(!asked.contains("is irreversible"), "{asked}");
 }
 
 #[test]

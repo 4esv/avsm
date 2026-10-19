@@ -55,7 +55,7 @@ fn reason_key(r: &Reason) -> String {
         Reason::Hardwired { action, .. } => format!("Hardwired({action})"),
         Reason::Paused { venture } => format!("Paused({venture})"),
         Reason::OverCap { cap, .. } => format!("OverCap({cap})"),
-        Reason::NeedsDecision { action } => format!("NeedsDecision({action})"),
+        Reason::NeedsDecision { action, .. } => format!("NeedsDecision({action})"),
         Reason::NotJustified { action } => format!("NotJustified({action})"),
         Reason::OnlyInferred { .. } => "OnlyInferred".to_string(),
         Reason::UnknownRecord { seq } => format!("UnknownRecord({seq})"),

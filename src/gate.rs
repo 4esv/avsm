@@ -155,6 +155,9 @@ pub enum Reason {
     },
     NeedsDecision {
         action: String,
+        /// The lever was found ineffective: every run asks.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        suspended: bool,
     },
     NotJustified {
         action: String,
@@ -1204,7 +1207,10 @@ fn assemble<'a>(
             }
         }
         if p.needs_decision.iter().any(|(x, y)| x == v && y == a) {
-            reasons.push(Reason::NeedsDecision { action: a.clone() });
+            reasons.push(Reason::NeedsDecision {
+                action: a.clone(),
+                suspended: p.suspended.iter().any(|(x, y)| x == v && y == a),
+            });
         } else if !approved_by_code {
             reasons.push(Reason::NotJustified { action: a.clone() });
         }
@@ -1386,7 +1392,10 @@ fn assemble<'a>(
         reasons.push(Reason::NotJustified { action: a.clone() });
     }
     if p.needs_decision.iter().any(|(x, y)| x == v && y == a) {
-        reasons.push(Reason::NeedsDecision { action: a.clone() });
+        reasons.push(Reason::NeedsDecision {
+            action: a.clone(),
+            suspended: p.suspended.iter().any(|(x, y)| x == v && y == a),
+        });
     }
     if let Some(perm) = permitted {
         let used = p
@@ -1685,7 +1694,14 @@ impl fmt::Display for Reason {
             Reason::OverCap { used, cap } => {
                 write!(f, "the cap is {cap} and {used} are already used")
             }
-            Reason::NeedsDecision { action } => write!(
+            Reason::NeedsDecision {
+                action,
+                suspended: true,
+            } => write!(
+                f,
+                "{action} was found ineffective; each run needs a declared decision"
+            ),
+            Reason::NeedsDecision { action, .. } => write!(
                 f,
                 "{action} is irreversible and no declared decision approves it"
             ),
@@ -2897,6 +2913,7 @@ mod tests {
                 steps: vec![],
                 reasons: vec![Reason::NeedsDecision {
                     action: "deploy".into(),
+                    suspended: false,
                 }],
             }),
             payload: None,

@@ -1285,6 +1285,18 @@ impl Kernel {
                 } else if needs_human && !already {
                     let question = match &payload {
                         Some(_) => format!("may I {action} with this?{reason}"),
+                        None if refusal.reasons.iter().any(|r| {
+                            matches!(
+                                r,
+                                Reason::NeedsDecision {
+                                    suspended: true,
+                                    ..
+                                }
+                            )
+                        }) =>
+                        {
+                            format!("may I {action}? it was found ineffective{reason}")
+                        }
                         None => format!("may I {action}? it is irreversible{reason}"),
                     };
                     match self.append(Record::Ask {
