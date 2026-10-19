@@ -39,6 +39,13 @@ pub enum LedgerError {
     Tamper(#[from] Tamper),
 }
 
+/// Does the text a record is stored as read back as a record? Checked
+/// before anything is written: one unreadable row fails every later read.
+pub(crate) fn readable(record: &Record) -> Result<(), LedgerError> {
+    serde_json::from_str::<Record>(&record.canonical())?;
+    Ok(())
+}
+
 /// The table and the two triggers that make it append-only. Everything is
 /// `IF NOT EXISTS`, so opening an existing ledger runs it again harmlessly.
 const SCHEMA: &str = "
@@ -146,6 +153,8 @@ impl Ledger {
     /// The other process waits its turn, so two appends can never both
     /// chain to the same previous record.
     pub fn append_at(&mut self, record: Record, at: i64) -> Result<Entry, LedgerError> {
+        // A ledger must never store a record it cannot read.
+        readable(&record)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

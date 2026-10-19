@@ -325,14 +325,18 @@ pub enum Signal {
     /// but stop is refused until the reading is back inside.
     Guard {
         guard: String,
+        #[serde(with = "finite")]
         value: f64,
+        #[serde(with = "finite")]
         bound: f64,
     },
     /// The target improved over an audit's window while the audit worsened
     /// past its tolerance.
     Audit {
         audit: String,
+        #[serde(with = "finite")]
         target_delta: f64,
+        #[serde(with = "finite")]
         audit_delta: f64,
     },
     /// A report of the metric is not to be believed: the first of an
@@ -343,7 +347,9 @@ pub enum Signal {
     /// margins. The first report of an episode asks.
     Warning {
         metric: String,
+        #[serde(with = "finite")]
         variance_ratio: f64,
+        #[serde(with = "finite")]
         autocorrelation_rise: f64,
     },
     /// A forecast branch reached a wall: an irreversible delegation, a
@@ -360,7 +366,9 @@ pub enum Signal {
     /// levers can move it back, per day, computed in code.
     Capacity {
         metric: String,
+        #[serde(with = "finite")]
         drift: f64,
+        #[serde(with = "finite")]
         most: f64,
     },
 }
@@ -422,10 +430,15 @@ pub struct OptionForecast {
     pub metric: String,
     pub days: u32,
     pub seeds: u32,
+    #[serde(with = "finite")]
     pub p5: f64,
+    #[serde(with = "finite")]
     pub p50: f64,
+    #[serde(with = "finite")]
     pub p95: f64,
+    #[serde(with = "finite")]
     pub breach: f64,
+    #[serde(with = "finite")]
     pub spend: f64,
 }
 
@@ -493,11 +506,12 @@ pub enum Record {
         claim: Claim,
         venture: String,
         metric: String,
+        #[serde(default, with = "finite_opt")]
         value: Option<f64>,
         note: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "finite_opt")]
         confidence: Option<f64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cites: Vec<Seq>,
@@ -706,7 +720,9 @@ pub enum Record {
 pub struct Alternative {
     pub action: String,
     pub quantiles: Quantiles,
+    #[serde(with = "finite")]
     pub worst: f64,
+    #[serde(with = "finite")]
     pub propensity: f64,
 }
 
@@ -740,12 +756,19 @@ pub const MAX_VARIANT: usize = 200;
 /// The quantiles of a forecast: the 5th to the 95th percentile.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Quantiles {
+    #[serde(with = "finite")]
     pub p5: f64,
+    #[serde(with = "finite")]
     pub p10: f64,
+    #[serde(with = "finite")]
     pub p25: f64,
+    #[serde(with = "finite")]
     pub p50: f64,
+    #[serde(with = "finite")]
     pub p75: f64,
+    #[serde(with = "finite")]
     pub p90: f64,
+    #[serde(with = "finite")]
     pub p95: f64,
 }
 
@@ -784,6 +807,7 @@ impl Quantiles {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub name: String,
+    #[serde(with = "finite")]
     pub p: f64,
 }
 
@@ -1159,6 +1183,7 @@ pub struct Entry {
     /// Hash of this entry.
     pub hash: String,
     /// Trust weight. Unused in v0: trust is binary and this is always 1.
+    #[serde(with = "finite")]
     pub weight: f64,
     pub record: Record,
 }
@@ -1262,6 +1287,98 @@ pub fn verify_chain_from(seq: Seq, prev: &str, entries: &[Entry]) -> Result<(), 
         prev = e.hash.clone();
     }
     Ok(())
+}
+
+/// Serde for f64 fields. A finite number stays a plain JSON number, so
+/// stored text and hashes do not change. JSON has no infinity or NaN
+/// (serde_json writes null), so those are written as "inf", "-inf" and
+/// "nan", and read back as themselves. Reading also takes null, which
+/// older ledgers hold for these, as NaN.
+pub(crate) mod finite {
+    use serde::de::{self, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(x: &f64, s: S) -> Result<S::Ok, S::Error> {
+        if x.is_finite() {
+            s.serialize_f64(*x)
+        } else if x.is_nan() {
+            s.serialize_str("nan")
+        } else if *x > 0.0 {
+            s.serialize_str("inf")
+        } else {
+            s.serialize_str("-inf")
+        }
+    }
+
+    pub struct V;
+
+    impl Visitor<'_> for V {
+        type Value = f64;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a number, \"inf\", \"-inf\", \"nan\" or null")
+        }
+        fn visit_f64<E>(self, v: f64) -> Result<f64, E> {
+            Ok(v)
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+        fn visit_unit<E>(self) -> Result<f64, E> {
+            Ok(f64::NAN)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<f64, E> {
+            match v {
+                "inf" => Ok(f64::INFINITY),
+                "-inf" => Ok(f64::NEG_INFINITY),
+                "nan" => Ok(f64::NAN),
+                _ => Err(E::invalid_value(de::Unexpected::Str(v), &self)),
+            }
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        d.deserialize_any(V)
+    }
+}
+
+/// `finite` for Option<f64>: null is None, as it always was.
+mod finite_opt {
+    use serde::de::Visitor;
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(x: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+        match x {
+            None => s.serialize_none(),
+            Some(x) => super::finite::serialize(x, s),
+        }
+    }
+
+    struct V;
+
+    impl<'de> Visitor<'de> for V {
+        type Value = Option<f64>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a number, \"inf\", \"-inf\", \"nan\" or null")
+        }
+        fn visit_none<E>(self) -> Result<Option<f64>, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Option<f64>, E> {
+            Ok(None)
+        }
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Option<f64>, D::Error> {
+            super::finite::deserialize(d).map(Some)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        d.deserialize_option(V)
+    }
 }
 
 #[cfg(test)]

@@ -103,12 +103,14 @@ pub enum Step {
         seq: Seq,
         claim: Claim,
         metric: String,
+        #[serde(with = "crate::record::finite")]
         value: f64,
     },
     /// The threshold the report crosses: the mandate's, or the one the
     /// parent set with its `threshold` lever, cited as `from`.
     Threshold {
         metric: String,
+        #[serde(with = "crate::record::finite")]
         bound: f64,
         above: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,8 +238,10 @@ pub enum Reason {
     /// until it is back inside, whatever approves or calls for it.
     Guarded {
         guard: String,
+        #[serde(with = "crate::record::finite")]
         value: f64,
         above: bool,
+        #[serde(with = "crate::record::finite")]
         bound: f64,
     },
 }

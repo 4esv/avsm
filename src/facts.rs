@@ -15,8 +15,11 @@ const DECIMALS: f64 = 1e6;
 /// declared readings only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetricFacts {
+    #[serde(with = "crate::record::finite")]
     pub last: f64,
+    #[serde(with = "crate::record::finite")]
     pub min: f64,
+    #[serde(with = "crate::record::finite")]
     pub max: f64,
     /// How many plausible readings the span held.
     pub readings: u32,
