@@ -190,6 +190,13 @@ impl Warden for LocalWarden {
             .permitted(action)
             .ok_or_else(|| format!("{venture} does not permit {action}"))?;
         let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
+        // The schema comes first, as at action time: a payload that misses
+        // it is the schema's to refuse then, not the check's now.
+        if let Some(fields) = &perm.fields {
+            if payload_schema(fields, payload).is_err() {
+                return Ok(());
+            }
+        }
         match &perm.check {
             Some(check) => payload_check(&self.home, &dir, check, payload, index, venture),
             None => Ok(()),
