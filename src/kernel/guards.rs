@@ -20,6 +20,10 @@
 //! max_step: the third re-anchors, so a sensor that was stuck and then
 //! reads the truth is not locked out forever. A declared approval of the
 //! ask vouches for one reading, the anchor; its repeats are still checked.
+//! With max_step, a reading right after an implausible one is unconfirmed,
+//! marked like one and never a premise, until the next reading agrees with
+//! it within max_step (not by an exact repeat where the metric varies); a
+//! re-anchor needs no more. `confirm: false` opts a reading out.
 //!
 //! Stuck, away from a bound of its range: a reading exactly equal to the
 //! readings before it, when the metric's own plausible history says so
@@ -350,6 +354,54 @@ fn vouches(index: &Index, e: &Entry, venture: &str, metric: &str) -> bool {
     })
 }
 
+/// Why a reading code would otherwise believe is unconfirmed, if it is:
+/// the report just before it, `last`, is implausible and no declared
+/// approval since vouches for it. One that is itself unconfirmed is
+/// confirmed by this reading when the two agree within max_step `s`;
+/// where the metric varies, an exact repeat away from a bound of the
+/// range is a stuck sensor's and never confirms. A flap's first reading
+/// back is never a premise; the one after it, agreeing, is.
+#[allow(clippy::too_many_arguments)]
+fn unconfirmed(
+    index: &Index,
+    venture: &str,
+    metric: &str,
+    last: &Entry,
+    x: f64,
+    s: f64,
+    range: Option<[f64; 2]>,
+    varies: bool,
+) -> Option<String> {
+    let Record::Report {
+        value, implausible, ..
+    } = &last.record
+    else {
+        return None;
+    };
+    let why = implausible.as_deref()?;
+    let vouched = index
+        .of(venture)
+        .rev()
+        .take_while(|e| e.seq > last.seq)
+        .any(|e| vouches(index, e, venture, metric));
+    if vouched {
+        return None;
+    }
+    let bound = range.is_some_and(|[lo, hi]| x == lo || x == hi);
+    if let Some(prev) = value.filter(|_| why.starts_with(UNCONFIRMED)) {
+        let repeat = x == prev && varies && !bound;
+        if (x - prev).abs() <= s && !repeat {
+            return None;
+        }
+    }
+    Some(format!(
+        "{UNCONFIRMED}: {x} follows an implausible reading; it is a premise once the next agrees with it within max_step {s}"
+    ))
+}
+
+/// How the why of an unconfirmed reading begins.
+pub const UNCONFIRMED: &str = "unconfirmed";
+
 /// The latest `n` readings a step is measured from, oldest first: the
 /// plausible ones, where the latest reading before the latest declared
 /// approval of an implausible ask about the metric counts as one of them,
@@ -498,6 +550,7 @@ impl Kernel {
         value: Option<f64>,
         range: Option<[f64; 2]>,
         max_step: Option<f64>,
+        confirm: bool,
     ) -> (Option<String>, bool) {
         let Ok(index) = self.index() else {
             return (None, false);
@@ -551,15 +604,26 @@ impl Kernel {
                 history,
             },
         );
-        let fresh = reports(&index, venture, metric)
-            .next()
-            .is_none_or(|e| e.record.implausible().is_none());
+        let last = reports(&index, venture, metric).next();
+        let why = why.or_else(|| {
+            let x = value?;
+            let s = max_step.filter(|_| confirm)?;
+            // Believed past max_step from the last plausible reading, it
+            // re-anchored: AGREE readings agree, the confirmation already.
+            if before.last().is_some_and(|p| (x - p).abs() > s) {
+                return None;
+            }
+            let varies = median_step(&before) > 0.0;
+            unconfirmed(&index, venture, metric, last?, x, s, range, varies)
+        });
+        let fresh = last.is_none_or(|e| e.record.implausible().is_none());
         (why, fresh)
     }
 
     /// Write a guard's or an audit's reading as a measured report, marked
     /// when it is implausible. Returns the entry, and why when the reading
     /// starts an episode of implausible ones.
+    #[allow(clippy::too_many_arguments)]
     fn write_reading(
         &mut self,
         v: &Venture,
@@ -568,8 +632,9 @@ impl Kernel {
         note: &str,
         range: Option<[f64; 2]>,
         max_step: Option<f64>,
+        confirm: bool,
     ) -> Option<(Entry, Option<String>)> {
-        let (why, fresh) = self.doubt(&v.name, metric, value, range, max_step);
+        let (why, fresh) = self.doubt(&v.name, metric, value, range, max_step, confirm);
         let mut record = Record::report(
             Claim::Measured,
             &v.name,
@@ -635,7 +700,7 @@ impl Kernel {
                 },
             };
             if let Some((e, why)) =
-                self.write_reading(v, &metric, value, &note, g.range, g.max_step)
+                self.write_reading(v, &metric, value, &note, g.range, g.max_step, g.confirm)
             {
                 doubts.extend(why.map(|w| (metric, w)));
                 out.push((g, e));
@@ -648,7 +713,7 @@ impl Kernel {
                 Err(e) => (None, format!("cannot read: {e}")),
             };
             if let Some((_, why)) =
-                self.write_reading(v, &metric, value, &note, a.range, a.max_step)
+                self.write_reading(v, &metric, value, &note, a.range, a.max_step, a.confirm)
             {
                 doubts.extend(why.map(|w| (metric, w)));
             }

@@ -628,7 +628,10 @@ fn implausible_reports_are_kept_never_a_premise_and_ask_once_an_episode() {
         assert_eq!(implausible(&k), 1, "{what}: once an episode");
         // A plausible report ends the episode; the next implausible one
         // starts another, which asks only once the first is answered.
+        // The first report back is unconfirmed, still the episode; the
+        // next, agreeing, confirms it.
         report(&mut k, &dir, "counter", "5");
+        report(&mut k, &dir, "counter", "6");
         let first = signals(&k, |s| matches!(s, Signal::Implausible { .. }))[0].seq;
         k.deny(first, "seen").unwrap();
         report(&mut k, &dir, "counter", "FAIL");
@@ -1038,7 +1041,12 @@ fn a_single_absurd_spike_stays_implausible() {
         f[3].as_deref().is_some_and(|w| w.contains("max_step")),
         "{f:?}"
     );
-    assert_eq!(f[4], None, "{f:?}");
+    // The reading back is unconfirmed until the next agrees with it.
+    assert!(
+        f[4].as_deref()
+            .is_some_and(|w| w.starts_with("unconfirmed")),
+        "{f:?}"
+    );
     assert_eq!(count(&k, Kind::Intent, "reset"), 0);
 }
 
@@ -1120,7 +1128,12 @@ fn an_implausible_guard_reading_never_clears_a_breach() {
     }
     assert_eq!(implausible_asks(&k, "guard.soil"), 1);
     // Back inside, plausibly: the breach clears, and no second guard ask.
+    // The first reading back is unconfirmed and clears nothing; the next,
+    // agreeing, does.
     set(&dir, "soil", "30");
+    report(&mut k, &dir, "shop", "5");
+    assert_eq!(state(&k, "shop"), State::Guarded, "unconfirmed");
+    set(&dir, "soil", "31");
     report(&mut k, &dir, "shop", "5");
     k.propose("shop", "tidy", None).unwrap();
     assert!(dir.join("tidied").exists(), "back inside, the lever runs");

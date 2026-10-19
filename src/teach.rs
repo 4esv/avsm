@@ -324,6 +324,12 @@ pub fn render(m: &Mandate) -> String {
             m.metric_name(),
             num(s)
         ));
+        if !m.confirm {
+            line(format!(
+                "confirm: off; a report of {} right after an implausible one is acted on at once",
+                m.metric_name()
+            ));
+        }
     }
     if let Some(w) = &m.world {
         line(format!(

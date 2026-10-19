@@ -79,6 +79,12 @@ pub struct Mandate {
     /// The largest plausible change from one report to the next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_step: Option<f64>,
+    /// With max_step: a plausible report right after an implausible one
+    /// is unconfirmed, never a premise, until the next agrees with it
+    /// within max_step. False lets it act at once, where waiting costs
+    /// more than a misreading.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub confirm: bool,
     /// A world model: a command run in the venture directory that steps
     /// the venture's world forward, a JSON state in and a JSON state with
     /// the metric out. What it says is inferred: it ranks, vetoes and
@@ -233,6 +239,10 @@ pub struct Guard {
     /// The largest plausible change from one reading to the next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_step: Option<f64>,
+    /// With max_step: a reading right after an implausible one waits for
+    /// the next to agree with it. False lets it count at once.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub confirm: bool,
     /// The one lever, with the one payload, the kernel runs when the guard
     /// trips: a delegation of exactly that payload, declared here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -370,6 +380,19 @@ pub struct Audit {
     /// The largest plausible change from one reading to the next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_step: Option<f64>,
+    /// With max_step: a reading right after an implausible one waits for
+    /// the next to agree with it. False lets it count at once.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub confirm: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 fn is_up(w: &Worse) -> bool {
@@ -1031,6 +1054,7 @@ const FIELDS: &[&str] = &[
     "audits",
     "range",
     "max_step",
+    "confirm",
     "escalate",
     "world",
     "calibration",
@@ -1040,7 +1064,7 @@ const FIELDS: &[&str] = &[
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadband", "hold"];
 const GUARD_FIELDS: &[&str] = &[
     "name", "run", "adapter", "above", "below", "then", "drawdown", "of", "range", "max_step",
-    "unwind",
+    "confirm", "unwind",
 ];
 const UNWIND_FIELDS: &[&str] = &["action", "payload"];
 const AUDIT_FIELDS: &[&str] = &[
@@ -1053,6 +1077,7 @@ const AUDIT_FIELDS: &[&str] = &[
     "window",
     "range",
     "max_step",
+    "confirm",
 ];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
 const PLAN_FIELDS: &[&str] = &[
@@ -1786,6 +1811,7 @@ impl Mandate {
             audits: vec![],
             range: None,
             max_step: None,
+            confirm: true,
             escalate: None,
             world: None,
             calibration: None,
@@ -2123,6 +2149,15 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
         Some(other) => {
             return fail(format!(
                 "max_step is a number like 50, the largest plausible change between two reports, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match map.get("confirm") {
+        None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+        Some(other) => {
+            return fail(format!(
+                "confirm is true or false: whether a report right after an implausible one waits for the next to agree, not {}",
                 describe(other)
             ))
         }
@@ -3168,11 +3203,29 @@ max_step: 5000
     }
 
     #[test]
+    fn confirm_defaults_on_turns_off_only_by_a_human_and_is_a_limit() {
+        let on = Mandate::parse(&(VALID.to_string() + "max_step: 5\n")).unwrap();
+        assert!(on.confirm);
+        let text = VALID.to_string()
+            + "max_step: 5\nconfirm: false\nguards:\n  - {name: g, run: ./g, above: 1, max_step: 2, confirm: false}\naudits:\n  - {name: a, run: ./a, worse: up, max_step: 2, confirm: false}\n";
+        let off = Mandate::parse(&text).unwrap();
+        assert!(!off.confirm && !off.guards[0].confirm && !off.audits[0].confirm);
+        // Waiting is a guard: turning it off, or on, is a limit edit,
+        // never the improving loop's.
+        assert_eq!(edits_limits(&on, &off).as_deref(), Some("audits"));
+        let mut only = on.clone();
+        only.confirm = false;
+        assert_eq!(edits_limits(&on, &only).as_deref(), Some("confirm"));
+        assert_eq!(edits_limits(&only, &on).as_deref(), Some("confirm"));
+        assert!(fails(&(VALID.to_string() + "confirm: maybe\n")).contains("true or false"));
+    }
+
+    #[test]
     fn unknown_field_is_named_with_the_known_ones() {
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step, escalate, world, calibration, early_warning, better"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step, confirm, escalate, world, calibration, early_warning, better"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");

@@ -84,6 +84,7 @@ fn valid_fixture_parses_field_by_field() {
         audits: vec![],
         range: None,
         max_step: None,
+        confirm: true,
         escalate: None,
         world: None,
         calibration: None,

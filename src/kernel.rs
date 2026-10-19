@@ -1540,8 +1540,14 @@ impl Kernel {
         // A reading code does not believe is kept, marked, and never a
         // premise; the first of an episode asks.
         let metric = v.mandate.metric_name().to_string();
-        let (implausible, fresh) =
-            self.doubt(name, &metric, value, v.mandate.range, v.mandate.max_step);
+        let (implausible, fresh) = self.doubt(
+            name,
+            &metric,
+            value,
+            v.mandate.range,
+            v.mandate.max_step,
+            v.mandate.confirm,
+        );
         let entry = match self.append(Record::Report {
             claim: Claim::Measured,
             venture: name.to_string(),

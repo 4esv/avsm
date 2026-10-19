@@ -123,7 +123,10 @@ set) while the audit gets worse by more than its tolerance. The metric improves
 going up unless the audit says `better: down`, as for unread mail. No model ever sees
 an audit reading. A report outside `range`, a step past `max_step`, a flap, a
 NaN or a failed report is kept, marked implausible, never acted on, and asks
-once until a plausible report comes. On a threshold, `deadband: 2` acts once
+once until a plausible report comes. With `max_step`, the report right after an
+implausible one is unconfirmed: kept and shown, never acted on, until the next
+agrees with it within `max_step`; `confirm: false` on the mandate, a guard or an
+audit acts on it at once, where waiting costs more than a misreading. On a threshold, `deadband: 2` acts once
 and again only after the metric comes back past the bound by 2; `hold: 3` acts
 after three crossed reports in a row.
 

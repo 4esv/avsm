@@ -194,6 +194,7 @@ pub fn canary() -> Result<(), String> {
         audits: vec![],
         range: None,
         max_step: None,
+        confirm: true,
         escalate: None,
         world: None,
         calibration: None,

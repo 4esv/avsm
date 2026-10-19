@@ -662,12 +662,20 @@ fn a_sensor_that_recovers_never_suspends_a_lever_that_ran_while_it_was_stuck() {
         f.flags()
     );
     // Back, and lower than before the runs: judged across the stuck
-    // readings, that would be the wrong direction.
+    // readings, that would be the wrong direction. The first reading
+    // back is unconfirmed; the next agrees and confirms it.
     for v in [40.0, 41.0, 42.0] {
         f.report(v);
     }
     assert!(
-        f.flags()[11..].iter().all(Option::is_none),
+        f.flags()[11]
+            .as_deref()
+            .is_some_and(|w| w.starts_with("unconfirmed")),
+        "{:?}",
+        f.flags()
+    );
+    assert!(
+        f.flags()[12..].iter().all(Option::is_none),
         "{:?}",
         f.flags()
     );
@@ -786,15 +794,117 @@ fn a_reading_stuck_after_a_run_is_no_effect_and_never_lets_it_run_again() {
         "{:?}",
         f.ineffective()
     );
-    // Another sensor event, plausible and different, crosses the threshold.
+    // Another sensor event, plausible and different, crosses the
+    // threshold: unconfirmed after the stuck reading, then confirmed.
     f.report(25.0);
     f.report_tomorrow(22.0);
     assert!(
-        f.flags()[7..].iter().all(Option::is_none),
+        f.flags()[7]
+            .as_deref()
+            .is_some_and(|w| w.starts_with("unconfirmed")),
         "{:?}",
         f.flags()
     );
+    assert_eq!(f.flags()[8], None, "{:?}", f.flags());
     assert_eq!(f.intents(), 1, "suspended: not run again");
     assert!(f.lever_asks().is_empty(), "{:?}", f.lever_asks());
     assert!(f.suspended_refusals() > 0, "the refusal is a record");
+}
+
+/// The tomato with this extra line in its mandate head.
+fn tomato_with(extra: &str) -> Fixture {
+    fixture_in(
+        &format!(
+            "controller: {{kind: threshold, below: 35, action: boost}}\ncadence: 1h\n\
+             range: [0, 100]\nmax_step: 30\n{extra}"
+        ),
+        "{name: boost, run: echo boost >> boosts, cap: 99/day, reversible: true, \
+         delegated: true, expects: up 5 within 1}",
+    )
+}
+
+/// Above the threshold, then a flap: 95, rejected, and back to 34, a
+/// small step from the 36 before it that crosses the threshold.
+fn flap(f: &mut Fixture) {
+    for v in [40.0, 42.0, 41.0, 38.0, 36.0] {
+        f.report(v);
+    }
+    assert_eq!(f.intents(), 0);
+    f.report(95.0);
+    f.report(34.0);
+}
+
+#[test]
+fn the_first_reading_back_from_a_flap_is_never_a_premise() {
+    let _c = clock();
+    let mut f = tomato();
+    flap(&mut f);
+    let flags = f.flags();
+    assert!(
+        flags[6]
+            .as_deref()
+            .is_some_and(|w| w.starts_with("unconfirmed")),
+        "{flags:?}"
+    );
+    assert_eq!(f.intents(), 0, "34 after a rejected 95 waits for the next");
+    // Another implausible one keeps it unconfirmed, and so on.
+    f.report(95.0);
+    f.report(34.0);
+    assert!(
+        f.flags()[7..].iter().all(Option::is_some),
+        "{:?}",
+        f.flags()
+    );
+    assert_eq!(f.intents(), 0);
+}
+
+#[test]
+fn a_second_reading_that_agrees_confirms_the_first_and_acts() {
+    let _c = clock();
+    let mut f = tomato();
+    flap(&mut f);
+    assert_eq!(f.intents(), 0);
+    f.report(33.5); // within max_step of 34: confirmed, a premise
+    assert_eq!(f.flags()[7], None, "{:?}", f.flags());
+    assert_eq!(f.intents(), 1, "the confirmed reading crosses and acts");
+}
+
+#[test]
+fn an_exact_repeat_or_a_far_reading_never_confirms() {
+    let _c = clock();
+    let mut f = tomato();
+    flap(&mut f);
+    f.report(34.0); // the same exactly: a stuck sensor's, no confirmation
+    assert!(f.flags()[7].is_some(), "{:?}", f.flags());
+    assert_eq!(f.intents(), 0);
+    // Far from the unconfirmed reading, though near the last plausible
+    // one: no confirmation either.
+    let mut g = tomato();
+    for v in [40.0, 42.0, 41.0, 38.0, 36.0] {
+        g.report(v);
+    }
+    g.report(f64::NAN);
+    g.report(10.0); // after a missing reading: unconfirmed
+    g.report(60.0); // 24 from 36, 50 from 10
+    let flags = g.flags();
+    assert!(
+        flags[5..].iter().all(|w| w.as_deref().is_some()),
+        "{flags:?}"
+    );
+    assert!(
+        flags[7]
+            .as_deref()
+            .is_some_and(|w| w.starts_with("unconfirmed")),
+        "{flags:?}"
+    );
+    assert_eq!(g.intents(), 0);
+}
+
+#[test]
+fn confirm_false_lets_the_first_reading_back_act() {
+    let _c = clock();
+    let mut f = tomato_with("confirm: false\n");
+    flap(&mut f);
+    assert_eq!(f.flags()[6], None, "{:?}", f.flags());
+    assert_eq!(f.intents(), 1, "hesitating is the costlier choice here");
 }
