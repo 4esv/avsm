@@ -61,6 +61,7 @@ impl Fx {
 
     fn signal(&mut self, claim: Claim, question: &str, signal: Option<Signal>) -> u64 {
         self.put(Record::Ask {
+            packet: None,
             cites: vec![],
             claim,
             venture: V.to_string(),
@@ -409,6 +410,7 @@ fn venture(parent: &Path, name: &str) -> PathBuf {
 
 fn ask(k: &mut Kernel, venture: &str, signal: Signal) {
     k.append(Record::Ask {
+        packet: None,
         cites: vec![],
         claim: Claim::Measured,
         venture: venture.to_string(),

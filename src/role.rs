@@ -551,6 +551,7 @@ pub fn read_reply(ctx: &Context, reply: &str) -> Result<Vec<Record>, String> {
         question,
         refusal: None,
         signal: None,
+        packet: None,
         payload,
     };
     let choose = |r: Reply| -> Result<Record, String> {
@@ -791,6 +792,7 @@ mod tests {
         let ask = entry(
             8,
             Record::Ask {
+                packet: None,
                 cites: vec![],
                 claim: Claim::Measured,
                 venture: "shop".into(),
@@ -843,6 +845,7 @@ mod tests {
                 question: "refund order 7?".into(),
                 refusal: None,
                 signal: None,
+                packet: None,
                 payload: None,
             },
         )];

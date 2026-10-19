@@ -139,6 +139,8 @@ impl Kernel {
                 let question = format!(
                     "{lever} is ineffective, so it asks each time again: {why}; approve to delegate it again"
                 );
+                let signal = Signal::Ineffective { action: lever, why };
+                let packet = self.signal_packet(venture, &signal);
                 match self.append(Record::Ask {
                     cites: vec![],
                     claim: Claim::Measured,
@@ -147,7 +149,8 @@ impl Kernel {
                     question,
                     refusal: None,
                     payload: None,
-                    signal: Some(Signal::Ineffective { action: lever, why }),
+                    signal: Some(signal),
+                    packet,
                 }) {
                     Ok(e) => log(&e.line()),
                     Err(e) => log(&format!("{venture}: cannot write ask: {e}")),

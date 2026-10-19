@@ -278,6 +278,11 @@ impl Kernel {
         if already {
             return;
         }
+        let signal = Signal::Saturated {
+            action: lever.to_string(),
+            reason: last.detail,
+        };
+        let packet = self.signal_packet(venture, &signal);
         match self.append(Record::Ask {
             cites: vec![],
             claim: Claim::Measured,
@@ -286,10 +291,8 @@ impl Kernel {
             question,
             refusal: None,
             payload: None,
-            signal: Some(Signal::Saturated {
-                action: lever.to_string(),
-                reason: last.detail,
-            }),
+            signal: Some(signal),
+            packet,
         }) {
             Ok(e) => log(&e.line()),
             Err(e) => log(&format!("{venture}: cannot write ask: {e}")),

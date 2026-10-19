@@ -105,6 +105,7 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
         proposal("shop", "deploy"),
         proposal("shop", "wipe"),
         Record::Ask {
+            packet: None,
             cites: vec![],
             claim: Claim::Inferred,
             venture: "shop".into(),
@@ -168,7 +169,14 @@ fn one_full_cycle_with_a_fake_role_and_a_shell_venture() {
             .nth(1),
         Some("asking")
     );
-    assert_eq!(k.asks().unwrap().lines().count(), 2);
+    assert_eq!(
+        k.asks()
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with('#'))
+            .count(),
+        2
+    );
 
     // The proof behind the action cites the proposal as occasion only.
     let why = k.why(4).unwrap();

@@ -1193,6 +1193,12 @@ pub fn asks(index: &Index, outcome: &Outcome, seqs: &BTreeMap<String, Vec<Seq>>)
         }
         question
             .push_str("  the forecast is inferred and authorizes nothing; avsm asks on its own");
+        let signal = Signal::Forecast {
+            wall: first.kind.clone(),
+            metric: first.metric.clone(),
+            envelope,
+            days: first.days.clone(),
+        };
         out.push(Record::Ask {
             claim: Claim::Measured,
             venture: venture.to_string(),
@@ -1200,12 +1206,13 @@ pub fn asks(index: &Index, outcome: &Outcome, seqs: &BTreeMap<String, Vec<Seq>>)
             question,
             refusal: None,
             payload: None,
-            signal: Some(Signal::Forecast {
-                wall: first.kind.clone(),
-                metric: first.metric.clone(),
-                envelope,
-                days: first.days.clone(),
-            }),
+            packet: Some(crate::packet::signal_packet(
+                index,
+                venture,
+                &signal,
+                &first.metric,
+            )),
+            signal: Some(signal),
             cites: seqs.get(venture).cloned().unwrap_or_default(),
         });
     }

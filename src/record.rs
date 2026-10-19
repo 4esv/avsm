@@ -383,6 +383,97 @@ impl Signal {
     }
 }
 
+/// What a human is given to answer an ask: the measured and declared
+/// records it rests on, the options with what each leads to, and last, the
+/// model's reason, which is inferred. Built by code, never by a model.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Packet {
+    pub premises: Vec<Premise>,
+    pub options: Vec<PacketOption>,
+    /// The model's reason, if a model gave one. Always inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A measured or declared record an ask rests on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Premise {
+    pub seq: Seq,
+    pub claim: Claim,
+    pub summary: String,
+}
+
+/// One way to answer: `approve`, `deny`, or `approve with edit`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PacketOption {
+    pub name: String,
+    /// A short forecast of this option, when forecasts are on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<OptionForecast>,
+    /// The lever's cost, and the cap or budget left after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<String>,
+}
+
+/// What a short forecast of one option found: the target's p5, p50 and p95
+/// at the horizon, the chance a guard is breached, and the spend (p50).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OptionForecast {
+    pub metric: String,
+    pub days: u32,
+    pub seeds: u32,
+    pub p5: f64,
+    pub p50: f64,
+    pub p95: f64,
+    pub breach: f64,
+    pub spend: f64,
+}
+
+/// The line every packet ends with.
+pub const UNANSWERED: &str = "Unanswered means no.";
+
+impl Packet {
+    /// The packet as a human reads it: premises, then options, then the
+    /// reason labeled inferred, then the last line.
+    pub fn render(&self) -> String {
+        let mut out = String::from("  premises:\n");
+        if self.premises.is_empty() {
+            out.push_str("    none\n");
+        }
+        for p in &self.premises {
+            out.push_str(&format!("    #{} {}: {}\n", p.seq, p.claim, p.summary));
+        }
+        out.push_str("  options:\n");
+        for o in &self.options {
+            let forecast = match &o.forecast {
+                Some(f) => format!(
+                    "{} p5 {} p50 {} p95 {} over {}d x {} seeds, guard breach {:.0}%, spend {}",
+                    f.metric,
+                    f.p5,
+                    f.p50,
+                    f.p95,
+                    f.days,
+                    f.seeds,
+                    f.breach * 100.0,
+                    f.spend
+                ),
+                None => "no forecast".to_string(),
+            };
+            out.push_str(&format!("    {}: {forecast}", o.name));
+            if let Some(c) = &o.cost {
+                out.push_str(&format!("; {c}"));
+            }
+            out.push('\n');
+        }
+        if let Some(r) = &self.reason {
+            out.push_str(&format!("  reason (inferred): {}\n", first_line(r)));
+        }
+        out.push_str(UNANSWERED);
+        out.push('\n');
+        out
+    }
+}
+
 /// The first day a policy's branches hit a wall, if any did.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PolicyDay {
@@ -463,6 +554,10 @@ pub enum Record {
         /// second backend made.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cites: Vec<Seq>,
+        /// What a human needs to answer: premises, options, reason. Built
+        /// by code when the ask is written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        packet: Option<Packet>,
     },
     /// A human's verdict. `by` names the human when the record came in
     /// over a path that knows who they are.
@@ -881,6 +976,12 @@ impl Record {
                     format!("  {detail}")
                 }
             ),
+            // A canary ask reads like any other: its lever is not shown.
+            Record::Ask {
+                action: Some(a),
+                question,
+                ..
+            } if a == crate::gate::CANARY => question.clone(),
             Record::Ask {
                 action: Some(a),
                 question,

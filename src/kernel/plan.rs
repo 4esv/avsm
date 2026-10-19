@@ -344,7 +344,15 @@ impl Kernel {
                                     false,
                                 );
                             } else {
+                                let packet = self.packet(
+                                    name,
+                                    action.as_deref(),
+                                    &[],
+                                    Some(question.clone()),
+                                    payload.is_some(),
+                                );
                                 match self.append(Record::Ask {
+                                    packet,
                                     claim: Claim::Inferred,
                                     venture: name.to_string(),
                                     action,

@@ -345,7 +345,11 @@ fn shared_quotas_are_refused_before_the_gate_and_shown_in_why() {
         k.propose("shop", lever, None).unwrap();
     }
     let asks = k.asks().unwrap();
-    assert_eq!(asks.lines().count(), 2, "{asks}");
+    assert_eq!(
+        asks.lines().filter(|l| l.starts_with('#')).count(),
+        2,
+        "{asks}"
+    );
     assert!(
         asks.contains("w1?") && asks.contains("w2?") && !asks.contains("w3?"),
         "{asks}"

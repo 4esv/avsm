@@ -312,6 +312,7 @@ fn record(op: &Op, n: u64) -> Record {
             payload,
         },
         Op::Ask(venture, action, claim, payload) => Record::Ask {
+            packet: None,
             cites: vec![],
             claim,
             venture,
@@ -322,6 +323,7 @@ fn record(op: &Op, n: u64) -> Record {
             payload,
         },
         Op::Signalled(venture, claim, k) => Record::Ask {
+            packet: None,
             cites: vec![],
             claim,
             venture,
@@ -662,6 +664,7 @@ fn build(case: &Case) -> (Ledger, Index, Vec<Adopted>, i64) {
                 let ask = ledger
                     .append_at(
                         Record::Ask {
+                            packet: None,
                             cites: vec![],
                             claim: *claim,
                             venture: venture.clone(),

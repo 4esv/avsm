@@ -262,7 +262,9 @@ impl Kernel {
                 Some(m) => format!("a mean skill of {m:.3} over {n} scores"),
                 None => "no scores yet".to_string(),
             };
+            let packet = self.packet(venture, Some(best), &cites, None, payload.is_some());
             match self.append(Record::Ask {
+                packet,
                 claim: Claim::Measured,
                 venture: venture.to_string(),
                 action: Some(best.clone()),

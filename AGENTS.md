@@ -13,6 +13,8 @@ Use these words and no synonyms.
 - ledger, gate, proof, adapter, canary, warden, guard, audit, world, plan
 - parent, child, payload, adapter (built-in metric or lever), digest, know, expects
 - escalate, escalation (the `escalate:` backend asked when the first cannot answer)
+- packet (premises, options, reason: what an ask carries for the human, built by code)
+- canary is the self venture's check that the gate still refuses what it must. A canary ask is a different thing: an ask that can never run, written every n asks (`canary_asks`) to measure whether the human reads what they approve. Say "canary ask", never "canary" alone, for it.
 - Commands: start, add, status, tail, asks, approve, deny, pause, resume, why, know, propose, digest, forecast
 
 ## Non-negotiables

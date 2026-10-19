@@ -58,6 +58,20 @@ pub struct Config {
     /// and by the `forecast` lever look.
     #[serde(default)]
     pub forecast: Forecast,
+    /// Off when absent. When set, a canary ask goes out after every this
+    /// many real asks: an ask that can never run, whose content is
+    /// plausibly wrong, to measure whether the human reads what they
+    /// approve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary_asks: Option<CanaryAsks>,
+}
+
+/// `canary_asks:` in config.yaml.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryAsks {
+    /// One canary ask after this many asks.
+    pub every: u32,
 }
 
 fn default_ratchet() -> u32 {
@@ -197,6 +211,7 @@ impl Default for Config {
             quotas: Quotas::default(),
             ratchet: default_ratchet(),
             forecast: Forecast::default(),
+            canary_asks: None,
         }
     }
 }
@@ -270,6 +285,9 @@ impl Config {
     pub fn parse(text: &str) -> Result<Config, String> {
         let config: Config = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
         config.nightly_minutes()?;
+        if config.canary_asks.is_some_and(|c| c.every == 0) {
+            return Err("canary_asks.every is 1 or more asks".to_string());
+        }
         if !(1..=crate::forecast::MAX_DAYS).contains(&config.forecast.days) {
             return Err(format!(
                 "forecast.days is 1 to {}, not {}",

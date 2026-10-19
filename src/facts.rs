@@ -167,6 +167,7 @@ mod tests {
             closes: None,
         };
         let ask = || Record::Ask {
+            packet: None,
             claim: Claim::Inferred,
             venture: "shop".into(),
             action: None,

@@ -426,6 +426,7 @@ mod tests {
             )
                 .prop_map(
                     |(claim, venture, action, question, refusal, payload, signal)| Record::Ask {
+                        packet: None,
                         cites: vec![],
                         claim,
                         venture,

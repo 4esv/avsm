@@ -121,6 +121,7 @@ fn fields(e: &Entry) -> (&str, &str, u32, Option<Seq>) {
 
 fn spent_ask(venture: &str) -> Record {
     Record::Ask {
+        packet: None,
         cites: vec![],
         claim: Claim::Inferred,
         venture: venture.into(),

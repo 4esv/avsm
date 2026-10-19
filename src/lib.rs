@@ -14,6 +14,7 @@ pub mod index;
 pub mod kernel;
 pub mod ledger;
 pub mod mandate;
+pub mod packet;
 pub mod pbo;
 pub mod plan;
 pub mod protocol;

@@ -155,6 +155,13 @@ impl Kernel {
                     payload,
                     ..
                 } => Record::Ask {
+                    packet: self.packet(
+                        venture,
+                        action.as_deref(),
+                        &[started.seq],
+                        Some(question.clone()),
+                        payload.is_some(),
+                    ),
                     cites: vec![started.seq],
                     claim: Claim::Inferred,
                     venture: venture.to_string(),

@@ -221,6 +221,7 @@ impl Kernel {
         if already {
             return;
         }
+        let packet = self.signal_packet(venture, &signal);
         match self.append(Record::Ask {
             cites: vec![],
             claim: Claim::Measured,
@@ -230,6 +231,7 @@ impl Kernel {
             refusal: None,
             payload: None,
             signal: Some(signal),
+            packet,
         }) {
             Ok(e) => log(&e.line()),
             Err(e) => log(&format!("{venture}: cannot write ask: {e}")),

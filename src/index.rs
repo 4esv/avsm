@@ -21,6 +21,13 @@ pub const EXPECTATION: &str = "expectation";
 /// `calibration.<model>`.
 pub const CALIBRATION: &str = "calibration.";
 
+/// The metric of the measured report that marks a canary ask answered.
+pub const CANARY: &str = "canary";
+
+/// Who approved when the decision came in over the socket, which knows
+/// nobody.
+pub const LOCAL: &str = "local";
+
 /// The latest parent levers one venture pulled on another.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pulled {
@@ -115,6 +122,11 @@ pub struct Index {
     /// The latest trusted report of each venture's metric, value or not,
     /// and whether code marked it implausible.
     flagged: HashMap<(String, String), (Seq, bool)>,
+    /// Canary asks answered, per approver: (approved, answered). Counted
+    /// from the measured canary report that cites the decision.
+    canaries: BTreeMap<String, (u32, u32)>,
+    /// Decisions already counted.
+    canaried: HashSet<Seq>,
 }
 
 impl Index {
@@ -236,6 +248,11 @@ impl Index {
                 }
                 if metric == EXPECTATION && *claim == Claim::Measured {
                     self.expected.extend(cites.iter().copied());
+                }
+                if metric == CANARY && *claim == Claim::Measured {
+                    for c in cites {
+                        self.score_canary(*c);
+                    }
                 }
                 if metric.starts_with(CALIBRATION) && *claim == Claim::Measured {
                     if let Some(open) = self.predictions.get_mut(&venture) {
@@ -390,6 +407,73 @@ impl Index {
             _ => {}
         }
         self.entries.push(e);
+    }
+
+    /// A declared decision on a canary ask, counted once for whoever gave
+    /// it. Anything else is not a canary answer.
+    fn score_canary(&mut self, decision: Seq) {
+        let Some(Record::Decision {
+            claim: Claim::Declared,
+            verdict,
+            by,
+            ..
+        }) = self.get(decision).map(|e| &e.record)
+        else {
+            return;
+        };
+        let (ask, approved) = match verdict {
+            Verdict::Approve { ask, .. } => (*ask, true),
+            Verdict::Deny { ask, .. } => (*ask, false),
+            _ => return,
+        };
+        let who = by.clone().unwrap_or_else(|| LOCAL.to_string());
+        let canary = self
+            .get(ask)
+            .is_some_and(|e| matches!(&e.record, Record::Ask { action: Some(a), .. } if a == crate::gate::CANARY));
+        if !canary || !self.canaried.insert(decision) {
+            return;
+        }
+        let slot = self.canaries.entry(who).or_default();
+        slot.1 += 1;
+        if approved {
+            slot.0 += 1;
+        }
+    }
+
+    /// The share of the canary asks this approver answered that they
+    /// approved, 0 when they answered none.
+    pub fn canary_rate(&self, by: &str) -> f64 {
+        match self.canaries.get(by) {
+            Some((approved, answered)) if *answered > 0 => {
+                f64::from(*approved) / f64::from(*answered)
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Canary asks written, per venture, and the number of real asks
+    /// written since the last one. For the kernel's schedule.
+    pub fn canary_due(&self, venture: &str, every: u32) -> bool {
+        let mut since = 0;
+        let mut open = false;
+        for e in self.of(venture) {
+            if let Record::Ask { action, signal, .. } = &e.record {
+                if action.as_deref() == Some(crate::gate::CANARY) {
+                    since = 0;
+                    open = self.is_open(e.seq);
+                } else if signal.is_none() {
+                    since += 1;
+                }
+            }
+        }
+        !open && since >= every
+    }
+
+    /// How many canary asks a venture has been given.
+    pub fn canaries_asked(&self, venture: &str) -> usize {
+        self.of(venture)
+            .filter(|e| matches!(&e.record, Record::Ask { action: Some(a), .. } if a == crate::gate::CANARY))
+            .count()
     }
 
     /// A parent lever done: an ok action, or an intent with an ok outcome,

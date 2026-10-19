@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Quotas;
 use crate::index::{Index, Pulled};
 use crate::mandate::{Cap, Controller, Mandate, ParentCall, Permitted};
-use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Signal, Takes, Verdict};
+use crate::record::{Claim, Entry, Kind, Packet, Payload, Record, Seq, Signal, Takes, Verdict};
 
 /// The action that always passes.
 pub const STOP: &str = crate::mandate::STOP;
@@ -23,6 +23,13 @@ pub const RESUME: &str = "resume";
 /// The built-in action that adopts a changed mandate: self proposes it,
 /// only a declared decision runs it.
 pub const DELEGATE: &str = "delegate";
+/// The lever of a canary ask: an ask whose content is plausibly wrong, to
+/// measure whether the human reads what they approve. Hardwired: it is
+/// refused for every venture, even when a mandate permits it and a human
+/// approves it. Not the self venture's canary, which checks the gate.
+pub const CANARY: &str = "canary";
+/// Why the gate refuses it.
+pub const CANARY_WHY: &str = "a canary ask can never run, whoever approves it";
 /// The built-in venture that watches avsm itself.
 pub const SELF: &str = "self";
 
@@ -990,6 +997,10 @@ fn limits(
 ) -> (Vec<Step>, Vec<Reason>) {
     let mut extra_steps = Vec::new();
     let mut extra_reasons = Vec::new();
+    if a == CANARY {
+        p.hardwired
+            .push((v.to_string(), a.to_string(), CANARY_WHY.to_string()));
+    }
     let cost = adopted
         .iter()
         .find(|m| m.venture == v)
@@ -2006,9 +2017,19 @@ pub fn why(entry: &Entry) -> String {
     match &entry.record {
         Record::Action { proof, .. } | Record::Intent { proof, .. } => format!("{head}\n{proof}"),
         Record::Ask {
-            refusal: Some(r), ..
-        } => format!("{head}\n{r}"),
-        Record::Ask { question, .. } => format!("{head}\n  asked: {question}\n"),
+            refusal: Some(r),
+            packet,
+            ..
+        } => format!(
+            "{head}\n{r}{}",
+            packet.as_ref().map_or(String::new(), Packet::render)
+        ),
+        Record::Ask {
+            question, packet, ..
+        } => format!(
+            "{head}\n  asked: {question}\n{}",
+            packet.as_ref().map_or(String::new(), Packet::render)
+        ),
         Record::Report {
             claim,
             source,
@@ -2749,6 +2770,7 @@ mod tests {
 
     fn ask(claim: Claim, action: &str) -> Record {
         Record::Ask {
+            packet: None,
             cites: vec![],
             claim,
             venture: V.to_string(),
@@ -2762,6 +2784,7 @@ mod tests {
 
     fn ask_with(claim: Claim, action: &str, payload: Payload) -> Record {
         Record::Ask {
+            packet: None,
             cites: vec![],
             claim,
             venture: V.to_string(),
@@ -3314,6 +3337,7 @@ mod tests {
             assert!(!why(e).is_empty());
         }
         let q = fx.push(Record::Ask {
+            packet: None,
             cites: vec![],
             claim: Claim::Inferred,
             venture: V.into(),
@@ -3654,6 +3678,7 @@ mod tests {
             "{refusal}"
         );
         let q = fx.push(Record::Ask {
+            packet: None,
             cites: vec![],
             claim: Claim::Inferred,
             venture: "portfolio".into(),
@@ -3779,6 +3804,7 @@ mod tests {
         );
         // A human approves the ask. The floor still holds.
         let q = fx.push(Record::Ask {
+            packet: None,
             cites: vec![],
             claim: Claim::Inferred,
             venture: "portfolio".into(),
@@ -3940,6 +3966,7 @@ mod tests {
                 NOW,
                 GENESIS,
                 Record::Ask {
+                    packet: None,
                     cites: vec![],
                     claim: Claim::Measured,
                     venture: "portfolio".into(),
@@ -4218,6 +4245,7 @@ mod tests {
             "{refusal}"
         );
         let q = fx.push(Record::Ask {
+            packet: None,
             cites: vec![],
             claim: Claim::Measured,
             venture: V.into(),
@@ -4244,6 +4272,7 @@ mod tests {
         );
         // An ask a model wrote cannot carry a mandate change, approved or not.
         let mq = fx.push(Record::Ask {
+            packet: None,
             cites: vec![],
             claim: Claim::Inferred,
             venture: V.into(),
@@ -4266,6 +4295,7 @@ mod tests {
         let mut fx = Fx::new();
         fx.adopt(SELF, mandate(model(), vec![], &[]));
         let q = fx.push(Record::Ask {
+            packet: None,
             cites: vec![],
             claim: Claim::Measured,
             venture: SELF.into(),

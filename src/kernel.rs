@@ -21,7 +21,8 @@ use crate::gate::{self, Adopted, Candidate, Reason, State, DELEGATE, SELF};
 use crate::index::Index;
 use crate::ledger::Ledger;
 use crate::mandate::{self, Cap, Controller, Permitted, Restart};
-use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Signal, Verdict};
+use crate::packet;
+use crate::record::{Claim, Entry, Kind, Packet, Payload, Record, Seq, Signal, Verdict};
 use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role, SUMMARY};
 use crate::venture::{self, Venture};
 use crate::warden::{self, Failure, FromWarden, LocalWarden, ToWarden, Warden};
@@ -32,6 +33,16 @@ mod guards;
 pub mod plan;
 pub mod predict;
 mod refusals;
+
+/// What a canary ask asks, each plausibly wrong on its face: it rests on
+/// nothing measured. Taken in turn.
+const CANARIES: [&str; 5] = [
+    "reply to ops@vendor-example.test, an address seen only in an inferred record",
+    "refund order 4412 in full, a figure that appears in no measured record",
+    "delete the backups older than three days to make room, which no mandate names",
+    "raise the cap to 40 a day on the strength of one inferred summary",
+    "email every customer about the outage, which no report shows",
+];
 
 /// How long a report may take.
 pub const REPORT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -683,6 +694,13 @@ impl Kernel {
             if let Some(p) = e.record.payload() {
                 out.push_str(&indent(&p.text(), 40));
             }
+            if let Record::Ask {
+                packet: Some(packet),
+                ..
+            } = &e.record
+            {
+                out.push_str(&packet.render());
+            }
         }
         Ok(out)
     }
@@ -758,6 +776,7 @@ impl Kernel {
         let entry = self
             .append(self.decision(ask.record.venture(), Verdict::Approve { ask: seq, payload }))?;
         let mut out = entry.line() + "\n";
+        self.mark_canary(&ask, &entry);
         if let Some(intent) = pending_asked(&ask) {
             out.push_str(&self.settle(&ask, intent, true, "a human says it happened")?);
         }
@@ -817,7 +836,13 @@ impl Kernel {
                     ok,
                     detail: format!("checked after a restart: {found}"),
                 },
-                Ok(None) => Record::Ask { cites: vec![],
+                Ok(None) => {
+                    let signal = Signal::Pending {
+                        intent,
+                        action: action.clone(),
+                    };
+                    Record::Ask {
+                        cites: vec![],
                         claim: Claim::Measured,
                         venture: venture.clone(),
                         action: None,
@@ -831,11 +856,10 @@ impl Kernel {
                             reasons: vec![Reason::Pending { intent }],
                         }),
                         payload: None,
-                        signal: Some(Signal::Pending {
-                            intent,
-                            action: action.clone(),
-                        }),
-                    },
+                        packet: self.signal_packet(&venture, &signal),
+                        signal: Some(signal),
+                    }
+                }
             };
             match self.append(record) {
                 Ok(e) => log(&e.line()),
@@ -860,6 +884,7 @@ impl Kernel {
             },
         ))?;
         let mut out = entry.line() + "\n";
+        self.mark_canary(&ask, &entry);
         if let Some(intent) = pending_asked(&ask) {
             let what = format!("a human says it did not happen: {reason}");
             out.push_str(&self.settle(&ask, intent, false, &what)?);
@@ -1000,6 +1025,7 @@ impl Kernel {
                     self.check_capacity(name);
                 }
             }
+            self.canary();
             self.ratchet();
             for name in &names {
                 if self.nightly_due(name) {
@@ -1130,6 +1156,89 @@ impl Kernel {
                 );
                 break;
             }
+        }
+    }
+
+    /// Write a canary ask for each venture that is due one: `every` asks
+    /// since its last. The ask can never run; whoever answers it is
+    /// measured by it. Off unless config.yaml says `canary_asks`.
+    fn canary(&mut self) {
+        let Some(every) = self.config.canary_asks.map(|c| c.every) else {
+            return;
+        };
+        let names: Vec<String> = self
+            .ventures
+            .values()
+            .filter(|v| v.name != SELF && v.problem.is_none())
+            .map(|v| v.name.clone())
+            .collect();
+        for name in names {
+            let (due, n, may_ask) = {
+                let Ok(index) = self.index() else { return };
+                (
+                    index.canary_due(&name, every),
+                    index.canaries_asked(&name),
+                    self.may_ask(&index),
+                )
+            };
+            if !due || !may_ask {
+                continue;
+            }
+            let content = CANARIES[n % CANARIES.len()];
+            // It looks like any other ask: the model's words last.
+            let packet = self.packet(&name, None, &[], Some(content.to_string()), false);
+            match self.append(Record::Ask {
+                cites: vec![],
+                claim: Claim::Measured,
+                venture: name.clone(),
+                action: Some(gate::CANARY.to_string()),
+                question: format!("may I {content}?"),
+                refusal: None,
+                payload: None,
+                signal: None,
+                packet,
+            }) {
+                Ok(e) => log(&e.line()),
+                Err(e) => log(&format!("{name}: cannot write ask: {e}")),
+            }
+        }
+    }
+
+    /// The answer to a canary ask is a measured fact: who approved or
+    /// denied what could never run. It cites the decision.
+    fn mark_canary(&mut self, ask: &Entry, decision: &Entry) {
+        if ask.record.action() != Some(gate::CANARY) {
+            return;
+        }
+        let approved = matches!(
+            &decision.record,
+            Record::Decision {
+                verdict: Verdict::Approve { .. },
+                ..
+            }
+        );
+        let who = self
+            .by
+            .clone()
+            .unwrap_or_else(|| crate::index::LOCAL.to_string());
+        let record = Record::Report {
+            claim: Claim::Measured,
+            venture: ask.record.venture().to_string(),
+            metric: crate::index::CANARY.to_string(),
+            value: Some(if approved { 1.0 } else { 0.0 }),
+            note: format!(
+                "canary ask #{} {} by {who}",
+                ask.seq,
+                if approved { "approved" } else { "denied" }
+            ),
+            source: None,
+            confidence: None,
+            cites: vec![decision.seq],
+            implausible: None,
+            facts: None,
+        };
+        if let Err(e) = self.append(record) {
+            log(&format!("cannot write the canary record: {e}"));
         }
     }
 
@@ -1660,6 +1769,31 @@ impl Kernel {
                         }
                         None => format!("may I {action}? it is irreversible{reason}"),
                     };
+                    // A model's proposal gives the reason, labeled inferred;
+                    // a measured or declared one is a premise.
+                    let model_reason = {
+                        let index = self.index().ok();
+                        index.and_then(|index| {
+                            candidate
+                                .cites
+                                .iter()
+                                .find_map(|s| match &index.get(*s)?.record {
+                                    Record::Proposal {
+                                        claim: Claim::Inferred,
+                                        reason,
+                                        ..
+                                    } => Some(reason.clone()),
+                                    _ => None,
+                                })
+                        })
+                    };
+                    let packet = self.packet(
+                        name,
+                        Some(action),
+                        &candidate.cites,
+                        model_reason,
+                        payload.is_some(),
+                    );
                     match self.append(Record::Ask {
                         cites: ask_cites,
                         claim,
@@ -1669,6 +1803,7 @@ impl Kernel {
                         refusal: Some(refusal),
                         payload,
                         signal: None,
+                        packet,
                     }) {
                         Ok(e) => lines.push(e.line()),
                         Err(e) => lines.push(format!("{name}: cannot write ask: {e}")),
@@ -1689,6 +1824,78 @@ impl Kernel {
             log(line);
         }
         lines
+    }
+
+    /// The packet of an ask about `action` (or about nothing in
+    /// particular), built here for every ask a lever or a model raises.
+    /// `cites` are the records it rests on; `reason` is a model's, if any.
+    /// With forecasts on, a short forecast of approving and of denying is
+    /// run for a lever; otherwise each option says no forecast.
+    pub(crate) fn packet(
+        &self,
+        venture: &str,
+        action: Option<&str>,
+        cites: &[Seq],
+        reason: Option<String>,
+        has_payload: bool,
+    ) -> Option<Packet> {
+        let v = self.ventures.get(venture)?;
+        let takes = action
+            .and_then(|a| v.mandate.permitted(a))
+            .and_then(Permitted::takes);
+        let (mut approve, mut deny) = (None, None);
+        if let Some(a) = action {
+            if a != DELEGATE && self.forecasts && self.config.forecast.seeds > 0 {
+                let mut opts =
+                    crate::forecast::Options::new(vec![venture.to_string()], self.config.forecast);
+                opts.days = packet::DAYS;
+                opts.seeds = packet::SEEDS;
+                match crate::forecast::run(&self.ledger, &self.home, &opts) {
+                    Ok(outcome) => {
+                        approve = packet::option_forecast(
+                            &outcome,
+                            venture,
+                            crate::forecast::Policy::All,
+                        );
+                        deny = packet::option_forecast(
+                            &outcome,
+                            venture,
+                            crate::forecast::Policy::None,
+                        );
+                    }
+                    Err(e) => log(&format!("{venture}: no forecast of {a}: {e}")),
+                }
+            }
+        }
+        let index = self.index().ok()?;
+        let adopted = self.adopted();
+        Some(packet::build(
+            &index,
+            &adopted,
+            now(),
+            &packet::Basis {
+                venture,
+                action,
+                editable: has_payload || takes.is_some(),
+                cites: cites.to_vec(),
+                metric: Some(v.mandate.metric_name()),
+                reason,
+                approve,
+                deny,
+            },
+        ))
+    }
+
+    /// The packet of an ask the kernel raises on its own.
+    pub(crate) fn signal_packet(&self, venture: &str, signal: &Signal) -> Option<Packet> {
+        let metric = self
+            .ventures
+            .get(venture)?
+            .mandate
+            .metric_name()
+            .to_string();
+        let index = self.index().ok()?;
+        Some(packet::signal_packet(&index, venture, signal, &metric))
     }
 
     /// Is there room under the asks quota for one more ask?
@@ -2023,6 +2230,13 @@ impl Kernel {
                         Some(a) => fit_payload(&v.mandate, a, payload, name),
                         None => None,
                     };
+                    let packet = self.packet(
+                        name,
+                        action.as_deref(),
+                        &[],
+                        Some(question.clone()),
+                        payload.is_some(),
+                    );
                     Record::Ask {
                         cites: vec![],
                         claim: Claim::Inferred,
@@ -2032,6 +2246,7 @@ impl Kernel {
                         refusal: None,
                         signal: None,
                         payload,
+                        packet,
                     }
                 }
                 Record::Report {
@@ -2147,6 +2362,7 @@ impl Kernel {
             );
             return;
         }
+        let packet = self.packet(name, None, &[], None, false);
         match self.append(Record::Ask {
             cites: vec![],
             claim: Claim::Measured,
@@ -2156,6 +2372,7 @@ impl Kernel {
             refusal: None,
             signal: None,
             payload: None,
+            packet,
         }) {
             Ok(e) => log(&e.line()),
             Err(e) => log(&format!("{name}: cannot write ask: {e}")),
@@ -2310,10 +2527,14 @@ fn ripe(index: &Index, venture: &str, lever: &str, n: usize) -> Option<(String, 
             })
         })
         .unwrap_or(0);
-    let mut by_shape: BTreeMap<String, Vec<Seq>> = BTreeMap::new();
+    // An approval counts as 1, less the share of canary asks its approver
+    // approved: someone who approves what can never be right counts for
+    // less, so delegating needs more of their approvals.
+    let mut by_shape: BTreeMap<String, Vec<(Seq, f64)>> = BTreeMap::new();
     for d in answers.iter().filter(|d| **d > since) {
         let Some(Record::Decision {
             verdict: Verdict::Approve { ask, payload },
+            by,
             ..
         }) = index.get(*d).map(|e| &e.record)
         else {
@@ -2329,9 +2550,16 @@ fn ripe(index: &Index, venture: &str, lever: &str, n: usize) -> Option<(String, 
             .as_ref()
             .or(asked.record.payload())
             .map_or("none".to_string(), Payload::shape);
-        by_shape.entry(shape).or_default().push(*d);
+        let who = by.as_deref().unwrap_or(crate::index::LOCAL);
+        by_shape
+            .entry(shape)
+            .or_default()
+            .push((*d, 1.0 - index.canary_rate(who)));
     }
-    by_shape.into_iter().find(|(_, s)| s.len() >= n)
+    by_shape
+        .into_iter()
+        .find(|(_, s)| s.iter().map(|(_, w)| w).sum::<f64>() + 1e-9 >= n as f64)
+        .map(|(shape, s)| (shape, s.into_iter().map(|(d, _)| d).collect()))
 }
 
 /// Was anything in this time-ordered list written on this local date?
