@@ -1232,9 +1232,15 @@ pub struct Tamper {
 /// each entry chains to the hash of the one before, and every hash matches
 /// its contents.
 pub fn verify_chain(entries: &[Entry]) -> Result<(), Tamper> {
-    let mut prev = GENESIS.to_string();
+    verify_chain_from(0, GENESIS, entries)
+}
+
+/// Verify entries that follow entry `seq`, whose hash is `prev`, as
+/// `verify_chain` does the whole chain: 0 and GENESIS start it.
+pub fn verify_chain_from(seq: Seq, prev: &str, entries: &[Entry]) -> Result<(), Tamper> {
+    let mut prev = prev.to_string();
     for (i, e) in entries.iter().enumerate() {
-        let expect = i as Seq + 1;
+        let expect = seq + i as Seq + 1;
         if e.seq != expect {
             return Err(Tamper {
                 seq: e.seq,

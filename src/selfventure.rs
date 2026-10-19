@@ -5,7 +5,7 @@
 //! permitted action, stop, and halts every venture until a human resumes.
 
 use crate::gate::{self, Adopted, Candidate, HARDWIRED, SELF};
-use crate::ledger::Ledger;
+use crate::ledger::{Ledger, LedgerError};
 use crate::mandate::{Cap, Controller, Mandate, Permitted, Restart};
 use crate::record::{Claim, Entry, Record, Seq, Verdict, GENESIS};
 use crate::venture::Venture;
@@ -68,13 +68,65 @@ pub fn adopt_record() -> Record {
     }
 }
 
+/// How often the whole chain is read again, at the most: a row changed
+/// behind avsm's back is found within this, however it was changed.
+pub const WHOLE_EVERY: i64 = 86_400;
+
+/// What the chain check has verified: up to which entry, with what hash,
+/// how many entries that is, and when and under which schema version the
+/// whole chain was last read. Between whole reads only the entries
+/// appended since are checked; the whole chain is read again after
+/// `WHOLE_EVERY`, or at once when the schema changed (an UPDATE or a
+/// DELETE has to drop a trigger first, and that changes it).
+#[derive(Clone, Debug, Default)]
+pub struct Checked {
+    seq: Seq,
+    hash: String,
+    count: u64,
+    whole: Option<(i64, i64)>,
+}
+
+impl Checked {
+    /// Verify the chain as of `now`: only what is new since the last
+    /// check, or the whole of it when that is due. Ok carries how many
+    /// entries the chain holds. A failure forgets what was verified, so
+    /// the next check reads the whole chain again.
+    pub fn verify(&mut self, ledger: &Ledger, now: i64) -> Result<u64, String> {
+        let r = self.check(ledger, now);
+        if r.is_err() {
+            *self = Checked::default();
+        }
+        r.map_err(|e| e.to_string().trim_start_matches("ledger: ").to_string())
+    }
+
+    fn check(&mut self, ledger: &Ledger, now: i64) -> Result<u64, LedgerError> {
+        let schema = ledger.schema_version()?;
+        let due = self
+            .whole
+            .is_none_or(|(at, s)| s != schema || now - at >= WHOLE_EVERY || now < at);
+        if due {
+            let (n, seq, hash) = ledger.verify_after(0, GENESIS)?;
+            *self = Checked {
+                seq,
+                hash,
+                count: n,
+                whole: Some((now, schema)),
+            };
+        } else {
+            let (n, seq, hash) = ledger.verify_after(self.seq, &self.hash)?;
+            self.seq = seq;
+            self.hash = hash;
+            self.count += n;
+        }
+        Ok(self.count)
+    }
+}
+
 /// Measure integrity: the chain verifies and the canary holds. Returns
-/// the value and a note saying what was checked.
-pub fn measure(ledger: &Ledger) -> (Option<f64>, String) {
-    let chain = match ledger.verify() {
-        Ok(n) => Ok(n),
-        Err(e) => Err(e.to_string().trim_start_matches("ledger: ").to_string()),
-    };
+/// the value and a note saying what was checked. `checked` is what was
+/// verified before; see `Checked`.
+pub fn measure(ledger: &Ledger, checked: &mut Checked, now: i64) -> (Option<f64>, String) {
+    let chain = checked.verify(ledger, now);
     let canary = canary();
     let value = if chain.is_ok() && canary.is_ok() {
         1.0
@@ -261,8 +313,107 @@ mod tests {
     fn integrity_is_one_on_a_sound_ledger_and_zero_on_a_broken_one() {
         let mut ledger = Ledger::open_in_memory().unwrap();
         ledger.append(adopt_record()).unwrap();
-        let (value, note) = measure(&ledger);
+        let (value, note) = measure(&ledger, &mut Checked::default(), 0);
         assert_eq!(value, Some(1.0));
         assert_eq!(note, "chain ok (1 records); canary ok");
+    }
+
+    const T: i64 = 1_800_000_000;
+
+    fn report(v: f64) -> Record {
+        Record::report(crate::record::Claim::Measured, "c", "n", Some(v), "")
+    }
+
+    fn file_ledger(dir: &std::path::Path, n: usize) -> Ledger {
+        let mut ledger = Ledger::open(&dir.join("ledger.db")).unwrap();
+        ledger.append(adopt_record()).unwrap();
+        for i in 0..n {
+            ledger.append(report(i as f64)).unwrap();
+        }
+        ledger
+    }
+
+    /// Edit a stored row through another connection and cover the
+    /// tracks: put the trigger back and the schema version with it, so
+    /// only reading the row again finds the edit.
+    fn edit_quietly(dir: &std::path::Path, seq: Seq) {
+        let conn = rusqlite::Connection::open(dir.join("ledger.db")).unwrap();
+        let schema: i64 = conn
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        conn.execute_batch(&format!(
+            "DROP TRIGGER records_no_update;
+             UPDATE records SET at = at + 1 WHERE seq = {seq};
+             CREATE TRIGGER records_no_update BEFORE UPDATE ON records
+             BEGIN SELECT RAISE(ABORT, 'the ledger is append-only'); END;
+             PRAGMA schema_version = {schema};"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn the_incremental_check_counts_what_the_whole_check_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = file_ledger(tmp.path(), 0);
+        let mut checked = Checked::default();
+        for i in 0..20 {
+            for _ in 0..i % 3 {
+                ledger.append(report(f64::from(i))).unwrap();
+            }
+            let now = T + i64::from(i) * 600;
+            assert_eq!(
+                checked.verify(&ledger, now),
+                Ok(ledger.verify().unwrap()),
+                "step {i}"
+            );
+        }
+        assert_eq!(checked.whole.map(|(at, _)| at), Some(T), "read whole once");
+    }
+
+    #[test]
+    fn a_row_edited_behind_avsms_back_is_found_within_a_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = file_ledger(tmp.path(), 5);
+        let mut checked = Checked::default();
+        assert_eq!(measure(&ledger, &mut checked, T).0, Some(1.0));
+        edit_quietly(tmp.path(), 2);
+        ledger.append(report(9.0)).unwrap();
+        const DAY: i64 = 86_400;
+        // The edit left no trace in the schema: the next check reads only
+        // the new entry, and does not see it yet.
+        assert_eq!(measure(&ledger, &mut checked, T + 600).0, Some(1.0));
+        // Every check after, every ten minutes: one within a day of the
+        // whole read finds it.
+        let mut found = None;
+        let mut now = T + 600;
+        while now <= T + DAY {
+            now += 600;
+            let (value, note) = measure(&ledger, &mut checked, now);
+            if value == Some(0.0) {
+                assert!(note.starts_with("chain broken: record #2"), "{note}");
+                found = Some(now);
+                break;
+            }
+        }
+        let found = found.expect("an edited row is found within a day");
+        assert!(found - T <= DAY, "found after {}s", found - T);
+        // And it stays found: a failure forgets what was verified.
+        assert_eq!(measure(&ledger, &mut checked, found + 60).0, Some(0.0));
+    }
+
+    #[test]
+    fn a_dropped_trigger_makes_the_next_check_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = file_ledger(tmp.path(), 5);
+        let mut checked = Checked::default();
+        assert_eq!(measure(&ledger, &mut checked, T).0, Some(1.0));
+        let conn = rusqlite::Connection::open(tmp.path().join("ledger.db")).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER records_no_update; UPDATE records SET at = at + 1 WHERE seq = 3;",
+        )
+        .unwrap();
+        let (value, note) = measure(&ledger, &mut checked, T + 60);
+        assert_eq!(value, Some(0.0));
+        assert!(note.starts_with("chain broken: record #3"), "{note}");
     }
 }

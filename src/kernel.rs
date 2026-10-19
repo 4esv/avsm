@@ -97,6 +97,8 @@ pub struct Kernel {
     /// Each venture's last packet forecast, with the report of its metric
     /// it started from: asks before the next reading reuse it.
     packet_forecasts: RefCell<BTreeMap<String, (Seq, crate::forecast::Outcome)>>,
+    /// What self's chain check has verified so far.
+    checked: crate::selfventure::Checked,
     /// The local date each venture's capacity was last checked nightly.
     capacity_checked: BTreeMap<String, NaiveDate>,
     /// A forecast branch ticks only the ventures it forecasts: the rest,
@@ -270,6 +272,7 @@ impl Kernel {
             short: BTreeMap::new(),
             capacity_checked: BTreeMap::new(),
             packet_forecasts: RefCell::new(BTreeMap::new()),
+            checked: crate::selfventure::Checked::default(),
             scope: None,
         };
         kernel.reload()?;
@@ -1652,7 +1655,11 @@ impl Kernel {
     /// The built-in self venture measures itself.
     fn measure(&mut self, v: &Venture) -> Option<(Option<f64>, String)> {
         if v.name == SELF && v.path.is_none() {
-            return Some(crate::selfventure::measure(&self.ledger));
+            return Some(crate::selfventure::measure(
+                &self.ledger,
+                &mut self.checked,
+                now(),
+            ));
         }
         if let (Some(sim), Some(dir)) = (self.sim.clone(), v.path.as_deref()) {
             let simulated = {

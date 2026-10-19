@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, Params, TransactionBehavior};
 
-use crate::record::{verify_chain, Entry, Record, Seq, Tamper, GENESIS};
+use crate::record::{verify_chain, verify_chain_from, Entry, Record, Seq, Tamper, GENESIS};
 
 /// An open ledger.
 pub struct Ledger {
@@ -243,6 +243,27 @@ impl Ledger {
         let entries = self.all()?;
         verify_chain(&entries)?;
         Ok(entries.len() as u64)
+    }
+
+    /// The schema version SQLite keeps in the file's header. Appends
+    /// leave it alone; dropping or creating a trigger changes it.
+    pub fn schema_version(&self) -> Result<i64, LedgerError> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))?)
+    }
+
+    /// Check only the entries after entry `seq`, whose hash is `prev`, as
+    /// `verify` checks them all; `(0, GENESIS)` checks the whole chain.
+    /// Ok carries how many entries were checked and the number and hash
+    /// of the last one (`seq` and `prev` when there were none).
+    pub fn verify_after(&self, seq: Seq, prev: &str) -> Result<(u64, Seq, String), LedgerError> {
+        let entries = self.after(seq)?;
+        verify_chain_from(seq, prev, &entries)?;
+        Ok(match entries.last() {
+            Some(e) => (entries.len() as u64, e.seq, e.hash.clone()),
+            None => (0, seq, prev.to_string()),
+        })
     }
 
     /// Run a query that selects [`COLUMNS`] and decode every row it returns.
