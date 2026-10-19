@@ -93,6 +93,33 @@ starts it again. There is no other steering. To change what a venture may do,
 edit its mandate and run `avsm add` again; the old permissions end with the old
 mandate.
 
+### Guards, audits and plausibility
+
+A guard is a reading of its own that the warden takes beside the metric, with
+a bound. Past it, the guard pauses the venture (`then: pause`, the default) or
+asks once (`then: ask`); either way no lever but stop runs until the reading is
+back inside, whatever approves it. A guard may not read a lever's command or
+the metric's. A drawdown guard falls from the metric's peak:
+
+```yaml
+guards:
+  - {name: spend, run: ./spend, above: 100}
+  - {name: errors, adapter: http.status https://example.com/health, above: 299, then: ask}
+  - {name: dd, drawdown: 15%, of: equity}
+audits:
+  - {name: refunds, run: ./refunds, worse: up, tolerance: 2}
+range: [0, 100000]
+max_step: 5000
+```
+
+An audit asks when the metric rises over its last `window` readings (5 unless
+set) while the audit gets worse by more than its tolerance. No model ever sees
+an audit reading. A report outside `range`, a step past `max_step`, a flap, a
+NaN or a failed report is kept, marked implausible, never acted on, and asks
+once until a plausible report comes. On a threshold, `deadband: 2` acts once
+and again only after the metric comes back past the bound by 2; `hold: 3` acts
+after three crossed reports in a row.
+
 ### Letting a model choose
 
 With `controller: {kind: model}` (or `kind: classifier`, which answers with one

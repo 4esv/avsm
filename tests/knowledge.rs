@@ -54,6 +54,7 @@ fn finding(venture: &str, topic: &str, note: &str, cites: Vec<u64>) -> Record {
         source: Some("https://x.example".into()),
         confidence: Some(0.7),
         cites,
+        implausible: None,
     }
 }
 
@@ -152,6 +153,7 @@ fn past_the_bound_the_older_records_are_summarized_and_leave_the_context() {
             source: None,
             confidence: None,
             cites: (2..=7).collect(),
+            implausible: None,
         }]]),
         seen: Arc::clone(&seen),
     };

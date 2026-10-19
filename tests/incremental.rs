@@ -63,6 +63,8 @@ permitted:
   - {name: post, run: ./post, cap: 4/day, reversible: true, takes: text, cost: 1}
   - {name: mail, adapter: mail.send me@example.com, cap: 5/day, reversible: false, delegated: true}
 forbidden: [withdraw]
+guards:
+  - {name: spend, run: ./spend, above: 50, then: ask}
 "
         }
         "orphan" => {
@@ -86,6 +88,8 @@ permitted:
   - {name: post, run: ./post, cap: 2/day, reversible: false, takes: text}
   - {name: mail, adapter: mail.send me@example.com, cap: 5/day, reversible: false, delegated: true, cost: 2}
 forbidden: [withdraw]
+guards:
+  - {name: spend, run: ./spend, below: 10}
 "
         }
     }
@@ -174,7 +178,8 @@ fn seq() -> impl Strategy<Value = u64> {
 /// One record, with its record numbers as fractions of the ledger so far.
 #[derive(Clone, Debug)]
 enum Op {
-    Report(String, bool, Claim, Option<f64>, Option<u64>),
+    /// venture, metric, claim, value, cites, implausible
+    Report(String, String, Claim, Option<f64>, Option<u64>, bool),
     Proposal(String, String, Claim, Option<Payload>),
     Ask(String, Option<String>, Claim, Option<Payload>),
     Approve(String, Claim, u64, Option<Payload>),
@@ -200,12 +205,13 @@ fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         6 => (
             prop_oneof![2 => Just("child".to_string()), 1 => name()],
-            prop::bool::weighted(0.85),
+            prop::sample::select(&["count", "count", "count", "count", "other", "guard.spend"][..]),
             claim(),
-            prop::option::of(prop::sample::select(&[1.0, 7.0, 12.0, 12.0][..])),
+            prop::option::of(prop::sample::select(&[1.0, 7.0, 12.0, 12.0, 60.0][..])),
             prop::option::of(seq()),
+            prop::bool::weighted(0.2),
         )
-            .prop_map(|(v, own, c, x, cites)| Op::Report(v, own, c, x, cites)),
+            .prop_map(|(v, m, c, x, cites, doubt)| Op::Report(v, m.to_string(), c, x, cites, doubt)),
         3 => (lever(), claim(), payload()).prop_map(|((v, a), c, p)| Op::Proposal(v, a, c, p)),
         3 => (lever(), any::<bool>(), claim(), payload()).prop_map(|((v, a), some, c, p)| Op::Ask(v, some.then_some(a), c, p)),
         3 => (name(), claim(), seq(), payload()).prop_map(|(v, c, q, p)| Op::Approve(v, c, q, p)),
@@ -270,15 +276,16 @@ fn proof(venture: &str, action: &str, decision: Option<Seq>) -> Proof {
 
 fn record(op: &Op, n: u64) -> Record {
     match op.clone() {
-        Op::Report(v, own, claim, value, cites) => Record::Report {
+        Op::Report(v, metric, claim, value, cites, doubt) => Record::Report {
             claim,
-            metric: if own { "count" } else { "other" }.to_string(),
+            metric,
             venture: v,
             value,
             note: String::new(),
             source: None,
             confidence: None,
             cites: cites.map(|x| pick(n, x)).into_iter().collect(),
+            implausible: doubt.then(|| "a step too big".to_string()),
         },
         Op::Proposal(venture, action, claim, payload) => Record::Proposal {
             claim,

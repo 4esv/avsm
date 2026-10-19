@@ -479,6 +479,7 @@ fn the_parents_nightly_call_sees_childrens_records_not_their_raw_input() {
         source: Some("https://x".into()),
         confidence: Some(0.5),
         cites: vec![],
+        implausible: None,
     })
     .unwrap();
     k.cycle("portfolio");

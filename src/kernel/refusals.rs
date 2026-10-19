@@ -76,6 +76,7 @@ fn reason_key(r: &Reason) -> String {
             child, deadband, ..
         } => format!("InDeadband({child},{deadband})"),
         Reason::Reversal { child, last, .. } => format!("Reversal({child},{last})"),
+        Reason::Guarded { guard, .. } => format!("Guarded({guard})"),
     }
 }
 

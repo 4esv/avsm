@@ -32,6 +32,8 @@ fn valid_fixture_parses_field_by_field() {
             above: Some(10.0),
             below: None,
             action: "reset".into(),
+            deadband: None,
+            hold: None,
         },
         permitted: vec![
             Permitted {
@@ -76,6 +78,10 @@ fn valid_fixture_parses_field_by_field() {
         children: vec![],
         parent: None,
         allocation: None,
+        guards: vec![],
+        audits: vec![],
+        range: None,
+        max_step: None,
     };
     assert_eq!(m.purpose, expected.purpose);
     assert_eq!(m.metric, expected.metric);

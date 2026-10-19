@@ -106,6 +106,8 @@ pub fn canary() -> Result<(), String> {
             above: Some(0.0),
             below: None,
             action: "edit-mandate".to_string(),
+            deadband: None,
+            hold: None,
         },
         permitted: HARDWIRED
             .iter()
@@ -135,6 +137,10 @@ pub fn canary() -> Result<(), String> {
         children: vec![],
         parent: None,
         allocation: None,
+        guards: vec![],
+        audits: vec![],
+        range: None,
+        max_step: None,
     };
     let mandate_hash = Mandate::hash(&serde_yaml::to_string(&permissive).unwrap_or_default());
     let adopt = Record::Decision {

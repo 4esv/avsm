@@ -20,6 +20,20 @@ pub const UNUSABLE: &str = "unusable";
 /// nothing. Its note is the model's reason, one bounded line.
 pub const NOTHING: &str = "nothing";
 
+/// Is this record kept from every model? Audit readings, and the asks
+/// about them: an audit checks the target is not being gamed, and a model
+/// that saw it could game it too.
+pub fn hidden(e: &Entry) -> bool {
+    match &e.record {
+        Record::Report { metric, .. } => metric.starts_with(crate::mandate::AUDIT_PREFIX),
+        Record::Ask {
+            signal: Some(crate::record::Signal::Audit { .. }),
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
 /// What a role is shown.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Context {
@@ -136,7 +150,7 @@ pub fn summary_prompt(ctx: &Context) -> InferRequest {
         ctx.venture,
         ctx.mandate.purpose.trim()
     );
-    for e in &ctx.to_summarize {
+    for e in ctx.to_summarize.iter().filter(|e| !hidden(e)) {
         user.push_str("  ");
         user.push_str(&e.line());
         user.push('\n');
@@ -175,6 +189,7 @@ pub fn summary_record(ctx: &Context, text: &str) -> Option<Record> {
         source: None,
         confidence: None,
         cites: ctx.to_summarize.iter().map(|e| e.seq).collect(),
+        implausible: None,
     })
 }
 
@@ -305,7 +320,7 @@ pub fn prompt_with(ctx: &Context, drilled: &str) -> InferRequest {
     if !m.forbidden.is_empty() {
         user.push_str(&format!("Forbidden: {}\n", m.forbidden.join(", ")));
     }
-    for s in &ctx.summaries {
+    for s in ctx.summaries.iter().filter(|e| !hidden(e)) {
         if let Record::Report { note, cites, .. } = &s.record {
             user.push_str(&format!(
                 "Summary of records up to #{} (#{}):\n",
@@ -320,17 +335,19 @@ pub fn prompt_with(ctx: &Context, drilled: &str) -> InferRequest {
         }
     }
     user.push_str("Recent records, oldest first (number, time, venture, claim, kind, summary):\n");
-    if ctx.entries.is_empty() {
+    let entries: Vec<&Entry> = ctx.entries.iter().filter(|e| !hidden(e)).collect();
+    if entries.is_empty() {
         user.push_str("  (none yet)\n");
     }
-    for e in &ctx.entries {
+    for e in entries {
         user.push_str("  ");
         user.push_str(&e.line());
         user.push('\n');
     }
-    if !ctx.asks.is_empty() {
+    let asks: Vec<&Entry> = ctx.asks.iter().filter(|e| !hidden(e)).collect();
+    if !asks.is_empty() {
         user.push_str("Open asks, waiting on the human:\n");
-        for e in &ctx.asks {
+        for e in asks {
             user.push_str("  ");
             user.push_str(&e.line());
             user.push('\n');
@@ -401,6 +418,7 @@ pub fn unusable_record(ctx: &Context, why: &str, reply: &str) -> Record {
         source: None,
         confidence: None,
         cites: vec![],
+        implausible: None,
     }
 }
 
@@ -435,6 +453,7 @@ pub fn nothing_record(venture: &str, reason: Option<&str>) -> Record {
         source: None,
         confidence: None,
         cites: vec![],
+        implausible: None,
     }
 }
 
@@ -641,6 +660,10 @@ mod tests {
                 children: vec![],
                 parent: None,
                 allocation: None,
+                guards: vec![],
+                audits: vec![],
+                range: None,
+                max_step: None,
             },
             entries: vec![Entry::new(
                 1,
@@ -663,6 +686,39 @@ mod tests {
     }
 
     #[test]
+    fn audit_readings_and_audit_asks_never_reach_the_prompt() {
+        let mut c = ctx(false);
+        let audit = entry(
+            7,
+            Record::report(Claim::Measured, "shop", "audit.refunds", Some(4242.0), ""),
+        );
+        let ask = entry(
+            8,
+            Record::Ask {
+                claim: Claim::Measured,
+                venture: "shop".into(),
+                action: None,
+                question: "refunds rose by 4242".into(),
+                refusal: None,
+                payload: None,
+                signal: Some(crate::record::Signal::Audit {
+                    audit: "refunds".into(),
+                    target_delta: 1.0,
+                    audit_delta: 4242.0,
+                }),
+            },
+        );
+        assert!(hidden(&audit) && hidden(&ask));
+        c.entries.push(audit.clone());
+        c.asks.push(ask.clone());
+        c.to_summarize = vec![audit.clone(), ask];
+        c.summaries = vec![audit];
+        let text = format!("{}\n{}", prompt(&c).user, summary_prompt(&c).user);
+        assert!(!text.contains("4242"), "{text}");
+        assert!(!text.contains("audit."), "{text}");
+    }
+
+    #[test]
     fn summaries_asks_and_drills_shape_the_prompt() {
         let mut c = ctx(false);
         c.summaries = vec![entry(
@@ -676,6 +732,7 @@ mod tests {
                 source: None,
                 confidence: None,
                 cites: vec![3, 4, 5],
+                implausible: None,
             },
         )];
         c.asks = vec![entry(

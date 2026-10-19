@@ -117,6 +117,7 @@ pub fn records(venture: &str, findings: &[Finding], action: Seq) -> Vec<Record> 
             source: f.source.clone(),
             confidence: f.confidence,
             cites: vec![action],
+            implausible: None,
         })
         .collect()
 }

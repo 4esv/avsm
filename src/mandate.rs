@@ -60,6 +60,166 @@ pub struct Mandate {
     /// How steadily a parent may move its children's budgets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocation: Option<Allocation>,
+    /// Readings the warden takes beside the metric; past its bound a
+    /// guard pauses the venture or asks, and no lever but stop passes
+    /// until it is back inside.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<Guard>,
+    /// Readings that check the metric is not being gamed. A model never
+    /// sees them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audits: Vec<Audit>,
+    /// The values the metric can plausibly take, low and high.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<[f64; 2]>,
+    /// The largest plausible change from one report to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_step: Option<f64>,
+}
+
+/// What a guard does past its bound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Then {
+    /// Stop the venture until a human resumes it.
+    #[default]
+    Pause,
+    /// Ask once, and refuse every lever but stop while it is past.
+    Ask,
+}
+
+/// A guard: a command or a built-in metric the warden reads, with a bound;
+/// or the drawdown of the venture's own metric from its peak.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Guard {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub above: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub below: Option<f64>,
+    #[serde(default)]
+    pub then: Then,
+    /// The fall from the peak, in percent, that trips the guard.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "percent")]
+    pub drawdown: Option<f64>,
+    /// The metric a drawdown is computed over: the venture's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub of: Option<String>,
+}
+
+impl Guard {
+    /// The metric its readings carry: `guard.<name>`.
+    pub fn metric(&self) -> String {
+        format!("guard.{}", self.name)
+    }
+
+    /// Whether the guard trips above its bound, and the bound. A drawdown
+    /// trips at or above its percent.
+    pub fn bound(&self) -> (bool, f64) {
+        match (self.drawdown, self.above, self.below) {
+            (Some(d), _, _) => (true, d),
+            (_, Some(b), _) => (true, b),
+            (_, _, Some(b)) => (false, b),
+            _ => (true, f64::INFINITY),
+        }
+    }
+
+    /// Is this reading past the bound?
+    pub fn breached(&self, value: f64) -> bool {
+        match self.bound() {
+            _ if !value.is_finite() => false,
+            (true, b) if self.drawdown.is_some() => value >= b,
+            (true, b) => value > b,
+            (false, b) => value < b,
+        }
+    }
+}
+
+/// Which way an audit gets worse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Worse {
+    Up,
+    Down,
+}
+
+/// An audit: a reading that should not get worse while the target gets
+/// better.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Audit {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    pub worse: Worse,
+    /// How far the audit may move the worse way over the window.
+    #[serde(default)]
+    pub tolerance: f64,
+    /// How many audit readings the window spans, the latest included.
+    #[serde(default = "default_window")]
+    pub window: u32,
+}
+
+fn default_window() -> u32 {
+    5
+}
+
+impl Audit {
+    /// The metric its readings carry: `audit.<name>`.
+    pub fn metric(&self) -> String {
+        format!("audit.{}", self.name)
+    }
+
+    /// How much worse the audit got for a change of `delta`.
+    pub fn worsened(&self, delta: f64) -> f64 {
+        match self.worse {
+            Worse::Up => delta,
+            Worse::Down => -delta,
+        }
+    }
+}
+
+/// The prefix of an audit's readings: never shown to a model.
+pub const AUDIT_PREFIX: &str = "audit.";
+
+/// `drawdown:` as `15%`.
+pub mod percent {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(p: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+        match p {
+            Some(p) => s.serialize_str(&format!("{p}%")),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        let Some(text) = Option::<String>::deserialize(d)? else {
+            return Ok(None);
+        };
+        parse(&text).map(Some).map_err(serde::de::Error::custom)
+    }
+
+    pub fn parse(text: &str) -> Result<f64, String> {
+        let n = text
+            .trim()
+            .strip_suffix('%')
+            .and_then(|n| n.trim().parse::<f64>().ok())
+            .ok_or_else(|| format!("drawdown is a percent like 15%, not {text:?}"))?;
+        if !(n > 0.0 && n <= 100.0) {
+            return Err(format!(
+                "drawdown is a percent above 0% and at most 100%, not {text:?}"
+            ));
+        }
+        Ok(n)
+    }
 }
 
 /// A child as its parent lists it: a name, or a name with the order budgets
@@ -195,6 +355,13 @@ pub enum Controller {
         #[serde(default)]
         below: Option<f64>,
         action: String,
+        /// After acting, the metric must come back past the bound by this
+        /// much before the threshold acts again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadband: Option<f64>,
+        /// How many crossed reports in a row it takes to act.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold: Option<u32>,
     },
     /// A backend picks one label: nothing, a permitted action, or ask.
     Classifier {
@@ -450,8 +617,16 @@ const FIELDS: &[&str] = &[
     "children",
     "parent",
     "allocation",
+    "guards",
+    "audits",
+    "range",
+    "max_step",
 ];
-const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action"];
+const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadband", "hold"];
+const GUARD_FIELDS: &[&str] = &[
+    "name", "run", "adapter", "above", "below", "then", "drawdown", "of",
+];
+const AUDIT_FIELDS: &[&str] = &["name", "run", "adapter", "worse", "tolerance", "window"];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
 const ACTION_FIELDS: &[&str] = &[
     "name",
@@ -756,6 +931,7 @@ impl Mandate {
             above,
             below,
             action,
+            ..
         } = &self.controller
         {
             match (above, below) {
@@ -830,6 +1006,30 @@ impl Mandate {
                 ));
             }
         }
+        if let Controller::Threshold {
+            deadband: Some(d), ..
+        } = &self.controller
+        {
+            if !d.is_finite() || *d < 0.0 {
+                return fail(format!(
+                    "threshold deadband must be a number 0 or more, like 2, not {d}"
+                ));
+            }
+        }
+        self.check_guards()?;
+        self.check_audits()?;
+        if let Some([lo, hi]) = self.range {
+            if !lo.is_finite() || !hi.is_finite() || lo >= hi {
+                return fail(format!(
+                    "range is low then high, like [0, 1000], not [{lo}, {hi}]"
+                ));
+            }
+        }
+        if let Some(s) = self.max_step {
+            if !s.is_finite() || s <= 0.0 {
+                return fail(format!("max_step must be a number above 0, not {s}"));
+            }
+        }
         if let Some(hosts) = &self.network {
             for h in hosts {
                 let ok = !h.is_empty()
@@ -843,6 +1043,176 @@ impl Mandate {
             }
         }
         Ok(())
+    }
+
+    /// Guards: each named once, read one way, with one bound; and none
+    /// reading what a lever runs or what the metric reads, so a lever can
+    /// never move its own guard.
+    fn check_guards(&self) -> Result<(), MandateError> {
+        let mut names: Vec<&str> = Vec::new();
+        for g in &self.guards {
+            let who = format!("guard {:?}", g.name);
+            if !is_word(&g.name) {
+                return fail(format!(
+                    "a guard's name is one word like spend, not {:?}",
+                    g.name
+                ));
+            }
+            if names.contains(&g.name.as_str()) {
+                return fail(format!(
+                    "{who} is listed twice; each guard needs its own name"
+                ));
+            }
+            names.push(&g.name);
+            match (&g.run, &g.adapter, g.drawdown) {
+                (Some(run), None, None) if run.trim().is_empty() => {
+                    return fail(format!("{who} has an empty run; give it a command"))
+                }
+                (Some(_), None, None) => {}
+                (None, Some(spec), None) => check_metric_spec(&who, spec)?,
+                (None, None, Some(_)) => {
+                    if g.above.is_some() || g.below.is_some() {
+                        return fail(format!(
+                            "{who} is a drawdown; it trips at its percent and takes no above or below"
+                        ));
+                    }
+                    match g.of.as_deref() {
+                        Some(of) if of.trim() == self.metric_name() => {}
+                        Some(of) => {
+                            return fail(format!(
+                                "{who}: a drawdown is of the venture's metric, {}, not {of:?}",
+                                self.metric_name()
+                            ))
+                        }
+                        None => {
+                            return fail(format!(
+                                "{who}: a drawdown needs of: the metric, here {}",
+                                self.metric_name()
+                            ))
+                        }
+                    }
+                }
+                _ => {
+                    return fail(format!(
+                        "{who} needs exactly one of run (a command), adapter (a built-in metric) or drawdown (like 15%)"
+                    ))
+                }
+            }
+            if g.drawdown.is_none() {
+                if g.of.is_some() {
+                    return fail(format!("{who}: of goes only with drawdown"));
+                }
+                match (g.above, g.below) {
+                    (Some(_), Some(_)) => {
+                        return fail(format!("{who} takes one bound, above or below, not both"))
+                    }
+                    (None, None) => {
+                        return fail(format!(
+                            "{who} needs a bound: above or below, a number like 100"
+                        ))
+                    }
+                    (Some(b), None) | (None, Some(b)) if !b.is_finite() => {
+                        return fail(format!(
+                            "{who}: the bound must be an ordinary number, not {b}"
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(cmd) = g.run.as_deref().or(g.adapter.as_deref()) {
+                self.apart(&who, cmd)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a guard that reads what a lever runs or what the metric
+    /// reads: a guard is read apart from what it guards.
+    fn apart(&self, who: &str, cmd: &str) -> Result<(), MandateError> {
+        let lever = self.permitted.iter().find(|p| {
+            p.run.as_deref().is_some_and(|r| same_command(r, cmd))
+                || p.adapter.as_deref().is_some_and(|a| same_command(a, cmd))
+        });
+        if let Some(p) = lever {
+            return fail(format!(
+                "{who} reads {cmd:?}, the command of lever {:?}; a guard is read apart from what it guards",
+                p.name
+            ));
+        }
+        let metric = self.metric.trim();
+        let shell = metric.strip_prefix("shell ").unwrap_or(metric);
+        if same_command(metric, cmd)
+            || same_command(shell, cmd)
+            || (self.metric_adapter().is_none() && same_command("report", cmd))
+        {
+            return fail(format!(
+                "{who} reads {cmd:?}, which is how the metric is read; a guard is read apart from what it guards"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Audits: each named once, read one way.
+    fn check_audits(&self) -> Result<(), MandateError> {
+        let mut names: Vec<&str> = Vec::new();
+        for a in &self.audits {
+            let who = format!("audit {:?}", a.name);
+            if !is_word(&a.name) {
+                return fail(format!(
+                    "an audit's name is one word like refunds, not {:?}",
+                    a.name
+                ));
+            }
+            if names.contains(&a.name.as_str()) {
+                return fail(format!(
+                    "{who} is listed twice; each audit needs its own name"
+                ));
+            }
+            names.push(&a.name);
+            match (&a.run, &a.adapter) {
+                (Some(run), None) if !run.trim().is_empty() => {}
+                (None, Some(spec)) => check_metric_spec(&who, spec)?,
+                _ => {
+                    return fail(format!(
+                        "{who} needs exactly one of run (a command) or adapter (a built-in metric)"
+                    ))
+                }
+            }
+            if !a.tolerance.is_finite() || a.tolerance < 0.0 {
+                return fail(format!(
+                    "{who}: tolerance is a number 0 or more, not {}",
+                    a.tolerance
+                ));
+            }
+            if a.window < 2 {
+                return fail(format!(
+                    "{who}: window is at least 2 readings, not {}",
+                    a.window
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The guard with this name, if any.
+    pub fn guard(&self, name: &str) -> Option<&Guard> {
+        self.guards.iter().find(|g| g.name == name)
+    }
+
+    /// The audit with this name, if any.
+    pub fn audit(&self, name: &str) -> Option<&Audit> {
+        self.audits.iter().find(|a| a.name == name)
+    }
+
+    /// The threshold's deadband and hold: 0 and 1 when unset or not a
+    /// threshold.
+    pub fn deadband_hold(&self) -> (f64, u32) {
+        match &self.controller {
+            Controller::Threshold { deadband, hold, .. } => {
+                (deadband.unwrap_or(0.0), hold.unwrap_or(1).max(1))
+            }
+            _ => (0.0, 1),
+        }
     }
 
     /// May the venture reach this host? Yes when the mandate sets no
@@ -883,6 +1253,10 @@ impl Mandate {
             children: vec![],
             parent: None,
             allocation: None,
+            guards: vec![],
+            audits: vec![],
+            range: None,
+            max_step: None,
         }
     }
 
@@ -1043,6 +1417,30 @@ impl Permitted {
     }
 }
 
+/// Do two commands run the same thing: the same words, a leading `./`
+/// aside?
+fn same_command(a: &str, b: &str) -> bool {
+    let words = |c: &str| -> Vec<String> {
+        c.split_whitespace()
+            .map(|w| w.strip_prefix("./").unwrap_or(w).to_string())
+            .collect()
+    };
+    let (a, b) = (words(a), words(b));
+    !a.is_empty() && a == b
+}
+
+/// A built-in metric named by a guard or an audit.
+fn check_metric_spec(who: &str, spec: &str) -> Result<(), MandateError> {
+    match adapter::Metric::parse(spec) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => fail(format!(
+            "{who}: {spec:?} is not a built-in metric; name one like {}",
+            adapter::METRICS.join(", ")
+        )),
+        Err(e) => fail(format!("{who}: {e}")),
+    }
+}
+
 fn fail<T>(msg: impl Into<String>) -> Result<T, MandateError> {
     Err(MandateError(msg.into()))
 }
@@ -1138,7 +1536,74 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
             ))
         }
     }
-    check_allocation(map.get("allocation"))
+    check_allocation(map.get("allocation"))?;
+    check_list(
+        map.get("guards"),
+        "guards",
+        "a guard",
+        GUARD_FIELDS,
+        "name, run or adapter, above or below, then: pause or ask",
+    )?;
+    check_list(
+        map.get("audits"),
+        "audits",
+        "an audit",
+        AUDIT_FIELDS,
+        "name, run or adapter, worse: up or down, tolerance",
+    )?;
+    match map.get("range") {
+        None | Some(Value::Null) => {}
+        Some(Value::Sequence(items))
+            if items.len() == 2 && items.iter().all(|i| matches!(i, Value::Number(_))) => {}
+        Some(other) => {
+            return fail(format!(
+                "range is two numbers, low and high, like [0, 1000], not {}",
+                describe(other)
+            ))
+        }
+    }
+    match map.get("max_step") {
+        None | Some(Value::Null) | Some(Value::Number(_)) => Ok(()),
+        Some(other) => fail(format!(
+            "max_step is a number like 50, the largest plausible change between two reports, not {}",
+            describe(other)
+        )),
+    }
+}
+
+/// A list of sets of fields, each with only the known fields.
+fn check_list(
+    v: Option<&Value>,
+    field: &str,
+    one: &str,
+    known: &[&str],
+    example: &str,
+) -> Result<(), MandateError> {
+    let items = match v {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Sequence(items)) => items,
+        Some(other) => {
+            return fail(format!(
+                "{field} is a list, each with {example}; not {}",
+                describe(other)
+            ))
+        }
+    };
+    for item in items {
+        let Value::Mapping(map) = item else {
+            return fail(format!(
+                "{one} in {field} is a set of fields ({example}), not {}",
+                describe(item)
+            ));
+        };
+        if let Some(f) = unknown_field(map, known)? {
+            return fail(format!(
+                "unknown field {f:?} in {field}; {one} has these fields: {}",
+                known.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 const CHILD_FIELDS: &[&str] = &["name", "priority", "floor"];
@@ -1335,6 +1800,25 @@ fn check_controller(v: Option<&Value>) -> Result<(), MandateError> {
                     describe(other)
                 ))
             }
+        }
+    }
+    match map.get("deadband") {
+        None | Some(Value::Null) | Some(Value::Number(_)) => {}
+        Some(other) => {
+            return fail(format!(
+                "threshold deadband must be a number like 2, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match map.get("hold") {
+        None | Some(Value::Null) => {}
+        Some(Value::Number(n)) if n.as_u64().is_some_and(|n| (1..=1000).contains(&n)) => {}
+        Some(other) => {
+            return fail(format!(
+                "threshold hold must be a whole number of reports from 1 to 1000, like 3, not {}",
+                describe(other)
+            ))
         }
     }
     match map.get("action") {
@@ -1765,6 +2249,99 @@ forbidden: [rm]
     }
 
     #[test]
+    fn guards_audits_range_deadband_and_hold_parse_and_round_trip() {
+        let text = edit(
+            "  action: reset\n",
+            "  action: reset\n  deadband: 2\n  hold: 3\n",
+        ) + "guards:
+  - {name: spend, run: ./spend, above: 100}
+  - {name: errors, adapter: http.status https://example.com/health, above: 299, then: ask}
+  - {name: dd, drawdown: 15%, of: count}
+audits:
+  - {name: refunds, run: ./refunds, worse: up, tolerance: 2}
+range: [0, 100000]
+max_step: 5000
+";
+        let m = Mandate::parse(&text).unwrap();
+        assert_eq!(m.deadband_hold(), (2.0, 3));
+        assert_eq!(m.guards[0].then, Then::Pause);
+        assert_eq!(m.guards[1].then, Then::Ask);
+        assert_eq!(m.guards[2].bound(), (true, 15.0));
+        assert!(m.guards[2].breached(15.0) && !m.guards[2].breached(14.9));
+        assert!(m.guards[0].breached(101.0) && !m.guards[0].breached(100.0));
+        assert_eq!(m.audits[0].window, 5);
+        assert_eq!(m.range, Some([0.0, 100000.0]));
+        let back: Mandate = serde_yaml::from_str(&serde_yaml::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn guards_audits_and_ranges_say_what_is_wrong() {
+        let with = |extra: &str| fails(&format!("{VALID}{extra}"));
+        for (extra, says) in [
+            ("guards:\n  - {name: g, run: ./g}\n", "needs a bound"),
+            (
+                "guards:\n  - {name: g, run: ./g, above: 1, below: 0}\n",
+                "not both",
+            ),
+            ("guards:\n  - {name: g, above: 1}\n", "exactly one of run"),
+            (
+                "guards:\n  - {name: g, drawdown: 15, of: count}\n",
+                "a percent like 15%",
+            ),
+            (
+                "guards:\n  - {name: g, drawdown: 15%, of: other}\n",
+                "of the venture's metric",
+            ),
+            ("guards:\n  - {name: g, drawdown: 15%}\n", "needs of"),
+            (
+                "guards:\n  - {name: g, run: ./g, above: 1, bogus: 2}\n",
+                "unknown field \"bogus\" in guards",
+            ),
+            (
+                "guards:\n  - {name: g, run: ./reset.sh, above: 1}\n",
+                "the command of lever \"reset\"",
+            ),
+            (
+                "guards:\n  - {name: g, run: report, above: 1}\n",
+                "how the metric is read",
+            ),
+            (
+                "guards:\n  - {name: g, run: a, above: 1}\n  - {name: g, run: b, above: 1}\n",
+                "listed twice",
+            ),
+            ("guards: 3\n", "guards is a list"),
+            (
+                "audits:\n  - {name: a, run: ./a, worse: sideways}\n",
+                "sideways",
+            ),
+            ("audits:\n  - {name: a, worse: up}\n", "exactly one of run"),
+            (
+                "audits:\n  - {name: a, run: ./a, worse: up, tolerance: -1}\n",
+                "tolerance",
+            ),
+            (
+                "audits:\n  - {name: a, run: ./a, worse: up, window: 1}\n",
+                "window",
+            ),
+            ("range: [5, 1]\n", "low then high"),
+            ("range: 5\n", "two numbers"),
+            ("max_step: 0\n", "above 0"),
+            ("max_step: big\n", "max_step is a number"),
+        ] {
+            let msg = with(extra);
+            assert!(msg.contains(says), "{extra:?}: {msg}");
+        }
+        let msg = fails(&edit("  action: reset\n", "  action: reset\n  hold: 0\n"));
+        assert!(msg.contains("hold must be a whole number"), "{msg}");
+        let msg = fails(&edit(
+            "  action: reset\n",
+            "  action: reset\n  deadband: -1\n",
+        ));
+        assert!(msg.contains("deadband must be a number 0 or more"), "{msg}");
+    }
+
+    #[test]
     fn valid_text_parses() {
         let m = Mandate::parse(VALID).unwrap();
         assert_eq!(m.metric, "count");
@@ -1818,7 +2395,7 @@ forbidden: [rm]
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");
@@ -1978,7 +2555,7 @@ forbidden: [rm]
         let msg = fails(&edit("  above: 10\n", "  above: 10\n  over: 10\n"));
         assert_eq!(
             msg,
-            "unknown field \"over\" in controller; a threshold controller has these fields: kind, above, below, action"
+            "unknown field \"over\" in controller; a threshold controller has these fields: kind, above, below, action, deadband, hold"
         );
         let text = edit(
             "controller:\n  kind: threshold\n  above: 10\n  action: reset\n",
@@ -2021,7 +2598,9 @@ forbidden: [rm]
             Controller::Threshold {
                 above: None,
                 below: Some(-2.5),
-                action: "reset".into()
+                action: "reset".into(),
+                deadband: None,
+                hold: None,
             }
         );
     }
@@ -2053,7 +2632,9 @@ forbidden: [rm]
             Controller::Threshold {
                 above: Some(10.0),
                 below: None,
-                action: STOP.into()
+                action: STOP.into(),
+                deadband: None,
+                hold: None,
             }
         );
     }
@@ -2871,6 +3452,8 @@ forbidden: [rm]
             above: None,
             below: None,
             action: "reset".into(),
+            deadband: None,
+            hold: None,
         };
         assert!(m.validate().unwrap_err().0.contains("needs a bound"));
         m.controller = Controller::Classifier { backend: None };

@@ -111,6 +111,7 @@ fn note(k: &mut Kernel, claim: Claim, address: &str) {
         source: None,
         confidence: None,
         cites: vec![],
+        implausible: None,
     })
     .unwrap();
 }

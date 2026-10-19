@@ -45,6 +45,13 @@ pub trait Warden {
     /// Measure a venture's metric through its adapter, with the key the
     /// adapter is scoped to. The value, or None with a note saying why.
     fn measure(&mut self, venture: &str) -> Result<(Option<f64>, String), String>;
+    /// Read one of a venture's guards or audits by its metric,
+    /// `guard.<name>` or `audit.<name>`: its command or its built-in
+    /// metric, run by the warden and never by the venture. The value, or
+    /// None with a note saying why.
+    fn read(&mut self, _venture: &str, metric: &str) -> Result<(Option<f64>, String), String> {
+        Err(format!("this warden cannot read {metric}"))
+    }
 }
 
 /// Why `execute` wrote nothing. A refusal is the warden's own typed
@@ -446,6 +453,14 @@ impl Warden for LocalWarden {
         self.measure_in(&ventures, venture)
     }
 
+    fn read(&mut self, venture: &str, metric: &str) -> Result<(Option<f64>, String), String> {
+        self.index
+            .refresh(&self.ledger)
+            .map_err(|e| e.to_string())?;
+        let ventures = venture::from_adoptions(self.index.adoptions());
+        self.read_in(&ventures, venture, metric)
+    }
+
     fn confirm(&mut self, intent: Seq) -> Result<Option<(bool, String)>, String> {
         self.index
             .refresh(&self.ledger)
@@ -476,6 +491,71 @@ impl Warden for LocalWarden {
 }
 
 impl LocalWarden {
+    /// Read a guard's or an audit's command or built-in metric.
+    fn read_in(
+        &self,
+        ventures: &BTreeMap<String, venture::Venture>,
+        venture: &str,
+        metric: &str,
+    ) -> Result<(Option<f64>, String), String> {
+        let v = ventures
+            .get(venture)
+            .ok_or_else(|| format!("no venture named {venture}"))?;
+        let m = &v.mandate;
+        let (run, spec) = if let Some(name) = metric.strip_prefix("guard.") {
+            let g = m
+                .guard(name)
+                .ok_or_else(|| format!("{venture} has no guard {name}"))?;
+            (g.run.clone(), g.adapter.clone())
+        } else if let Some(name) = metric.strip_prefix(crate::mandate::AUDIT_PREFIX) {
+            let a = m
+                .audit(name)
+                .ok_or_else(|| format!("{venture} has no audit {name}"))?;
+            (a.run.clone(), a.adapter.clone())
+        } else {
+            return Err(format!("{metric} is neither a guard nor an audit"));
+        };
+        let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
+        if let Some(cmd) = run {
+            let ran = run_command_raw(&dir, &cmd, ACTION_TIMEOUT);
+            if !ran.ok {
+                return Ok((
+                    None,
+                    format!("{metric} failed: {}", ran.detail(ACTION_TIMEOUT)),
+                ));
+            }
+            return Ok(match adapter::number_from(&ran.stdout) {
+                Ok(n) => (Some(n), String::new()),
+                Err(_) => (
+                    None,
+                    format!(
+                        "{metric} did not print a number: {}",
+                        ran.detail(ACTION_TIMEOUT)
+                    ),
+                ),
+            });
+        }
+        let spec = spec.ok_or_else(|| format!("{metric} reads nothing"))?;
+        let reading = adapter::Metric::parse(&spec)?
+            .ok_or_else(|| format!("{metric}: {spec:?} is not a built-in metric"))?;
+        if let Some(host) = reading.host(&self.config.adapters) {
+            if !m.allows_host(&host) {
+                return Ok((
+                    None,
+                    format!(
+                        "{} would reach {host}, which is not in the venture's network list",
+                        reading.name()
+                    ),
+                ));
+            }
+        }
+        let key = reading
+            .key_name()
+            .and_then(|k| self.keys.get(k))
+            .map(String::as_str);
+        Ok(reading.measure(&dir, key, &self.config.adapters))
+    }
+
     fn measure_in(
         &self,
         ventures: &BTreeMap<String, venture::Venture>,
@@ -767,6 +847,11 @@ fn read_capped(from: &mut impl Read, cap: usize, into: &mut String) {
 
 /// Run a shell command in a directory; see `run`. Returns whether it
 /// exited 0 and one line of what happened.
+/// Run a command line with `sh -c` and keep what it printed.
+fn run_command_raw(dir: &Path, command: &str, timeout: Duration) -> Ran {
+    run(dir, "sh", &["-c", command], "", timeout)
+}
+
 pub fn run_command(dir: &Path, command: &str, stdin: &str, timeout: Duration) -> (bool, String) {
     let ran = run(dir, "sh", &["-c", command], stdin, timeout);
     (ran.ok, ran.detail(timeout))
@@ -819,6 +904,8 @@ pub enum ToWarden {
     Infer(InferRequest),
     Measure(String),
     Confirm(Seq),
+    /// A venture and a guard's or an audit's metric.
+    Read(String, String),
 }
 
 /// What a warden process answers.

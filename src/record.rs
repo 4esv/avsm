@@ -311,6 +311,23 @@ pub enum Signal {
     /// its runs kept failing. Until a declared decision answers the ask,
     /// every run of the lever needs a declared decision of its own.
     Ineffective { action: String, why: String },
+    /// A guard's reading is past its bound and the guard asks: every lever
+    /// but stop is refused until the reading is back inside.
+    Guard {
+        guard: String,
+        value: f64,
+        bound: f64,
+    },
+    /// The target improved over an audit's window while the audit worsened
+    /// past its tolerance.
+    Audit {
+        audit: String,
+        target_delta: f64,
+        audit_delta: f64,
+    },
+    /// A report of the metric is not to be believed: the first of an
+    /// episode, which ends at the next plausible report.
+    Implausible { metric: String, why: String },
 }
 
 /// One ledger record. Every variant carries its claim and its venture.
@@ -333,6 +350,11 @@ pub enum Record {
         confidence: Option<f64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cites: Vec<Seq>,
+        /// Set when code read the value and does not believe it: NaN,
+        /// missing, out of range, too big a step, or a flap. Such a report
+        /// is kept, and is never a premise for a crossed threshold.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        implausible: Option<String>,
     },
     /// A model, or a human by hand, suggests an action by name, with the
     /// payload the lever would consume.
@@ -524,6 +546,15 @@ impl Record {
             source: None,
             confidence: None,
             cites: vec![],
+            implausible: None,
+        }
+    }
+
+    /// Is this a report code marked implausible?
+    pub fn implausible(&self) -> Option<&str> {
+        match self {
+            Record::Report { implausible, .. } => implausible.as_deref(),
+            _ => None,
         }
     }
 
@@ -539,22 +570,23 @@ impl Record {
         match self {
             Record::Report {
                 metric,
-                value: Some(v),
+                value,
                 note,
+                implausible,
                 ..
             } => {
-                if note.is_empty() {
-                    format!("{metric}={v}")
-                } else {
-                    format!("{metric}={v}  {}", first_line(note))
+                let mut text = match value {
+                    Some(v) => format!("{metric}={v}"),
+                    None => format!("{metric}=?"),
+                };
+                if let Some(why) = implausible {
+                    text.push_str(&format!("  implausible: {why}"));
                 }
+                if !note.is_empty() || value.is_none() {
+                    text.push_str(&format!("  {}", first_line(note)));
+                }
+                text
             }
-            Record::Report {
-                metric,
-                value: None,
-                note,
-                ..
-            } => format!("{metric}=?  {}", first_line(note)),
             Record::Proposal {
                 action,
                 reason,

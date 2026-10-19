@@ -225,6 +225,14 @@ pub enum Reason {
         last: Seq,
         hold: Duration,
     },
+    /// A guard's latest reading is past its bound: no lever but stop runs
+    /// until it is back inside, whatever approves or calls for it.
+    Guarded {
+        guard: String,
+        value: f64,
+        above: bool,
+        bound: f64,
+    },
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -330,6 +338,10 @@ ascent! {
     // venture, action: refused by its parent's budget, or a shared quota
     relation over_budget(String, String);
     relation over_quota(String, String);
+    // a report code marked implausible
+    relation implausible(Seq);
+    // venture, guard metric, trips above, bound, trips at the bound too
+    relation guard(String, String, bool, Num, bool);
 
     // Non-negotiable 2: only measured and declared records can authorize.
     relation trusted(Seq);
@@ -363,6 +375,8 @@ ascent! {
         candidate(v, a),
         threshold(v, m, above, bound, a, _),
         report(s, v, m, val), cites(s), trusted(s), !stale(s),
+        // A report code does not believe is never a premise.
+        !implausible(s),
         if (*above && val.0 > bound.0) || (!*above && val.0 < bound.0);
     relation approved(String, String, Seq, Seq);
     approved(v, a, d, q) <--
@@ -415,6 +429,16 @@ ascent! {
     relation open_ask(Seq, String);
     open_ask(q, v) <-- asked(q, v), !decided(q);
 
+    // A guard's latest trusted reading past its bound guards the venture.
+    // No score, approval or proposal gets a lever past a guard; only stop.
+    relation breached(String, String, Seq);
+    breached(v, g, s) <--
+        guard(v, g, above, bound, at),
+        report(s, v, g, val), trusted(s), !stale(s),
+        if (*above && (val.0 > bound.0 || (*at && val.0 >= bound.0))) || (!*above && val.0 < bound.0);
+    relation guarded(String);
+    guarded(v) <-- breached(v, _, _);
+
     relation hard(String, String);
     hard(v, a) <-- hardwired(v, a, _);
     relation under_cap(String, String);
@@ -437,6 +461,7 @@ ascent! {
         mandate(_, v, _),
         !hard(v, a),
         approved(v, a, _, q), code_ask(q),
+        !guarded(v),
         !paused(v);
     allowed(v, a) <--
         plain(v, a),
@@ -449,6 +474,7 @@ ascent! {
         under_cap(v, a),
         !over_budget(v, a),
         !over_quota(v, a),
+        !guarded(v),
         !paused(v);
 }
 
@@ -551,6 +577,7 @@ fn mandate_threshold(mandates: &[&Adopted], venture: &str) -> Option<Threshold> 
         above,
         below,
         action,
+        ..
     } = &m.mandate.controller
     else {
         return None;
@@ -810,6 +837,12 @@ pub fn gate_in(
         }
     }
     seqs.extend(index.pause_sources(v));
+    // The latest reading of each of the venture's guards.
+    for m in mandates.iter().filter(|m| m.venture == v) {
+        for g in &m.mandate.guards {
+            seqs.extend(index.latest_report(v, &g.metric()));
+        }
+    }
     for s in seqs {
         if let Some(e) = index.get(s) {
             load_entry(&mut p, e);
@@ -909,6 +942,16 @@ fn load_mandates(
         }
         for f in &m.mandate.forbidden {
             p.forbidden.push((venture.clone(), f.clone()));
+        }
+        for g in &m.mandate.guards {
+            let (above, bound) = g.bound();
+            p.guard.push((
+                venture.clone(),
+                g.metric(),
+                above,
+                Num(bound),
+                g.drawdown.is_some(),
+            ));
         }
         if let Some(t) = threshold(&venture) {
             p.threshold.push((
@@ -1021,6 +1064,9 @@ fn load_entry(p: &mut Rules, e: &Entry) {
     let r = &e.record;
     let venture = r.venture().to_string();
     p.record.push((e.seq, venture.clone(), r.claim(), r.kind()));
+    if r.implausible().is_some() {
+        p.implausible.push((e.seq,));
+    }
     match r {
         Record::Report {
             metric,
@@ -1214,6 +1260,7 @@ fn assemble<'a>(
         } else if !approved_by_code {
             reasons.push(Reason::NotJustified { action: a.clone() });
         }
+        reasons.extend(guarded(p, v, find));
         if p.paused.iter().any(|(x,)| x == v) {
             reasons.push(Reason::Paused { venture: v.clone() });
         }
@@ -1416,6 +1463,7 @@ fn assemble<'a>(
     }
     steps.extend(extra_steps);
     reasons.extend(extra_reasons);
+    reasons.extend(guarded(p, v, find));
     if p.paused.iter().any(|(x,)| x == v) {
         reasons.push(Reason::Paused { venture: v.clone() });
     } else {
@@ -1557,6 +1605,32 @@ fn allocation_reasons<'a>(
         }
     }
     reasons
+}
+
+/// The guards that hold a venture, as reasons.
+fn guarded<'a>(p: &Rules, v: &str, find: &dyn Fn(Seq) -> Option<&'a Entry>) -> Vec<Reason> {
+    let mut out: Vec<Reason> = p
+        .breached
+        .iter()
+        .filter(|(x, _, _)| x == v)
+        .filter_map(|(_, g, s)| {
+            let value = match find(*s).map(|e| &e.record) {
+                Some(Record::Report {
+                    value: Some(val), ..
+                }) => *val,
+                _ => return None,
+            };
+            let (_, _, above, bound, _) = p.guard.iter().find(|(x, m, ..)| x == v && m == g)?;
+            Some(Reason::Guarded {
+                guard: g.strip_prefix("guard.").unwrap_or(g).to_string(),
+                value,
+                above: *above,
+                bound: bound.0,
+            })
+        })
+        .collect();
+    out.sort_by_key(|r| r.to_string());
+    out
 }
 
 fn finish(
@@ -1776,6 +1850,16 @@ impl fmt::Display for Reason {
                 f,
                 "{child}'s budget moved the other way in #{last}, and the hold is {}",
                 humantime::format_duration(*hold)
+            ),
+            Reason::Guarded {
+                guard,
+                value,
+                above,
+                bound,
+            } => write!(
+                f,
+                "guard {guard} reads {value}, past its bound ({} {bound}); no lever but stop runs until it is back inside",
+                if *above { "above" } else { "below" }
             ),
         }
     }
@@ -2301,6 +2385,10 @@ mod tests {
             children: vec![],
             parent: None,
             allocation: None,
+            guards: vec![],
+            audits: vec![],
+            range: None,
+            max_step: None,
         }
     }
 
@@ -2309,6 +2397,8 @@ mod tests {
             above: Some(bound),
             below: None,
             action: action.to_string(),
+            deadband: None,
+            hold: None,
         }
     }
 
@@ -3726,6 +3816,7 @@ mod tests {
             source: None,
             confidence: None,
             cites,
+            implausible: None,
         };
         let f1 = fx.push(finding("rivals charge 9", vec![]));
         let f2 = fx.push(finding("rivals charge 8", vec![]));
@@ -3739,6 +3830,7 @@ mod tests {
             source: None,
             confidence: None,
             cites: vec![a, b, f1, f2],
+            implausible: None,
         });
         let current: Vec<Seq> = current_facts(&fx.entries)
             .into_iter()

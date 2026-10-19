@@ -365,6 +365,7 @@ mod tests {
                             source,
                             confidence,
                             cites,
+                            implausible: None,
                         }
                     }
                 ),

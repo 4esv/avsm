@@ -27,6 +27,7 @@ use crate::venture::{self, Venture};
 use crate::warden::{self, Failure, FromWarden, LocalWarden, ToWarden, Warden};
 
 mod expect;
+mod guards;
 mod refusals;
 
 /// How long a report may take.
@@ -759,7 +760,7 @@ impl Kernel {
     pub fn know(&self, what: &str) -> Result<String, String> {
         let index = self.index()?;
         let ventures: BTreeSet<String> = self.ventures.keys().cloned().collect();
-        Ok(know_in(&index, &ventures, what))
+        Ok(know_in(&index, &ventures, what, false))
     }
 
     // ----- the loop -----
@@ -1056,35 +1057,62 @@ impl Kernel {
             Some(m) => m,
             None => return,
         };
-        let entry = match self.append(Record::report(
-            Claim::Measured,
-            name,
-            v.mandate.metric_name(),
-            value,
-            &note,
-        )) {
+        // A reading code does not believe is kept, marked, and never a
+        // premise; the first of an episode asks.
+        let (implausible, fresh) = self.doubt(&v, value);
+        let metric = v.mandate.metric_name().to_string();
+        let entry = match self.append(Record::Report {
+            claim: Claim::Measured,
+            venture: name.to_string(),
+            metric: metric.clone(),
+            value: value.filter(|x| x.is_finite()),
+            note,
+            source: None,
+            confidence: None,
+            cites: vec![],
+            implausible: implausible.clone(),
+        }) {
             Ok(e) => e,
             Err(e) => {
                 log(&format!("{name}: cannot write report: {e}"));
                 return;
             }
         };
+        let readings = self.read_guards(&v);
         if halted {
             return;
         }
-        let Some(val) = value else { return };
+        if let (Some(why), true) = (&implausible, fresh) {
+            self.signal(
+                name,
+                format!("{metric} reported something implausible: {why}"),
+                Signal::Implausible {
+                    metric: metric.clone(),
+                    why: why.clone(),
+                },
+            );
+        }
+        self.enforce_guards(name, readings);
+        self.check_audits(&v);
+        if value.is_none() {
+            return;
+        }
+        // What the lever runs did to the metric, judged on plausible
+        // reports only.
         self.judge(name);
+        if implausible.is_some() {
+            return;
+        }
         // The bound is the mandate's, or the one the parent set.
         let threshold = match self.index() {
             Ok(index) => gate::effective_threshold_in(&index, &self.adopted(), name),
             Err(_) => return,
         };
         if let Some(t) = threshold {
-            let crossed = (t.above && val > t.bound) || (!t.above && val < t.bound);
-            if crossed {
+            if self.threshold_fires(&v, &t) {
                 self.forget_refusal();
                 self.act(name, &t.action, vec![entry.seq], Claim::Measured);
-                self.saturate(name, &t.action, v.mandate.metric_name(), t.bound);
+                self.saturate(name, &t.action, &metric, t.bound);
             }
         }
     }
@@ -1128,8 +1156,21 @@ impl Kernel {
                 format!("report failed: {}", ran.detail(REPORT_TIMEOUT)),
             ));
         }
+        // NaN and infinity parse but mean nothing; they are passed on so
+        // the report says so, and are never stored as a value.
+        let not_finite = ran
+            .stdout
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .and_then(|l| l.trim().parse::<f64>().ok())
+            .filter(|n| !n.is_finite());
         match crate::adapter::number_from(&ran.stdout) {
             Ok(n) => Some((Some(n), String::new())),
+            Err(_) if not_finite.is_some() => Some((
+                not_finite,
+                format!("report printed {}", not_finite.unwrap_or(f64::NAN)),
+            )),
             Err(_) => Some((
                 None,
                 format!(
@@ -1257,6 +1298,7 @@ impl Kernel {
                         source: None,
                         confidence: None,
                         cites: candidate.cites.clone(),
+                        implausible: None,
                     };
                     if let Err(e) = self.append(failed) {
                         lines.push(format!("{name}: cannot write record: {e}"));
@@ -1264,12 +1306,13 @@ impl Kernel {
                 }
             },
             Err((refusal, already, may_ask, payload, reason)) => {
-                // A paused venture is not asked about: an approval could
-                // not run until a human resumes it anyway.
+                // A paused or guarded venture is not asked about: an
+                // approval could not run until a human resumes it, or the
+                // guard is back inside, anyway.
                 let paused = refusal
                     .reasons
                     .iter()
-                    .any(|r| matches!(r, Reason::Paused { .. }));
+                    .any(|r| matches!(r, Reason::Paused { .. } | Reason::Guarded { .. }));
                 let needs_human = !paused
                     && refusal
                         .reasons
@@ -1421,7 +1464,13 @@ impl Kernel {
                 return;
             }
         };
-        let mine: Vec<Entry> = index.of(name).cloned().collect();
+        // Audit readings never reach a model: not as records, not in a
+        // summary, not as asks.
+        let mine: Vec<Entry> = index
+            .of(name)
+            .filter(|e| !role::hidden(e))
+            .cloned()
+            .collect();
         // Context by budget: the mandate, the latest summary, the records
         // it does not stand for, and the open asks. Past the venture's
         // bound, the older records go to the role to be summarized first;
@@ -1483,7 +1532,7 @@ impl Kernel {
                 }
                 let theirs: Vec<&Entry> = index
                     .of(c)
-                    .filter(|e| e.record.claim().authorizes())
+                    .filter(|e| e.record.claim().authorizes() && !role::hidden(e))
                     .collect();
                 let metric = theirs
                     .iter()
@@ -1539,8 +1588,14 @@ impl Kernel {
             let mut drill = |what: &str, arg: &str| -> Result<String, String> {
                 let index = index.borrow();
                 let text = match what {
-                    "know" => know_in(&index, &ventures, arg),
-                    "why" => why_in(&index, &adopted, &quotas, parse_seq(arg)?)?,
+                    "know" => know_in(&index, &ventures, arg, true),
+                    "why" => {
+                        let seq = parse_seq(arg)?;
+                        if index.get(seq).is_some_and(role::hidden) {
+                            return Err(format!("record #{seq} is not shown to a model"));
+                        }
+                        why_in(&index, &adopted, &quotas, seq)?
+                    }
                     _ => return Err(format!("a drill is know or why, not {what}")),
                 };
                 let note = format!("{arg}: {} lines shown", text.lines().count());
@@ -1554,6 +1609,7 @@ impl Kernel {
                         source: None,
                         confidence: None,
                         cites: vec![],
+                        implausible: None,
                     })
                     .map_err(|e| e.to_string())?;
                 Ok(text.chars().take(6000).collect())
@@ -1574,6 +1630,7 @@ impl Kernel {
                     source: None,
                     confidence: None,
                     cites: vec![],
+                    implausible: None,
                 };
                 match self.append(failed) {
                     Ok(entry) => log(&entry.line()),
@@ -1654,6 +1711,7 @@ impl Kernel {
                         source: None,
                         confidence: None,
                         cites,
+                        implausible: None,
                     }
                 }
                 Record::Report { metric, note, .. } if metric == role::NOTHING => {
@@ -1668,6 +1726,7 @@ impl Kernel {
                     source: None,
                     confidence: None,
                     cites: vec![],
+                    implausible: None,
                 },
                 other => Record::Report {
                     claim: Claim::Inferred,
@@ -1681,6 +1740,7 @@ impl Kernel {
                     source: None,
                     confidence: None,
                     cites: vec![],
+                    implausible: None,
                 },
             };
             let entry = match self.append(record) {
@@ -2135,13 +2195,14 @@ fn mandate_version_line(index: &Index, proof: &gate::Proof) -> Option<String> {
 /// The current facts about a venture (when `what` names one) or a topic,
 /// from a snapshot of the ledger: number, age, claim, the fact, and what
 /// it rests on.
-fn know_in(index: &Index, ventures: &BTreeSet<String>, what: &str) -> String {
+fn know_in(index: &Index, ventures: &BTreeSet<String>, what: &str, for_model: bool) -> String {
     let by_venture = ventures.contains(what) || what == SELF;
     let current = gate::current_facts(index.entries());
     let picked: Vec<&Entry> = current
         .iter()
         .filter(|(_, v, t)| if by_venture { v == what } else { t == what })
         .filter_map(|(s, _, _)| index.get(*s))
+        .filter(|e| !(for_model && role::hidden(e)))
         .collect();
     if picked.is_empty() {
         return format!(
@@ -2444,6 +2505,16 @@ impl Warden for WardenProcess {
         }
     }
 
+    fn read(&mut self, venture: &str, metric: &str) -> Result<(Option<f64>, String), String> {
+        self.0
+            .send(&ToWarden::Read(venture.to_string(), metric.to_string()))?;
+        match self.0.recv::<FromWarden>()? {
+            FromWarden::Measured(value, note) => Ok((value, note)),
+            FromWarden::Err(e) => Err(e),
+            _ => Err("the warden answered the wrong question".to_string()),
+        }
+    }
+
     fn confirm(&mut self, intent: Seq) -> Result<Option<(bool, String)>, String> {
         self.0.send(&ToWarden::Confirm(intent))?;
         match self.0.recv::<FromWarden>()? {
@@ -2528,6 +2599,10 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
             },
             Ok(ToWarden::Confirm(i)) => match warden.confirm(i) {
                 Ok(found) => FromWarden::Confirmed(found),
+                Err(e) => FromWarden::Err(e),
+            },
+            Ok(ToWarden::Read(v, m)) => match warden.read(&v, &m) {
+                Ok((value, note)) => FromWarden::Measured(value, note),
                 Err(e) => FromWarden::Err(e),
             },
             Err(e) => FromWarden::Err(format!("bad request: {e}")),

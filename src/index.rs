@@ -89,7 +89,8 @@ pub struct Index {
     done: HashSet<Seq>,
     /// Intents with no trusted outcome yet: venture, action.
     pending: BTreeMap<Seq, (String, String)>,
-    /// Every trusted report with a value, per venture and metric, by number.
+    /// Every trusted, plausible report with a value, per venture and
+    /// metric, by number.
     series: HashMap<String, HashMap<String, Vec<(Seq, f64)>>>,
     /// Reports of what a run did to the metric, by the intent they cite.
     expected: HashSet<Seq>,
@@ -102,6 +103,9 @@ pub struct Index {
     ineffective: HashMap<(String, String), Vec<Seq>>,
     /// The ventures whose declared approval answered an ask.
     approved_by: HashMap<Seq, HashSet<String>>,
+    /// The highest trusted, plausible value of each venture's metrics: the
+    /// peak a drawdown falls from.
+    peaks: HashMap<String, HashMap<String, f64>>,
 }
 
 impl Index {
@@ -187,9 +191,12 @@ impl Index {
                 metric,
                 value,
                 cites,
+                implausible,
                 ..
             } => {
-                if let (Some(x), true) = (value, claim.authorizes()) {
+                // An implausible report is never a premise: not for what a
+                // run did to the metric, not for a peak.
+                if let (Some(x), true, None) = (value, claim.authorizes(), implausible) {
                     let list = self
                         .series
                         .entry(venture.clone())
@@ -198,6 +205,15 @@ impl Index {
                         .or_default();
                     let i = list.partition_point(|(s, _)| *s <= seq);
                     list.insert(i, (seq, *x));
+                    if x.is_finite() {
+                        let peak = self
+                            .peaks
+                            .entry(venture.clone())
+                            .or_default()
+                            .entry(metric.clone())
+                            .or_insert(*x);
+                        *peak = peak.max(*x);
+                    }
                 }
                 if metric == EXPECTATION && *claim == Claim::Measured {
                     self.expected.extend(cites.iter().copied());
@@ -476,6 +492,11 @@ impl Index {
             self.acted.insert(d);
             self.unacted.remove(&d);
         }
+    }
+
+    /// The highest trusted, plausible value a venture's metric has had.
+    pub fn peak(&self, venture: &str, metric: &str) -> Option<f64> {
+        self.peaks.get(venture)?.get(metric).copied()
     }
 
     /// The latest trusted report of a metric with a value.

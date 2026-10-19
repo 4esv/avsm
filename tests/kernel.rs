@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use avsm::gate::Candidate;
 use avsm::kernel::{Kernel, RolesProcess, WardenProcess};
-use avsm::record::{Claim, Kind, Payload, Record};
+use avsm::record::{Claim, Kind, Payload, Record, Signal};
 use avsm::role::{Context, InferRequest, Role};
 use avsm::warden::{LocalWarden, Warden};
 
@@ -243,7 +243,14 @@ fn threshold_acts_on_measured_reports_until_the_cap() {
     // A report that fails is still a record, with no value.
     script(&dir, "report", "echo broken >&2; exit 2");
     k.report("counter", false);
-    let last = k.entries().unwrap().pop().unwrap();
+    // It is implausible, and the first of an episode asks.
+    let mut entries = k.entries().unwrap();
+    let ask = entries.pop().unwrap();
+    assert!(
+        matches!(&ask.record, Record::Ask { signal: Some(Signal::Implausible { why, .. }), .. } if why == "missing"),
+        "{ask:?}"
+    );
+    let last = entries.pop().unwrap();
     assert!(
         matches!(&last.record, Record::Report { value: None, note, .. } if note.contains("report failed: exit 2  broken")),
         "{last:?}"
