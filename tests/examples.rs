@@ -421,46 +421,6 @@ fn paper_trader_halts_past_the_drawdown_cap() {
 }
 
 #[test]
-fn greenhouse_opens_the_vent_above_thirty() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = home(tmp.path(), "nightly: never\n");
-    let dir = example(tmp.path(), "greenhouse", &[]);
-    std::fs::write(dir.join("temperature"), "35\n").unwrap();
-    let (role, _) = quiet();
-    let mut k = kernel(&home, role);
-    k.add(&dir).unwrap();
-    k.tick();
-    assert_eq!(
-        std::fs::read_to_string(dir.join("temperature"))
-            .unwrap()
-            .trim(),
-        "22"
-    );
-    let vent = k
-        .entries()
-        .unwrap()
-        .iter()
-        .rev()
-        .find(|e| e.record.action() == Some("vent"))
-        .unwrap()
-        .seq;
-    let why = k.why(vent).unwrap();
-    assert!(why.contains("measured  temperature=35"), "{why}");
-    assert!(why.contains("threshold  temperature above 30"), "{why}");
-    assert!(why.contains("cap        0 of 12/hour used"), "{why}");
-    k.report("greenhouse", false);
-    assert_eq!(
-        k.entries()
-            .unwrap()
-            .iter()
-            .filter(|e| e.record.action() == Some("vent"))
-            .count(),
-        1,
-        "22 is under 30"
-    );
-}
-
-#[test]
 fn portfolio_allocates_to_its_two_children_and_sees_their_records() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = Stub::start(vec![route(

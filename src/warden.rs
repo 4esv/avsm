@@ -839,6 +839,8 @@ pub fn run_bounded(
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
         )
         .env("HOME", dir)
+        // The time avsm reads: real, or a simulation's.
+        .env("AVSM_NOW", crate::clock::now().to_string())
         .envs(env.iter().copied())
         .stdin(if stdin.is_empty() {
             Stdio::null()
@@ -1033,7 +1035,13 @@ mod tests {
         assert!(out.starts_with("killed after 0s"), "{out}");
         let (ok, out) = run_command(tmp.path(), "env", "", Duration::from_secs(5));
         assert!(ok);
-        assert!(!out.contains("AVSM"), "clean environment: {out}");
+        // Clean but for the time (AVSM_NOW, deliberate: the greenhouse reads it).
+        let avsm: Vec<&str> = out
+            .split_whitespace()
+            .filter(|w| w.starts_with("AVSM"))
+            .map(|w| w.split('=').next().unwrap())
+            .collect();
+        assert_eq!(avsm, vec!["AVSM_NOW"], "clean environment: {out}");
     }
 
     #[test]

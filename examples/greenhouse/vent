@@ -1,4 +1,6 @@
 #!/bin/sh
-# Opens the vent: the temperature falls to twenty-two.
-echo 22 > temperature
-echo "vent opened; 22 degrees"
+# Opens the vent: the temperature drops, and recovers over two hours. The
+# time it opened is the state the report reads.
+now=${AVSM_NOW:-$(date +%s)}
+echo "$now" > vented
+echo "vent opened at $now"

@@ -218,8 +218,9 @@ Each of these is in `examples/` and runs end to end with nothing but stubs.
   every send is an ask, so nothing leaves without your word.
 - `paper-trader`: a book that follows a wandering price. Past ten percent
   of drawdown the built-in stop halts it, and only you can resume it.
-- `greenhouse`: a thermometer and a vent. Above thirty degrees avsm opens
-  the vent, and the proof names the reading that made it.
+- `greenhouse`: a thermometer that follows the clock and a vent that cools
+  it. Above thirty degrees avsm opens the vent, and the proof names the
+  reading that made it.
 - `portfolio`: a parent over the store and the inbox. It moves budget
   between them, pauses one, and sees their records each night.
 
