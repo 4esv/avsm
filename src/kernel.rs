@@ -21,7 +21,7 @@ use crate::gate::{self, Adopted, Candidate, Reason, State, DELEGATE, SELF};
 use crate::index::Index;
 use crate::ledger::Ledger;
 use crate::mandate::{self, Cap, Controller, Permitted, Restart};
-use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Verdict};
+use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Signal, Verdict};
 use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role, SUMMARY};
 use crate::venture::{self, Venture};
 use crate::warden::{self, FromWarden, LocalWarden, ToWarden, Warden};
@@ -584,17 +584,19 @@ impl Kernel {
     /// answer is a measured outcome; otherwise a human is asked, once,
     /// and the answer becomes a declared outcome. Until then the gate
     /// refuses the lever. When the warden cannot look now, it is left
-    /// for later.
+    /// for later. The ask goes past the asks quota: a lever stuck with
+    /// nobody told is the failure this removes. One open ask per intent.
     pub fn recover(&mut self) {
         let pending: Vec<(Seq, String, String)> = {
             let Ok(index) = self.index() else { return };
+            let asked: BTreeSet<Seq> = index
+                .open_signals()
+                .into_iter()
+                .filter_map(|(e, _)| pending_asked(e))
+                .collect();
             index
                 .pending()
-                .filter(|(s, v, _)| {
-                    !index
-                        .open_of(v)
-                        .any(|q| index.get(q).and_then(pending_asked) == Some(*s))
-                })
+                .filter(|(s, _, _)| !asked.contains(s))
                 .map(|(s, v, a)| (s, v.to_string(), a.to_string()))
                 .collect()
         };
@@ -613,18 +615,7 @@ impl Kernel {
                     ok,
                     detail: format!("checked after a restart: {found}"),
                 },
-                Ok(None) => {
-                    let may_ask = match self.index() {
-                        Ok(index) => self.may_ask(&index),
-                        Err(_) => continue,
-                    };
-                    if !may_ask {
-                        log(&format!(
-                            "{venture}: the asks quota is used up; intent #{intent} stays unsettled and {action} stays refused"
-                        ));
-                        continue;
-                    }
-                    Record::Ask {
+                Ok(None) => Record::Ask {
                         claim: Claim::Measured,
                         venture: venture.clone(),
                         action: None,
@@ -638,9 +629,11 @@ impl Kernel {
                             reasons: vec![Reason::Pending { intent }],
                         }),
                         payload: None,
-                        signal: None,
-                    }
-                }
+                        signal: Some(Signal::Pending {
+                            intent,
+                            action: action.clone(),
+                        }),
+                    },
             };
             match self.append(record) {
                 Ok(e) => log(&e.line()),
@@ -1330,6 +1323,9 @@ impl Kernel {
                     }
                     _ => None,
                 })
+                // A lever whose last run has no outcome waits: its approval
+                // is not spent, and runs on the tick after it is settled.
+                .filter(|(_, venture, action)| index.pending_of(venture, action).is_none())
                 .collect()
         };
         for (seq, venture, action) in pending {
@@ -1825,12 +1821,9 @@ fn pending_asked(e: &Entry) -> Option<Seq> {
         Record::Ask {
             claim: Claim::Measured,
             action: None,
-            refusal: Some(r),
+            signal: Some(Signal::Pending { intent, .. }),
             ..
-        } => r.reasons.iter().find_map(|r| match r {
-            Reason::Pending { intent } => Some(*intent),
-            _ => None,
-        }),
+        } => Some(*intent),
         _ => None,
     }
 }

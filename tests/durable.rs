@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use avsm::gate::{Candidate, Proof};
 use avsm::kernel::Kernel;
-use avsm::record::{self, Claim, Entry, Kind, Payload, Record, Seq};
+use avsm::record::{self, Claim, Entry, Kind, Payload, Record, Seq, Signal};
 use avsm::role::{Context, InferRequest, ModelRole, Role};
 use avsm::warden::{LocalWarden, Warden};
 
@@ -48,15 +48,20 @@ const MANDATE: &str = "purpose: Sell.\nmetric: orders\ncontroller: {kind: model}
      permitted:\n\
      - {name: tidy, run: \"echo x >> tidies; echo $AVSM_KEY > key\", cap: 9/day, reversible: true}\n\
      - {name: ship, run: \"echo x >> ships\", cap: 9/day, reversible: false, delegated: true}\n\
-     - {name: post, run: \"cat > posted; echo $AVSM_KEY > key\", cap: 9/day, reversible: true, takes: text}\n";
+     - {name: post, run: \"cat > posted; echo $AVSM_KEY > key\", cap: 9/day, reversible: true, takes: text}\n\
+     - {name: wipe, run: \"echo x >> wipes\", cap: 9/day, reversible: false}\n";
 
 fn setup(tmp: &Path, backend: &str) -> (PathBuf, PathBuf) {
+    setup_with(tmp, backend, "")
+}
+
+fn setup_with(tmp: &Path, backend: &str, extra: &str) -> (PathBuf, PathBuf) {
     let home = tmp.join("home");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
         home.join("config.yaml"),
         format!(
-            "nightly: never\ndefault: k\nbackends:\n  k: {{kind: command, run: '{backend}'}}\n"
+            "nightly: never\ndefault: k\nbackends:\n  k: {{kind: command, run: '{backend}'}}\n{extra}"
         ),
     )
     .unwrap();
@@ -200,9 +205,68 @@ fn pending_ask(k: &Kernel, intent: Seq) -> Option<Entry> {
     let open = k.open_asks().unwrap();
     k.entries().unwrap().into_iter().find(|e| {
         open.contains(&e.seq)
-            && matches!(&e.record, Record::Ask { claim: Claim::Measured, action: None, question, .. }
-                if question.contains(&format!("intent #{intent} has no outcome")))
+            && matches!(&e.record, Record::Ask {
+                    claim: Claim::Measured,
+                    action: None,
+                    question,
+                    signal: Some(Signal::Pending { intent: n, .. }),
+                    ..
+                }
+                if *n == intent && question.contains(&format!("intent #{intent} has no outcome")))
     })
+}
+
+#[test]
+fn a_pending_intent_is_asked_about_past_the_asks_quota() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A cap of 0 is refused by the config, so the quota is one, spent.
+    let (home, dir) = setup_with(tmp.path(), "echo nothing", "quotas: {asks: 1/day}\n");
+    let mut k = open(&home, quiet());
+    k.add(&dir).unwrap();
+    k.propose("shop", "wipe", None).unwrap();
+    let spent = k.open_asks().unwrap();
+    assert_eq!(spent.len(), 1);
+    k.deny(spent[0], "not now").unwrap();
+    // The quota is spent: an ordinary ask is not written.
+    let out = k.propose("shop", "wipe", None).unwrap();
+    assert!(out.contains("asks quota"), "{out}");
+    assert!(k.open_asks().unwrap().is_empty(), "{out}");
+    let intent = crash_mid_run(&mut k, "ship");
+    k.tick();
+    let ask = pending_ask(&k, intent).expect("asked past the quota");
+    assert!(
+        matches!(&ask.record, Record::Ask { signal: Some(Signal::Pending { intent: n, action }), .. }
+            if *n == intent && action == "ship"),
+        "{}",
+        ask.line()
+    );
+    // One open ask per intent, however many ticks.
+    k.tick();
+    k.tick();
+    assert_eq!(k.open_asks().unwrap(), vec![ask.seq]);
+}
+
+#[test]
+fn an_approval_blocked_by_a_pending_intent_runs_once_it_is_settled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, dir) = setup(tmp.path(), "echo nothing");
+    let mut k = open(&home, quiet());
+    k.add(&dir).unwrap();
+    k.propose("shop", "wipe", None).unwrap();
+    let wipe_ask = k.open_asks().unwrap()[0];
+    // A run of wipe that died mid-way, then the human approves the ask.
+    let intent = crash_mid_run(&mut k, "wipe");
+    k.approve(wipe_ask, None).unwrap();
+    k.tick();
+    k.tick();
+    assert_eq!(runs(&dir, "wipes"), 0, "blocked while pending");
+    // Settled in the same process: the approval runs on the next tick.
+    let pending = pending_ask(&k, intent).expect("asked about the intent");
+    k.deny(pending.seq, "it never ran").unwrap();
+    k.tick();
+    assert_eq!(runs(&dir, "wipes"), 1, "the approval was not spent");
+    k.tick();
+    assert_eq!(runs(&dir, "wipes"), 1, "and runs once");
 }
 
 #[test]

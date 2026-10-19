@@ -304,6 +304,9 @@ pub enum Signal {
     /// A threshold was crossed while its lever was refused for a cap, a
     /// budget or a quota.
     Saturated { action: String, reason: String },
+    /// A run of `action` has an intent and no outcome: whether it happened
+    /// is a human's to say, and until then the lever is refused.
+    Pending { intent: Seq, action: String },
 }
 
 /// One ledger record. Every variant carries its claim and its venture.
