@@ -287,16 +287,28 @@ def why(seq):
     import subprocess
     try:
         ran = subprocess.run(["cargo", "run", "--quiet", "--manifest-path", os.path.join(REPO, "Cargo.toml"), "--example", "why",
-                              "--", "--home", os.path.join(R, "home"), str(seq)], capture_output=True, text=True, timeout=300)
+                              "--", os.path.join(R, "home"), str(seq)], capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"why did not run: {e}"
     return short(ran.stdout, 600) if ran.returncode == 0 else f"why failed (exit {ran.returncode})"
 
 
+# A check refusal with no ask behind it: the check ran before the ask was
+# written, so the reply was refused and never asked. Its detail is the why.
+asked_refusals = {x["refusal"] for x in attempts if x["refusal"]}
+refused_by_check = [{"ask": None, "day": day(a), "refusal": s, "answer": "refused by check, no ask",
+                     "to": None, "counted_in_open_refusal": False}
+                    for s, a in pc_open if s not in asked_refusals]
+_why = {}
+def why_once(seq):
+    if seq not in _why: _why[seq] = why(seq)
+    return _why[seq]
 for att in attempts:
-    if att["refusal"]: att["why"] = why(att["refusal"])
+    if att["refusal"]: att["why"] = why_once(att["refusal"])
 OLD_BREACH_DAYS = [151, 256, 274, 331, 346]  # the 1.0 year's five breaches, by day the outbox saw them
-old_breaches = [{"old_day": d, "attempts": [x for x in attempts if d - 2 <= x["day"] <= d]} for d in OLD_BREACH_DAYS]
+for x in refused_by_check:
+    if any(d - 2 <= x["day"] <= d for d in OLD_BREACH_DAYS): x["why"] = why_once(x["refusal"])
+old_breaches = [{"old_day": d, "attempts": [x for x in attempts + refused_by_check if d - 2 <= x["day"] <= d]} for d in OLD_BREACH_DAYS]
 
 # --- the book from the ledger: every equity report -----------------------------------
 eq = [(day(a), r["value"]) for s, a, r in reports
@@ -410,7 +422,7 @@ out = {
     "replies": {"to_non_customers_asked": attempts[:CAP], "asked": len(attempts),
                 "approved": sum(1 for x in attempts if x["answer"] == "approve"),
                 "intents_to_non_customers": reply_intents_bad[:CAP], "check_refusals": check_refusals,
-                "check_refusal_records": check_refusal_seqs[:CAP], "old_breaches": old_breaches},
+                "check_refusal_records": check_refusal_seqs[:CAP], "refused_by_check_before_any_ask": len(refused_by_check), "old_breaches": old_breaches},
     "poison": {"served": poison_served[:CAP], "armed_not_served": sorted(os.listdir(os.path.join(R, "world", "poison")))
                if os.path.isdir(os.path.join(R, "world", "poison")) else []},
 }
