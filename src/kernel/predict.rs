@@ -123,9 +123,12 @@ pub fn trusted(index: &Index, venture: &str, mandate: &Mandate) -> bool {
     }
 }
 
-/// Does a venture get predictions once per report?
+/// Does a venture get predictions once per report? With a world model, a
+/// calibration bar, or a planner, whose trust rests on them.
 pub fn predicts(mandate: &Mandate) -> bool {
-    mandate.world.is_some() || mandate.calibration.is_some()
+    mandate.world.is_some()
+        || mandate.calibration.is_some()
+        || matches!(mandate.controller, crate::mandate::Controller::Plan { .. })
 }
 
 /// The first trusted, plausible report of `metric` after `after` and at or

@@ -1176,7 +1176,9 @@ impl Holds {
             Signal::Implausible { .. } => self.implausible = true,
             Signal::Ineffective { .. } => self.ineffective = true,
             Signal::Saturated { .. } => self.saturated = true,
-            Signal::Pending { .. } | Signal::Audit { .. } => self.asking = true,
+            Signal::Pending { .. } | Signal::Audit { .. } | Signal::Warning { .. } => {
+                self.asking = true
+            }
         }
     }
 }
@@ -2099,6 +2101,34 @@ pub fn why(entry: &Entry) -> String {
             text.push_str("  ranks, vetoes and asks; authorizes nothing\n");
             text
         }
+        Record::Branch {
+            chosen,
+            alternatives,
+            members,
+            horizon,
+            separated,
+            ..
+        } => {
+            let mut text = format!(
+                "{head}\n  inferred by the planner over {members} members, {horizon} steps ahead; {}\n",
+                if *separated {
+                    "the chosen stands apart from the runner-up"
+                } else {
+                    "not separated from the runner-up; a backend chose among the top three"
+                }
+            );
+            for (what, a) in std::iter::once(("chosen", chosen))
+                .chain(alternatives.iter().map(|a| ("rejected", a)))
+            {
+                let q = &a.quantiles;
+                text.push_str(&format!(
+                    "  {what:<10} {}  worst {}  p10 {} p50 {} p90 {}  propensity {}\n",
+                    a.action, a.worst, q.p10, q.p50, q.p90, a.propensity
+                ));
+            }
+            text.push_str("  ranks, vetoes and asks; authorizes nothing\n");
+            text
+        }
     }
 }
 
@@ -2614,6 +2644,7 @@ mod tests {
             escalate: None,
             world: None,
             calibration: None,
+            early_warning: false,
         }
     }
 

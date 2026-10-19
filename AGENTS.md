@@ -8,9 +8,9 @@ Use these words and no synonyms.
 
 - mandate, record, action, ask
 - measured, declared, inferred
-- report, proposal, action, ask, decision, intent, outcome, refusal, prediction
+- report, proposal, action, ask, decision, intent, outcome, refusal, prediction, branch
 - running, asking, paused
-- ledger, gate, proof, adapter, canary, warden, guard, audit, world
+- ledger, gate, proof, adapter, canary, warden, guard, audit, world, plan
 - parent, child, payload, adapter (built-in metric or lever), digest, know, expects
 - escalate, escalation (the `escalate:` backend asked when the first cannot answer)
 - Commands: start, add, status, tail, asks, approve, deny, pause, resume, why, know, propose, digest

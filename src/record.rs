@@ -66,6 +66,7 @@ pub enum Kind {
     Escalation,
     Answer,
     Prediction,
+    Branch,
 }
 
 impl Kind {
@@ -82,6 +83,7 @@ impl Kind {
             Kind::Escalation => "escalation",
             Kind::Answer => "answer",
             Kind::Prediction => "prediction",
+            Kind::Branch => "branch",
         }
     }
 }
@@ -334,6 +336,14 @@ pub enum Signal {
     /// A report of the metric is not to be believed: the first of an
     /// episode, which ends at the next plausible report.
     Implausible { metric: String, why: String },
+    /// Critical slowing down: over the last reports of the metric, the
+    /// variance and the lag-1 autocorrelation both rose past their
+    /// margins. The first report of an episode asks.
+    Warning {
+        metric: String,
+        variance_ratio: f64,
+        autocorrelation_rise: f64,
+    },
 }
 
 /// One ledger record. Every variant carries its claim and its venture.
@@ -501,7 +511,42 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         events: Vec<Event>,
     },
+    /// What the planner found: the action it chose, the best rejected
+    /// alternatives, each with the quantiles of the target at the horizon
+    /// over the ensemble, and the chance each had of being chosen. Always
+    /// inferred: it ranks, vetoes and asks, and never authorizes.
+    Branch {
+        claim: Claim,
+        venture: String,
+        chosen: Alternative,
+        /// The top rejected alternatives, best first; at most
+        /// `MAX_ALTERNATIVES`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        alternatives: Vec<Alternative>,
+        /// Ensemble members each sequence ran through.
+        members: u32,
+        /// Steps of cadence ahead.
+        horizon: u32,
+        /// Could the chosen be told apart from the runner-up? When not, a
+        /// backend chose among the top three.
+        separated: bool,
+    },
 }
+
+/// One first action the planner weighed: the quantiles of the target at
+/// the horizon over the members of its best sequence, the worst member's
+/// target, and its propensity, the chance it had of being chosen.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Alternative {
+    pub action: String,
+    pub quantiles: Quantiles,
+    pub worst: f64,
+    pub propensity: f64,
+}
+
+/// The most alternatives a branch carries, and the longest action name.
+pub const MAX_ALTERNATIVES: usize = 3;
+pub const MAX_ACTION_NAME: usize = 64;
 
 /// The quantiles of a forecast: the 5th to the 95th percentile.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -582,7 +627,8 @@ impl Record {
             | Record::Refusal { claim, .. }
             | Record::Escalation { claim, .. }
             | Record::Answer { claim, .. }
-            | Record::Prediction { claim, .. } => *claim,
+            | Record::Prediction { claim, .. }
+            | Record::Branch { claim, .. } => *claim,
         }
     }
 
@@ -598,7 +644,8 @@ impl Record {
             | Record::Refusal { venture, .. }
             | Record::Escalation { venture, .. }
             | Record::Answer { venture, .. }
-            | Record::Prediction { venture, .. } => venture,
+            | Record::Prediction { venture, .. }
+            | Record::Branch { venture, .. } => venture,
         }
     }
 
@@ -615,6 +662,7 @@ impl Record {
             Record::Escalation { .. } => Kind::Escalation,
             Record::Answer { .. } => Kind::Answer,
             Record::Prediction { .. } => Kind::Prediction,
+            Record::Branch { .. } => Kind::Branch,
         }
     }
 
@@ -841,6 +889,21 @@ impl Record {
                     None => String::new(),
                 },
                 resolves_at
+            ),
+            Record::Branch {
+                chosen,
+                alternatives,
+                horizon,
+                separated,
+                ..
+            } => format!(
+                "plan: {} p50 {} (worst {}) in {horizon} steps, propensity {}; {} alternatives{}",
+                chosen.action,
+                chosen.quantiles.p50,
+                chosen.worst,
+                chosen.propensity,
+                alternatives.len(),
+                if *separated { "" } else { ", not separated" }
             ),
         }
     }

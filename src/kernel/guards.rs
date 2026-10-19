@@ -35,6 +35,7 @@ fn subject(s: &Signal) -> String {
         Signal::Guard { guard, .. } => format!("guard:{guard}"),
         Signal::Audit { audit, .. } => format!("audit:{audit}"),
         Signal::Implausible { metric, .. } => format!("implausible:{metric}"),
+        Signal::Warning { metric, .. } => format!("warning:{metric}"),
     }
 }
 

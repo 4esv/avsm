@@ -713,6 +713,7 @@ mod tests {
                 escalate: None,
                 world: None,
                 calibration: None,
+                early_warning: false,
             },
             entries: vec![Entry::new(
                 1,

@@ -92,6 +92,11 @@ pub struct Mandate {
     /// can add it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalate: Option<Escalate>,
+    /// Watch the metric for critical slowing down: rising variance and
+    /// rising lag-1 autocorrelation ask once per episode. Always on for a
+    /// plan controller.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub early_warning: bool,
 }
 
 /// Where an escalation may go beyond this machine.
@@ -423,6 +428,50 @@ pub enum Controller {
         #[serde(default)]
         backend: Option<String>,
     },
+    /// Code searches lever sequences through the world model's ensemble
+    /// and proposes the first lever of the best one by its worst member.
+    /// Its branch and proposal are inferred, like a model controller's.
+    Plan {
+        /// How many steps of cadence a sequence looks ahead.
+        #[serde(default = "default_horizon")]
+        horizon: u32,
+        /// The most levers a sequence pulls.
+        #[serde(default = "default_depth")]
+        depth: u32,
+        /// How many ensemble members each sequence runs through.
+        #[serde(default = "default_members")]
+        members: u32,
+        /// Reversible levers the planner may explore by Thompson sampling.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        explore: Vec<String>,
+        /// The backend asked for payloads and when branches tie.
+        #[serde(default)]
+        backend: Option<String>,
+        /// Which way the target improves.
+        #[serde(default, skip_serializing_if = "is_up")]
+        better: Worse,
+    },
+}
+
+/// The planner's defaults: four steps ahead, two levers, eight members.
+pub const DEFAULT_HORIZON: u32 = 4;
+pub const DEFAULT_DEPTH: u32 = 2;
+pub const DEFAULT_MEMBERS: u32 = 8;
+/// The planner's bounds: what keeps a search small.
+pub const MAX_HORIZON: u32 = 48;
+pub const MAX_DEPTH: u32 = 3;
+pub const MAX_MEMBERS: u32 = 64;
+
+fn default_horizon() -> u32 {
+    DEFAULT_HORIZON
+}
+
+fn default_depth() -> u32 {
+    DEFAULT_DEPTH
+}
+
+fn default_members() -> u32 {
+    DEFAULT_MEMBERS
 }
 
 /// An action the venture may take: a command of the venture's own, or a
@@ -801,6 +850,7 @@ const FIELDS: &[&str] = &[
     "escalate",
     "world",
     "calibration",
+    "early_warning",
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadband", "hold"];
 const GUARD_FIELDS: &[&str] = &[
@@ -816,6 +866,9 @@ const AUDIT_FIELDS: &[&str] = &[
     "window",
 ];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
+const PLAN_FIELDS: &[&str] = &[
+    "kind", "horizon", "depth", "members", "explore", "backend", "better",
+];
 const ACTION_FIELDS: &[&str] = &[
     "name",
     "run",
@@ -930,12 +983,12 @@ impl ParentCall {
 /// permits it by name alone, with no run and no adapter.
 pub const RESEARCH: &str = "research";
 
-const KINDS: &str = "threshold, classifier or model";
+const KINDS: &str = "threshold, classifier, model or plan";
 const NEEDS_PURPOSE: &str = "mandate needs a purpose: what the venture is for, in your own words";
 const NEEDS_METRIC: &str =
     "mandate needs a metric: the name of the number the report prints, like count";
 const NEEDS_CONTROLLER: &str =
-    "mandate needs a controller: what decides when to act, with a kind of threshold, classifier or model";
+    "mandate needs a controller: what decides when to act, with a kind of threshold, classifier, model or plan";
 const NEEDS_CADENCE: &str =
     "mandate needs a cadence: how often the report runs, like 30s, 5m or 1h";
 const NEEDS_ACTION: &str =
@@ -1242,6 +1295,15 @@ impl Mandate {
                 ));
             }
         }
+        if let Controller::Plan { explore, .. } = &self.controller {
+            for name in explore {
+                if self.permitted(name).is_none() {
+                    return fail(format!(
+                        "plan explore names {name:?}, which is not a permitted action"
+                    ));
+                }
+            }
+        }
         if let Some(c) = self.calibration {
             if !c.is_finite() || c > 1.0 {
                 return fail(format!(
@@ -1479,6 +1541,7 @@ impl Mandate {
             escalate: None,
             world: None,
             calibration: None,
+            early_warning: false,
         }
     }
 
@@ -1808,9 +1871,18 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
         }
     }
     match map.get("calibration") {
-        None | Some(Value::Null) | Some(Value::Number(_)) => Ok(()),
+        None | Some(Value::Null) | Some(Value::Number(_)) => {}
+        Some(other) => {
+            return fail(format!(
+                "calibration is a skill score like 0.1, the bar the world model must reach, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match map.get("early_warning") {
+        None | Some(Value::Null) | Some(Value::Bool(_)) => Ok(()),
         Some(other) => fail(format!(
-            "calibration is a skill score like 0.1, the bar the world model must reach, not {}",
+            "early_warning is true or false, not {}",
             describe(other)
         )),
     }
@@ -2059,7 +2131,7 @@ fn check_controller(v: Option<&Value>) -> Result<(), MandateError> {
     let kind = match map.get("kind") {
         None | Some(Value::Null) => return fail(format!("controller needs a kind: {KINDS}")),
         Some(Value::String(kind))
-            if matches!(kind.as_str(), "threshold" | "classifier" | "model") =>
+            if matches!(kind.as_str(), "threshold" | "classifier" | "model" | "plan") =>
         {
             kind.as_str()
         }
@@ -2073,16 +2145,61 @@ fn check_controller(v: Option<&Value>) -> Result<(), MandateError> {
             ))
         }
     };
-    let fields = if kind == "threshold" {
-        THRESHOLD_FIELDS
-    } else {
-        BACKEND_FIELDS
+    let fields = match kind {
+        "threshold" => THRESHOLD_FIELDS,
+        "plan" => PLAN_FIELDS,
+        _ => BACKEND_FIELDS,
     };
     if let Some(field) = unknown_field(map, fields)? {
         return fail(format!(
             "unknown field {field:?} in controller; a {kind} controller has these fields: {}",
             fields.join(", ")
         ));
+    }
+    if kind == "plan" {
+        for (field, max, what) in [
+            (
+                "horizon",
+                MAX_HORIZON,
+                "steps of cadence a sequence looks ahead, like 4",
+            ),
+            ("depth", MAX_DEPTH, "levers a sequence pulls, like 2"),
+            ("members", MAX_MEMBERS, "ensemble members, like 8"),
+        ] {
+            match map.get(field) {
+                None | Some(Value::Null) => {}
+                Some(Value::Number(n))
+                    if n.as_u64()
+                        .is_some_and(|n| (1..=u64::from(max)).contains(&n)) => {}
+                Some(other) => {
+                    return fail(format!(
+                        "plan {field} is a whole number from 1 to {max}: the {what}; not {}",
+                        describe(other)
+                    ))
+                }
+            }
+        }
+        match map.get("explore") {
+            None | Some(Value::Null) => {}
+            Some(Value::Sequence(items)) if items.iter().all(|i| matches!(i, Value::String(_))) => {
+            }
+            Some(other) => {
+                return fail(format!(
+                    "plan explore is a list of permitted reversible levers, like [boost], not {}",
+                    describe(other)
+                ))
+            }
+        }
+        match map.get("better") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) if s == "up" || s == "down" => {}
+            Some(other) => {
+                return fail(format!(
+                    "plan better is up or down, which way the target improves, not {}",
+                    describe(other)
+                ))
+            }
+        }
     }
     if kind != "threshold" {
         return match map.get("backend") {
@@ -2733,7 +2850,7 @@ max_step: 5000
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step, escalate, world, calibration"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step, escalate, world, calibration, early_warning"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");
@@ -2928,17 +3045,17 @@ max_step: 5000
         );
         assert_eq!(
             fails(&text),
-            "controller must be a set of fields starting with kind: threshold, classifier or model, not the text \"threshold\""
+            "controller must be a set of fields starting with kind: threshold, classifier, model or plan, not the text \"threshold\""
         );
         let msg = fails(&edit("  kind: threshold\n", ""));
         assert_eq!(
             msg,
-            "controller needs a kind: threshold, classifier or model"
+            "controller needs a kind: threshold, classifier, model or plan"
         );
         let msg = fails(&edit("kind: threshold", "kind: magic"));
         assert_eq!(
             msg,
-            "controller kind must be threshold, classifier or model, not \"magic\""
+            "controller kind must be threshold, classifier, model or plan, not \"magic\""
         );
         let msg = fails(&edit("kind: threshold", "kind: 3"));
         assert!(msg.ends_with("not the number 3"), "{msg}");
@@ -3889,5 +4006,49 @@ max_step: 5000
             Mandate::hash(VALID),
             Mandate::hash(&edit("above: 10", "above: 11"))
         );
+    }
+
+    #[test]
+    fn a_plan_controller_parses_with_its_defaults_and_says_what_is_wrong() {
+        let threshold = "controller:\n  kind: threshold\n  above: 10\n  action: reset\n";
+        let m = Mandate::parse(&edit(threshold, "controller: {kind: plan}\n")).unwrap();
+        assert_eq!(
+            m.controller,
+            Controller::Plan {
+                horizon: DEFAULT_HORIZON,
+                depth: DEFAULT_DEPTH,
+                members: DEFAULT_MEMBERS,
+                explore: vec![],
+                backend: None,
+                better: Worse::Up,
+            }
+        );
+        assert!(!m.early_warning);
+        let m = Mandate::parse(&edit(
+            threshold,
+            "controller: {kind: plan, horizon: 6, depth: 1, members: 16, explore: [reset], backend: local, better: down}\nearly_warning: true\n",
+        ))
+        .unwrap();
+        assert!(m.early_warning);
+        assert!(
+            matches!(&m.controller, Controller::Plan { horizon: 6, depth: 1, members: 16, explore, backend: Some(b), better: Worse::Down } if explore == &["reset"] && b == "local")
+        );
+        // Round trip.
+        let text = serde_yaml::to_string(&m).unwrap();
+        assert_eq!(Mandate::parse(&text).unwrap(), m);
+        for (bad, says) in [
+            ("{kind: plan, horizon: 0}", "plan horizon is a whole number from 1 to 48"),
+            ("{kind: plan, depth: 9}", "plan depth is a whole number from 1 to 3"),
+            ("{kind: plan, members: 1000}", "plan members is a whole number from 1 to 64"),
+            ("{kind: plan, explore: reset}", "plan explore is a list"),
+            ("{kind: plan, better: left}", "plan better is up or down"),
+            ("{kind: plan, explore: [nope]}", "plan explore names \"nope\", which is not a permitted action"),
+            ("{kind: plan, above: 3}", "a plan controller has these fields: kind, horizon, depth, members, explore, backend, better"),
+        ] {
+            let msg = fails(&edit(threshold, &format!("controller: {bad}\n")));
+            assert!(msg.contains(says), "{bad}: {msg}");
+        }
+        let msg = fails(&format!("{VALID}early_warning: yes please\n"));
+        assert!(msg.contains("early_warning is true or false"), "{msg}");
     }
 }

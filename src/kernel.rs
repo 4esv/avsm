@@ -29,6 +29,7 @@ use crate::warden::{self, Failure, FromWarden, LocalWarden, ToWarden, Warden};
 mod escalate;
 mod expect;
 mod guards;
+pub mod plan;
 pub mod predict;
 mod refusals;
 
@@ -1137,6 +1138,10 @@ impl Kernel {
         if implausible.is_some() {
             return;
         }
+        let plans = name != SELF && matches!(v.mandate.controller, Controller::Plan { .. });
+        if name != SELF && (plans || v.mandate.early_warning) {
+            self.early_warning(name, &metric);
+        }
         // The bound is the mandate's, or the one the parent set.
         let threshold = match self.index() {
             Ok(index) => gate::effective_threshold_in(&index, &self.adopted(), name),
@@ -1153,6 +1158,9 @@ impl Kernel {
                 }
                 self.saturate(name, &t.action, &metric, t.bound);
             }
+        }
+        if plans {
+            ran = self.plan(name).or(ran);
         }
         // One step ahead, with the lever that just ran, if any.
         if forecast {
@@ -1483,7 +1491,12 @@ impl Kernel {
         let Some(v) = self.ventures.get(name) else {
             return false;
         };
-        if v.problem.is_some() || matches!(v.mandate.controller, Controller::Threshold { .. }) {
+        if v.problem.is_some()
+            || matches!(
+                v.mandate.controller,
+                Controller::Threshold { .. } | Controller::Plan { .. }
+            )
+        {
             return false;
         }
         let Ok(Some(at)) = self.config.nightly_minutes() else {
@@ -1515,7 +1528,7 @@ impl Kernel {
         };
         let wanted = match &v.mandate.controller {
             Controller::Classifier { backend } | Controller::Model { backend } => backend.clone(),
-            Controller::Threshold { .. } => return,
+            Controller::Threshold { .. } | Controller::Plan { .. } => return,
         };
         let index = match self.index() {
             Ok(i) => i,

@@ -221,6 +221,21 @@ pub fn render(m: &Mandate) -> String {
                 .map(|b| format!("{b} "))
                 .unwrap_or_default()
         )),
+        Controller::Plan {
+            horizon,
+            depth,
+            members,
+            explore,
+            ..
+        } => {
+            let mut s = format!(
+                "controller plan: searches up to {depth} levers over {horizon} steps through {members} members of the world model and proposes the first lever of the best sequence by its worst member; it ranks, vetoes and asks, and never authorizes"
+            );
+            if !explore.is_empty() {
+                s.push_str(&format!("; explores {}", explore.join(", ")));
+            }
+            line(s);
+        }
     }
     for p in &m.permitted {
         let mut s = format!(
