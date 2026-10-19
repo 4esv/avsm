@@ -803,6 +803,87 @@ fn a_stuck_sensor_then_the_truth_re_anchors_on_the_third_agreeing_reading() {
 }
 
 #[test]
+fn a_stuck_value_never_anchors_and_the_truth_re_anchors_on_three_that_agree() {
+    let none = "{kind: threshold, above: 900, action: reset}";
+    let values = [
+        "60", "62", "61", "63", "60", "200", "200", "200", "200", "300", "302", "301",
+    ];
+    let (_k, _dir, _tmp) = plausibility(none, &values);
+    let f = flags(&_k, "counter", "count");
+    assert!(f[..5].iter().all(Option::is_none), "{f:?}");
+    assert!(f[5..11].iter().all(Option::is_some), "never 200: {f:?}");
+    assert!(
+        f[8].as_deref().is_some_and(|w| w.starts_with("stuck")),
+        "the fourth 200 is stuck: {f:?}"
+    );
+    assert_eq!(f[11], None, "re-anchored on 301: {f:?}");
+}
+
+#[test]
+fn a_sensor_stuck_at_its_last_value_is_stuck_from_the_fourth() {
+    let none = "{kind: threshold, above: 900, action: reset}";
+    let values = ["60", "62", "61", "63", "60", "60", "60", "60", "60"];
+    let (k, _dir, _tmp) = plausibility(none, &values);
+    let f = flags(&k, "counter", "count");
+    assert!(f[..7].iter().all(Option::is_none), "{f:?}");
+    assert!(
+        f[7..]
+            .iter()
+            .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
+        "{f:?}"
+    );
+    assert_eq!(implausible_asks(&k, "count"), 1, "one ask an episode");
+}
+
+#[test]
+fn a_constant_metric_is_never_stuck() {
+    let none = "{kind: threshold, above: 900, action: reset}";
+    let (k, _dir, _tmp) = plausibility(none, &["50"; 12]);
+    let f = flags(&k, "counter", "count");
+    assert!(f.iter().all(Option::is_none), "{f:?}");
+}
+
+#[test]
+fn expects_is_never_judged_on_stuck_readings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = venture(
+        tmp.path(),
+        "pot",
+        "purpose: Keep it wet.\nmetric: moisture\ncontroller: {kind: model}\ncadence: 1h\n\
+         range: [0, 100]\nmax_step: 50\n\
+         permitted:\n- {name: water, run: touch watered, cap: 9/day, reversible: true, delegated: true, expects: up 5 within 1}\n",
+    );
+    let mut k = kernel(&home, Box::new(Silent));
+    k.add(&dir).unwrap();
+    for v in ["30", "32", "31", "33", "30", "30", "30"] {
+        report(&mut k, &dir, "pot", v);
+    }
+    k.propose("pot", "water", None).unwrap();
+    assert!(dir.join("watered").exists(), "water ran");
+    // The sensor is stuck: every reading after the run is flagged.
+    for _ in 0..4 {
+        report(&mut k, &dir, "pot", "30");
+    }
+    let f = flags(&k, "pot", "moisture");
+    assert!(
+        f[7..]
+            .iter()
+            .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
+        "{f:?}"
+    );
+    assert!(
+        signals(&k, |s| matches!(s, Signal::Ineffective { .. })).is_empty(),
+        "no judgement on a frozen number"
+    );
+    assert!(!k
+        .entries()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(&e.record, Record::Report { metric, .. } if metric == "expectation")));
+}
+
+#[test]
 fn a_flap_never_re_anchors() {
     let water = "{kind: threshold, below: 20, action: reset}";
     let (k, _dir, _tmp) = plausibility(

@@ -40,9 +40,33 @@ fn subject(s: &Signal) -> String {
 /// step: the last of them is plausible, whatever the anchor was.
 pub const AGREE: usize = 3;
 
+/// A reading exactly equal to each of this many readings before it is
+/// stuck, where the metric's plausible history varies.
+pub const STUCK: usize = 3;
+
+/// How many plausible readings say whether a metric varies.
+pub const HISTORY: usize = 20;
+
+/// The median absolute step between consecutive readings, or 0 with
+/// fewer than two.
+fn median_step(history: &[f64]) -> f64 {
+    let mut steps: Vec<f64> = history.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+    if steps.is_empty() {
+        return 0.0;
+    }
+    steps.sort_by(f64::total_cmp);
+    let n = steps.len();
+    if n % 2 == 1 {
+        steps[n / 2]
+    } else {
+        (steps[n / 2 - 1] + steps[n / 2]) / 2.0
+    }
+}
+
 /// Why a reading is not to be believed, or None when it is. `before`
-/// holds the latest plausible readings, oldest first; `recent` the values
-/// of the latest readings, plausible or not, oldest first.
+/// holds the latest plausible readings, up to HISTORY, oldest first;
+/// `recent` the values of the latest readings, plausible or not, oldest
+/// first.
 pub fn implausible(
     value: Option<f64>,
     before: &[f64],
@@ -66,26 +90,40 @@ pub fn implausible(
         }
     }
     let s = max_step?;
+    // Exact repeats are the stuck signature, where the metric varies. A
+    // metric that never varies is not stuck.
+    let varies = median_step(before) > 0.0;
+    if varies
+        && recent.len() >= STUCK
+        && recent[recent.len() - STUCK..].iter().all(|r| *r == Some(x))
+    {
+        return Some(format!(
+            "stuck: {x} exactly, as the {STUCK} readings before it, where the metric varies"
+        ));
+    }
     let n = before.len();
     if let Some(prev) = before.last() {
         let step = (x - prev).abs();
         if step > s {
             // Re-anchor: this reading and the AGREE - 1 before it, all in
             // range, agree with each other within max_step. A flap never
-            // agrees; a single spike has nothing to agree with.
+            // agrees; a single spike has nothing to agree with. Where the
+            // metric varies, an exact repeat is a stuck sensor's, so it
+            // never counts toward agreeing.
             let k = AGREE - 1;
             let mut run = vec![x];
             if recent.len() >= k {
-                for r in &recent[recent.len() - k..] {
+                for r in recent[recent.len() - k..].iter().rev() {
                     match r {
                         Some(v) if v.is_finite() && inside(*v) => run.push(*v),
                         _ => break,
                     }
                 }
             }
+            let repeats = run.windows(2).any(|w| w[0] == w[1]);
             let lo = run.iter().copied().fold(f64::INFINITY, f64::min);
             let hi = run.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            if run.len() == AGREE && hi - lo <= s {
+            if run.len() == AGREE && hi - lo <= s && !(varies && repeats) {
                 return None;
             }
             return Some(format!(
@@ -252,8 +290,8 @@ impl Kernel {
         let Ok(index) = self.index() else {
             return (None, false);
         };
-        let before = plausible_before(&index, venture, metric, 3);
-        let recent = recent(&index, venture, metric, AGREE - 1);
+        let before = plausible_before(&index, venture, metric, HISTORY);
+        let recent = recent(&index, venture, metric, STUCK.max(AGREE - 1));
         let why = implausible(value, &before, &recent, range, max_step);
         let fresh = reports(&index, venture, metric)
             .next()
@@ -572,6 +610,31 @@ mod tests {
         // Re-anchored, a small wiggle back is no flap.
         let after = [60.0, 60.0, 0.0];
         assert_eq!(implausible(Some(1.0), &after, &[], range, step), None);
+    }
+
+    #[test]
+    fn exact_repeats_are_stuck_where_the_metric_varies_and_never_agree() {
+        let (range, step) = (Some([0.0, 1000.0]), Some(50.0));
+        let varied = [40.0, 42.0, 41.0, 43.0, 41.0];
+        let at =
+            |x: f64, recent: &[Option<f64>]| implausible(Some(x), &varied, recent, range, step);
+        let stuck = at(41.0, &[Some(41.0), Some(41.0), Some(41.0)]).unwrap();
+        assert!(stuck.starts_with("stuck"), "{stuck}");
+        assert_eq!(
+            at(41.0, &[Some(43.0), Some(41.0), Some(41.0)]),
+            None,
+            "two repeats"
+        );
+        // Three identical readings after a jump never re-anchor.
+        assert!(at(200.0, &[Some(41.0), Some(200.0), Some(200.0)]).is_some());
+        // Three that agree but differ do.
+        assert_eq!(at(301.0, &[Some(200.0), Some(300.0), Some(302.0)]), None);
+        // A metric that never varies is never stuck, and its repeats agree.
+        let flat = [50.0; 10];
+        let same = [Some(50.0), Some(50.0), Some(50.0)];
+        assert_eq!(implausible(Some(50.0), &flat, &same, range, step), None);
+        assert_eq!(median_step(&flat), 0.0);
+        assert_eq!(median_step(&varied), 2.0);
     }
 
     #[test]
