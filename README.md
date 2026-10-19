@@ -150,7 +150,7 @@ If a reply cannot be used, or is bigger than avsm will read (256 KiB), avsm can
 ask a second backend the same question. Name it with `escalate:` in
 `config.yaml`. Before the call avsm writes a measured `escalation` record (from,
 to, why); the answer comes back as inferred records that cite it, and the
-escalation then gets a measured outcome: the records cited, or `unusable`. An
+escalation then gets a measured `answer` record: the records cited, or `unusable`. An
 answer proposes or asks like any model reply and never authorizes. With no
 `escalate:`, nothing changes.
 

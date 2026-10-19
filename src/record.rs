@@ -63,6 +63,8 @@ pub enum Kind {
     Intent,
     Outcome,
     Refusal,
+    Escalation,
+    Answer,
 }
 
 impl Kind {
@@ -76,6 +78,8 @@ impl Kind {
             Kind::Intent => "intent",
             Kind::Outcome => "outcome",
             Kind::Refusal => "refusal",
+            Kind::Escalation => "escalation",
+            Kind::Answer => "answer",
         }
     }
 }
@@ -448,6 +452,30 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         closes: Option<Seq>,
     },
+    /// The first backend could not answer, so a second was asked (or, with
+    /// `refused`, was not: the reason). Written by code before the call and
+    /// authorizes nothing.
+    Escalation {
+        claim: Claim,
+        venture: String,
+        from: String,
+        to: String,
+        why: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refused: Option<String>,
+    },
+    /// How an escalation went: the records of the second backend's answer
+    /// (each cites the escalation), or none when it too was unusable.
+    /// Written by code after the call and authorizes nothing.
+    Answer {
+        claim: Claim,
+        venture: String,
+        escalation: Seq,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cites: Vec<Seq>,
+        detail: String,
+    },
 }
 
 /// The idempotency key of a lever run: sha256 over the venture, the
@@ -472,7 +500,9 @@ impl Record {
             | Record::Decision { claim, .. }
             | Record::Intent { claim, .. }
             | Record::Outcome { claim, .. }
-            | Record::Refusal { claim, .. } => *claim,
+            | Record::Refusal { claim, .. }
+            | Record::Escalation { claim, .. }
+            | Record::Answer { claim, .. } => *claim,
         }
     }
 
@@ -485,7 +515,9 @@ impl Record {
             | Record::Decision { venture, .. }
             | Record::Intent { venture, .. }
             | Record::Outcome { venture, .. }
-            | Record::Refusal { venture, .. } => venture,
+            | Record::Refusal { venture, .. }
+            | Record::Escalation { venture, .. }
+            | Record::Answer { venture, .. } => venture,
         }
     }
 
@@ -499,6 +531,8 @@ impl Record {
             Record::Intent { .. } => Kind::Intent,
             Record::Outcome { .. } => Kind::Outcome,
             Record::Refusal { .. } => Kind::Refusal,
+            Record::Escalation { .. } => Kind::Escalation,
+            Record::Answer { .. } => Kind::Answer,
         }
     }
 
@@ -534,7 +568,8 @@ impl Record {
         match self {
             Record::Report { cites, .. }
             | Record::Proposal { cites, .. }
-            | Record::Ask { cites, .. } => cites,
+            | Record::Ask { cites, .. }
+            | Record::Answer { cites, .. } => cites,
             _ => &[],
         }
     }
@@ -679,6 +714,33 @@ impl Record {
                 closes: Some(open),
                 ..
             } => format!("#{open} {action} refused {count} times: {detail}"),
+            Record::Escalation {
+                from,
+                to,
+                why,
+                refused: None,
+                ..
+            } => format!("escalated {from} -> {to}: {}", first_line(why)),
+            Record::Escalation {
+                from,
+                to,
+                why,
+                refused: Some(reason),
+                ..
+            } => format!(
+                "escalation {from} -> {to} refused: {} ({})",
+                first_line(reason),
+                first_line(why)
+            ),
+            Record::Answer {
+                escalation,
+                ok,
+                detail,
+                ..
+            } => format!(
+                "#{escalation} answer {}  {detail}",
+                if *ok { "usable" } else { "unusable" }
+            ),
         }
     }
 }

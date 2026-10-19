@@ -4,7 +4,7 @@
 //! Recorded, then done. A measured `escalation` record (from, to, why) is
 //! written before the call. The answer goes through the same parse path as
 //! any reply and its inferred records cite the escalation. The escalation
-//! then gets a measured outcome: the cited seqs, or `unusable`. An answer
+//! then gets a measured answer record: the cited seqs, or `unusable`. An answer
 //! is inferred like any other: it proposes or asks and never authorizes.
 //!
 //! A backend that leaves the machine is asked only for a venture whose
@@ -15,10 +15,6 @@ use crate::mandate::Escalate;
 use crate::record::{Claim, Entry, Record, Seq};
 use crate::role::{self, Context, InferRequest};
 
-/// The metric of the record an escalation leaves before the call.
-pub const ESCALATION: &str = "escalation";
-/// The metric of the record a refused escalation leaves.
-pub const ESCALATION_REFUSED: &str = "escalation_refused";
 /// What an escalation's outcome says when the second backend failed too.
 pub const UNANSWERED: &str = role::UNUSABLE;
 /// The most characters the reason of an escalation may hold.
@@ -67,27 +63,24 @@ impl Kernel {
             cites,
             implausible: None,
         };
+        let escalation = |refused: Option<String>| Record::Escalation {
+            claim: Claim::Measured,
+            venture: venture.to_string(),
+            from: request.backend.clone(),
+            to: to.clone(),
+            why: why.clone(),
+            refused,
+        };
         if offbox && v.mandate.escalate != Some(Escalate::Offbox) {
-            let refused = self.append(report(
-                ESCALATION_REFUSED,
-                format!(
-                    "not escalating from {} to {to}, which leaves the machine; the mandate does not say escalate: offbox ({why})",
-                    request.backend
-                ),
-                vec![],
-                Claim::Measured,
-            ))?;
+            let refused = self.append(escalation(Some(format!(
+                "{to} leaves the machine; the mandate does not say escalate: offbox"
+            ))))?;
             log(&refused.line());
             return Ok(vec![refused]);
         }
 
         // Recorded, then done.
-        let started = self.append(report(
-            ESCALATION,
-            format!("{} -> {to}: {why}", request.backend),
-            vec![],
-            Claim::Measured,
-        ))?;
+        let started = self.append(escalation(None))?;
         log(&started.line());
         let mut written = vec![started.clone()];
         let ctx = Context {
@@ -184,11 +177,12 @@ impl Kernel {
         } else {
             UNANSWERED.to_string()
         };
-        let done = self.append(Record::Outcome {
+        let done = self.append(Record::Answer {
             claim: Claim::Measured,
             venture: venture.to_string(),
-            intent: started.seq,
+            escalation: started.seq,
             ok: usable,
+            cites: cited,
             detail,
         })?;
         log(&done.line());

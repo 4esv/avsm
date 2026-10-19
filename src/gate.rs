@@ -1950,6 +1950,35 @@ pub fn why(entry: &Entry) -> String {
             text.push_str("  authorizes nothing and counts toward nothing\n");
             text
         }
+        Record::Escalation {
+            from,
+            to,
+            why,
+            refused,
+            ..
+        } => {
+            let mut text =
+                format!("{head}\n  from       {from}\n  to         {to}\n  why        {why}\n");
+            if let Some(reason) = refused {
+                text.push_str(&format!("  refused    {reason}\n"));
+            }
+            text.push_str("  written by code before the call; authorizes nothing\n");
+            text
+        }
+        Record::Answer {
+            escalation,
+            cites,
+            detail,
+            ..
+        } => {
+            let list: Vec<String> = cites.iter().map(|s| format!("#{s}")).collect();
+            let mut text = format!("{head}\n  answer to escalation #{escalation}: {detail}\n");
+            if !list.is_empty() {
+                text.push_str(&format!("  cites      {}\n", list.join(", ")));
+            }
+            text.push_str("  the inferred records it cites authorize nothing\n");
+            text
+        }
     }
 }
 

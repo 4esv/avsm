@@ -66,7 +66,7 @@ fn world(s: Setup) -> World {
     script(
         &second,
         &format!(
-            "cat > {r}/request.json\ntouch {r}/called\ncat {r}/home/ledger.db* | grep -ac escalation > {r}/in_ledger_at_call\n{}",
+            "cat > {r}/request.json\ntouch {r}/called\ncat {r}/home/ledger.db* | grep -aic escalation > {r}/in_ledger_at_call\n{}",
             s.second,
             r = root.display()
         ),
@@ -121,12 +121,59 @@ impl World {
             .join("\n")
     }
 
+    /// The first escalation, asked or refused.
+    fn escalation(&self) -> Option<Entry> {
+        self.entries()
+            .into_iter()
+            .find(|e| e.record.kind() == Kind::Escalation)
+    }
+
     /// The first report of this metric.
     fn report(&self, metric: &str) -> Option<Entry> {
         self.entries()
             .into_iter()
             .find(|e| matches!(&e.record, Record::Report { metric: m, .. } if m == metric))
     }
+}
+
+/// The digest's incidents a week, as the last digest wrote it.
+fn incidents(w: &World) -> Option<f64> {
+    w.entries().iter().rev().find_map(|e| match &e.record {
+        Record::Report {
+            metric,
+            value: Some(v),
+            ..
+        } if metric == "incidents_per_week" => Some(*v),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_venture_whose_metric_is_named_escalation_has_no_escalations() {
+    let mut w = world(Setup {
+        configured: false,
+        ..Setup::default()
+    });
+    // A venture of its own, reporting a metric called escalation.
+    let dir = w.dir.parent().unwrap().join("odd");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        "purpose: Count.\nmetric: escalation\ncontroller: {kind: model}\ncadence: 1h\n",
+    )
+    .unwrap();
+    script(&dir.join("report"), "echo 7");
+    w.kernel.add(&dir).unwrap();
+    w.kernel.tick();
+    let reports = w
+        .entries()
+        .iter()
+        .filter(|e| matches!(&e.record, Record::Report { venture, metric, .. } if venture == "odd" && metric == "escalation"))
+        .count();
+    assert!(reports > 0, "the venture reported: {}", w.lines());
+    assert!(w.escalation().is_none(), "{}", w.lines());
+    w.kernel.record_digest().unwrap();
+    assert_eq!(incidents(&w), Some(0.0), "{}", w.lines());
 }
 
 #[test]
@@ -140,9 +187,16 @@ fn an_unusable_reply_escalates_in_order() {
     let unusable = at(
         &|e| matches!(&e.record, Record::Report { metric, claim: Claim::Inferred, .. } if metric == "unusable"),
     );
-    let escalation = at(
-        &|e| matches!(&e.record, Record::Report { metric, claim: Claim::Measured, .. } if metric == "escalation"),
-    );
+    let escalation = at(&|e| {
+        matches!(
+            &e.record,
+            Record::Escalation {
+                claim: Claim::Measured,
+                refused: None,
+                ..
+            }
+        )
+    });
     let answer = at(&|e| {
         matches!(
             &e.record,
@@ -152,7 +206,7 @@ fn an_unusable_reply_escalates_in_order() {
             }
         )
     });
-    let outcome = at(&|e| matches!(&e.record, Record::Outcome { .. }));
+    let outcome = at(&|e| matches!(&e.record, Record::Answer { .. }));
     assert!(
         unusable < escalation && escalation < answer && answer < outcome,
         "unusable {unusable}, escalation {escalation}, answer {answer}, outcome {outcome}\n{}",
@@ -160,17 +214,19 @@ fn an_unusable_reply_escalates_in_order() {
     );
 
     let esc = &entries[escalation];
-    let Record::Report { note, .. } = &esc.record else {
+    let Record::Escalation { from, to, why, .. } = &esc.record else {
         unreachable!()
     };
-    assert!(note.starts_with("primary -> second: "), "{note}");
-    assert!(note.contains("neither the JSON asked for"), "{note}");
-    // The answer cites the escalation; the outcome names the answer.
+    assert_eq!((from.as_str(), to.as_str()), ("primary", "second"));
+    assert!(why.contains("neither the JSON asked for"), "{why}");
+    // The answer's records cite the escalation; the Answer cites them and
+    // nothing else.
     assert_eq!(entries[answer].record.cites(), &[esc.seq]);
-    let Record::Outcome {
+    let Record::Answer {
         claim,
-        intent,
+        escalation: of,
         ok,
+        cites,
         detail,
         ..
     } = &entries[outcome].record
@@ -178,9 +234,17 @@ fn an_unusable_reply_escalates_in_order() {
         unreachable!()
     };
     assert_eq!(*claim, Claim::Measured);
-    assert_eq!(*intent, esc.seq);
+    assert_eq!(*of, esc.seq);
     assert!(*ok);
+    assert_eq!(cites, &vec![entries[answer].seq]);
     assert_eq!(*detail, format!("answer: #{}", entries[answer].seq));
+    for c in cites {
+        let cited = entries.iter().find(|e| e.seq == *c).unwrap();
+        assert!(cited.record.cites().contains(&esc.seq), "{}", cited.line());
+    }
+    // An escalation is an incident in the digest.
+    w.kernel.record_digest().unwrap();
+    assert_eq!(incidents(&w), Some(1.0), "{}", w.lines());
     // Recorded, then done: the escalation was already stored when the
     // second backend was called.
     let in_ledger: u32 = std::fs::read_to_string(w.dir.parent().unwrap().join("in_ledger_at_call"))
@@ -206,12 +270,12 @@ fn an_oversized_reply_escalates() {
     });
     w.kernel.cycle("shop");
     assert!(w.called(), "{}", w.lines());
-    let esc = w.report("escalation").expect("an escalation");
-    let Record::Report { note, claim, .. } = &esc.record else {
+    let esc = w.escalation().expect("an escalation");
+    let Record::Escalation { why, claim, .. } = &esc.record else {
         unreachable!()
     };
     assert_eq!(*claim, Claim::Measured);
-    assert!(note.contains("reply too big"), "{note}");
+    assert!(why.contains("reply too big"), "{why}");
     assert!(
         w.entries().iter().any(|e| e.seq > esc.seq
             && matches!(
@@ -234,7 +298,7 @@ fn without_escalate_configured_there_is_no_escalation() {
     });
     w.kernel.cycle("shop");
     assert!(!w.called(), "{}", w.lines());
-    assert!(w.report("escalation").is_none(), "{}", w.lines());
+    assert!(w.escalation().is_none(), "{}", w.lines());
     assert!(w.report("unusable").is_some(), "{}", w.lines());
     // Asking by hand gives nothing either.
     let request = avsm::role::InferRequest {
@@ -259,13 +323,17 @@ fn an_offbox_backend_needs_the_mandate_to_say_so() {
     });
     w.kernel.cycle("shop");
     assert!(!w.called(), "nothing left the machine\n{}", w.lines());
-    assert!(w.report("escalation").is_none(), "{}", w.lines());
-    let refused = w.report("escalation_refused").expect("a refusal");
-    let Record::Report { note, claim, .. } = &refused.record else {
+    let refused = w.escalation().expect("a refusal");
+    let Record::Escalation { refused, claim, .. } = &refused.record else {
         unreachable!()
     };
     assert_eq!(*claim, Claim::Measured);
-    assert!(note.contains("escalate: offbox"), "{note}");
+    let reason = refused.as_deref().expect("refused");
+    assert!(reason.contains("escalate: offbox"), "{reason}");
+    assert!(
+        !w.entries().iter().any(|e| e.record.kind() == Kind::Answer),
+        "no answer to a refusal"
+    );
 
     // The same setup with the mandate's say-so asks the backend.
     let mut w = world(Setup {
@@ -275,8 +343,11 @@ fn an_offbox_backend_needs_the_mandate_to_say_so() {
     });
     w.kernel.cycle("shop");
     assert!(w.called(), "{}", w.lines());
-    assert!(w.report("escalation").is_some());
-    assert!(w.report("escalation_refused").is_none());
+    let asked = w.escalation().expect("an escalation");
+    assert!(matches!(
+        &asked.record,
+        Record::Escalation { refused: None, .. }
+    ));
 }
 
 #[test]
@@ -289,7 +360,7 @@ fn an_answer_is_inferred_and_never_authorizes() {
     });
     w.kernel.cycle("shop");
     let entries = w.entries();
-    let esc = w.report("escalation").expect("an escalation");
+    let esc = w.escalation().expect("an escalation");
     let proposal = entries
         .iter()
         .find(|e| matches!(&e.record, Record::Proposal { action, .. } if action == "deploy"))
@@ -322,13 +393,19 @@ fn a_second_backend_that_fails_too_leaves_an_unusable_outcome() {
         });
         w.kernel.cycle("shop");
         let entries = w.entries();
-        let esc = w.report("escalation").expect("an escalation");
+        let esc = w.escalation().expect("an escalation");
         let outcome = entries
             .iter()
-            .find(|e| matches!(&e.record, Record::Outcome { intent, .. } if *intent == esc.seq))
+            .find(
+                |e| matches!(&e.record, Record::Answer { escalation, .. } if *escalation == esc.seq),
+            )
             .unwrap_or_else(|| panic!("{second}: {}", w.lines()));
-        let Record::Outcome {
-            claim, ok, detail, ..
+        let Record::Answer {
+            claim,
+            ok,
+            detail,
+            cites,
+            ..
         } = &outcome.record
         else {
             unreachable!()
@@ -336,6 +413,7 @@ fn a_second_backend_that_fails_too_leaves_an_unusable_outcome() {
         assert_eq!(*claim, Claim::Measured);
         assert!(!ok);
         assert_eq!(detail, "unusable", "{second}");
+        assert!(cites.is_empty(), "{second}");
         assert!(
             !entries
                 .iter()

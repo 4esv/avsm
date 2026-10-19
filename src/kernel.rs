@@ -1998,7 +1998,9 @@ fn weekly(entries: &[Entry], now: i64) -> (u32, u32) {
     for e in week {
         match &e.record {
             Record::Ask { .. } => asks += 1,
-            Record::Action { ok: false, .. } | Record::Outcome { ok: false, .. } => incidents += 1,
+            Record::Action { ok: false, .. }
+            | Record::Outcome { ok: false, .. }
+            | Record::Escalation { .. } => incidents += 1,
             Record::Action { action, .. } if action == crate::gate::STOP => incidents += 1,
             Record::Report {
                 venture,

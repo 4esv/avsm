@@ -478,6 +478,42 @@ mod tests {
                         closes,
                     }
                 }),
+            (
+                claim(),
+                text(),
+                text(),
+                text(),
+                text(),
+                prop::option::of(text())
+            )
+                .prop_map(|(claim, venture, from, to, why, refused)| {
+                    Record::Escalation {
+                        claim,
+                        venture,
+                        from,
+                        to,
+                        why,
+                        refused,
+                    }
+                }),
+            (
+                claim(),
+                text(),
+                any::<Seq>(),
+                any::<bool>(),
+                prop::collection::vec(any::<Seq>(), 0..3),
+                text()
+            )
+                .prop_map(|(claim, venture, escalation, ok, cites, detail)| {
+                    Record::Answer {
+                        claim,
+                        venture,
+                        escalation,
+                        ok,
+                        cites,
+                        detail,
+                    }
+                }),
         ]
     }
 

@@ -199,6 +199,11 @@ enum Op {
     /// An ask that a lever is ineffective, by any claim, and perhaps an
     /// approval of it by any claim and venture.
     Ineffective(String, String, Claim, Option<(Claim, String)>),
+    /// An escalation, refused or not, by any claim.
+    Escalation(String, Claim, bool),
+    /// The answer to a record already written, by any claim, citing
+    /// perhaps another.
+    Answer(String, Claim, u64, bool, Option<u64>),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -247,6 +252,9 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|((v, a), c, ok)| Op::Ineffective(v, a, c, ok)),
         1 => (prop::sample::select(VENTURES).prop_map(str::to_string), any::<bool>())
             .prop_map(|(v, same)| Op::Readopt(v, same)),
+        2 => (name(), claim(), any::<bool>()).prop_map(|(v, c, r)| Op::Escalation(v, c, r)),
+        2 => (name(), claim(), seq(), any::<bool>(), prop::option::of(seq()))
+            .prop_map(|(v, c, e, ok, cite)| Op::Answer(v, c, e, ok, cite)),
     ]
 }
 
@@ -351,6 +359,22 @@ fn record(op: &Op, n: u64) -> Record {
             venture,
             action,
             payload,
+        },
+        Op::Escalation(venture, claim, refused) => Record::Escalation {
+            claim,
+            venture,
+            from: "primary".to_string(),
+            to: "second".to_string(),
+            why: "unusable".to_string(),
+            refused: refused.then(|| "it leaves the machine".to_string()),
+        },
+        Op::Answer(venture, claim, e, ok, cite) => Record::Answer {
+            claim,
+            venture,
+            escalation: pick(n, e),
+            ok,
+            cites: cite.map(|x| pick(n, x)).into_iter().collect(),
+            detail: String::new(),
         },
         Op::Outcome(..) | Op::Run(..) | Op::Ineffective(..) => unreachable!("written by build"),
         Op::Pull(venture, action, ok, text) => Record::Action {
