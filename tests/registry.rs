@@ -465,7 +465,8 @@ fn alarm_fatigue_a_saturation_ask_is_written_past_the_asks_quota_and_only_once()
 /// `src/expect.rs`). Only a declared approval gives it back.
 ///
 /// SHOWN: a lever runs, the metric does not move, and at the horizon an
-/// ineffective ask is written and the next crossing asks instead of runs.
+/// ineffective ask is written and the next crossing is refused, with no
+/// ask of its own.
 /// One report short of the horizon, nothing is judged.
 #[test]
 fn hindsight_a_lever_that_does_nothing_is_judged_ineffective_and_loses_its_delegation() {
@@ -500,14 +501,16 @@ fn hindsight_a_lever_that_does_nothing_is_judged_ineffective_and_loses_its_deleg
     assert!(matches!(&ineffective[0].record,
         Record::Ask { claim: Claim::Measured, action: None,
             signal: Some(Signal::Ineffective { action, .. }), .. } if action == "boost"));
-    // Tomorrow's crossing asks; it does not run.
+    // Tomorrow's crossing is refused, with a refusal record; it does not
+    // run and asks nothing more.
     report(&mut k, 3.0, DAY);
     assert_eq!(intents(&k, "raiser", "boost"), 1);
-    assert!(k
-        .entries()
-        .unwrap()
+    let entries = k.entries().unwrap();
+    assert!(!entries
         .iter()
         .any(|e| matches!(&e.record, Record::Ask { action: Some(a), .. } if a == "boost")));
+    assert!(entries.iter().any(|e| matches!(&e.record,
+        Record::Refusal { action, reason, .. } if action == "boost" && reason.contains("Suspended"))));
 }
 
 /// FAILURE: tampering. Whoever can write the store can rewrite what

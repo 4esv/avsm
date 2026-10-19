@@ -318,8 +318,8 @@ pub enum Signal {
     /// is a human's to say, and until then the lever is refused.
     Pending { intent: Seq, action: String },
     /// A lever ran and the metric did not move as the mandate expects, or
-    /// its runs kept failing. Until a declared decision answers the ask,
-    /// every run of the lever needs a declared decision of its own.
+    /// its runs kept failing. Until a declared approval of the ask, every
+    /// run of the lever is refused and none asks; one ask an episode.
     Ineffective { action: String, why: String },
     /// A guard's reading is past its bound and the guard asks: every lever
     /// but stop is refused until the reading is back inside.

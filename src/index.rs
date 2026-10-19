@@ -18,6 +18,11 @@ use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Signal, Verdict};
 /// The metric of the reports that say what a run did to the venture's metric.
 pub const EXPECTATION: &str = "expectation";
 
+/// The metric of the measured report that suspends a restored lever again
+/// when it misses and nothing new was measured to ask on. It cites the
+/// ineffective ask it follows.
+pub const SUSPENSION: &str = "suspension";
+
 /// The prefix of the metric of the reports that score a prediction:
 /// `calibration.<model>`.
 pub const CALIBRATION: &str = "calibration.";
@@ -118,6 +123,12 @@ pub struct Index {
     settled: HashMap<Seq, (Seq, bool)>,
     /// Measured asks that say a lever is ineffective, per venture and lever.
     ineffective: HashMap<(String, String), Vec<Seq>>,
+    /// Measured reports that suspend a restored lever again without an
+    /// ask, per venture and lever.
+    relapses: HashMap<(String, String), Vec<Seq>>,
+    /// Every trusted report code marked implausible, per venture and
+    /// metric, by number.
+    doubted: HashMap<String, HashMap<String, Vec<Seq>>>,
     /// The ventures whose declared approval answered an ask.
     approved_by: HashMap<Seq, HashSet<String>>,
     /// The highest trusted, plausible value of each venture's metrics: the
@@ -259,6 +270,29 @@ impl Index {
                             .entry(metric.clone())
                             .or_insert(*x);
                         *peak = peak.max(*x);
+                    }
+                }
+                if let (true, Some(_)) = (claim.authorizes(), implausible) {
+                    let list = self
+                        .doubted
+                        .entry(venture.clone())
+                        .or_default()
+                        .entry(metric.clone())
+                        .or_default();
+                    let i = list.partition_point(|s| *s <= seq);
+                    list.insert(i, seq);
+                }
+                if metric == SUSPENSION && *claim == Claim::Measured {
+                    for c in cites {
+                        let lever = self.ineffective.iter().find_map(|((v, a), asks)| {
+                            (*v == venture && asks.contains(c)).then(|| a.clone())
+                        });
+                        if let Some(a) = lever {
+                            self.relapses
+                                .entry((venture.clone(), a))
+                                .or_default()
+                                .push(seq);
+                        }
                     }
                 }
                 if claim.authorizes() {
@@ -612,24 +646,52 @@ impl Index {
             .max()
     }
 
+    /// The latest measured record that suspended this lever: its latest
+    /// ineffective ask or its latest relapse. Runs are judged after it.
+    pub fn last_suspension(&self, venture: &str, action: &str) -> Option<Seq> {
+        let key = (venture.to_string(), action.to_string());
+        let relapse = self.relapses.get(&key).and_then(|r| r.iter().max());
+        self.last_ineffective(venture, action).max(relapse.copied())
+    }
+
     /// Is this lever suspended: a measured ask says it is ineffective and
     /// neither a declared approval of that ask by the same venture nor a
-    /// later declared adoption of the venture's mandate has answered it.
-    /// While it is, each run needs a declared decision. Tightening is
-    /// measured; only a declared decision loosens.
+    /// later declared adoption of the venture's mandate has answered it;
+    /// or a measured relapse after the latest such ask says the restored
+    /// lever missed again. While it is, every run is refused. Tightening
+    /// is measured; only a declared decision loosens.
     pub fn suspended(&self, venture: &str, action: &str) -> bool {
         // A declared adoption of the mandate after the ask answers it too.
         let adopted = self.adoptions.get(venture).map_or(0, |a| a.seq);
-        self.ineffective
-            .get(&(venture.to_string(), action.to_string()))
-            .is_some_and(|asks| {
-                asks.iter().any(|q| {
-                    *q > adopted
-                        && !self
-                            .approved_by
-                            .get(q)
-                            .is_some_and(|by| by.contains(venture))
-                })
+        let key = (venture.to_string(), action.to_string());
+        let asks = self.ineffective.get(&key);
+        let unanswered = asks.is_some_and(|asks| {
+            asks.iter().any(|q| {
+                *q > adopted
+                    && !self
+                        .approved_by
+                        .get(q)
+                        .is_some_and(|by| by.contains(venture))
+            })
+        });
+        let last_ask = asks.and_then(|a| a.iter().max()).copied().unwrap_or(0);
+        let relapsed = self
+            .relapses
+            .get(&key)
+            .and_then(|r| r.iter().max())
+            .is_some_and(|r| *r > adopted && *r > last_ask);
+        unanswered || relapsed
+    }
+
+    /// Is any trusted report of this metric between these two numbers,
+    /// both excluded, marked implausible?
+    pub fn doubted_between(&self, venture: &str, metric: &str, from: Seq, to: Seq) -> bool {
+        self.doubted
+            .get(venture)
+            .and_then(|m| m.get(metric))
+            .is_some_and(|list| {
+                let i = list.partition_point(|s| *s <= from);
+                list.get(i).is_some_and(|s| *s < to)
             })
     }
 

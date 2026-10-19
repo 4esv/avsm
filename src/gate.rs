@@ -164,7 +164,8 @@ pub enum Reason {
     },
     NeedsDecision {
         action: String,
-        /// The lever was found ineffective: every run asks.
+        /// The lever was found ineffective: a run passes only on a
+        /// declared approval of that run, and the kernel asks for none.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         suspended: bool,
     },
@@ -408,11 +409,13 @@ ascent! {
     irreversible_ok(v, a) <-- permitted(v, a, _, false, true);
     irreversible_ok(v, a) <-- permitted(v, a, _, false, _), approved(v, a, _, _);
     // venture, action: a measured ask says the lever is ineffective and no
-    // declared decision has answered it
+    // declared decision has answered it, or a measured relapse suspended
+    // it again
     relation suspended(String, String);
     relation needs_decision(String, String);
     // A suspended lever needs a declared decision for each run, whatever
-    // its reversibility or delegation.
+    // its reversibility or delegation. The kernel refuses it and asks
+    // once an episode, not once a run.
     needs_decision(v, a) <-- candidate(v, a), suspended(v, a), !approved(v, a, _, _);
     needs_decision(v, a) <-- candidate(v, a), permitted(v, a, _, false, _), !irreversible_ok(v, a);
 
@@ -1903,7 +1906,7 @@ impl fmt::Display for Reason {
                 suspended: true,
             } => write!(
                 f,
-                "{action} was found ineffective; each run needs a declared decision"
+                "{action} was found ineffective; it is refused until a declared decision restores it"
             ),
             Reason::NeedsDecision { action, .. } => write!(
                 f,
@@ -2533,33 +2536,71 @@ pub mod reference {
 
     /// Is the lever suspended: some measured ask says it is ineffective
     /// and neither a declared approval of it by the same venture nor a
-    /// declared adoption of the venture's mandate after it answers it?
+    /// declared adoption of the venture's mandate after it answers it? Or
+    /// does a measured relapse after the latest such ask and after any
+    /// adoption suspend it again?
     pub fn suspended(ledger: &[Entry], venture: &str, action: &str) -> bool {
-        ledger.iter().any(|e| {
+        let is_ask = |e: &Entry| {
             matches!(&e.record, Record::Ask {
                 claim: Claim::Measured,
                 venture: v,
                 signal: Some(crate::record::Signal::Ineffective { action: a, .. }),
                 ..
             } if v == venture && a == action)
-                && !ledger.iter().any(|d| {
-                    matches!(&d.record, Record::Decision {
+        };
+        let last_ask = ledger.iter().filter(|e| is_ask(e)).map(|e| e.seq).max();
+        let adopted = ledger
+            .iter()
+            .filter(|d| {
+                matches!(&d.record, Record::Decision {
+                    claim: Claim::Declared,
+                    venture: dv,
+                    verdict: Verdict::Adopt { .. },
+                    ..
+                } if dv == venture)
+            })
+            .map(|d| d.seq)
+            .max()
+            .unwrap_or(0);
+        let relapsed = ledger.iter().any(|r| {
+            matches!(&r.record, Record::Report {
+                claim: Claim::Measured,
+                venture: v,
+                metric,
+                cites,
+                ..
+            } if v == venture
+                && metric == crate::index::SUSPENSION
+                && cites.iter().any(|c| ledger.iter().any(|e| e.seq == *c && is_ask(e))))
+                && r.seq > adopted
+                && last_ask.is_some_and(|q| r.seq > q)
+        });
+        relapsed
+            || ledger.iter().any(|e| {
+                matches!(&e.record, Record::Ask {
+                claim: Claim::Measured,
+                venture: v,
+                signal: Some(crate::record::Signal::Ineffective { action: a, .. }),
+                ..
+            } if v == venture && a == action)
+                    && !ledger.iter().any(|d| {
+                        matches!(&d.record, Record::Decision {
                         claim: Claim::Declared,
                         venture: dv,
                         verdict: Verdict::Approve { ask, .. },
                         ..
                     } if dv == venture && *ask == e.seq)
-                })
-                && !ledger.iter().any(|d| {
-                    d.seq > e.seq
-                        && matches!(&d.record, Record::Decision {
+                    })
+                    && !ledger.iter().any(|d| {
+                        d.seq > e.seq
+                            && matches!(&d.record, Record::Decision {
                             claim: Claim::Declared,
                             venture: dv,
                             verdict: Verdict::Adopt { .. },
                             ..
                         } if dv == venture)
-                })
-        })
+                    })
+            })
     }
 
     /// Parents and children as facts, and every pause and resume a parent

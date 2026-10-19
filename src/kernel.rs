@@ -1865,7 +1865,25 @@ impl Kernel {
                         .reasons
                         .iter()
                         .any(|r| matches!(r, Reason::NeedsDecision { .. }));
-                if needs_human && !already && !may_ask {
+                // A lever found ineffective is refused, never asked about
+                // run by run: its one ask an episode is the signal, which
+                // asks again only on new evidence.
+                let suspended = refusal.reasons.iter().any(|r| {
+                    matches!(
+                        r,
+                        Reason::NeedsDecision {
+                            suspended: true,
+                            ..
+                        }
+                    )
+                });
+                if needs_human && suspended {
+                    let (key, detail, limit) =
+                        refusals::describe(&refusal.reasons, &[refusals::SUSPENDED]);
+                    lines.push(format!("{name}: {action} refused: {detail}"));
+                    self.refuse(name, action, key, detail, limit);
+                    self.reask_ineffective(name, action);
+                } else if needs_human && !already && !may_ask {
                     lines.push(format!(
                         "{name}: {action} needs a decision, but the asks quota is used up; not asking"
                     ));
@@ -1875,18 +1893,6 @@ impl Kernel {
                 } else if needs_human && !already {
                     let question = match &payload {
                         Some(_) => format!("may I {action} with this?{reason}"),
-                        None if refusal.reasons.iter().any(|r| {
-                            matches!(
-                                r,
-                                Reason::NeedsDecision {
-                                    suspended: true,
-                                    ..
-                                }
-                            )
-                        }) =>
-                        {
-                            format!("may I {action}? it was found ineffective{reason}")
-                        }
                         None => format!("may I {action}? it is irreversible{reason}"),
                     };
                     // A model's proposal gives the reason, labeled inferred;

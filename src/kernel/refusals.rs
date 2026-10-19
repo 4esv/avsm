@@ -21,6 +21,9 @@ use crate::record::{Claim, Record, Seq, Signal};
 const ASKS_SPENT: &str = "AsksQuotaSpent";
 /// What a question already open is called in a reason key.
 const ALREADY_ASKED: &str = "AlreadyAsked";
+/// What a lever found ineffective is called in a reason key: refused,
+/// not asked about.
+pub(super) const SUSPENDED: &str = "Suspended";
 /// How a saturation question ends. Code never reads it; the signal field does.
 const SATURATED: &str = "; the limits cannot keep up";
 

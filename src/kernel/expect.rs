@@ -2,14 +2,18 @@
 //! the mandate expects something of is judged once enough reports follow
 //! it. The right way by the wrong size is a measured report, the input to
 //! the baseline. No effect or the wrong way is a miss, and so is a failed
-//! run when the lever says `revoke_after`. Enough misses in a row write a
-//! measured ask and the lever is suspended, reversible or not: each run
-//! needs a declared decision, until a declared approval of that ask or a
-//! declared adoption of the mandate after it. Tightening is measured;
-//! loosening is declared.
+//! run when the lever says `revoke_after`. A run whose step spans a
+//! reading code marked implausible is never judged. Enough misses in a row
+//! write a measured ask and the lever is suspended, reversible or not:
+//! every run is refused, and none asks, until a declared approval of that
+//! ask or a declared adoption of the mandate after it. One ask an episode:
+//! a restored lever that misses again is suspended again, by a measured
+//! relapse report with no ask unless the metric was measured somewhere new
+//! since the last ask; a suspended lever that is refused asks again only
+//! then too. Tightening is measured; loosening is declared.
 
 use crate::expect::{self, Judgement};
-use crate::index::EXPECTATION;
+use crate::index::{Index, EXPECTATION, SUSPENSION};
 use crate::record::{Claim, Record, Seq, Signal};
 use crate::world;
 
@@ -24,6 +28,31 @@ pub(super) enum Run {
     Failed,
     /// The metric did not move as expected; the words say how.
     Ineffective(String),
+    /// A reading the step spans is implausible: neither a hit nor a miss.
+    Unjudged,
+}
+
+/// New measured evidence about a suspended lever since its last
+/// ineffective ask: a plausible reading of the metric after the ask that
+/// is further from the frozen value (the last plausible reading at the
+/// ask) than the metric's noise then. Returns the two values, or None.
+/// With no ask, anything is new.
+pub(super) fn evidence(
+    index: &Index,
+    venture: &str,
+    metric: &str,
+    since: Option<Seq>,
+) -> Option<(f64, f64)> {
+    let since = since?;
+    let series = index.series(venture, metric);
+    let i = series.partition_point(|(s, _)| *s <= since);
+    let frozen = series[..i].last()?.1;
+    let values: Vec<f64> = series[..i].iter().map(|(_, x)| *x).collect();
+    let noise = expect::noise(&values);
+    series[i..]
+        .iter()
+        .find(|(_, x)| (x - frozen).abs() > noise)
+        .map(|(_, x)| (frozen, *x))
 }
 
 impl Kernel {
@@ -40,10 +69,10 @@ impl Kernel {
             }
             let mut memo: Vec<(Seq, Run)> = Vec::new();
             let mut records: Vec<Record> = Vec::new();
-            let mut ask: Option<String> = None;
+            let mut ask: Option<(String, Option<Seq>)> = None;
             {
                 let Ok(index) = self.index() else { return };
-                let floor = index.last_ineffective(venture, &perm.name).unwrap_or(0);
+                let floor = index.last_suspension(venture, &perm.name).unwrap_or(0);
                 let mut seen: Vec<Run> = Vec::new();
                 for &intent in index.intents_of(venture, &perm.name) {
                     if intent <= floor {
@@ -69,18 +98,26 @@ impl Kernel {
                         // run to the one judged, by the recent drift before
                         // the run.
                         let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
-                        let span = match (
+                        let ends = (
                             b.checked_sub(1).map(|i| series[i].0),
                             series.get(a + expects.within as usize - 1).map(|p| p.0),
-                        ) {
+                        );
+                        let span = match ends {
                             (Some(s0), Some(s1)) => Some((at(s0), at(s1) - at(s0))),
                             _ => None,
+                        };
+                        // A step that spans an implausible reading says
+                        // nothing about the run: the sensor, not the lever.
+                        let doubted = match ends {
+                            (Some(s0), Some(s1)) => index.doubted_between(venture, &metric, s0, s1),
+                            _ => false,
                         };
                         let (drift, noise) = span.map_or((0.0, 0.0), |(t0, dt)| {
                             world::counterfactual(&index, venture, &v.mandate, intent, t0, dt)
                         });
                         match expect::judge(expects, &before, &after, drift, noise) {
                             Judgement::Waiting => break,
+                            _ if doubted => Run::Unjudged,
                             Judgement::Unknown | Judgement::Met => Run::Hit,
                             Judgement::WrongSize { observed, noise, .. } => {
                                 if !index.expectation_reported(intent) {
@@ -133,6 +170,7 @@ impl Kernel {
                     match r {
                         Run::Ineffective(_) => misses.push(r),
                         Run::Failed if perm.revoke_after.is_some() => misses.push(r),
+                        Run::Unjudged => continue,
                         _ => break,
                     }
                 }
@@ -147,7 +185,24 @@ impl Kernel {
                         }
                         _ => format!("{} runs in a row failed", misses.len()),
                     };
-                    ask = Some(why);
+                    // The first miss of an episode asks. A restored lever
+                    // that misses again asks only on new evidence since
+                    // the last ask; otherwise it relapses, measured and
+                    // silent. An adoption starts a new episode.
+                    let adopted = index.adoptions().get(venture).map_or(0, |a| a.seq);
+                    let last = index
+                        .last_ineffective(venture, &perm.name)
+                        .filter(|q| *q > adopted);
+                    ask = Some(match last {
+                        None => (why, None),
+                        Some(q) => match evidence(&index, venture, &metric, Some(q)) {
+                            Some((was, now)) => (
+                                format!("{why}; {metric} read {was} at ask #{q} and {now} since"),
+                                None,
+                            ),
+                            None => (why, Some(q)),
+                        },
+                    });
                 }
             }
             self.judged.extend(memo);
@@ -156,28 +211,82 @@ impl Kernel {
                     log(&format!("{venture}: cannot write expectation: {e}"));
                 }
             }
-            if let Some(why) = ask {
-                let lever = perm.name.clone();
-                let question = format!(
-                    "{lever} is ineffective, so it asks each time again: {why}; approve to delegate it again"
-                );
-                let signal = Signal::Ineffective { action: lever, why };
-                let packet = self.signal_packet(venture, &signal);
-                match self.append(Record::Ask {
-                    cites: vec![],
-                    claim: Claim::Measured,
-                    venture: venture.to_string(),
-                    action: None,
-                    question,
-                    refusal: None,
-                    payload: None,
-                    signal: Some(signal),
-                    packet,
-                }) {
-                    Ok(e) => log(&e.line()),
-                    Err(e) => log(&format!("{venture}: cannot write ask: {e}")),
+            match ask {
+                Some((why, None)) => self.ask_ineffective(venture, &perm.name, why),
+                Some((why, Some(q))) => {
+                    let record = Record::Report {
+                        claim: Claim::Measured,
+                        venture: venture.to_string(),
+                        metric: SUSPENSION.to_string(),
+                        value: None,
+                        note: format!(
+                            "{} missed again after ask #{q} restored it: {why}; suspended again, and nothing new was measured since to ask on",
+                            perm.name
+                        ),
+                        source: None,
+                        confidence: None,
+                        cites: vec![q],
+                        implausible: None,
+                        facts: None,
+                    };
+                    match self.append(record) {
+                        Ok(e) => log(&e.line()),
+                        Err(e) => log(&format!("{venture}: cannot write relapse: {e}")),
+                    }
                 }
+                None => {}
             }
+        }
+    }
+
+    /// Write the measured ask that suspends `lever`: one an episode.
+    pub(super) fn ask_ineffective(&mut self, venture: &str, lever: &str, why: String) {
+        let question = format!(
+            "{lever} is ineffective, so it is refused and asks no more: {why}; approve to delegate it again"
+        );
+        let signal = Signal::Ineffective {
+            action: lever.to_string(),
+            why,
+        };
+        let packet = self.signal_packet(venture, &signal);
+        match self.append(Record::Ask {
+            cites: vec![],
+            claim: Claim::Measured,
+            venture: venture.to_string(),
+            action: None,
+            question,
+            refusal: None,
+            payload: None,
+            signal: Some(signal),
+            packet,
+        }) {
+            Ok(e) => log(&e.line()),
+            Err(e) => log(&format!("{venture}: cannot write ask: {e}")),
+        }
+    }
+
+    /// A suspended lever was refused: ask again when no ask about it is
+    /// open and the metric was measured somewhere new since the last one.
+    pub(super) fn reask_ineffective(&mut self, venture: &str, lever: &str) {
+        let found = {
+            let Ok(index) = self.index() else { return };
+            let Some(v) = self.ventures.get(venture) else {
+                return;
+            };
+            let metric = v.mandate.metric_name().to_string();
+            let last = index.last_ineffective(venture, lever);
+            if last.is_some_and(|q| index.is_open(q)) {
+                return;
+            }
+            evidence(&index, venture, &metric, last).map(|(was, now)| {
+                format!(
+                    "found ineffective before, at ask #{}; {metric} read {was} then and {now} since",
+                    last.unwrap_or(0)
+                )
+            })
+        };
+        if let Some(why) = found {
+            self.ask_ineffective(venture, lever, why);
         }
     }
 }
