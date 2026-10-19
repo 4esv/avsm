@@ -174,6 +174,21 @@ impl Ledger {
         )
     }
 
+    /// Write a copy of the ledger as it stands, in one read transaction,
+    /// to a new file at `path`: a forecast's fork at the head.
+    pub fn copy_to(&self, path: &Path) -> Result<(), LedgerError> {
+        self.conn
+            .execute("VACUUM INTO ?1", params![path.to_string_lossy()])?;
+        Ok(())
+    }
+
+    /// Stop waiting for the disk on each append: for a forecast branch's
+    /// copy, which is deleted after, never for a ledger that is kept.
+    pub(crate) fn throwaway(&self) -> Result<(), LedgerError> {
+        self.conn.pragma_update(None, "synchronous", "OFF")?;
+        Ok(())
+    }
+
     /// How many entries there are.
     pub fn len(&self) -> Result<u64, LedgerError> {
         Ok(self

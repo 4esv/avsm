@@ -1176,9 +1176,11 @@ impl Holds {
             Signal::Implausible { .. } => self.implausible = true,
             Signal::Ineffective { .. } => self.ineffective = true,
             Signal::Saturated { .. } => self.saturated = true,
-            Signal::Pending { .. } | Signal::Audit { .. } | Signal::Warning { .. } => {
-                self.asking = true
-            }
+            Signal::Pending { .. }
+            | Signal::Audit { .. }
+            | Signal::Warning { .. }
+            | Signal::Forecast { .. }
+            | Signal::Capacity { .. } => self.asking = true,
         }
     }
 }
@@ -2125,6 +2127,52 @@ pub fn why(entry: &Entry) -> String {
                     "  {what:<10} {}  worst {}  p10 {} p50 {} p90 {}  propensity {}\n",
                     a.action, a.worst, q.p10, q.p50, q.p90, a.propensity
                 ));
+            }
+            text.push_str("  ranks, vetoes and asks; authorizes nothing\n");
+            text
+        }
+        Record::Forecast {
+            policy,
+            horizon,
+            seeds,
+            variant,
+            metrics,
+            guards,
+            reached,
+            cites,
+            ..
+        } => {
+            let mut text = format!(
+                "{head}\n  inferred from forked branches of the ledger: {horizon} days, {seeds} seeds, the asks answered by policy {policy}\n"
+            );
+            if let Some(v) = variant {
+                text.push_str(&format!("  variant    {v}\n"));
+            }
+            let q = |q: &crate::record::Quantiles| {
+                let v = q.values().map(crate::record::round);
+                format!(
+                    "p5 {} p10 {} p25 {} p50 {} p75 {} p90 {} p95 {}",
+                    v[0], v[1], v[2], v[3], v[4], v[5], v[6]
+                )
+            };
+            for m in metrics {
+                text.push_str(&format!("  metric     {} {}\n", m.name, q(&m.quantiles)));
+            }
+            for g in guards {
+                text.push_str(&format!("  breach     {} p={}\n", g.name, g.p));
+            }
+            for (name, r) in [
+                ("spend", &reached.spend),
+                ("asks", &reached.asks),
+                ("refusals", &reached.refusals),
+                ("halts", &reached.halts),
+                ("delegations", &reached.delegations),
+            ] {
+                text.push_str(&format!("  reached    {name} {}\n", q(r)));
+            }
+            if !cites.is_empty() {
+                let list: Vec<String> = cites.iter().map(|s| format!("#{s}")).collect();
+                text.push_str(&format!("  cites      {}\n", list.join(", ")));
             }
             text.push_str("  ranks, vetoes and asks; authorizes nothing\n");
             text

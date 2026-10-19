@@ -104,9 +104,12 @@ pub struct LocalWarden {
     index: Index,
     config: Config,
     keys: BTreeMap<String, String>,
-    /// Set only by `simulate`: every lever run goes to the simulation,
-    /// never to the lever.
+    /// Set only by `simulate` and a forecast's branches: every lever run
+    /// goes to the simulation, never to the lever.
     sim: Option<Arc<Simulation>>,
+    /// A forecast branch's warden: it holds no keys, calls no backend,
+    /// reads no adapter, runs no payload check and writes no mandate file.
+    keyless: bool,
 }
 
 impl LocalWarden {
@@ -120,7 +123,29 @@ impl LocalWarden {
             config: Config::load(home)?,
             keys: config::load_keys(home)?,
             sim: None,
+            keyless: false,
         })
+    }
+
+    /// The warden of a forecast branch: it never reads the keys file, and
+    /// every lever run goes to the simulation.
+    pub(crate) fn keyless(home: &Path, sim: Arc<Simulation>) -> Result<LocalWarden, String> {
+        let ledger = Ledger::open(&home.join("ledger.db")).map_err(|e| e.to_string())?;
+        ledger.throwaway().map_err(|e| e.to_string())?;
+        Ok(LocalWarden {
+            home: home.to_path_buf(),
+            ledger,
+            index: Index::default(),
+            config: Config::load(home)?,
+            keys: BTreeMap::new(),
+            sim: Some(sim),
+            keyless: true,
+        })
+    }
+
+    /// How many keys this warden holds.
+    pub fn keys_held(&self) -> usize {
+        self.keys.len()
     }
 
     /// A warden for a simulation: it gates, writes the intent and the
@@ -220,7 +245,14 @@ impl Warden for LocalWarden {
             // The mandate text is the payload the decision approved; the
             // intent cites it by the proof and does not carry it again.
             let started = append(intent(proof, None))?;
-            let (ok, detail) = match std::fs::write(&path, &text) {
+            // A forecast branch adopts the text in its own ledger alone:
+            // the venture's mandate file is the real one.
+            let wrote = if self.keyless {
+                Ok(())
+            } else {
+                std::fs::write(&path, &text)
+            };
+            let (ok, detail) = match wrote {
                 Ok(()) => (
                     true,
                     format!(
@@ -306,22 +338,68 @@ impl Warden for LocalWarden {
             written.push(done);
             return Ok(written);
         }
+        if perm.is_forecast() {
+            // Recorded, then done, like research: the forecast forks the
+            // ledger at its head, and only its records and its asks come
+            // back into this one.
+            let mut append = |record: Record| self.ledger.append(record).map_err(|e| e.to_string());
+            let started = append(intent(proof, None))?;
+            if self.keyless {
+                written.push(append(outcome(
+                    &started,
+                    true,
+                    "a forecast branch does not forecast".to_string(),
+                ))?);
+                written.insert(0, started);
+                return Ok(written);
+            }
+            let opts = crate::forecast::Options::for_lever(&venture, self.config.forecast);
+            let ran = crate::forecast::run(&self.ledger, &self.home, &opts);
+            let mut append = |record: Record| self.ledger.append(record).map_err(|e| e.to_string());
+            let (ok, detail) = match &ran {
+                Ok(o) => (true, o.describe()),
+                Err(e) => (false, e.clone()),
+            };
+            let done = append(outcome(&started, ok, detail))?;
+            let seq = started.seq;
+            written.push(started);
+            written.push(done);
+            if let Ok(o) = ran {
+                let mut seqs = BTreeMap::new();
+                for record in o.records(&[seq]) {
+                    let e = append(record)?;
+                    seqs.entry(e.record.venture().to_string())
+                        .or_insert_with(Vec::new)
+                        .push(e.seq);
+                    written.push(e);
+                }
+                for record in crate::forecast::asks(index, &o, &seqs) {
+                    written.push(append(record)?);
+                }
+            }
+            return Ok(written);
+        }
         if perm.is_research() {
             let question = payload.as_ref().map(Payload::text).unwrap_or_default();
             let started = append(intent(proof, payload))?;
-            let (ok, detail, findings) =
-                match research(&self.config, &self.home, &question, &venture) {
-                    Ok(f) => (
-                        true,
-                        format!(
-                            "{} {}",
-                            f.len(),
-                            if f.len() == 1 { "finding" } else { "findings" }
-                        ),
-                        f,
+            // A forecast branch asks no backend.
+            let asked = if self.keyless {
+                Err("a forecast asks no backend".to_string())
+            } else {
+                research(&self.config, &self.home, &question, &venture)
+            };
+            let (ok, detail, findings) = match asked {
+                Ok(f) => (
+                    true,
+                    format!(
+                        "{} {}",
+                        f.len(),
+                        if f.len() == 1 { "finding" } else { "findings" }
                     ),
-                    Err(e) => (false, e, vec![]),
-                };
+                    f,
+                ),
+                Err(e) => (false, e, vec![]),
+            };
             let done = append(outcome(&started, ok, detail))?;
             let seq = started.seq;
             written.push(started);
@@ -348,7 +426,9 @@ impl Warden for LocalWarden {
         }
         // A payload check runs after the gate, so after any approval, and
         // before the intent: a failure runs nothing and writes no intent.
-        if let (Some(check), Some(p)) = (&perm.check, payload.as_ref()) {
+        // A forecast branch runs no check: its payload is a placeholder,
+        // and the check is a command of the venture's.
+        if let (Some(check), Some(p), false) = (&perm.check, payload.as_ref(), self.keyless) {
             payload_check(&self.home, &dir, check, p, index, &venture)?;
         }
         let proof_text = proof.to_string();
@@ -387,6 +467,9 @@ impl Warden for LocalWarden {
     }
 
     fn infer(&mut self, request: &InferRequest) -> Result<String, String> {
+        if self.keyless {
+            return Err("a forecast calls no backend".to_string());
+        }
         let (name, backend) = self.config.backend(Some(&request.backend))?;
         match backend {
             Backend::Anthropic {
@@ -487,6 +570,9 @@ impl Warden for LocalWarden {
     }
 
     fn measure(&mut self, venture: &str) -> Result<(Option<f64>, String), String> {
+        if self.keyless {
+            return Err("a forecast reads no adapter".to_string());
+        }
         self.index
             .refresh(&self.ledger)
             .map_err(|e| e.to_string())?;
@@ -495,6 +581,17 @@ impl Warden for LocalWarden {
     }
 
     fn read(&mut self, venture: &str, metric: &str) -> Result<(Option<f64>, String), String> {
+        if self.keyless {
+            // A forecast reads a guard from the world model's step, never
+            // from the guard's command or adapter.
+            let name = metric.strip_prefix("guard.").unwrap_or(metric);
+            return match self.sim.as_ref().and_then(|s| s.guard(venture, name)) {
+                Some(x) => Ok((Some(x), "simulated: world".to_string())),
+                None => Err(format!(
+                    "a forecast reads {metric} from the world model alone, and it gave none"
+                )),
+            };
+        }
         self.index
             .refresh(&self.ledger)
             .map_err(|e| e.to_string())?;
@@ -503,6 +600,9 @@ impl Warden for LocalWarden {
     }
 
     fn confirm(&mut self, intent: Seq) -> Result<Option<(bool, String)>, String> {
+        if self.keyless {
+            return Ok(None);
+        }
         self.index
             .refresh(&self.ledger)
             .map_err(|e| e.to_string())?;

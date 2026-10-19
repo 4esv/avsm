@@ -71,6 +71,36 @@ pub struct Kernel {
     /// Set only by `simulate`, when it builds the kernel: lever runs go to
     /// the simulation world, never to the levers. No config can set it.
     sim: Option<Arc<crate::simulate::Simulation>>,
+    /// Forecast at add and before a ratchet ask, as config.yaml's
+    /// `forecast:` says. The daemon sets it; a simulation and a forecast's
+    /// own branches never do, so a forecast never forecasts.
+    pub forecasts: bool,
+    /// Ventures whose metric is in a capacity episode: it drifts from the
+    /// target faster than the levers can bring it back. Asked once each.
+    short: BTreeSet<String>,
+    /// The local date each venture's capacity was last checked nightly.
+    capacity_checked: BTreeMap<String, NaiveDate>,
+    /// A forecast branch ticks only the ventures it forecasts: the rest,
+    /// self among them, are neither read nor cycled there.
+    pub(crate) scope: Option<BTreeSet<String>>,
+}
+
+thread_local! {
+    /// Set on a forecast branch's thread: its kernel logs nothing.
+    static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Silence this thread's log until the guard drops.
+pub(crate) struct Quiet(bool);
+
+pub(crate) fn quiet() -> Quiet {
+    Quiet(QUIET.with(|q| q.replace(true)))
+}
+
+impl Drop for Quiet {
+    fn drop(&mut self) {
+        QUIET.with(|q| q.set(self.0));
+    }
 }
 
 /// What the kernel knows about a venture beyond the ledger.
@@ -178,10 +208,51 @@ impl Kernel {
             refusals: refusals::Tally::default(),
             judged: BTreeMap::new(),
             sim: None,
+            forecasts: false,
+            short: BTreeSet::new(),
+            capacity_checked: BTreeMap::new(),
+            scope: None,
         };
         kernel.reload()?;
         kernel.recover();
         Ok(kernel)
+    }
+
+    /// A forecast branch's kernel: a keyless warden that sends every lever
+    /// run to the simulation, the given scripted role, and a ledger copy
+    /// that is deleted after. Only a forecast builds one.
+    pub(crate) fn forecasting(
+        home: &Path,
+        sim: Arc<crate::simulate::Simulation>,
+        role: Box<dyn Role + Send>,
+    ) -> Result<Kernel, String> {
+        let warden = LocalWarden::keyless(home, sim.clone())?;
+        let mut kernel = Kernel::with(home, role, Box::new(warden))?;
+        kernel.ledger.throwaway().map_err(|e| e.to_string())?;
+        kernel.sim = Some(sim);
+        Ok(kernel)
+    }
+
+    /// Adopt mandate text for a venture already taken on, as declared by
+    /// `by`: a forecast branch trying a proposed mandate in its own copy.
+    pub(crate) fn adopt_text(&mut self, name: &str, text: &str, by: &str) -> Result<(), String> {
+        let path = self
+            .ventures
+            .get(name)
+            .and_then(|v| v.path.clone())
+            .ok_or_else(|| format!("{name} has no directory"))?;
+        crate::mandate::Mandate::parse(text).map_err(|e| format!("{name}: {e}"))?;
+        self.append(Record::Decision {
+            claim: Claim::Declared,
+            venture: name.to_string(),
+            verdict: Verdict::Adopt {
+                mandate: crate::mandate::Mandate::hash(text),
+                path: path.to_string_lossy().into_owned(),
+                text: Some(text.to_string()),
+            },
+            by: Some(by.to_string()),
+        })?;
+        self.reload()
     }
 
     /// A kernel for a simulation: its warden sends every lever run to the
@@ -270,6 +341,15 @@ impl Kernel {
             ("why", [seq]) => self.why(parse_seq(seq)?),
             ("know", [what]) => self.know(what),
             ("digest", []) => self.digest(),
+            ("forecast", rest) => {
+                let opts = crate::forecast::Options::parse(rest, self.config.forecast)?;
+                let (outcome, written) = self.forecast(&opts, &[])?;
+                let mut out = outcome.render();
+                for e in &written {
+                    out.push_str(&format!("  {}\n", e.line()));
+                }
+                Ok(out)
+            }
             ("propose", [venture, lever]) => self.propose(venture, lever, None),
             ("propose", [venture, lever, payload @ ..]) => {
                 self.propose(venture, lever, Some(&payload.join(" ")))
@@ -328,8 +408,102 @@ impl Kernel {
         }
         let mut out = format!("added {name} from {}\n", dir.display());
         out.push_str(&crate::teach::render(&mandate));
+        // What the mandate can keep up with, and where it leads, before
+        // anything runs under it. They follow the adoption in the ledger;
+        // the adoption stays the last line shown, where scripts read it.
+        if let Some(e) = self.check_capacity(&name) {
+            out.push_str(&format!("  {}\n", e.line()));
+        }
+        if self.forecasts && self.config.forecast.seeds > 0 {
+            let opts = crate::forecast::Options::new(vec![name.clone()], self.config.forecast);
+            match self.forecast(&opts, &[entry.seq]) {
+                Ok((_, written)) => {
+                    for e in &written {
+                        out.push_str(&format!("  {}\n", e.line()));
+                    }
+                }
+                Err(e) => out.push_str(&format!("  no forecast: {e}\n")),
+            }
+        }
         out.push_str(&format!("  {}\n", entry.line()));
         Ok(out)
+    }
+
+    /// Forecast as `opts` says, and write what it found into the ledger:
+    /// one inferred forecast record per venture, variant and policy, each
+    /// citing `cites`, and a measured ask for each venture whose branches
+    /// reached a wall. Nothing else of the branches comes back.
+    pub fn forecast(
+        &mut self,
+        opts: &crate::forecast::Options,
+        cites: &[Seq],
+    ) -> Result<(crate::forecast::Outcome, Vec<Entry>), String> {
+        let outcome = crate::forecast::run(&self.ledger, &self.home, opts)?;
+        let mut written = Vec::new();
+        let mut seqs: BTreeMap<String, Vec<Seq>> = BTreeMap::new();
+        for record in outcome.records(cites) {
+            let e = self.append(record)?;
+            seqs.entry(e.record.venture().to_string())
+                .or_default()
+                .push(e.seq);
+            written.push(e);
+        }
+        let asks = {
+            let index = self.index()?;
+            crate::forecast::asks(&index, &outcome, &seqs)
+        };
+        for record in asks {
+            let e = self.append(record)?;
+            log(&e.line());
+            written.push(e);
+        }
+        Ok((outcome, written))
+    }
+
+    /// Check, in code, that the permitted levers can keep the venture's
+    /// metric from drifting off the target: its drift a day against the
+    /// most the levers can move it a day. When they cannot, ask once per
+    /// episode, before any saturation; the episode ends at a check that
+    /// finds them able. Returns the ask written, if one was.
+    pub fn check_capacity(&mut self, name: &str) -> Option<Entry> {
+        let v = self.ventures.get(name)?.clone();
+        let gap = {
+            let index = self.index().ok()?;
+            crate::forecast::capacity(&index, name, &v.mandate)
+        };
+        let Some(gap) = gap else {
+            self.short.remove(name);
+            return None;
+        };
+        if !self.short.insert(name.to_string()) {
+            return None;
+        }
+        let before = self.ledger_last();
+        self.signal(
+            name,
+            format!("{}; the target is out of reach", gap.describe()),
+            Signal::Capacity {
+                metric: gap.metric.clone(),
+                drift: gap.drift,
+                most: gap.most,
+            },
+        );
+        let index = self.index().ok()?;
+        let found = index
+            .of(name)
+            .rev()
+            .take_while(|e| e.seq > before)
+            .find(|e| {
+                matches!(
+                    &e.record,
+                    Record::Ask {
+                        signal: Some(Signal::Capacity { .. }),
+                        ..
+                    }
+                )
+            })
+            .cloned();
+        found
     }
 
     /// Refuse a mandate whose parent and children do not agree with the
@@ -787,7 +961,12 @@ impl Kernel {
     /// Problems are logged and never stop the pass.
     pub fn tick(&mut self) {
         self.recover();
-        let names: Vec<String> = self.ventures.keys().cloned().collect();
+        let names: Vec<String> = self
+            .ventures
+            .keys()
+            .filter(|n| self.scope.as_ref().is_none_or(|s| s.contains(*n)))
+            .cloned()
+            .collect();
         let adopted = self.adopted();
         // Every state as the ledger stood when the pass began.
         let (halted, paused) = {
@@ -816,13 +995,19 @@ impl Kernel {
         }
         if !halted {
             self.act_on_decisions();
+            for name in &names {
+                if self.capacity_due(name) {
+                    self.check_capacity(name);
+                }
+            }
             self.ratchet();
             for name in &names {
                 if self.nightly_due(name) {
                     self.cycle(name);
                 }
             }
-            if self.digest_due() {
+            // The digest is self's, and a forecast branch leaves self out.
+            if self.scope.is_none() && self.digest_due() {
                 match self.record_digest() {
                     Ok(e) => log(&e.line()),
                     Err(e) => log(&format!("cannot write the digest: {e}")),
@@ -907,7 +1092,9 @@ impl Kernel {
                     venture: v.name.clone(),
                     action: DELEGATE.to_string(),
                     reason,
-                    payload: Some(Payload::Text { text: changed }),
+                    payload: Some(Payload::Text {
+                        text: changed.clone(),
+                    }),
                 }) {
                     Ok(e) => e,
                     Err(e) => {
@@ -916,10 +1103,51 @@ impl Kernel {
                     }
                 };
                 log(&proposal.line());
-                self.act(&v.name, DELEGATE, vec![proposal.seq], Claim::Measured);
+                // The forecast runs on the proposed mandate before the ask
+                // is written, and the ask cites it.
+                let mut forecast = vec![];
+                if self.forecasts && self.config.forecast.seeds > 0 {
+                    let mut opts =
+                        crate::forecast::Options::new(vec![v.name.clone()], self.config.forecast);
+                    opts.mandates.insert(v.name.clone(), changed.clone());
+                    match self.forecast(&opts, &[proposal.seq]) {
+                        Ok((_, written)) => {
+                            forecast = written
+                                .iter()
+                                .filter(|e| e.record.kind() == Kind::Forecast)
+                                .map(|e| e.seq)
+                                .collect();
+                        }
+                        Err(e) => log(&format!("{}: no forecast of the delegation: {e}", v.name)),
+                    }
+                }
+                self.act_citing(
+                    &v.name,
+                    DELEGATE,
+                    vec![proposal.seq],
+                    Claim::Measured,
+                    forecast,
+                );
                 break;
             }
         }
+    }
+
+    /// Is the nightly capacity check due for a venture: past the nightly
+    /// time, with none today? Marks it done.
+    fn capacity_due(&mut self, name: &str) -> bool {
+        if name == SELF {
+            return false;
+        }
+        let Ok(Some(at)) = self.config.nightly_minutes() else {
+            return false;
+        };
+        let local = crate::clock::local();
+        if local.hour() * 60 + local.minute() < at {
+            return false;
+        }
+        let today = local.date_naive();
+        self.capacity_checked.insert(name.to_string(), today) != Some(today)
     }
 
     /// Is the nightly digest due: past the nightly time, with none written
@@ -1259,6 +1487,19 @@ impl Kernel {
     /// it; if it needs a human, ask once. Returns what happened, one line
     /// each, after logging it.
     fn act(&mut self, name: &str, action: &str, cites: Vec<Seq>, claim: Claim) -> Vec<String> {
+        self.act_citing(name, action, cites, claim, vec![])
+    }
+
+    /// `act`, and an ask it writes cites `ask_cites`: the forecast of a
+    /// delegation, say. They are never premises for the gate.
+    fn act_citing(
+        &mut self,
+        name: &str,
+        action: &str,
+        cites: Vec<Seq>,
+        claim: Claim,
+        ask_cites: Vec<Seq>,
+    ) -> Vec<String> {
         let mut lines = Vec::new();
         let candidate = Candidate {
             venture: name.to_string(),
@@ -1418,7 +1659,7 @@ impl Kernel {
                         None => format!("may I {action}? it is irreversible{reason}"),
                     };
                     match self.append(Record::Ask {
-                        cites: vec![],
+                        cites: ask_cites,
                         claim,
                         venture: name.to_string(),
                         action: Some(action.to_string()),
@@ -2471,7 +2712,9 @@ pub fn ago(secs: i64) -> String {
 }
 
 fn log(line: &str) {
-    eprintln!("avsm: {line}");
+    if !QUIET.with(std::cell::Cell::get) {
+        eprintln!("avsm: {line}");
+    }
 }
 
 // ----- the warden and roles processes -----
@@ -2847,6 +3090,7 @@ pub fn start(home: &Path) -> Result<(), String> {
         roles.id()
     ));
     let mut kernel = Kernel::with(home, Box::new(roles), Box::new(warden))?;
+    kernel.forecasts = true;
     kernel.adopt_self()?;
     let kernel = Arc::new(Mutex::new(kernel));
     // SAFETY: the handler only stores to an atomic.

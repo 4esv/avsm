@@ -54,10 +54,42 @@ pub struct Config {
     /// payload, self proposes delegating it. 0 turns the ratchet off.
     #[serde(default = "default_ratchet")]
     pub ratchet: u32,
+    /// How far and how wide the forecasts at add, before a ratchet ask
+    /// and by the `forecast` lever look.
+    #[serde(default)]
+    pub forecast: Forecast,
 }
 
 fn default_ratchet() -> u32 {
     5
+}
+
+/// How far and how wide a forecast looks: days ahead, and seeds per
+/// policy.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forecast {
+    #[serde(default = "default_forecast_days")]
+    pub days: u32,
+    #[serde(default = "default_forecast_seeds")]
+    pub seeds: u32,
+}
+
+impl Default for Forecast {
+    fn default() -> Forecast {
+        Forecast {
+            days: default_forecast_days(),
+            seeds: default_forecast_seeds(),
+        }
+    }
+}
+
+fn default_forecast_days() -> u32 {
+    30
+}
+
+fn default_forecast_seeds() -> u32 {
+    16
 }
 
 /// Limits shared by every venture, each like `20/day`.
@@ -164,6 +196,7 @@ impl Default for Config {
             remote_users: vec![],
             quotas: Quotas::default(),
             ratchet: default_ratchet(),
+            forecast: Forecast::default(),
         }
     }
 }
@@ -237,6 +270,20 @@ impl Config {
     pub fn parse(text: &str) -> Result<Config, String> {
         let config: Config = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
         config.nightly_minutes()?;
+        if !(1..=crate::forecast::MAX_DAYS).contains(&config.forecast.days) {
+            return Err(format!(
+                "forecast.days is 1 to {}, not {}",
+                crate::forecast::MAX_DAYS,
+                config.forecast.days
+            ));
+        }
+        if config.forecast.seeds > crate::forecast::MAX_SEEDS {
+            return Err(format!(
+                "forecast.seeds is 0 (no forecast at add or before a ratchet ask) to {}, not {}",
+                crate::forecast::MAX_SEEDS,
+                config.forecast.seeds
+            ));
+        }
         for (name, url) in [
             ("stripe", &config.adapters.stripe.url),
             ("github", &config.adapters.github.url),

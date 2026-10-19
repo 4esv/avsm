@@ -983,6 +983,11 @@ impl ParentCall {
 /// permits it by name alone, with no run and no adapter.
 pub const RESEARCH: &str = "research";
 
+/// The built-in lever that forecasts the venture: forked branches of the
+/// ledger, every lever stepping the world model. Permitted by name alone;
+/// it only reads, and takes no payload.
+pub const FORECAST: &str = "forecast";
+
 const KINDS: &str = "threshold, classifier, model or plan";
 const NEEDS_PURPOSE: &str = "mandate needs a purpose: what the venture is for, in your own words";
 const NEEDS_METRIC: &str =
@@ -1114,6 +1119,23 @@ impl Mandate {
                         "research is built in; permit it by name alone, with no run and no adapter",
                     )
                 }
+                (None, None) if p.name == FORECAST => {
+                    if p.takes.is_some() {
+                        return fail(
+                            "permitted action \"forecast\" takes no payload; leave takes out",
+                        );
+                    }
+                    if !p.reversible {
+                        return fail(
+                            "permitted action \"forecast\" only reads; say reversible: true",
+                        );
+                    }
+                }
+                (Some(_), None) | (None, Some(_)) if p.name == FORECAST => {
+                    return fail(
+                        "forecast is built in; permit it by name alone, with no run and no adapter",
+                    )
+                }
                 (Some(run), None) if run.trim().is_empty() => {
                     return fail(format!(
                         "permitted action {:?} has an empty run; give it the command to run, like ./reset.sh",
@@ -1151,7 +1173,7 @@ impl Mandate {
                 }
                 (None, None) => {
                     return fail(format!(
-                        "permitted action {:?} needs run (a command) or adapter (a built-in: {}); only research and the parent levers need neither",
+                        "permitted action {:?} needs run (a command) or adapter (a built-in: {}); only research, forecast and the parent levers need neither",
                         p.name,
                         adapter::LEVERS.join(", ")
                     ))
@@ -1684,6 +1706,11 @@ impl Permitted {
     /// Is this the built-in research lever?
     pub fn is_research(&self) -> bool {
         self.name == RESEARCH && self.run.is_none() && self.adapter.is_none()
+    }
+
+    /// Is this the built-in forecast lever?
+    pub fn is_forecast(&self) -> bool {
+        self.name == FORECAST && self.run.is_none() && self.adapter.is_none()
     }
 
     /// Is this one of the parent levers?
@@ -2308,7 +2335,7 @@ fn check_action(position: usize, item: &Value) -> Result<(), MandateError> {
             if map
                 .get("name")
                 .and_then(Value::as_str)
-                .is_some_and(|n| n == RESEARCH || PARENT_LEVERS.contains(&n)) => {}
+                .is_some_and(|n| n == RESEARCH || n == FORECAST || PARENT_LEVERS.contains(&n)) => {}
         (None | Some(Value::Null), None | Some(Value::Null)) => {
             return fail(format!(
                 "{who} needs run: the command to run, like ./reset.sh; or adapter: a built-in action like github.issue owner/repo"

@@ -165,7 +165,7 @@ impl Index {
         let venture = r.venture().to_string();
         self.of.entry(venture.clone()).or_default().push(seq);
         // A forecast is not the nightly cycle: it does not say the cycle ran.
-        if r.claim() == Claim::Inferred && r.kind() != Kind::Prediction {
+        if r.claim() == Claim::Inferred && !matches!(r.kind(), Kind::Prediction | Kind::Forecast) {
             by_time(
                 self.inferred_at.entry(venture.clone()).or_default(),
                 at,

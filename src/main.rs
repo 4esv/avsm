@@ -85,6 +85,20 @@ enum Command {
         /// What the action consumes, if it takes something; - reads it from standard input
         payload: Vec<String>,
     },
+    /// Forecast the ventures over the next days from forked copies of the ledger; nothing real runs
+    Forecast {
+        /// The ventures to forecast (default: every one)
+        ventures: Vec<String>,
+        /// How many days ahead (default: forecast.days in config.yaml, 30)
+        #[arg(long)]
+        days: Option<u32>,
+        /// Seeds per policy (default: forecast.seeds in config.yaml, 16)
+        #[arg(long)]
+        seeds: Option<u32>,
+        /// Try a mandate field at several values, like: --sweep permitted.water.cap 2/day,4/day,8/day
+        #[arg(long, num_args = 2, value_names = ["FIELD", "VALUES"])]
+        sweep: Option<Vec<String>>,
+    },
     /// The warden process; avsm start runs it for you
     #[command(hide = true)]
     Warden,
@@ -289,6 +303,26 @@ fn main() -> ExitCode {
         Command::Why { number } => vec!["why".to_string(), number],
         Command::Know { what } => vec!["know".to_string(), what],
         Command::Digest => vec!["digest".to_string()],
+        Command::Forecast {
+            ventures,
+            days,
+            seeds,
+            sweep,
+        } => {
+            let mut v = vec!["forecast".to_string()];
+            v.extend(ventures);
+            if let Some(d) = days {
+                v.extend(["--days".to_string(), d.to_string()]);
+            }
+            if let Some(k) = seeds {
+                v.extend(["--seeds".to_string(), k.to_string()]);
+            }
+            if let Some(s) = sweep {
+                v.push("--sweep".to_string());
+                v.extend(s);
+            }
+            v
+        }
     };
     let answer = match &remote {
         Some(at) => avsm::protocol::request_remote(at, &args),

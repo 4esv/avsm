@@ -24,19 +24,11 @@ use crate::record::{Claim, Entry, Record, Seq, Signal};
 use crate::venture::Venture;
 
 /// How a signal question ends. Code never reads it; the signal field does.
-const SIGNALLED: &str = "; avsm asks on its own";
+pub(crate) const SIGNALLED: &str = "; avsm asks on its own";
 
 /// What a signal is about, to keep one open per venture and subject.
 fn subject(s: &Signal) -> String {
-    match s {
-        Signal::Saturated { action, .. } => format!("saturated:{action}"),
-        Signal::Pending { intent, .. } => format!("pending:{intent}"),
-        Signal::Ineffective { action, .. } => format!("ineffective:{action}"),
-        Signal::Guard { guard, .. } => format!("guard:{guard}"),
-        Signal::Audit { audit, .. } => format!("audit:{audit}"),
-        Signal::Implausible { metric, .. } => format!("implausible:{metric}"),
-        Signal::Warning { metric, .. } => format!("warning:{metric}"),
-    }
+    s.subject()
 }
 
 /// Why a reading of the metric is not to be believed, or None when it is.

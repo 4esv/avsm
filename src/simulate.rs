@@ -67,14 +67,19 @@ pub struct Plan {
 }
 
 /// Where a simulation sends lever runs instead of the levers. Built only
-/// by `run`, and handed to the kernel and the warden as they are made: no
-/// configuration and no command can set it, so a running daemon never
-/// routes a lever anywhere but to the lever.
+/// by `run` and by a forecast's branches, and handed to the kernel and the
+/// warden as they are made: no configuration and no command can set it,
+/// so a running daemon never routes a lever anywhere but to the lever.
 pub(crate) struct Simulation {
     /// The `--world` command, if one was given.
     world: Option<String>,
     /// Each venture's world-model state, and when it was stepped last.
     states: Mutex<BTreeMap<String, (Value, i64)>>,
+    /// Each venture's guard readings from its world model's last step.
+    guards: Mutex<BTreeMap<String, BTreeMap<String, f64>>>,
+    /// A forecast branch's seed, mixed into every step's; None for
+    /// `avsm simulate`, whose steps stay as they were.
+    seed: Option<u64>,
 }
 
 impl Simulation {
@@ -82,7 +87,40 @@ impl Simulation {
         Simulation {
             world,
             states: Mutex::new(BTreeMap::new()),
+            guards: Mutex::new(BTreeMap::new()),
+            seed: None,
         }
+    }
+
+    /// The simulation of one forecast branch: no `--world`, and every
+    /// step's seed mixed with the branch's.
+    pub(crate) fn branch(seed: u64) -> Simulation {
+        Simulation {
+            seed: Some(seed),
+            ..Simulation::new(None)
+        }
+    }
+
+    /// A step's seed, mixed with the branch's when there is one.
+    fn salt(&self, seed: u64) -> u64 {
+        match self.seed {
+            Some(branch) => world::mix(seed, branch),
+            None => seed,
+        }
+    }
+
+    /// A guard reading the venture's world model gave at its last step.
+    pub(crate) fn guard(&self, venture: &str, name: &str) -> Option<f64> {
+        let guards = self.guards.lock().unwrap_or_else(|e| e.into_inner());
+        guards.get(venture)?.get(name).copied()
+    }
+
+    fn keep_guards(&self, venture: &str, guards: &BTreeMap<String, f64>) {
+        if guards.is_empty() {
+            return;
+        }
+        let mut all = self.guards.lock().unwrap_or_else(|e| e.into_inner());
+        all.insert(venture.to_string(), guards.clone());
     }
 
     /// Run a lever in the simulation: through the `--world` command, or a
@@ -124,8 +162,9 @@ impl Simulation {
             name: action.to_string(),
             payload: payload.map(Payload::text),
         };
-        match model.step(&state, Some(&act), world::seed_of(key), now, 0) {
+        match model.step(&state, Some(&act), self.salt(world::seed_of(key)), now, 0) {
             Ok(next) => {
+                self.keep_guards(venture, &next.guards);
                 states.insert(venture.to_string(), (next.state, now));
                 (
                     true,
@@ -162,11 +201,17 @@ impl Simulation {
             .get(venture)
             .cloned()
             .unwrap_or((Value::Null, now - mandate.cadence.as_secs() as i64));
-        let seed = world::mix(world::seed_of(venture), now as u64);
+        let seed = self.salt(world::mix(world::seed_of(venture), now as u64));
         match model.step(&state, None, seed, now, now - at) {
             Ok(next) => {
+                self.keep_guards(venture, &next.guards);
                 states.insert(venture.to_string(), (next.state, now));
                 Some((Some(next.metric), format!("simulated: {}", model.name())))
+            }
+            // A forecast branch never reads for real: a report program is
+            // the venture's, and may change what it reads.
+            Err(_) if model.name() == world::BASELINE && state.is_null() && self.seed.is_some() => {
+                Some((None, "simulated: no reading yet to start from".to_string()))
             }
             Err(_) if model.name() == world::BASELINE && state.is_null() => None,
             Err(e) => Some((None, format!("simulated: {}  {e}", model.name()))),
@@ -317,7 +362,7 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
 }
 
 /// What the human says to ask `q`, the `n`th it has answered.
-fn answer(kernel: &Kernel, human: Human, seq: Seq, n: u64) -> Vec<String> {
+pub(crate) fn answer(kernel: &Kernel, human: Human, seq: Seq, n: u64) -> Vec<String> {
     let q = seq.to_string();
     if human == Human::Mixed {
         if n % 3 == 2 {

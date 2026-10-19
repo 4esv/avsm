@@ -67,6 +67,7 @@ pub enum Kind {
     Answer,
     Prediction,
     Branch,
+    Forecast,
 }
 
 impl Kind {
@@ -84,6 +85,7 @@ impl Kind {
             Kind::Answer => "answer",
             Kind::Prediction => "prediction",
             Kind::Branch => "branch",
+            Kind::Forecast => "forecast",
         }
     }
 }
@@ -344,6 +346,48 @@ pub enum Signal {
         variance_ratio: f64,
         autocorrelation_rise: f64,
     },
+    /// A forecast branch reached a wall: an irreversible delegation, a
+    /// guard breach, a quota or a halt. The envelope is the p5..p95 of the
+    /// metric it hit at the horizon, and `days` the first day each policy
+    /// hit it, if it did.
+    Forecast {
+        wall: String,
+        metric: String,
+        envelope: Quantiles,
+        days: Vec<PolicyDay>,
+    },
+    /// The metric drifts away from the target faster than the permitted
+    /// levers can move it back, per day, computed in code.
+    Capacity {
+        metric: String,
+        drift: f64,
+        most: f64,
+    },
+}
+
+impl Signal {
+    /// What the signal is about: at most one ask stays open per venture
+    /// and subject.
+    pub fn subject(&self) -> String {
+        match self {
+            Signal::Saturated { action, .. } => format!("saturated:{action}"),
+            Signal::Pending { intent, .. } => format!("pending:{intent}"),
+            Signal::Ineffective { action, .. } => format!("ineffective:{action}"),
+            Signal::Guard { guard, .. } => format!("guard:{guard}"),
+            Signal::Audit { audit, .. } => format!("audit:{audit}"),
+            Signal::Implausible { metric, .. } => format!("implausible:{metric}"),
+            Signal::Warning { metric, .. } => format!("warning:{metric}"),
+            Signal::Forecast { .. } => "forecast".to_string(),
+            Signal::Capacity { metric, .. } => format!("capacity:{metric}"),
+        }
+    }
+}
+
+/// The first day a policy's branches hit a wall, if any did.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolicyDay {
+    pub policy: String,
+    pub day: Option<u32>,
 }
 
 /// One ledger record. Every variant carries its claim and its venture.
@@ -531,6 +575,33 @@ pub enum Record {
         /// backend chose among the top three.
         separated: bool,
     },
+    /// What forked branches of the ledger came to over `horizon` days
+    /// under one policy for the asks, across `seeds` seeds, with every
+    /// lever stepping the world model and a scripted worst-case role.
+    /// Always inferred and size-bounded: it ranks, vetoes and asks, and
+    /// never authorizes.
+    Forecast {
+        claim: Claim,
+        venture: String,
+        /// `all`, `none` or `mixed`: who answered the asks in the branches.
+        policy: String,
+        /// Days.
+        horizon: u32,
+        seeds: u32,
+        /// In a sweep, the field and the value this forecast tried.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant: Option<String>,
+        /// Each metric's quantiles at the horizon, over the seeds.
+        metrics: Vec<Envelope>,
+        /// Each guard's chance of a breach before the horizon.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        guards: Vec<Event>,
+        /// What the branches reached, quantiles over the seeds.
+        reached: Reached,
+        /// What asked for it: a proposal, or the intent of the lever.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cites: Vec<Seq>,
+    },
 }
 
 /// One first action the planner weighed: the quantiles of the target at
@@ -547,6 +618,29 @@ pub struct Alternative {
 /// The most alternatives a branch carries, and the longest action name.
 pub const MAX_ALTERNATIVES: usize = 3;
 pub const MAX_ACTION_NAME: usize = 64;
+
+/// A metric's quantiles at a forecast's horizon.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Envelope {
+    pub name: String,
+    pub quantiles: Quantiles,
+}
+
+/// What a forecast's branches reached by the horizon, as quantiles over
+/// the seeds: spend (cost of the runs), asks, refusals, halts (stops) and
+/// delegations (runs no human decided).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Reached {
+    pub spend: Quantiles,
+    pub asks: Quantiles,
+    pub refusals: Quantiles,
+    pub halts: Quantiles,
+    pub delegations: Quantiles,
+}
+
+/// The most metrics a forecast may carry, and the longest variant.
+pub const MAX_METRICS: usize = 16;
+pub const MAX_VARIANT: usize = 200;
 
 /// The quantiles of a forecast: the 5th to the 95th percentile.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -629,6 +723,7 @@ impl Record {
             | Record::Answer { claim, .. }
             | Record::Prediction { claim, .. }
             | Record::Branch { claim, .. } => *claim,
+            Record::Forecast { claim, .. } => *claim,
         }
     }
 
@@ -646,6 +741,7 @@ impl Record {
             | Record::Answer { venture, .. }
             | Record::Prediction { venture, .. }
             | Record::Branch { venture, .. } => venture,
+            Record::Forecast { venture, .. } => venture,
         }
     }
 
@@ -663,6 +759,7 @@ impl Record {
             Record::Answer { .. } => Kind::Answer,
             Record::Prediction { .. } => Kind::Prediction,
             Record::Branch { .. } => Kind::Branch,
+            Record::Forecast { .. } => Kind::Forecast,
         }
     }
 
@@ -699,7 +796,8 @@ impl Record {
             Record::Report { cites, .. }
             | Record::Proposal { cites, .. }
             | Record::Ask { cites, .. }
-            | Record::Answer { cites, .. } => cites,
+            | Record::Answer { cites, .. }
+            | Record::Forecast { cites, .. } => cites,
             _ => &[],
         }
     }
@@ -905,8 +1003,41 @@ impl Record {
                 alternatives.len(),
                 if *separated { "" } else { ", not separated" }
             ),
+            Record::Forecast {
+                policy,
+                horizon,
+                seeds,
+                variant,
+                metrics,
+                guards,
+                ..
+            } => {
+                let mut text = format!("{policy} over {horizon}d x {seeds} seeds:");
+                match metrics.first() {
+                    Some(m) => text.push_str(&format!(
+                        " {} p50 {} (p5 {} to p95 {})",
+                        m.name,
+                        round(m.quantiles.p50),
+                        round(m.quantiles.p5),
+                        round(m.quantiles.p95)
+                    )),
+                    None => text.push_str(" no metric reached the horizon"),
+                }
+                for g in guards {
+                    text.push_str(&format!("; {} breach p={}", g.name, round(g.p)));
+                }
+                if let Some(v) = variant {
+                    text.push_str(&format!("  [{v}]"));
+                }
+                text
+            }
         }
     }
+}
+
+/// A number to four places, as short as it goes.
+pub fn round(x: f64) -> f64 {
+    (x * 10_000.0).round() / 10_000.0
 }
 
 fn first_line(note: &str) -> String {

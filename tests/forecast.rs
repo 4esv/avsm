@@ -1,0 +1,723 @@
+//! Forecasts: forked branches of the ledger, every lever stepping the
+//! world model, worst-case governance from code. Nothing real runs, no
+//! backend is called, only forecast and signal records come back, and the
+//! branch homes are gone after.
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
+use avsm::config::{self, Quotas};
+use avsm::forecast::{self, Options, Policy, Sweep};
+use avsm::gate::{self, Candidate};
+use avsm::kernel::Kernel;
+use avsm::record::{Claim, Entry, Kind, Payload, Record, Signal};
+use avsm::role::{Context, InferRequest, Role};
+use avsm::warden::LocalWarden;
+
+/// The virtual clock is shared by the whole process: one test at a time.
+static CLOCK: Mutex<()> = Mutex::new(());
+
+/// A Tuesday, 00:00 UTC.
+const T0: i64 = 1_800_057_600;
+const HOUR: i64 = 3_600;
+const DAY: i64 = 86_400;
+
+fn clock() -> MutexGuard<'static, ()> {
+    let guard = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    avsm::clock::set(T0);
+    guard
+}
+
+struct NoRole;
+
+impl Role for NoRole {
+    fn decide(
+        &mut self,
+        _ctx: &Context,
+        _infer: &mut dyn FnMut(&InferRequest) -> Result<String, String>,
+        _drill: &mut dyn FnMut(&str, &str) -> Result<String, String>,
+    ) -> Result<Vec<Record>, String> {
+        Ok(vec![])
+    }
+}
+
+fn script(dir: &Path, name: &str, body: &str) {
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+struct Fixture {
+    tmp: tempfile::TempDir,
+    k: Kernel,
+    now: i64,
+}
+
+/// A home whose default, research and escalation backend is a command
+/// that writes a line to `calls` each time it is asked.
+fn home(tmp: &Path, extra: &str) -> PathBuf {
+    let home = tmp.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let calls = tmp.join("calls");
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "nightly: \"00:00\"\ndefault: rec\nresearch: rec\nescalate: rec\n\
+             backends:\n  rec: {{kind: command, run: \"echo call >> {}; echo nothing\"}}\n{extra}",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    home
+}
+
+fn fixture(extra_config: &str) -> Fixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path(), extra_config);
+    let warden = LocalWarden::open(&home).unwrap();
+    let mut k = Kernel::with(&home, Box::new(NoRole), Box::new(warden)).unwrap();
+    k.adopt_self().unwrap();
+    Fixture { tmp, k, now: T0 }
+}
+
+impl Fixture {
+    /// A venture whose metric is read from its `value` file, with the
+    /// given mandate body after the purpose and metric.
+    fn venture(&mut self, name: &str, metric: &str, body: &str) -> PathBuf {
+        let dir = self.tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mandate.yaml"),
+            format!("purpose: Grow.\nmetric: {metric}\n{body}"),
+        )
+        .unwrap();
+        script(&dir, "report", "echo read >> reads; cat value");
+        std::fs::write(dir.join("value"), "100\n").unwrap();
+        self.k.add(&dir).unwrap();
+        dir
+    }
+
+    /// Report `values` for a venture, one every `gap` seconds.
+    fn history(&mut self, name: &str, values: &[f64], gap: i64) {
+        let dir = self.tmp.path().join(name);
+        for v in values {
+            self.now += gap;
+            avsm::clock::set(self.now);
+            std::fs::write(dir.join("value"), format!("{v}\n")).unwrap();
+            self.k.report(name, false);
+        }
+    }
+
+    fn entries(&self) -> Vec<Entry> {
+        self.k.entries().unwrap()
+    }
+
+    fn opts(&self, ventures: &[&str], days: u32, seeds: u32) -> Options {
+        let mut o = Options::new(
+            ventures.iter().map(|s| s.to_string()).collect(),
+            config::Forecast { days, seeds },
+        );
+        o.scratch = Some(self.scratch());
+        o
+    }
+
+    fn scratch(&self) -> PathBuf {
+        let s = self.tmp.path().join("scratch");
+        std::fs::create_dir_all(&s).unwrap();
+        s
+    }
+}
+
+/// A garden whose water level falls an hour at a time, with a delegated
+/// script lever that would write to `invoked` if it ever ran for real.
+const GARDEN: &str = "controller: {kind: threshold, below: 50, action: water}\ncadence: 1h\n\
+     permitted:\n- {name: water, run: echo ran >> invoked, cap: 4/day, reversible: true, delegated: true, expects: up 5 within 1}\n";
+
+/// A shop run by a model controller on the recording backend, permitted
+/// research and a script lever that would write to `invoked`.
+const SHOP: &str = "controller: {kind: model}\ncadence: 1h\n\
+     permitted:\n- {name: research, cap: 5/day, reversible: true, delegated: true}\n\
+     - {name: boost, run: echo ran >> invoked, cap: 9/day, reversible: true}\n";
+
+fn falling(from: f64, n: usize, by: f64) -> Vec<f64> {
+    (1..=n).map(|i| from - by * i as f64).collect()
+}
+
+#[test]
+fn a_forecast_runs_nothing_real_calls_no_backend_and_leaves_only_its_records() {
+    let _c = clock();
+    let mut f = fixture("");
+    let garden = f.venture("garden", "level", GARDEN);
+    let shop = f.venture("shop", "count", SHOP);
+    f.history("garden", &falling(100.0, 12, 1.0), HOUR);
+    f.history("shop", &[10.0, 11.0, 12.0, 13.0], HOUR);
+    let before = f.entries();
+    assert!(!garden.join("invoked").exists() && !shop.join("invoked").exists());
+
+    let opts = f.opts(&["garden", "shop"], 3, 4);
+    let (outcome, written) = f.k.forecast(&opts, &[]).unwrap();
+
+    // Not one real lever ran, not one backend was called.
+    assert!(
+        !garden.join("invoked").exists(),
+        "a script lever ran for real"
+    );
+    assert!(
+        !shop.join("invoked").exists(),
+        "a script lever ran for real"
+    );
+    assert!(!f.tmp.path().join("calls").exists(), "a backend was called");
+    // The levers did run, in the branches: the garden crossed its bound.
+    let all = outcome
+        .summaries
+        .iter()
+        .find(|s| s.venture == "garden" && s.policy == Policy::All)
+        .unwrap();
+    assert!(all.reached.delegations.p50 > 0.0, "{all:?}");
+
+    // The ledger before is untouched, and after it only forecast records
+    // and signal asks.
+    let after = f.entries();
+    assert_eq!(&after[..before.len()], &before[..]);
+    assert_eq!(after.len(), before.len() + written.len());
+    for e in &after[before.len()..] {
+        let ok = e.record.kind() == Kind::Forecast
+            || matches!(
+                &e.record,
+                Record::Ask {
+                    claim: Claim::Measured,
+                    signal: Some(Signal::Forecast { .. } | Signal::Capacity { .. }),
+                    ..
+                }
+            );
+        assert!(ok, "{}", e.line());
+    }
+    f.k.ledger.verify().unwrap();
+
+    // One forecast record per venture and policy, with the decided fields.
+    let forecasts: Vec<&Entry> = written
+        .iter()
+        .filter(|e| e.record.kind() == Kind::Forecast)
+        .collect();
+    assert_eq!(forecasts.len(), 6);
+    for venture in ["garden", "shop"] {
+        let policies: Vec<String> = forecasts
+            .iter()
+            .filter_map(|e| match &e.record {
+                Record::Forecast {
+                    claim,
+                    venture: v,
+                    policy,
+                    horizon,
+                    seeds,
+                    metrics,
+                    reached,
+                    variant,
+                    ..
+                } if v == venture => {
+                    assert_eq!(*claim, Claim::Inferred);
+                    assert_eq!((*horizon, *seeds, variant.clone()), (3, 4, None));
+                    assert!(metrics[0].quantiles.valid(), "{metrics:?}");
+                    assert!(reached.asks.valid() && reached.spend.valid());
+                    assert!(reached.refusals.valid() && reached.halts.valid());
+                    assert!(reached.delegations.valid());
+                    Some(policy.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(policies, ["all", "none", "mixed"], "{venture}");
+    }
+    let garden_metric = forecasts
+        .iter()
+        .find_map(|e| match &e.record {
+            Record::Forecast {
+                venture, metrics, ..
+            } if venture == "garden" => Some(metrics[0].name.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(garden_metric, "level");
+
+    // The branch homes are gone.
+    let left: Vec<_> = std::fs::read_dir(f.scratch()).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_plan_venture_is_forecast_through_its_planner_with_no_backend() {
+    let _c = clock();
+    let mut f = fixture("");
+    let dir = f.venture(
+        "shop",
+        "count",
+        "controller: {kind: plan, horizon: 2, depth: 1, members: 4}\ncadence: 1h\n\
+         permitted:\n- {name: boost, run: echo ran >> invoked, cap: 9/day, reversible: true, delegated: true}\n",
+    );
+    f.history("shop", &[10.0, 9.0, 8.0, 7.0, 6.0, 5.0], HOUR);
+    // The real kernel's planner may ask the backend on a tie, and its
+    // lever may run; the forecast's never.
+    let calls = |f: &Fixture| {
+        std::fs::read_to_string(f.tmp.path().join("calls")).map_or(0, |t| t.lines().count())
+    };
+    let runs = || std::fs::read_to_string(dir.join("invoked")).map_or(0, |t| t.lines().count());
+    let (calls_before, runs_before) = (calls(&f), runs());
+    let opts = f.opts(&["shop"], 2, 3);
+    let (outcome, _) = f.k.forecast(&opts, &[]).unwrap();
+    assert_eq!(outcome.summaries.len(), 3);
+    assert_eq!(runs(), runs_before, "a script lever ran for real");
+    assert_eq!(calls(&f), calls_before, "a backend was called");
+}
+
+#[test]
+fn a_forecast_is_deterministic_under_its_seeds() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("garden", "level", GARDEN);
+    f.history(
+        "garden",
+        &[100.0, 98.0, 99.0, 96.0, 97.0, 94.0, 95.0, 92.0],
+        HOUR,
+    );
+    let opts = f.opts(&["garden"], 2, 4);
+    let one = forecast::run(&f.k.ledger, &f.k.home, &opts).unwrap();
+    let two = forecast::run(&f.k.ledger, &f.k.home, &opts).unwrap();
+    assert_eq!(one.records(&[]), two.records(&[]));
+    // Another base seed is another forecast.
+    let mut other = opts.clone();
+    other.seed ^= 1;
+    let three = forecast::run(&f.k.ledger, &f.k.home, &other).unwrap();
+    assert_ne!(one.records(&[]), three.records(&[]));
+}
+
+#[test]
+fn a_forecast_that_hits_a_guard_asks_with_the_envelope() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture(
+        "fund",
+        "equity",
+        "controller: {kind: threshold, below: 1, action: rebalance}\ncadence: 1h\n\
+         permitted:\n- {name: rebalance, run: echo ran >> invoked, cap: 1/day, reversible: true}\n\
+         guards:\n- {name: dd, drawdown: 10%, of: equity, then: ask}\n",
+    );
+    // Falling a point an hour from 100: 4% down, with no lever between.
+    f.history("fund", &falling(100.0, 4, 1.0), HOUR);
+    let opts = f.opts(&["fund"], 2, 4);
+    let (outcome, written) = f.k.forecast(&opts, &[]).unwrap();
+    let wall = outcome
+        .walls
+        .iter()
+        .find(|w| w.kind == "guard")
+        .unwrap_or_else(|| panic!("{:?}", outcome.walls));
+    assert_eq!(wall.metric, "guard.dd");
+    let asks: Vec<&Entry> = written
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.record,
+                Record::Ask {
+                    signal: Some(Signal::Forecast { .. }),
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(asks.len(), 1);
+    let Record::Ask {
+        claim,
+        question,
+        signal:
+            Some(Signal::Forecast {
+                wall,
+                metric,
+                envelope,
+                days,
+            }),
+        cites,
+        ..
+    } = &asks[0].record
+    else {
+        unreachable!()
+    };
+    assert_eq!(*claim, Claim::Measured);
+    assert_eq!((wall.as_str(), metric.as_str()), ("guard", "guard.dd"));
+    assert!(envelope.valid() && envelope.p95 >= 10.0, "{envelope:?}");
+    assert_eq!(days.len(), 3);
+    assert!(days.iter().any(|d| d.day.is_some()), "{days:?}");
+    assert!(question.contains("envelope   guard.dd"), "{question}");
+    assert!(question.contains("first hit"), "{question}");
+    // It cites the venture's forecast records, all three.
+    assert_eq!(cites.len(), 3);
+    for c in cites {
+        assert!(written
+            .iter()
+            .any(|e| e.seq == *c && e.record.kind() == Kind::Forecast));
+    }
+    // One open per venture: a second forecast does not ask again.
+    let (_, again) = f.k.forecast(&opts, &[]).unwrap();
+    assert!(again.iter().all(|e| e.record.kind() == Kind::Forecast));
+}
+
+#[test]
+fn a_forecast_record_cited_alone_never_authorizes() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("garden", "level", GARDEN);
+    f.history("garden", &falling(100.0, 6, 1.0), HOUR);
+    let opts = f.opts(&["garden"], 1, 2);
+    let (_, written) = f.k.forecast(&opts, &[]).unwrap();
+    let index = f.k.index().unwrap();
+    for e in written.iter().filter(|e| e.record.kind() == Kind::Forecast) {
+        let gated = gate::gate_in(
+            &index,
+            &Candidate {
+                venture: "garden".to_string(),
+                action: "water".to_string(),
+                cites: vec![e.seq],
+            },
+            &f.k.adopted(),
+            &Quotas::default(),
+            f.now,
+        );
+        assert!(gated.is_err(), "a forecast authorized water: {gated:?}");
+    }
+}
+
+#[test]
+fn caps_that_cannot_keep_up_get_a_capacity_ask_before_any_saturation() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture(
+        "inbox",
+        "unread",
+        "controller: {kind: threshold, above: 500, action: reply}\ncadence: 1h\n\
+         permitted:\n- {name: reply, run: echo ran >> invoked, cap: 5/day, reversible: true, delegated: true, expects: down 1 within 1}\n",
+    );
+    // Twenty more unread a day, far below the bound: nothing has fired.
+    f.history("inbox", &[100.0, 120.0, 140.0, 160.0, 180.0], DAY);
+    // Past the nightly time, before the next report is due.
+    f.now += HOUR / 2;
+    avsm::clock::set(f.now);
+    f.k.tick();
+    let entries = f.entries();
+    let capacity: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.record,
+                Record::Ask {
+                    signal: Some(Signal::Capacity { .. }),
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(capacity.len(), 1, "{entries:#?}");
+    let Record::Ask {
+        question,
+        claim,
+        signal:
+            Some(Signal::Capacity {
+                metric,
+                drift,
+                most,
+            }),
+        ..
+    } = &capacity[0].record
+    else {
+        unreachable!()
+    };
+    assert_eq!(*claim, Claim::Measured);
+    assert_eq!((metric.as_str(), *drift, *most), ("unread", 20.0, 5.0));
+    assert!(
+        question.contains("unread grows 20/day; reply can remove at most 5/day: the cap"),
+        "{question}"
+    );
+    assert!(!entries.iter().any(|e| matches!(
+        &e.record,
+        Record::Ask {
+            signal: Some(Signal::Saturated { .. }),
+            ..
+        }
+    )));
+    // Once per episode: the next night says nothing more.
+    f.history("inbox", &[200.0], DAY);
+    f.k.tick();
+    let again = f
+        .entries()
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.record,
+                Record::Ask {
+                    signal: Some(Signal::Capacity { .. }),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(again, 1);
+}
+
+#[test]
+fn a_controller_asked_once_a_night_counts_once_a_day_against_the_drift() {
+    let _c = clock();
+    let mut f = fixture("");
+    // Seven more unread a day; the cap allows twenty replies a day, but
+    // the model is asked once a night for at most five choices.
+    f.venture(
+        "inbox",
+        "unread",
+        "controller: {kind: model}\ncadence: 1d\n\
+         permitted:\n- {name: reply, run: echo ran >> invoked, cap: 20/day, reversible: true, delegated: true, expects: down 1 within 1}\n",
+    );
+    f.history("inbox", &[3.0, 10.0, 17.0, 24.0], DAY);
+    let gap = forecast::capacity(
+        &f.k.index().unwrap(),
+        "inbox",
+        &f.k.ventures["inbox"].mandate,
+    )
+    .expect("five a day cannot keep up with seven");
+    assert_eq!((gap.drift, gap.most), (7.0, 5.0));
+    assert_eq!(
+        gap.describe(),
+        "unread grows 7/day; reply can remove at most 5/day: the model is asked once a night, for at most 5 choices"
+    );
+    // A drift the turns keep up with asks nothing.
+    f.history("inbox", &[24.0; 8], DAY);
+    assert!(forecast::capacity(
+        &f.k.index().unwrap(),
+        "inbox",
+        &f.k.ventures["inbox"].mandate
+    )
+    .is_none());
+}
+
+#[test]
+fn a_sweep_reports_its_trial_count_and_a_pbo() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("garden", "level", GARDEN);
+    f.history("garden", &falling(100.0, 8, 2.0), HOUR);
+    let mut opts = f.opts(&["garden"], 2, 4);
+    opts.sweep = Some(Sweep {
+        field: "permitted.water.cap".to_string(),
+        values: vec!["2/day".into(), "4/day".into(), "8/day".into()],
+    });
+    let (outcome, written) = f.k.forecast(&opts, &[]).unwrap();
+    assert_eq!(outcome.trials, 3);
+    assert_eq!(outcome.pbo.len(), 3);
+    for (_, p) in &outcome.pbo {
+        let p = p.as_ref().expect("four seeds split into groups");
+        assert!((0.0..=1.0).contains(&p.pbo), "{p:?}");
+        assert_eq!(p.splits, 6);
+    }
+    // One forecast per value and policy, each naming its value.
+    let variants: Vec<String> = written
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Forecast { variant, .. } => variant.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(variants.len(), 9);
+    assert_eq!(
+        variants
+            .iter()
+            .filter(|v| *v == "permitted.water.cap=8/day")
+            .count(),
+        3
+    );
+    let text = outcome.render();
+    assert!(
+        text.contains("sweep of permitted.water.cap: 3 trials"),
+        "{text}"
+    );
+    assert!(text.contains("PBO "), "{text}");
+    // And over the socket's words.
+    let out =
+        f.k.handle(&[
+            "forecast".to_string(),
+            "garden".to_string(),
+            "--days".to_string(),
+            "1".to_string(),
+            "--seeds".to_string(),
+            "2".to_string(),
+            "--sweep".to_string(),
+            "permitted.water.cap".to_string(),
+            "2/day,4/day,8/day".to_string(),
+        ])
+        .unwrap();
+    assert!(out.contains("3 trials"), "{out}");
+}
+
+/// A role that proposes posting, with a payload, every night.
+struct Poster;
+
+impl Role for Poster {
+    fn decide(
+        &mut self,
+        ctx: &Context,
+        _infer: &mut dyn FnMut(&InferRequest) -> Result<String, String>,
+        _drill: &mut dyn FnMut(&str, &str) -> Result<String, String>,
+    ) -> Result<Vec<Record>, String> {
+        Ok(vec![Record::Proposal {
+            cites: vec![],
+            claim: Claim::Inferred,
+            venture: ctx.venture.clone(),
+            action: "post".into(),
+            reason: "news".into(),
+            payload: Some(Payload::Text {
+                text: format!("hello {}", ctx.now),
+            }),
+        }])
+    }
+}
+
+const BLOG: &str = "controller: {kind: model}\ncadence: 1h\n\
+     permitted:\n- {name: post, run: echo ran >> invoked, cap: 9/day, reversible: true, takes: text}\n\
+     - {name: forecast, cap: 3/day, reversible: true, delegated: true}\n";
+
+#[test]
+fn forecasts_at_add_and_as_a_lever() {
+    let _c = clock();
+    let mut f = fixture("forecast: {days: 1, seeds: 2}\n");
+    f.k.forecasts = true;
+    // At add, after the adoption, citing it; with no reading yet, the
+    // branches start from nothing rather than run the report program.
+    let dir = f.venture("blog", "posts", BLOG);
+    assert!(
+        !dir.join("reads").exists(),
+        "a forecast ran the report program"
+    );
+    let entries = f.entries();
+    let adopt = entries
+        .iter()
+        .rfind(|e| e.record.venture() == "blog" && e.record.kind() == Kind::Decision)
+        .unwrap()
+        .seq;
+    let at_add: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.record.kind() == Kind::Forecast)
+        .collect();
+    assert_eq!(at_add.len(), 3);
+    assert!(at_add
+        .iter()
+        .all(|e| e.seq > adopt && e.record.cites() == [adopt]));
+
+    // As a lever: delegated, so a proposal runs it, recorded then done,
+    // and its forecast records cite the intent.
+    f.history("blog", &[1.0, 2.0, 3.0], HOUR);
+    let lines = f.k.propose("blog", "forecast", None).unwrap();
+    let entries = f.entries();
+    let intent = entries
+        .iter()
+        .rfind(|e| matches!(&e.record, Record::Intent { action, .. } if action == "forecast"))
+        .unwrap_or_else(|| panic!("{lines}"));
+    let outcome = entries
+        .iter()
+        .find(|e| matches!(&e.record, Record::Outcome { intent: i, ok: true, .. } if *i == intent.seq))
+        .unwrap_or_else(|| panic!("{lines}"));
+    let by_lever: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.record.kind() == Kind::Forecast && e.record.cites() == [intent.seq])
+        .collect();
+    assert_eq!(by_lever.len(), 3, "{lines}");
+    assert!(by_lever.iter().all(|e| e.seq > outcome.seq));
+    assert!(!dir.join("invoked").exists(), "a forecast ran a lever");
+    assert!(!f.tmp.path().join("calls").exists(), "a backend was called");
+}
+
+#[test]
+fn a_ratchet_delegate_ask_cites_the_forecast_of_the_proposed_mandate() {
+    let _c = clock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path(), "ratchet: 2\nforecast: {days: 1, seeds: 2}\n");
+    let warden = LocalWarden::open(&home).unwrap();
+    let mut k = Kernel::with(&home, Box::new(Poster), Box::new(warden)).unwrap();
+    k.adopt_self().unwrap();
+    k.forecasts = true;
+    let mut f = Fixture { tmp, k, now: T0 };
+    let dir = f.venture("blog", "posts", BLOG);
+    f.history("blog", &[1.0, 2.0, 3.0], HOUR);
+    for _ in 0..2 {
+        f.k.cycle("blog");
+        let q =
+            f.k.open_asks()
+                .unwrap()
+                .into_iter()
+                .rfind(|q| {
+                    f.k.index()
+                        .unwrap()
+                        .get(*q)
+                        .is_some_and(|e| e.record.action() == Some("post"))
+                })
+                .expect("post asks each time");
+        f.k.approve(q, None).unwrap();
+        f.now += 60;
+        avsm::clock::set(f.now);
+        f.k.tick();
+    }
+    let entries = f.entries();
+    let ask = entries
+        .iter()
+        .find(|e| matches!(&e.record, Record::Ask { action: Some(a), .. } if a == "delegate"))
+        .unwrap_or_else(|| panic!("{entries:#?}"));
+    let proposal = entries
+        .iter()
+        .rfind(|e| matches!(&e.record, Record::Proposal { action, .. } if action == "delegate"))
+        .unwrap()
+        .seq;
+    let cited = ask.record.cites();
+    assert_eq!(cited.len(), 3, "{}", ask.line());
+    for c in cited {
+        let e = &entries[*c as usize - 1];
+        assert!(e.seq > proposal && e.seq < ask.seq);
+        assert_eq!(e.record.kind(), Kind::Forecast);
+        assert_eq!(e.record.cites(), [proposal]);
+    }
+    // The approved posts ran for real, twice; the forecasts ran none, and
+    // the mandate file is as the human wrote it.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("invoked"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(!std::fs::read_to_string(dir.join("mandate.yaml"))
+        .unwrap()
+        .contains("delegated: true, takes"));
+}
+
+/// The time a 30-day, 16-seed forecast of examples/greenhouse takes, on a
+/// day of its history. Run with: cargo test --release --test forecast -- --ignored --nocapture
+#[test]
+#[ignore]
+fn time_a_month_of_the_greenhouse() {
+    let _c = clock();
+    let mut f = fixture("");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/greenhouse")
+        .canonicalize()
+        .unwrap();
+    let copy = f.tmp.path().join("greenhouse");
+    std::fs::create_dir_all(&copy).unwrap();
+    for file in ["mandate.yaml", "report", "vent"] {
+        std::fs::copy(dir.join(file), copy.join(file)).unwrap();
+    }
+    f.k.add(&copy).unwrap();
+    for _ in 0..(24 * 60) {
+        f.now += 60;
+        avsm::clock::set(f.now);
+        f.k.report("greenhouse", false);
+    }
+    let opts = f.opts(&["greenhouse"], 30, 16);
+    let started = std::time::Instant::now();
+    let (outcome, _) = f.k.forecast(&opts, &[]).unwrap();
+    let secs = started.elapsed().as_secs_f64();
+    println!("{}", outcome.render());
+    println!("greenhouse: 30 days x 16 seeds x 3 policies in {secs:.2}s");
+}
