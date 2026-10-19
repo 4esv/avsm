@@ -2699,12 +2699,11 @@ pub mod reference {
         series[i..].iter().any(|(_, x)| (x - frozen).abs() > noise)
     }
 
-    /// Is the lever suspended: some measured ask says it is ineffective
-    /// and neither a declared approval of it by the same venture nor a
-    /// declared adoption of the venture's mandate after it answers it? Or
-    /// does a measured relapse after the latest such ask and after any
-    /// adoption suspend it again? An ask or relapse that is void is
-    /// neither.
+    /// Is the lever suspended: is the latest measured ask that says it is
+    /// ineffective, after any declared adoption of the venture's mandate,
+    /// without a declared approval of it by the same venture? Or does a
+    /// measured relapse after the latest such ask and after any adoption
+    /// suspend it again? An ask or relapse that is void is neither.
     pub fn suspended(ledger: &[Entry], venture: &str, action: &str) -> bool {
         let is_ask = |e: &Entry| {
             matches!(&e.record, Record::Ask {
@@ -2742,32 +2741,23 @@ pub mod reference {
                 && last_ask.is_some_and(|q| r.seq > q)
                 && !voided(ledger, venture, r)
         });
+        // The latest non-void ask after the last adoption: the one whose
+        // answer governs.
+        let latest = ledger
+            .iter()
+            .filter(|e| is_ask(e) && e.seq > adopted && !voided(ledger, venture, e))
+            .map(|e| e.seq)
+            .max();
         relapsed
-            || ledger.iter().any(|e| {
-                !voided(ledger, venture, e)
-                    && matches!(&e.record, Record::Ask {
-                claim: Claim::Measured,
-                venture: v,
-                signal: Some(crate::record::Signal::Ineffective { action: a, .. }),
-                ..
-            } if v == venture && a == action)
-                    && !ledger.iter().any(|d| {
-                        matches!(&d.record, Record::Decision {
+            || latest.is_some_and(|q| {
+                !ledger.iter().any(|d| {
+                    matches!(&d.record, Record::Decision {
                         claim: Claim::Declared,
                         venture: dv,
                         verdict: Verdict::Approve { ask, .. },
                         ..
-                    } if dv == venture && *ask == e.seq)
-                    })
-                    && !ledger.iter().any(|d| {
-                        d.seq > e.seq
-                            && matches!(&d.record, Record::Decision {
-                            claim: Claim::Declared,
-                            venture: dv,
-                            verdict: Verdict::Adopt { .. },
-                            ..
-                        } if dv == venture)
-                    })
+                    } if dv == venture && *ask == q)
+                })
             })
     }
 

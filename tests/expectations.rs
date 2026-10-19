@@ -484,6 +484,70 @@ fn a_denial_leaves_the_delegation_suspended() {
     assert!(f.suspended());
 }
 
+/// A suspended lever whose ask was denied, asked again on a reading
+/// somewhere new: the fixture and the new ask, still open.
+fn denied_then_asked_again() -> (Fixture, Seq) {
+    let (mut f, ask) = suspended();
+    f.k.deny(ask, "no").unwrap();
+    assert!(f.suspended());
+    f.report_tomorrow(4.0); // refused; something new was measured: asks again
+    let asks = f.ineffective();
+    assert_eq!(asks.len(), 2, "{asks:#?}");
+    assert!(f.suspended(), "an open ask is no answer");
+    (f, asks[1].seq)
+}
+
+#[test]
+fn an_approval_after_a_denial_restores_the_lever() {
+    let _c = clock();
+    let (mut f, again) = denied_then_asked_again();
+    let runs = f.intents();
+    f.k.approve(again, None).unwrap();
+    assert!(
+        !f.suspended(),
+        "the latest word governs, not the first denial"
+    );
+    f.report_tomorrow(4.0);
+    assert_eq!(f.intents(), runs + 1, "delegated again: it runs");
+    // It misses again on readings that say nothing new: a relapse after
+    // the approved ask suspends it, measured.
+    f.report(4.0);
+    f.report(4.0);
+    assert!(f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.ineffective().len(), 2, "a relapse, not a new ask");
+}
+
+#[test]
+fn a_denial_never_answered_by_an_approval_stays_suspended() {
+    let _c = clock();
+    let (mut f, again) = denied_then_asked_again();
+    f.k.deny(again, "still no").unwrap();
+    assert!(f.suspended());
+    let runs = f.intents();
+    f.report_tomorrow(3.0);
+    assert_eq!(f.intents(), runs, "refused, not run");
+    assert!(f.suspended());
+}
+
+#[test]
+fn an_approval_of_an_old_ask_never_answers_a_newer_one() {
+    let _c = clock();
+    let (mut f, ask) = suspended();
+    f.k.deny(ask, "no").unwrap();
+    f.report_tomorrow(4.0); // asks again
+    assert_eq!(f.ineffective().len(), 2);
+    // The first ask is decided and cannot be approved now; an approval
+    // record of it, declared, still says nothing about the newer one.
+    f.k.append(Record::Decision {
+        claim: Claim::Declared,
+        venture: "raiser".into(),
+        verdict: Verdict::Approve { ask, payload: None },
+        by: None,
+    })
+    .unwrap();
+    assert!(f.suspended(), "the newest ask is still open");
+}
+
 #[test]
 fn a_fresh_miss_after_a_restore_suspends_again() {
     let _c = clock();

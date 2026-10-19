@@ -681,28 +681,31 @@ impl Index {
         self.last_ineffective(venture, action).max(relapse.copied())
     }
 
-    /// Is this lever suspended: a measured ask says it is ineffective and
-    /// neither a declared approval of that ask by the same venture nor a
-    /// later declared adoption of the venture's mandate has answered it;
-    /// or a measured relapse after the latest such ask says the restored
-    /// lever missed again. While it is, every run is refused. Tightening
-    /// is measured; only a declared decision loosens, but for a miss seen
-    /// only on stuck readings, which a plausible reading away from the
-    /// frozen value voids (`voided`).
+    /// Is this lever suspended: the latest measured ask since the last
+    /// declared adoption of the venture's mandate that says it is
+    /// ineffective has no declared approval by the same venture; or a
+    /// measured relapse after the latest such ask says the restored lever
+    /// missed again. The latest word governs: a denial keeps it
+    /// suspended, and an approval of a later ask restores it. While it
+    /// is, every run is refused. Tightening is measured; only a declared
+    /// decision loosens, but for a miss seen only on stuck readings, which
+    /// a plausible reading away from the frozen value voids (`voided`).
     pub fn suspended(&self, venture: &str, action: &str) -> bool {
         // A declared adoption of the mandate after the ask answers it too.
         let adopted = self.adoptions.get(venture).map_or(0, |a| a.seq);
         let key = (venture.to_string(), action.to_string());
         let asks = self.ineffective.get(&key);
-        let unanswered = asks.is_some_and(|asks| {
-            asks.iter().any(|q| {
-                *q > adopted
-                    && !self
-                        .approved_by
-                        .get(q)
-                        .is_some_and(|by| by.contains(venture))
-                    && !self.voided(venture, *q)
-            })
+        let latest = asks.and_then(|asks| {
+            asks.iter()
+                .copied()
+                .filter(|q| *q > adopted && !self.voided(venture, *q))
+                .max()
+        });
+        let unanswered = latest.is_some_and(|q| {
+            !self
+                .approved_by
+                .get(&q)
+                .is_some_and(|by| by.contains(venture))
         });
         let last_ask = asks.and_then(|a| a.iter().max()).copied().unwrap_or(0);
         let relapsed = self.relapses.get(&key).is_some_and(|r| {
