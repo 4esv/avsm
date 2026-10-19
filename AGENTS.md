@@ -11,7 +11,7 @@ Use these words and no synonyms.
 - mandate, record, action, ask
 - measured, declared, inferred
 - report, proposal, action, ask, decision, intent, outcome, refusal, prediction, branch, forecast
-- running, asking, paused
+- running, asking, saturated, ineffective, guarded, implausible, paused (the states, computed from records only)
 - ledger, gate, proof, adapter, canary, warden, guard, audit, world, plan
 - parent, child, payload, adapter (built-in metric or lever), digest, know, expects
 - escalate, escalation (the `escalate:` backend asked when the first cannot answer)
@@ -35,6 +35,9 @@ Use these words and no synonyms.
 12. Self-modification is a proposal. Only a declared decision adopts one.
 13. The only listener is the Tailscale one, off by default, bound to the tailnet interface only, identity from tailscaled, never from the client.
 14. World models, rollouts and forecasts are inferred. They rank, veto and ask, and never authorize.
+15. Simulation never runs a real lever. In simulate and forecast every lever goes to a world model or the simulation's world, and a simulation's world is never a venture's world model.
+16. Every side effect is recorded, then done: an intent with an idempotency key before the run, an outcome after. An intent with no outcome is never run again blindly.
+17. The improving loop never edits limits. It may only propose delegating a reversible lever; caps, costs, guards, budgets and everything else change only by a human.
 
 ## Warden
 

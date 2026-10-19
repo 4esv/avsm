@@ -1162,12 +1162,22 @@ impl Kernel {
                     continue;
                 };
                 let Some(dir) = v.path.as_ref() else { continue };
-                let text = match std::fs::read_to_string(dir.join(venture::MANDATE_FILE)) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        log(&format!("{}: cannot read the mandate: {e}", v.name));
-                        continue;
-                    }
+                // The mandate in force is the adopted text; an edit on disk
+                // nobody adopted never rides along. A 1.0 adoption has no
+                // text in the ledger, and its file is the mandate.
+                let adopted = {
+                    let Ok(index) = self.index() else { return };
+                    index.adoptions().get(&v.name).and_then(|a| a.text.clone())
+                };
+                let text = match adopted {
+                    Some(t) => t,
+                    None => match std::fs::read_to_string(dir.join(venture::MANDATE_FILE)) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log(&format!("{}: cannot read the mandate: {e}", v.name));
+                            continue;
+                        }
+                    },
                 };
                 let changed = match mandate::delegate_text(&text, &perm.name) {
                     Ok(t) => t,

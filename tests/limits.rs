@@ -50,7 +50,8 @@ struct Shop {
 
 /// A shop whose announce lever was approved once, and whose mandate file
 /// on disk then says `on_disk`; the next tick is the ratchet's, and what it
-/// proposes is the file as it stands. Returns the shop and the delegate ask.
+/// proposes is the adopted mandate, never the file. Returns the shop and
+/// the delegate ask.
 fn ratcheted(on_disk: &str) -> (Shop, u64) {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -91,6 +92,24 @@ fn ratcheted(on_disk: &str) -> (Shop, u64) {
     k.tick();
     let ask = open_ask(&k, "delegate").expect("the ratchet proposed");
     (Shop { _tmp: tmp, dir, k }, ask)
+}
+
+/// A delegate ask for `text` that no human amended, written as the
+/// improving loop writes one: what a broken or compromised loop could ask.
+fn forged(s: &mut Shop, text: &str) -> u64 {
+    s.k.append(Record::Ask {
+        claim: Claim::Measured,
+        venture: "shop".into(),
+        action: Some("delegate".into()),
+        question: "may I delegate?".into(),
+        refusal: None,
+        payload: Some(Payload::Text { text: text.into() }),
+        signal: None,
+        packet: None,
+        cites: vec![],
+    })
+    .unwrap()
+    .seq
 }
 
 fn delegated(text: &str) -> String {
@@ -134,7 +153,8 @@ fn the_ratchets_own_proposal_is_adopted() {
 #[test]
 fn a_proposal_that_also_raises_a_cap_is_refused() {
     let raised = SHOP.replace("cap: 9/day", "cap: 90/day");
-    let (mut s, ask) = ratcheted(&raised);
+    let (mut s, _) = ratcheted(SHOP);
+    let ask = forged(&mut s, &raised);
     s.k.approve(ask, None).unwrap();
     s.k.tick();
     let entries = s.k.entries().unwrap();
@@ -142,8 +162,8 @@ fn a_proposal_that_also_raises_a_cap_is_refused() {
     assert!(why.contains("cap"), "{why}");
     assert_eq!(
         std::fs::read_to_string(s.dir.join("mandate.yaml")).unwrap(),
-        raised,
-        "the file is the human's edit, not rewritten"
+        SHOP,
+        "the file is not rewritten"
     );
     assert!(
         !entries
@@ -160,7 +180,8 @@ fn a_guard_change_is_refused_too() {
         "cadence: 1h\n",
         "cadence: 1h\nguards:\n  - {name: load, run: echo 1, above: 5}\n",
     );
-    let (mut s, ask) = ratcheted(&guarded);
+    let (mut s, _) = ratcheted(SHOP);
+    let ask = forged(&mut s, &guarded);
     s.k.approve(ask, None).unwrap();
     s.k.tick();
     let entries = s.k.entries().unwrap();
@@ -189,7 +210,8 @@ fn the_same_change_amended_by_a_human_is_adopted() {
 #[test]
 fn turning_delegated_off_is_refused_too() {
     let off = SHOP.replace("    delegated: true\n", "");
-    let (mut s, ask) = ratcheted(&off);
+    let (mut s, _) = ratcheted(SHOP);
+    let ask = forged(&mut s, &off);
     s.k.approve(ask, None).unwrap();
     s.k.tick();
     let entries = s.k.entries().unwrap();
@@ -197,6 +219,24 @@ fn turning_delegated_off_is_refused_too() {
     assert!(why.contains("delegated"), "{why}");
     assert_eq!(
         std::fs::read_to_string(s.dir.join("mandate.yaml")).unwrap(),
-        off
+        SHOP
+    );
+}
+
+#[test]
+fn an_edit_on_disk_nobody_adopted_never_rides_along() {
+    let raised = SHOP.replace("cap: 9/day", "cap: 90/day");
+    let (s, ask) = ratcheted(&raised);
+    let payload =
+        s.k.entries()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.seq == ask)
+            .and_then(|e| e.record.payload().map(|p| p.text()))
+            .unwrap();
+    assert_eq!(
+        payload,
+        delegated(SHOP),
+        "the proposal is the adopted mandate, delegated"
     );
 }
