@@ -2006,6 +2006,7 @@ mod tests {
             delegated,
             takes: None,
             cost: 0,
+            check: None,
         }
     }
 

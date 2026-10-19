@@ -1,0 +1,23 @@
+#!/bin/sh
+# Pass only if line 1 of the payload is an address that sent us mail.
+# The warden hands this file the venture's measured and declared reports
+# in $AVSM_MEASURED, never an inferred one, so a name a research finding
+# or a model produced is not a sender. A sender is a report note that
+# says "from <address>", as in "from alice@example.com: Invoice 12".
+exec python3 -I -c '
+import json, os, re, sys
+
+want = (sys.stdin.readline() or "").strip().lower()
+if not re.fullmatch(r"[^\s@<>,;:]+@[^\s@<>,;:]+", want):
+    print("line 1 of the reply is not an address: %r" % want[:60])
+    sys.exit(1)
+with open(os.environ["AVSM_MEASURED"]) as f:
+    entries = json.load(f)
+for e in entries:
+    note = e.get("record", {}).get("note") or ""
+    for found in re.findall(r"\bfrom ([^\s@<>,;:]+@[^\s@<>,;:]+)", note, re.I):
+        if found.lower() == want:
+            sys.exit(0)
+print("%s is not a sender in any measured report" % want)
+sys.exit(1)
+'

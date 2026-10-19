@@ -121,6 +121,7 @@ pub fn canary() -> Result<(), String> {
                 delegated: true,
                 takes: None,
                 cost: 0,
+                check: None,
             })
             .collect(),
         forbidden: vec![],

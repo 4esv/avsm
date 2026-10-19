@@ -1224,6 +1224,13 @@ impl Kernel {
                         }
                     }
                 }
+                Err(e) if e.starts_with(warden::PAYLOAD_CHECK) => {
+                    // The check said no after the gate said yes: a refusal
+                    // record, no intent, nothing run.
+                    lines.push(format!("{name}: {action} refused: {e}"));
+                    log(lines.last().map_or("", String::as_str));
+                    self.refuse(name, action, warden::PAYLOAD_CHECK.to_string(), e, false);
+                }
                 Err(e) => {
                     lines.push(format!("{name}: {action} did not run: {e}"));
                     // The gate said yes and nothing ran: the ledger says so.

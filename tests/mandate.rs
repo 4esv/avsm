@@ -46,6 +46,7 @@ fn valid_fixture_parses_field_by_field() {
                 delegated: false,
                 takes: None,
                 cost: 0,
+                check: None,
             },
             Permitted {
                 name: "deploy".into(),
@@ -59,6 +60,7 @@ fn valid_fixture_parses_field_by_field() {
                 delegated: false,
                 takes: None,
                 cost: 0,
+                check: None,
             },
         ],
         forbidden: vec!["rm".into()],

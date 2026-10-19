@@ -2,6 +2,16 @@
 # (user:password), and the one lever sends mail, so it asks first every
 # time: a send is never delegated here. Put your server and address in.
 # It can be a child of the portfolio example, or stand alone.
+#
+# The reply lever carries a payload check. The first line of a reply is
+# the address being answered (mail.send puts it in the subject line), and
+# ./check-sender lets the reply through only if that address appears as a
+# sender in a measured or declared report of this venture. A sender is
+# named in the report's note: "from alice@example.com: Invoice 12". Write
+# those reports from your own mail rule or script; never by a model. A
+# finding a model made up, a research result, an inferred report: none
+# of them counts, so a phishing address a model was told about cannot be
+# written to, and a human's approval does not get past the check.
 purpose: Keep the inbox answered; never send without my say.
 metric: imap.unread mail.example.com
 controller:
@@ -13,3 +23,4 @@ permitted:
     adapter: mail.send owner@example.com
     cap: 10/day
     reversible: false
+    check: ./check-sender

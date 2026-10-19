@@ -610,6 +610,7 @@ mod tests {
             delegated: false,
             takes: None,
             cost: 0,
+            check: None,
         };
         Context {
             venture: "shop".to_string(),
@@ -1001,6 +1002,7 @@ mod tests {
             delegated: true,
             takes: None,
             cost: 0,
+            check: None,
         });
         c.children = vec![ChildView {
             name: "shop".to_string(),

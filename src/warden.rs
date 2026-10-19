@@ -268,6 +268,11 @@ impl Warden for LocalWarden {
                 }
             }
         }
+        // A payload check runs after the gate, so after any approval, and
+        // before the intent: a failure runs nothing and writes no intent.
+        if let (Some(check), Some(p)) = (&perm.check, payload.as_ref()) {
+            payload_check(&self.home, &dir, check, p, index, &venture)?;
+        }
         let proof_text = proof.to_string();
         let pull = |payload: Option<&Payload>| -> (bool, String) {
             match (perm.lever_adapter(), &perm.run, payload) {
@@ -511,6 +516,71 @@ fn fallbacks_apply(model: &str) -> bool {
     .any(|p| model.starts_with(p))
 }
 
+/// What a refusal by a payload check is called: the reason key, and the
+/// start of the error the warden returns.
+pub const PAYLOAD_CHECK: &str = "PayloadCheck";
+/// The most reports a check sees.
+pub const CHECK_REPORTS: usize = 500;
+/// The most of a check's stdout that is read, and the most of it that
+/// goes into a refusal.
+pub const CHECK_READ: usize = 4096;
+const CHECK_DETAIL: usize = 200;
+
+/// Run a lever's check. `Ok` when it exits 0. Otherwise an error starting
+/// `PayloadCheck: `, with the check's bounded stdout as the detail.
+fn payload_check(
+    home: &Path,
+    dir: &Path,
+    check: &str,
+    payload: &Payload,
+    index: &Index,
+    venture: &str,
+) -> Result<(), String> {
+    // Measured and declared reports only: an inferred record never
+    // authorizes, so a check never sees one.
+    let mut seen: Vec<&Entry> = index
+        .of(venture)
+        .filter(|e| e.record.kind() == record::Kind::Report && e.record.claim() != Claim::Inferred)
+        .collect();
+    let skip = seen.len().saturating_sub(CHECK_REPORTS);
+    seen.drain(..skip);
+    let json = serde_json::to_string(&seen).map_err(|e| format!("{PAYLOAD_CHECK}: {e}"))?;
+    let file = home.join(format!("measured-{}-{}.json", std::process::id(), now()));
+    std::fs::write(&file, json).map_err(|e| format!("{PAYLOAD_CHECK}: cannot write {e}"))?;
+    let path = file.to_string_lossy().into_owned();
+    let ran = run_bounded(
+        dir,
+        "sh",
+        &["-c", check],
+        &[
+            ("AVSM_MEASURED", path.as_str()),
+            ("AVSM_PAYLOAD", payload.takes().to_string().as_str()),
+        ],
+        &payload.text(),
+        ACTION_TIMEOUT,
+        CHECK_READ,
+    );
+    let _ = std::fs::remove_file(&file);
+    if ran.ok {
+        return Ok(());
+    }
+    let out: String = ran
+        .stdout
+        .trim()
+        .replace('\n', "  ")
+        .chars()
+        .take(CHECK_DETAIL)
+        .collect();
+    let how = if ran.killed {
+        "timed out".to_string()
+    } else {
+        format!("exit {}", ran.code.unwrap_or(-1))
+    };
+    Err(format!("{PAYLOAD_CHECK}: {check} failed ({how})  {out}")
+        .trim()
+        .to_string())
+}
+
 /// What running something came to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ran {
@@ -562,6 +632,20 @@ pub fn run_with(
     stdin: &str,
     timeout: Duration,
 ) -> Ran {
+    run_bounded(dir, program, args, env, stdin, timeout, usize::MAX)
+}
+
+/// Like `run_with`, keeping at most `cap` bytes of each of stdout and
+/// stderr; the rest is read and dropped so the child never blocks.
+pub fn run_bounded(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    stdin: &str,
+    timeout: Duration,
+    cap: usize,
+) -> Ran {
     let mut child = match Command::new(program)
         .args(args)
         .current_dir(dir)
@@ -600,11 +684,11 @@ pub fn run_with(
     let reader = std::thread::spawn(move || {
         let mut out = String::new();
         if let Some(s) = stdout.as_mut() {
-            let _ = s.read_to_string(&mut out);
+            read_capped(s, cap, &mut out);
         }
         let mut err = String::new();
         if let Some(s) = stderr.as_mut() {
-            let _ = s.read_to_string(&mut err);
+            read_capped(s, cap, &mut err);
         }
         (out, err)
     });
@@ -634,6 +718,14 @@ pub fn run_with(
         code: status.and_then(|s| s.code()),
         killed: status.is_none(),
     }
+}
+
+/// Read all of `from`, keeping the first `cap` bytes as text.
+fn read_capped(from: &mut impl Read, cap: usize, into: &mut String) {
+    let mut kept = Vec::new();
+    let _ = from.by_ref().take(cap as u64).read_to_end(&mut kept);
+    let _ = std::io::copy(from, &mut std::io::sink());
+    *into = String::from_utf8_lossy(&kept).into_owned();
 }
 
 /// Run a shell command in a directory; see `run`. Returns whether it
@@ -706,6 +798,22 @@ pub enum FromWarden {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bounded_run_keeps_the_cap_and_does_not_block_the_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ran = run_bounded(
+            tmp.path(),
+            "sh",
+            &["-c", "yes | head -c 3000000"],
+            &[],
+            "",
+            Duration::from_secs(20),
+            100,
+        );
+        assert!(ran.ok && !ran.killed);
+        assert_eq!(ran.stdout.len(), 100);
+    }
 
     #[test]
     fn commands_run_in_the_directory_with_a_timeout() {

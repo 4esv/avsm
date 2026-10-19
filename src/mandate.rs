@@ -152,6 +152,13 @@ pub struct Permitted {
     /// is held to the child's budget and to the shared quota.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cost: u32,
+    /// A command the warden runs in the venture directory after the gate
+    /// passes and before the intent is written, with the payload on
+    /// standard input and `AVSM_MEASURED` naming a file of the venture's
+    /// measured and declared reports. Exit 0 passes; anything else refuses
+    /// the run, even a human-approved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -283,6 +290,7 @@ const ACTION_FIELDS: &[&str] = &[
     "delegated",
     "takes",
     "cost",
+    "check",
 ];
 
 /// Names no permitted action may take: they are built in.
@@ -455,6 +463,13 @@ impl Mandate {
                 ));
             }
             names.push(&p.name);
+            if p.check.is_some() && (p.takes().is_none() || p.is_parent_lever() || p.is_research())
+            {
+                return fail(format!(
+                    "permitted action {:?} has a check, which reads a payload; only a lever that takes a payload, and not research or a parent lever, can have one",
+                    p.name
+                ));
+            }
             match (&p.run, &p.adapter) {
                 (None, None) if PARENT_LEVERS.contains(&p.name.as_str()) => {
                     if self.children.is_empty() {
@@ -1207,6 +1222,16 @@ fn check_action(position: usize, item: &Value) -> Result<(), MandateError> {
             ))
         }
     }
+    match map.get("check") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(c)) if !c.trim().is_empty() => {}
+        Some(other) => {
+            return fail(format!(
+                "{who} check must be the command to run, like ./check-sender, not {}",
+                describe(other)
+            ))
+        }
+    }
     match map.get("cost") {
         None => Ok(()),
         Some(value) => match value.as_u64() {
@@ -1732,7 +1757,7 @@ forbidden: [rm]
         ));
         assert_eq!(
             msg,
-            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes, cost"
+            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes, cost, check"
         );
     }
 
@@ -1952,6 +1977,30 @@ forbidden: [rm]
         assert!(msg.starts_with("research is built in"), "{msg}");
         let msg = fails(&text.replace("    cap: 5/day\n", "    cap: 5/day\n    takes: json\n"));
         assert!(msg.contains("takes text, the question"), "{msg}");
+    }
+
+    #[test]
+    fn a_check_needs_a_lever_that_takes_a_payload() {
+        let m = Mandate::parse(&edit(
+            "    reversible: false\n",
+            "    reversible: false\n    takes: text\n    check: ./check-sender\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            m.permitted("deploy").unwrap().check.as_deref(),
+            Some("./check-sender")
+        );
+        assert_eq!(m.permitted("reset").unwrap().check, None);
+        let msg = fails(&edit(
+            "    reversible: false\n",
+            "    reversible: false\n    check: ./check-sender\n",
+        ));
+        assert!(msg.contains("has a check, which reads a payload"), "{msg}");
+        let msg = fails(&edit(
+            "    reversible: false\n",
+            "    reversible: false\n    takes: text\n    check: [x]\n",
+        ));
+        assert!(msg.contains("check must be the command to run"), "{msg}");
     }
 
     #[test]

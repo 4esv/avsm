@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use avsm::kernel::Kernel;
-use avsm::record::{Kind, Record};
+use avsm::record::{Claim, Kind, Record};
 use avsm::role::{Context, InferRequest, Role};
 use avsm::warden::LocalWarden;
 use common::{imap_stub, ran, route, Stub};
@@ -94,6 +94,25 @@ fn last_report(k: &Kernel, venture: &str) -> (Option<f64>, String) {
         Record::Report { value, note, .. } => (*value, note.clone()),
         _ => unreachable!(),
     }
+}
+
+/// A measured report that `address` sent mail, as the example documents.
+fn sender(k: &mut Kernel, address: &str) {
+    note(k, Claim::Measured, address);
+}
+
+fn note(k: &mut Kernel, claim: Claim, address: &str) {
+    k.append(Record::Report {
+        claim,
+        venture: "mail-inbox".into(),
+        metric: "mail.from".into(),
+        value: None,
+        note: format!("from {address}: Invoice 12"),
+        source: None,
+        confidence: None,
+        cites: vec![],
+    })
+    .unwrap();
 }
 
 fn ask_number(out: &str, lever: &str) -> u64 {
@@ -320,25 +339,28 @@ fn mail_inbox_counts_unread_and_every_send_is_an_ask() {
     k.add(&dir).unwrap();
     k.report("mail-inbox", false);
     assert_eq!(last_report(&k, "mail-inbox").0, Some(7.0));
+    // The reply lever's check wants the address replied to on line 1, and
+    // that address named as a sender by a measured report.
+    sender(&mut k, "alice@example.com");
     let out = k
-        .propose("mail-inbox", "reply", Some("Re: your note\nOn it."))
+        .propose("mail-inbox", "reply", Some("alice@example.com\nOn it."))
         .unwrap();
     let ask = ask_number(&out, "reply");
     assert!(k
         .asks()
         .unwrap()
-        .contains("    Re: your note\n    On it.\n"));
+        .contains("    alice@example.com\n    On it.\n"));
     k.deny(ask, "not that one").unwrap();
     k.tick();
     assert!(!dir.join("sent.eml").exists());
     let out = k
-        .propose("mail-inbox", "reply", Some("Re: your note\nYes."))
+        .propose("mail-inbox", "reply", Some("alice@example.com\nYes."))
         .unwrap();
     k.approve(ask_number(&out, "reply"), None).unwrap();
     k.tick();
     let sent = std::fs::read_to_string(dir.join("sent.eml")).unwrap();
     assert!(
-        sent.contains("From: me@example.com\nSubject: Re: your note\n"),
+        sent.contains("From: me@example.com\nSubject: alice@example.com\n"),
         "{sent}"
     );
     assert!(sent.ends_with("Yes.\n"), "{sent}");
@@ -519,5 +541,139 @@ fn portfolio_allocates_to_its_two_children_and_sees_their_records() {
         ctx.children[1].metric.starts_with("imap.unread=2"),
         "{}",
         ctx.children[1].metric
+    );
+}
+
+/// An inbox whose mail command counts its invocations in `calls.log`.
+fn counting_inbox(tmp: &Path, check: Option<&str>) -> (Kernel, PathBuf) {
+    let (imap, _seen) = imap_stub(1);
+    let home = home(
+        tmp,
+        "nightly: never\nadapters:\n  mail: {command: \"echo run >> calls.log; cat > sent.eml\", from: me@example.com}\n",
+    );
+    let mut swaps = vec![(
+        "imap.unread mail.example.com".to_string(),
+        format!("imap.unread {imap}"),
+    )];
+    if let Some(c) = check {
+        swaps.push(("check: ./check-sender".to_string(), format!("check: {c}")));
+    }
+    let swaps: Vec<(&str, &str)> = swaps
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let dir = example(tmp, "mail-inbox", &swaps);
+    let (role, _) = quiet();
+    let mut k = kernel(&home, role);
+    k.add(&dir).unwrap();
+    (k, dir)
+}
+
+fn calls(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("calls.log")).map_or(0, |t| t.lines().count())
+}
+
+/// The refusals of the reply lever: reason key and detail.
+fn reply_refusals(k: &Kernel) -> Vec<(String, String)> {
+    k.entries()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Refusal {
+                action,
+                reason,
+                detail,
+                closes: None,
+                ..
+            } if action == "reply" => Some((reason.clone(), detail.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reply_intents(k: &Kernel) -> usize {
+    k.entries()
+        .unwrap()
+        .iter()
+        .filter(|e| e.record.kind() == Kind::Intent && e.record.action() == Some("reply"))
+        .count()
+}
+
+fn approve_reply(k: &mut Kernel, payload: &str) {
+    let out = k.propose("mail-inbox", "reply", Some(payload)).unwrap();
+    k.approve(ask_number(&out, "reply"), None).unwrap();
+    k.tick();
+}
+
+#[test]
+fn a_passing_check_runs_the_lever() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut k, dir) = counting_inbox(tmp.path(), None);
+    sender(&mut k, "alice@example.com");
+    approve_reply(&mut k, "alice@example.com\nOn it.");
+    assert_eq!(calls(&dir), 1);
+    assert_eq!(reply_intents(&k), 1);
+    assert!(reply_refusals(&k).is_empty(), "{:?}", reply_refusals(&k));
+}
+
+#[test]
+fn a_failing_check_refuses_even_after_a_declared_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut k, dir) = counting_inbox(tmp.path(), None);
+    sender(&mut k, "alice@example.com");
+    // A human approved this; the check still says nobody of that name wrote.
+    approve_reply(&mut k, "bob@example.com\nOn it.");
+    assert_eq!(calls(&dir), 0, "the lever was invoked");
+    assert!(!dir.join("sent.eml").exists());
+    assert_eq!(reply_intents(&k), 0, "nothing was intended");
+    let refusals = reply_refusals(&k);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "PayloadCheck");
+    assert!(
+        refusals[0].1.contains("bob@example.com is not a sender"),
+        "{refusals:?}"
+    );
+    // A first line that is no address fails the same way.
+    approve_reply(&mut k, "Re: your note\nOn it.");
+    assert_eq!(calls(&dir), 0);
+    assert_eq!(reply_intents(&k), 0);
+}
+
+#[test]
+fn a_reply_to_an_address_only_an_inferred_record_names_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut k, dir) = counting_inbox(tmp.path(), None);
+    sender(&mut k, "alice@example.com");
+    // The phishing case: a research finding says mail comes from here.
+    note(&mut k, Claim::Inferred, "phish@evil.example");
+    approve_reply(&mut k, "phish@evil.example\nWire the money.");
+    assert_eq!(
+        calls(&dir),
+        0,
+        "a reply went to an address only a model named"
+    );
+    assert_eq!(reply_intents(&k), 0);
+    let refusals = reply_refusals(&k);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "PayloadCheck");
+}
+
+#[test]
+fn a_checks_large_stdout_is_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Five megabytes on stdout, then a failure.
+    let (mut k, dir) = counting_inbox(
+        tmp.path(),
+        Some("'yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c 5000000; exit 1'"),
+    );
+    approve_reply(&mut k, "alice@example.com\nOn it.");
+    assert_eq!(calls(&dir), 0);
+    let refusals = reply_refusals(&k);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "PayloadCheck");
+    assert!(
+        refusals[0].1.len() < 400,
+        "the detail holds {} bytes",
+        refusals[0].1.len()
     );
 }
