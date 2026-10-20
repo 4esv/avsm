@@ -13,7 +13,7 @@ Two ways in, both from `avsm simulate --world`:
   it worked. A release, overtime, contractor or purge takes effect at the
   next step; an order lands after its lead time.
 
-Adversity, by day (physics.SCHEDULE): a level sensor that saturates at 92.0
+Adversity, by day (physics.SCHEDULE): a level sensor that saturates at 84.0
 for ten days of the wet season, with storms in it; a seasonal cycle longer
 than the history avsm keeps; a daily stock count that sits flat between
 counts, comes at irregular hours or not at all for eleven days; a supplier

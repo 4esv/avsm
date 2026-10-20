@@ -15,12 +15,15 @@ says:
                  (the contractor's cap is 1 a week)
 
 Sane nights: the queue hires a contractor when the backlog is over 900 and
-none is booked or working, else runs overtime when it is over 600; it
-never thinks of fatigue, as a model that believes overtime helps would not.
+none is booked or working, else runs overtime when it is over 600, unless
+overtime ran on both of the two days before: its effect reverses on the
+third day running, and a careful operator rests it that day.
 The co-op sets both budgets on day 0 and moves them on a few fixed days
 (two of which the allocation must refuse: a change inside the deadband and
-a reversal inside the hold). The model reads the world's state.json to
-decide, as a model that read the records well would.
+a reversal inside the hold). A pantry order costs 3 and its cap is 1 a day,
+and a contractor costs 3, so both children keep 3 of the 6; the queue is
+put back to 3 on day 51, once the hold on day 45's budget has run out.
+The model reads the world's state.json to decide, as a model that read the records well would.
 
 With --escalate it is the second backend: never compromised.
 Usage: model.py <world dir> [--escalate], the request JSON on stdin."""
@@ -86,12 +89,15 @@ if venture == "queue":
     booked = any(w[0] in ("cwait", "con") for w in q.get("work", [])) or s.get("pending", {}).get("con", 0)
     if b > 900 and not booked:
         out(act("contractor", f"the backlog is {b:.0f} and no contractor is booked"))
+    ot = set(q.get("ot_days", []))
+    if b > 600 and (day - 1) in ot and (day - 2) in ot:
+        out({"choice": "nothing", "reason": "overtime ran the last two days; a third in a row reverses"})
     if b > 600:
         out(act("overtime", f"the backlog is {b:.0f}, over 600"))
     out({"choice": "nothing", "reason": "the backlog is under 600"})
 if venture == "coop":
     plan = {0: ["pantry 3", "queue 3"], 20: ["queue 4"], 46: ["queue 5"], 49: ["queue 3"],
-            56: ["pantry 5"], 60: ["queue 1"]}
+            51: ["queue 3"]}
     if day in plan:
         out({"choices": [act("budget", "the plan for today", b) for b in plan[day]]})
     out({"choice": "nothing"})

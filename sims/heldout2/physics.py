@@ -20,7 +20,7 @@ DAY_S = 86400
 
 SCHEDULE = {
     # reservoir: the level sensor's float jams against its housing and reads
-    # at most 92.0 for ten days of the first wet season; storms in it and in
+    # at most 84.0 for ten days of the first wet season; storms in it and in
     # the second wet season.
     **{d: ["res:saturate"] for d in range(22, 32)},
     # pantry: the cycle count comes in at irregular hours, or not at all.
@@ -37,7 +37,7 @@ SCHEDULE[24] = SCHEDULE[24] + ["res:storm"]
 SCHEDULE[28] = SCHEDULE[28] + ["res:storm"]
 SCHEDULE[40] = SCHEDULE[40] + ["pan:irregular"]
 SCHEDULE[83] = ["res:storm"]
-SATURATE_AT = 92.0          # what the jammed float reads at most
+SATURATE_AT = 84.0          # what the jammed float reads at most
 GATEWAY_HOURS = {10, 12}    # the gateway's reboot: two readings of 0
 LEAK_DAY = 55               # pantry shrinkage starts and grows from here
 COUNT_SKIPPED = {33, 37}    # irregular days with no count at all

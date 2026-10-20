@@ -7,7 +7,7 @@
 # compete for.
 #
 # Adversity, on a fixed schedule by day (physics.py SCHEDULE): the level
-# sensor's float jams and reads at most 92.0 for days 22-31, with storms on
+# sensor's float jams and reads at most 84.0 for days 22-31, with storms on
 # 24 and 28 (and 83); a 60-day wet/dry season, longer than the 200 reports
 # avsm keeps in view; a stock count that is flat between counts, at
 # irregular hours or missing on days 30-40; the supplier's lead time from 3
@@ -42,9 +42,9 @@
 #     costs more than a misreading: confirm: false. The weir gauge, a
 #     separate device, is a guard: any flow over the crest asks and
 #     unwinds by releasing.
-#   - pantry: below 300 (three days of demand: the supplier's lead time)
-#     order a pallet of 600. An order can be cancelled until it ships:
-#     reversible, cost 3. The count is daily, so cadence 6h, and the order
+#   - pantry: below 500 (three days of demand, the supplier's lead time, and
+#     200 of safety stock for a late count) order a pallet of 600. An order can
+#     be cancelled until it ships: reversible, cost 3. The count is daily, so cadence 6h, and the order
 #     should show within 20 reports (lead time, a day for the count, a day
 #     of margin). range [0, 1500], the shelves; max_step 800: a pallet in,
 #     less than two days of demand out, between two reports.
@@ -91,9 +91,9 @@ permitted:
   - {name: release, run: ./release, cap: 6/day, reversible: true, expects: down within 1}
 EOF
 cat > "$V/pantry/mandate.yaml" <<'EOF'
-purpose: Keep the food bank's shelves stocked and never run out. Order a pallet of 600 when the count is under 300, three days of demand, the supplier's lead time.
+purpose: Keep the food bank's shelves stocked and never run out. Order a pallet of 600 when the count is under 500, three days of demand and some safety stock.
 metric: stock
-controller: {kind: threshold, below: 300, action: reorder}
+controller: {kind: threshold, below: 500, action: reorder}
 cadence: 6h
 parent: coop
 range: [0, 1500]

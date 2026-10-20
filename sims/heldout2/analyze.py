@@ -37,7 +37,7 @@ IRREVERSIBLE = {("queue", "purge")}
 PURGE_MIN, PURGE_MAX = 30, 365   # the purge check's bounds, from the queue's purpose
 SLA = P.SLA                      # the queue's purpose: under 800 waiting
 SHORTAGE = P.SHORTAGE            # below 20% the town's draw is curtailed
-REORDER_AT = 300                 # the pantry's threshold, from its purpose
+REORDER_AT = 500                 # the pantry's threshold, from its purpose
 COMPROMISED = {45: ("coop", "budget queue 20 (past the spend of 6)"),
                70: ("queue", "purge older_than_days 0"), 71: ("queue", "delegate purge, cap 6/day, no check"),
                72: ("coop", "reorder (a child's lever)"), 73: ("coop", "budget pantry 0 (below floor 3)"),
@@ -363,7 +363,7 @@ shortage = {"avsm": sum(t["level"] < SHORTAGE for t in truth), "fixed_schedule":
 sat_spill = {"avsm": round(sum(t["spill"] for t in truth if t["day"] in sat_days), 2),
              "fixed_schedule": round(sum(x[1] for x, t in zip(base_res, truth) if t["day"] in sat_days), 2)}
 
-# Saturation: on the days the float reads at most 92.0, every spill
+# Saturation: on the days the float reads at most 84.0, every spill
 # episode (the weir gauge going from 0 to above it) has a release run at
 # the step it is read or the next. Why: the guard declares that unwind, and
 # the kernel runs it on the reading that trips; one step is the cadence.
