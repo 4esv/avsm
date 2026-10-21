@@ -97,17 +97,20 @@ pub fn build(index: &Index, adopted: &[Adopted], now: i64, b: &Basis) -> Packet 
 
 /// What a forecast found for the venture's metric under each policy, in
 /// the order all, none, mixed, each against the mandate's threshold when
-/// its controller has one.
+/// its controller has one, or against both sides of its band.
 pub fn policy_forecasts(
     outcome: &Outcome,
     venture: &str,
     mandate: &Mandate,
 ) -> Vec<PolicyForecast> {
     let metric = mandate.metric_name();
-    let bound = match &mandate.controller {
-        Controller::Threshold { above: Some(b), .. } => Some((*b, true)),
-        Controller::Threshold { below: Some(b), .. } => Some((*b, false)),
-        _ => None,
+    // Each bound with the side it holds the metric from: a band's low
+    // first, then its high.
+    let bounds: Vec<(f64, bool)> = match &mandate.controller {
+        Controller::Threshold { above: Some(b), .. } => vec![(*b, true)],
+        Controller::Threshold { below: Some(b), .. } => vec![(*b, false)],
+        Controller::Band { low, high, .. } => vec![(*low, false), (*high, true)],
+        _ => vec![],
     };
     Policy::EVERY
         .iter()
@@ -117,18 +120,22 @@ pub fn policy_forecasts(
                 .iter()
                 .find(|s| s.venture == venture && s.policy == *policy && s.variant.is_none())?;
             let q = &s.metrics.iter().find(|m| m.name == metric)?.quantiles;
-            let threshold = bound.map(|(b, above)| {
-                let past = |x: f64| if above { x > b } else { x < b };
-                let side = if above { "above" } else { "below" };
-                let n = crate::record::round(b);
-                if past(q.p95) && past(q.p5) {
-                    format!("fails: {side} {n} even at p95")
-                } else if !past(q.p5) && !past(q.p95) {
-                    format!("holds: not {side} {n} even at p5")
-                } else {
-                    format!("may fail: {side} {n} in part of the seeds")
-                }
-            });
+            let found: Vec<String> = bounds
+                .iter()
+                .map(|&(b, above)| {
+                    let past = |x: f64| if above { x > b } else { x < b };
+                    let side = if above { "above" } else { "below" };
+                    let n = crate::record::round(b);
+                    if past(q.p95) && past(q.p5) {
+                        format!("fails: {side} {n} even at p95")
+                    } else if !past(q.p5) && !past(q.p95) {
+                        format!("holds: not {side} {n} even at p5")
+                    } else {
+                        format!("may fail: {side} {n} in part of the seeds")
+                    }
+                })
+                .collect();
+            let threshold = (!found.is_empty()).then(|| found.join("; "));
             Some(PolicyForecast {
                 policy: policy.name().to_string(),
                 metric: metric.to_string(),
@@ -259,4 +266,108 @@ pub fn option_forecast(outcome: &Outcome, venture: &str, policy: Policy) -> Opti
         breach: s.guards.iter().map(|g| g.p).fold(0.0, f64::max),
         spend: crate::record::round(s.reached.spend.p50),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::{Envelope, Quantiles, Reached};
+
+    fn quantiles(p5: f64, p50: f64, p95: f64) -> Quantiles {
+        Quantiles {
+            p5,
+            p10: p5,
+            p25: p50,
+            p50,
+            p75: p50,
+            p90: p95,
+            p95,
+        }
+    }
+
+    fn forecast(p5: f64, p50: f64, p95: f64) -> Outcome {
+        let zero = quantiles(0.0, 0.0, 0.0);
+        let summary = crate::forecast::Summary {
+            venture: "bay".to_string(),
+            policy: Policy::EVERY[0],
+            variant: None,
+            metrics: vec![Envelope {
+                name: "temperature".to_string(),
+                quantiles: quantiles(p5, p50, p95),
+            }],
+            guards: vec![],
+            reached: Reached {
+                spend: zero,
+                asks: zero,
+                refusals: zero,
+                halts: zero,
+                delegations: zero,
+            },
+        };
+        Outcome {
+            days: 30,
+            seeds: 8,
+            step: 3600,
+            branches: 8,
+            summaries: vec![summary],
+            walls: vec![],
+            field: None,
+            trials: 0,
+            pbo: vec![],
+            marks: vec![],
+            tried: 0,
+            nested: 0,
+        }
+    }
+
+    fn mandate(controller: &str) -> Mandate {
+        Mandate::parse(&format!(
+            "purpose: p\nmetric: temperature\ncontroller: {controller}\ncadence: 1h\n\
+             permitted:\n- {{name: heat, run: ./h, cap: 2/day, reversible: true}}\n\
+             - {{name: cool, run: ./c, cap: 2/day, reversible: true}}\n"
+        ))
+        .unwrap()
+    }
+
+    fn bound(controller: &str, outcome: &Outcome) -> Option<String> {
+        let got = policy_forecasts(outcome, "bay", &mandate(controller));
+        assert_eq!(got.len(), 1);
+        got[0].threshold.clone()
+    }
+
+    #[test]
+    fn a_threshold_shows_its_one_bound() {
+        let t = "{kind: threshold, above: 24, action: cool}";
+        assert_eq!(
+            bound(t, &forecast(25.0, 26.0, 28.0)).unwrap(),
+            "fails: above 24 even at p95"
+        );
+    }
+
+    #[test]
+    fn a_band_shows_both_sides_in_the_voice_of_a_threshold() {
+        let b = "{kind: band, low: 19, high: 24, below: heat, above: cool}";
+        let said = |p5, p50, p95| bound(b, &forecast(p5, p50, p95)).unwrap();
+        assert_eq!(
+            said(20.0, 21.0, 23.0),
+            "holds: not below 19 even at p5; holds: not above 24 even at p5"
+        );
+        assert_eq!(
+            said(15.0, 21.0, 23.0),
+            "may fail: below 19 in part of the seeds; holds: not above 24 even at p5"
+        );
+        assert_eq!(
+            said(20.0, 25.0, 28.0),
+            "holds: not below 19 even at p5; may fail: above 24 in part of the seeds"
+        );
+        assert_eq!(
+            said(10.0, 12.0, 15.0),
+            "fails: below 19 even at p95; holds: not above 24 even at p5"
+        );
+    }
+
+    #[test]
+    fn a_controller_without_a_bound_shows_none() {
+        assert_eq!(bound("{kind: model}", &forecast(1.0, 2.0, 3.0)), None);
+    }
 }
