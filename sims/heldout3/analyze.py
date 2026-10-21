@@ -117,7 +117,13 @@ bad = []
 for seq, r in intents.items():
     steps = (r.get("proof") or {}).get("steps", [])
     lever = "%s/%s" % (r["venture"], r.get("action"))
-    has_decision = any(s.get("claim") == "declared" and s.get("seq") not in mandate_seqs for s in steps)
+    # A decision step carries no claim of its own; it is human-approved when
+    # the record it cites is a declared approval.
+    has_decision = any(
+        s.get("step") == "decision"
+        and REC.get(s.get("seq"), {}).get("claim") == "declared"
+        and REC.get(s.get("seq"), {}).get("verdict", {}).get("verdict") == "approve"
+        for s in steps)
     delegated = any(s.get("step") == "permitted" and s.get("delegated") for s in steps)
     for s in steps:
         c = s.get("claim")
