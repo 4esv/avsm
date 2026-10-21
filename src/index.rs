@@ -39,8 +39,8 @@ pub const LOCAL: &str = "local";
 pub struct Pulled {
     pub pause: Option<Seq>,
     pub resume: Option<Seq>,
-    /// seq, above, bound
-    pub threshold: Option<(Seq, bool, f64)>,
+    /// The latest of each side, below then above: seq, bound.
+    pub threshold: [Option<(Seq, f64)>; 2],
     /// seq, amount
     pub budget: Option<(Seq, u32)>,
     /// Every budget set: seq, when, amount; oldest first.
@@ -700,8 +700,9 @@ impl Index {
             ParentCall::Pause { .. } => latest(pulled.pause.get_or_insert(seq), seq),
             ParentCall::Resume { .. } => latest(pulled.resume.get_or_insert(seq), seq),
             ParentCall::Threshold { above, bound, .. } => {
-                if pulled.threshold.is_none_or(|(s, _, _)| s < seq) {
-                    pulled.threshold = Some((seq, above, bound))
+                let side = &mut pulled.threshold[usize::from(above)];
+                if side.is_none_or(|(s, _)| s < seq) {
+                    *side = Some((seq, bound))
                 }
             }
             ParentCall::Budget { amount, .. } => {

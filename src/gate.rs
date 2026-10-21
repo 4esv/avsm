@@ -749,10 +749,19 @@ pub fn effective_thresholds_in(
 ) -> Vec<Threshold> {
     let refs: Vec<&Adopted> = mandates.iter().collect();
     let mut ts = mandate_thresholds(&refs, venture);
-    if let Some((seq, above, bound)) =
-        pulled_by_parent(index, &refs, venture).and_then(|p| p.threshold)
-    {
-        moved(&mut ts, seq, above, bound);
+    if let Some(p) = pulled_by_parent(index, &refs, venture) {
+        // Oldest first, so on a single threshold the latest call wins; a
+        // band keeps the latest call of each side.
+        let mut calls: Vec<(Seq, bool, f64)> = p
+            .threshold
+            .iter()
+            .zip([false, true])
+            .filter_map(|(c, above)| c.map(|(seq, bound)| (seq, above, bound)))
+            .collect();
+        calls.sort_by_key(|c| c.0);
+        for (seq, above, bound) in calls {
+            moved(&mut ts, seq, above, bound);
+        }
     }
     ts
 }
@@ -4722,6 +4731,86 @@ mod tests {
         let r = fx.push(report(Claim::Measured, 23.0));
         assert!(fx.gate(V, "cool", &[r]).is_ok(), "over the parent's high");
         assert!(fx.gate(V, "heat", &[r]).is_err());
+    }
+
+    #[test]
+    fn the_parent_moves_both_sides_of_a_band_one_call_each() {
+        let mut fx = Fx::new();
+        family(
+            &mut fx,
+            vec![parent_lever("threshold", true)],
+            mandate(
+                band(19.0, 24.0),
+                vec![
+                    permit("heat", 9, true, false),
+                    permit("cool", 9, true, false),
+                ],
+                &[],
+            ),
+        );
+        let low = fx.push(parent_action(
+            "portfolio",
+            "threshold",
+            &format!("{V} below 20"),
+        ));
+        let high = fx.push(parent_action(
+            "portfolio",
+            "threshold",
+            &format!("{V} above 22"),
+        ));
+        let side = |above, bound, action: &str, from| Threshold {
+            above,
+            bound,
+            action: action.into(),
+            from,
+        };
+        assert_eq!(
+            effective_thresholds(&fx.entries, &fx.adopted, V),
+            vec![
+                side(false, 20.0, "heat", Some(low)),
+                side(true, 22.0, "cool", Some(high))
+            ]
+        );
+    }
+
+    #[test]
+    fn the_latest_call_moves_a_single_threshold_whichever_side_it_names() {
+        let mut fx = Fx::new();
+        family(
+            &mut fx,
+            vec![parent_lever("threshold", true)],
+            mandate(
+                above(30.0, "vent"),
+                vec![permit("vent", 9, true, false)],
+                &[],
+            ),
+        );
+        let call = |fx: &mut Fx, call: &str| {
+            fx.push(parent_action(
+                "portfolio",
+                "threshold",
+                &format!("{V} {call}"),
+            ))
+        };
+        let moved_to = |fx: &Fx, above, bound, from| {
+            assert_eq!(
+                effective_thresholds(&fx.entries, &fx.adopted, V),
+                vec![Threshold {
+                    above,
+                    bound,
+                    action: "vent".into(),
+                    from: Some(from)
+                }]
+            )
+        };
+        call(&mut fx, "above 25");
+        let t = call(&mut fx, "below 10");
+        moved_to(&fx, false, 10.0, t);
+        let t = call(&mut fx, "above 22");
+        moved_to(&fx, true, 22.0, t);
+        call(&mut fx, "below 12");
+        let t = call(&mut fx, "above 21");
+        moved_to(&fx, true, 21.0, t);
     }
 
     #[test]
