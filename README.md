@@ -100,8 +100,10 @@ mandate.
 A guard is a reading of its own that the warden takes beside the metric, with
 a bound. Past it, the guard pauses the venture (`then: pause`, the default) or
 asks once (`then: ask`); either way no lever but stop runs until the reading is
-back inside, whatever approves it. A guard may not read a lever's command or
-the metric's. A drawdown guard falls from the metric's peak. A guard may
+back inside, whatever approves it. Every lever of the venture is refused, a
+band's corrective one and a delegation too; only stop and the guard's own
+unwind pass. A failed or implausible reading neither trips a guard nor clears
+it. A guard may not read a lever's command or the metric's. A drawdown guard falls from the metric's peak. A guard may
 declare an `unwind`: one permitted lever and the exact payload it takes, which
 the kernel runs once per episode when the guard trips (and on later readings
 past the bound until it has run ok), under the lever's cap, budget and check;
@@ -134,7 +136,18 @@ from 398 is implausible though a delivery of 600 is not. Beside `max_step`, each
 must be smaller than it and bounds its way tighter; a way bounded by neither is
 unbounded. On a threshold, `deadband: 2` acts once
 and again only after the metric comes back past the bound by 2; `hold: 3` acts
-after three crossed reports in a row.
+after three crossed reports in a row. A deadband means one action per
+excursion, whether or not the lever then ran and even if the metric is still
+past the bound after it; on a band, one for each side. Leave it off where one
+run only nudges the metric and the lever should go on running, within its cap,
+until the metric is back inside.
+
+A report's number is its last non-empty line, and that line is the number
+alone (`count: 5` is a failed report). Text before it is dropped for the
+metric and for a guard, whose record carries no note. For an audit the lines
+above the number are the note, at most 2000 characters, which a payload check
+may read and no model sees. A command that exits non-zero or prints no number
+is a failed report, kept with a note that says why.
 
 A reading is what a model may see that it could not otherwise: its command
 prints lines and then a number, and the warden keeps only the lines that are
@@ -196,6 +209,17 @@ backends:
   mine: { kind: command, run: /opt/mine/classify }
 ```
 
+Other keys in `config.yaml`, each optional (`avsmd -T` prints them all as
+they stand): `ratchet: 5` is the approvals of one lever that make `self` propose
+delegating it, 0 for never; `forecast: {days: 30, seeds: 16}` is how far and how
+wide the forecasts at add, before a ratchet ask and in a decision packet look,
+and `seeds: 0` turns them off; `canary_asks: {every: 20}` writes a canary ask
+after that many asks, and is off when absent; `port: 2876` is the
+tailnet port; `adapters:` says where `stripe` and `github` reach, each
+`{url: ...}`, and how `mail.send` sends, `mail: {command: "sendmail -t -i",
+from: you@example.com}`; an `anthropic` backend also takes `url` and `effort`
+(`low` to `max`), and a `command` backend `offbox`.
+
 Keys go in `keys` in the home, one `name=value` per line, readable by you alone.
 Only the warden, the one process avsmd starts that may act, ever reads them; the
 process that talks to models holds no keys and runs as `nobody` when avsmd runs
@@ -227,8 +251,28 @@ command flagged `offbox: true`) is asked only for a venture whose mandate says
 `avsm add`. A mandate change proposed by self or the ratchet that adds it is
 refused.
 
-Before it chooses, the model may look things up with `know` and `why`, a few
-times, and every look is a record. A mandate may also permit `research`, a
+The request has a `system` and a `user` text; a `command` backend gets both as
+one JSON object, `{"backend", "system", "user"}`, on standard input and prints
+its reply, so a command that saves its input shows exactly what a model is
+shown. The `user` text lists the permitted levers with their caps, the
+children with their state and recent records, the readings, the forbidden
+levers, the recent records and the open asks. The reply is one JSON object on
+one line:
+
+```json
+{"choice": "nothing", "reason": "all quiet"}
+{"choice": "action", "action": "discount", "reason": "slow day"}
+{"choice": "ask", "question": "Refund order 7?", "action": "refund"}
+{"choices": [{"choice": "action", "action": "reply", "payload": "..."}, {"choice": "nothing"}]}
+```
+
+A lever that takes content needs a `payload` field too: a string for `text`,
+`diff` or `file`, an object for `json`. `choices` carries up to five
+independent choices, each judged alone. A `classifier` answers one word
+instead: `nothing`, `ask`, or a permitted lever. Before it chooses, the model
+may look things up with `{"choice": "know", "topic": "<venture or topic>"}`
+and `{"choice": "why", "record": 12}`, three times at most, and every look is
+a record. A mandate may also permit `research`, a
 lever that sends a question to a command you name under `research:` in the
 config and keeps what comes back as inferred facts, each with its source. No
 provider is built in; the command is the provider.
@@ -251,10 +295,24 @@ and its outcome is written before avsmd exits 0.
 `avsm doctor` changes nothing. Each check it fails prints the command that
 fixes it, and it exits with the worst code it found. Both binaries exit as
 sysexits.h says: 64 for bad usage, 65 for input avsmd refused, 69 when no
-avsmd is running, 78 for a config or mandate that does not hold. Records go to
+avsmd is running, 78 for a config or mandate that does not hold. `avsm doctor`
+exits 0 when every check passes, and otherwise with the worst code it found, in
+this order: 65 a ledger that is not a database or whose chain is broken, 78 a
+config or mandate that does not hold, 77 a permission missing, 73 a home that
+is not a directory, 66 a home or mandate directory that is not there, 69 no
+avsmd answering. A sound ledger and no daemon running is 69. avsmd itself
+exits 75 when another is already answering. Records go to
 standard output, diagnostics to standard error, and nothing is in color.
 `avsm tail --since <number>` prints every record after that one, for a script
 that follows the ledger.
+
+The ledger is `ledger.db` in the home, a SQLite file in WAL mode, for tools of
+your own to read; open it read-only. One table, `records`: `seq` (the record
+number), `at` (unix seconds), `prev` and `hash` (SHA-256 hex, the chain),
+`weight` (always 1) and `record`, the record as JSON, whose `kind` (`report`,
+`proposal`, `action`, `ask` and so on), `claim` (`measured`, `declared` or
+`inferred`) and `venture` are always present. Triggers refuse every `UPDATE`
+and `DELETE`: the ledger is append-only.
 
 ## Ventures from one file
 
@@ -280,6 +338,12 @@ above 25` moves the line a child's reports cross. Parents allocate; children
 act. A parent never runs a child's lever, and its nightly call sees its
 children's numbers and records, not what the world told them.
 
+A child may be listed with terms, `children: [{name: shop, priority: 2, floor:
+3}, inbox]`. `floor` (0 unless set) is the least budget the parent may set for
+the child, and no approval lifts it. `priority` (0 unless set, higher is cut
+last) refuses a cut to a child's budget while a lower-priority sibling has a
+budget set above its own floor.
+
 A parent may say `allocation: {deadband: 2, hold: 5d, total: 6}`: a budget
 change under 2 is refused, so is moving a budget back inside five days, and
 so is any budget that brings its children's budgets past 6 (a child with
@@ -289,7 +353,19 @@ total, so a budget that should not have been set is undone at once.
 
 Limits shared by every venture go in the config as `quotas: {asks: 20/day,
 spend: 100/day, sends: 10/day}`; avsm refuses what would pass one before the
-gate is even asked, and `avsm why` shows the quota.
+gate is even asked, and `avsm why` shows the quota. A cap or quota window is
+the 24 hours before now for `day`, 60 minutes for `hour`, 7 days for `week`:
+`6/day` is six in any 24 hours, not six per calendar day, and no time zone
+enters. A venture's daily budget is counted the same way. Only the built-in
+metric `stripe.charges_today` counts from midnight UTC.
+
+The asks avsm writes on its own count against the `asks` quota, except those
+that carry a signal: a saturated or ineffective lever, an intent with no
+outcome, a tripped guard that asks, an audit, an implausible report, a warning
+of critical slowing down, a forecast that reaches a wall and a capacity
+shortfall. Those are measured and sit outside it, so they cannot starve the
+others. A canary ask and the ask for a run whose effect shows later than its
+`within` do count; a canary ask is not written when the quota is used up.
 
 ## Examples
 
