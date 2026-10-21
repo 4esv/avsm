@@ -157,6 +157,49 @@ fn a_cap_of_four_a_day_enforces_a_four_in_the_purpose() {
 }
 
 #[test]
+fn a_rise_and_a_fall_bound_read_back_and_enforce_the_numbers_in_the_purpose() {
+    let m = mandate(
+        "Never let equity jump more than 7 or drop more than 3 between reports.",
+        "max_rise: 7\nmax_fall: 3\nconfirm: false\n",
+    );
+    let text = render(&m);
+    for want in [
+        "max rise: equity rising more than 7 between reports is implausible",
+        "max fall: equity falling more than 3 between reports is implausible",
+        "confirm: off",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in\n{text}");
+    }
+    assert!(!text.contains("max step"), "{text}");
+    assert!(!text.contains("Nothing enforces"), "{text}");
+}
+
+#[test]
+fn a_step_bound_enforces_the_number_in_the_purpose() {
+    let m = mandate(
+        "Never let equity move more than 5 between reports.",
+        "max_step: 5\n",
+    );
+    let text = render(&m);
+    assert!(
+        text.contains("max step: equity moving more than 5"),
+        "{text}"
+    );
+    assert!(!text.contains("Nothing enforces"), "{text}");
+}
+
+#[test]
+fn a_guard_and_an_audit_rise_and_fall_bound_enforce_the_numbers_in_the_purpose() {
+    let m = mandate(
+        "Heat may not jump 6 and weeds may not drop 4 between readings.",
+        "guards:\n  - {name: heat, adapter: shell echo 1, above: 40, then: ask, max_rise: 6}\n\
+         audits:\n  - {name: weeds, adapter: shell echo 1, worse: up, tolerance: 2, window: 4, max_fall: 4}\n",
+    );
+    let text = render(&m);
+    assert!(!text.contains("Nothing enforces"), "{text}");
+}
+
+#[test]
 fn a_purpose_with_no_numbers_has_no_nothing_enforces_section() {
     let text = render(&mandate("Keep the shop tidy.", ""));
     assert!(!text.contains("Nothing enforces"), "{text}");

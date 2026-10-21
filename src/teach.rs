@@ -102,7 +102,7 @@ fn close(a: f64, b: f64) -> bool {
 
 /// Every number the mandate holds the venture to: guard bounds and
 /// drawdowns, threshold and band bounds, cap counts, costs, floors, range bounds,
-/// the largest step.
+/// the largest step, rise and fall.
 pub fn enforced(m: &Mandate) -> Vec<f64> {
     let mut v = Vec::new();
     for g in &m.guards {
@@ -127,7 +127,14 @@ pub fn enforced(m: &Mandate) -> Vec<f64> {
         v.push(lo);
         v.push(hi);
     }
-    v.extend(m.max_step);
+    for steps in [m.steps()]
+        .into_iter()
+        .chain(m.guards.iter().map(|g| g.steps()))
+        .chain(m.audits.iter().map(|a| a.steps()))
+        .flatten()
+    {
+        v.extend([steps.step, steps.rise, steps.fall].into_iter().flatten());
+    }
     v.extend(m.calibration);
     v
 }
@@ -337,12 +344,20 @@ pub fn render(m: &Mandate) -> String {
             num(hi)
         ));
     }
-    if let Some(s) = m.max_step {
-        line(format!(
-            "max step: {} moving more than {} between reports is implausible",
-            m.metric_name(),
-            num(s)
-        ));
+    if let Some(steps) = m.steps() {
+        for (key, moving, bound) in [
+            ("step", "moving", steps.step),
+            ("rise", "rising", steps.rise),
+            ("fall", "falling", steps.fall),
+        ] {
+            if let Some(b) = bound {
+                line(format!(
+                    "max {key}: {} {moving} more than {} between reports is implausible",
+                    m.metric_name(),
+                    num(b)
+                ));
+            }
+        }
         if !m.confirm {
             line(format!(
                 "confirm: off; a report of {} right after an implausible one is acted on at once",
