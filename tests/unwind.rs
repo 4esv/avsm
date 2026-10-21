@@ -524,3 +524,216 @@ fn another_tripped_guard_without_an_unwind_does_not_hold_this_one() {
     report(&mut k, &dir, "101");
     assert_eq!(trades(&dir).len(), 1, "{}", lines(&k));
 }
+
+// ----- a suspension and the unwind -----
+
+/// The heldout2 reservoir: the level and a weir gauge, `spill`, read by
+/// separate sensors. The guard unwinds by releasing; release expects the
+/// level down within one report.
+fn reservoir(parent: &Path) -> PathBuf {
+    let dir = parent.join("reservoir");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        "purpose: Keep the reservoir from spilling.\nmetric: level\n\
+         controller: {kind: threshold, above: 85, action: release}\ncadence: 2h\n\
+         range: [0, 100]\nmax_step: 8\nconfirm: false\n\
+         guards:\n\
+         \x20 - {name: spill, run: cat spill, above: 0, then: ask, range: [0, 50], unwind: {action: release}}\n\
+         permitted:\n\
+         \x20 - {name: release, run: echo release >> releases, cap: 9/day, reversible: true, expects: down within 1}\n",
+    )
+    .unwrap();
+    script(&dir, "report", "cat value");
+    dir
+}
+
+fn releases(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("releases"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Read the level and the weir gauge.
+fn read(k: &mut Kernel, dir: &Path, level: &str, spill: &str) {
+    std::fs::write(dir.join("value"), level).unwrap();
+    std::fs::write(dir.join("spill"), spill).unwrap();
+    k.report("reservoir", false);
+    avsmd::clock::advance(7_200);
+}
+
+fn release_suspended(k: &Kernel) -> bool {
+    let index = k.index().unwrap().suspended("reservoir", "release");
+    let reference = gate::reference::suspended(&k.entries().unwrap(), "reservoir", "release");
+    assert_eq!(index, reference, "the index and the reference agree");
+    index
+}
+
+/// The latest report of a metric.
+fn latest(k: &Kernel, metric: &str) -> Seq {
+    k.entries()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| matches!(&e.record, Record::Report { metric: m, .. } if m == metric))
+        .unwrap()
+        .seq
+}
+
+/// The gate's word on release citing these, from the index and from the
+/// reference, which agree.
+fn release_gate(k: &Kernel, cites: Vec<Seq>) -> Result<gate::Proof, gate::Refusal> {
+    let candidate = Candidate {
+        venture: "reservoir".into(),
+        action: "release".into(),
+        cites,
+    };
+    let now = avsmd::kernel::now();
+    let adopted = k.adopted();
+    let got = gate::gate_in(
+        &k.index().unwrap(),
+        &candidate,
+        &adopted,
+        &k.config.quotas,
+        now,
+    );
+    let want = gate::reference::gate(&candidate, &k.entries().unwrap(), &adopted, now);
+    assert_eq!(got, want, "the index and the reference agree");
+    got
+}
+
+#[test]
+fn a_suspension_seen_only_on_a_stuck_sensor_never_holds_a_guards_unwind() {
+    let _c = clock();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = reservoir(tmp.path());
+    let mut k = kernel(&tmp.path().join("home"));
+    k.add(&dir).unwrap();
+    for level in ["80", "81", "83", "82", "84"] {
+        read(&mut k, &dir, level, "0");
+    }
+    // The level saturates at 84 while the water rises: the weir spills,
+    // the unwind runs, and the level still reads 84, stuck at the value
+    // from before the run. Release is suspended on that reading alone.
+    read(&mut k, &dir, "84", "1.9");
+    assert_eq!(releases(&dir), 1, "{}", lines(&k));
+    read(&mut k, &dir, "84", "0");
+    assert!(release_suspended(&k), "{}", lines(&k));
+    // The weir spills again: a new episode. The gauge is measured, by
+    // another sensor; the frozen level cannot show what release did, so
+    // its suspension does not hold the unwind the mandate declares.
+    read(&mut k, &dir, "84", "0.6");
+    assert_eq!(releases(&dir), 2, "{}", lines(&k));
+    let ran = intents(&k, "release");
+    let Record::Intent { proof, .. } = &ran[1].record else {
+        unreachable!()
+    };
+    assert_eq!(proof.unwind(), Some("spill"));
+    assert!(proof.past_stuck(), "{:?}", proof.steps);
+    let why = k.why(ran[1].seq).unwrap();
+    assert!(
+        why.contains("rests only on readings flagged stuck"),
+        "the proof says why the suspension does not hold it: {why}"
+    );
+    assert!(
+        matches!(&ran[0].record, Record::Intent { proof, .. } if !proof.past_stuck()),
+        "the first unwind passed no suspension"
+    );
+    // Still suspended: a run on any other occasion is refused.
+    assert!(release_suspended(&k));
+    let spill = latest(&k, "guard.spill");
+    assert!(release_gate(&k, vec![spill]).is_ok(), "the unwind passes");
+    let level = latest(&k, "level");
+    let refused = release_gate(&k, vec![level]).unwrap_err();
+    assert!(refused.reasons.iter().any(|r| matches!(
+        r,
+        Reason::NeedsDecision {
+            suspended: true,
+            ..
+        }
+    )));
+}
+
+/// The measured asks that say release is ineffective.
+fn ineffective_asks(k: &Kernel) -> usize {
+    k.entries()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            matches!(&e.record, Record::Ask {
+                signal: Some(avsmd::record::Signal::Ineffective { action, .. }),
+                ..
+            } if action == "release")
+        })
+        .count()
+}
+
+#[test]
+fn an_unwind_past_a_stuck_suspension_is_never_a_miss_when_the_sensor_reads_again() {
+    let _c = clock();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = reservoir(tmp.path());
+    let mut k = kernel(&tmp.path().join("home"));
+    k.add(&dir).unwrap();
+    for level in ["80", "81", "83", "82", "84"] {
+        read(&mut k, &dir, level, "0");
+    }
+    read(&mut k, &dir, "84", "1.9");
+    read(&mut k, &dir, "84", "0");
+    assert!(release_suspended(&k));
+    // A human vouches for the frozen level: its 84s are believed.
+    for q in k.open_asks().unwrap() {
+        let implausible = k.entries().unwrap().iter().any(|e| {
+            e.seq == q
+                && matches!(&e.record, Record::Ask { question, .. } if question.contains("implausible"))
+        });
+        if implausible {
+            k.approve(q, None).unwrap();
+        }
+    }
+    // The unwind runs past the suspension, and the believed level reads
+    // 84 after it, as before.
+    read(&mut k, &dir, "84", "0.6");
+    assert_eq!(releases(&dir), 2, "{}", lines(&k));
+    read(&mut k, &dir, "84", "0");
+    read(&mut k, &dir, "84", "0");
+    assert_eq!(ineffective_asks(&k), 1, "{}", lines(&k));
+    // The level reads again, high: the stuck suspension is void. The run
+    // made while the sensor was frozen is no miss, so nothing suspends
+    // release again and the controller runs it on its own premises.
+    read(&mut k, &dir, "90", "0");
+    assert!(!release_suspended(&k), "{}", lines(&k));
+    assert_eq!(ineffective_asks(&k), 1, "{}", lines(&k));
+    assert_eq!(releases(&dir), 3, "{}", lines(&k));
+}
+
+#[test]
+fn a_suspension_measured_on_plausible_readings_holds_a_guards_unwind() {
+    let _c = clock();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = reservoir(tmp.path());
+    let mut k = kernel(&tmp.path().join("home"));
+    k.add(&dir).unwrap();
+    for level in ["80", "81", "83", "82", "80"] {
+        read(&mut k, &dir, level, "0");
+    }
+    // The weir spills, the unwind runs, and the level rises: measured on
+    // a plausible reading, release went the wrong way.
+    read(&mut k, &dir, "80", "1.9");
+    assert_eq!(releases(&dir), 1, "{}", lines(&k));
+    read(&mut k, &dir, "84", "0");
+    assert!(release_suspended(&k), "{}", lines(&k));
+    // The weir spills again: that finding holds the unwind.
+    read(&mut k, &dir, "83", "0.6");
+    assert_eq!(releases(&dir), 1, "{}", lines(&k));
+    assert!(
+        refusals(&k, "release")
+            .iter()
+            .any(|(r, _)| r.contains("NeedsDecision")),
+        "{:?}",
+        refusals(&k, "release")
+    );
+    let spill = latest(&k, "guard.spill");
+    assert!(release_gate(&k, vec![spill]).is_err());
+}

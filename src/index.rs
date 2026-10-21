@@ -810,8 +810,26 @@ impl Index {
     /// decision loosens, but for a miss seen only on stuck readings, which
     /// a plausible reading away from the frozen value voids (`voided`).
     pub fn suspended(&self, venture: &str, action: &str) -> bool {
-        let (latest, relapsed) = self.governing(venture, action);
-        relapsed || latest.is_some_and(|q| self.approval_of(venture, q).is_none())
+        !self.holding(venture, action).is_empty()
+    }
+
+    /// Does every measured record that holds this lever suspended, the
+    /// unanswered ask or a relapse since, cite a reading flagged stuck?
+    /// Such a suspension says the sensor could not see the lever act, not
+    /// that it did nothing. Asked only of a suspended lever.
+    pub fn suspended_on_stuck(&self, venture: &str, action: &str) -> bool {
+        self.holding(venture, action)
+            .iter()
+            .all(|s| self.stuck_cited(*s).is_some())
+    }
+
+    /// The measured records that hold this lever suspended: the latest
+    /// ask while no declared approval answers it, and every relapse
+    /// since.
+    fn holding(&self, venture: &str, action: &str) -> Vec<Seq> {
+        let (latest, mut relapses) = self.governing(venture, action);
+        relapses.extend(latest.filter(|q| self.approval_of(venture, *q).is_none()));
+        relapses
     }
 
     /// The ask and the declared decision that restored this lever: it had
@@ -821,7 +839,9 @@ impl Index {
     /// alone, and its proof says so.
     pub fn restored(&self, venture: &str, action: &str) -> Option<(Seq, Seq)> {
         match self.governing(venture, action) {
-            (Some(q), false) => self.approval_of(venture, q).map(|d| (q, d)),
+            (Some(q), relapses) if relapses.is_empty() => {
+                self.approval_of(venture, q).map(|d| (q, d))
+            }
             _ => None,
         }
     }
@@ -832,9 +852,9 @@ impl Index {
     }
 
     /// The latest non-void ineffective ask after the last declared
-    /// adoption, whose answer governs, and whether a measured relapse
-    /// after the latest ask suspended the lever again.
-    fn governing(&self, venture: &str, action: &str) -> (Option<Seq>, bool) {
+    /// adoption, whose answer governs, and the measured relapses after
+    /// the latest ask that suspended the lever again.
+    fn governing(&self, venture: &str, action: &str) -> (Option<Seq>, Vec<Seq>) {
         // A declared adoption of the mandate after the ask answers it too.
         let adopted = self.adoptions.get(venture).map_or(0, |a| a.seq);
         let key = (venture.to_string(), action.to_string());
@@ -846,11 +866,33 @@ impl Index {
                 .max()
         });
         let last_ask = asks.and_then(|a| a.iter().max()).copied().unwrap_or(0);
-        let relapsed = self.relapses.get(&key).is_some_and(|r| {
-            r.iter()
-                .any(|r| *r > adopted && *r > last_ask && !self.voided(venture, *r))
-        });
-        (latest, relapsed)
+        let relapses = self
+            .relapses
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|r| *r > adopted && *r > last_ask && !self.voided(venture, *r))
+            .collect();
+        (latest, relapses)
+    }
+
+    /// The metric of a trusted reading flagged stuck that this record
+    /// cites, if it cites one.
+    fn stuck_cited(&self, seq: Seq) -> Option<&str> {
+        self.get(seq)?
+            .record
+            .cites()
+            .iter()
+            .find_map(|c| match &self.get(*c)?.record {
+                Record::Report {
+                    metric,
+                    claim,
+                    implausible: Some(why),
+                    ..
+                } if claim.authorizes() && why.starts_with("stuck") => Some(metric.as_str()),
+                _ => None,
+            })
     }
 
     /// The latest ok run of this lever whose expectation is still waiting:
@@ -889,23 +931,8 @@ impl Index {
     /// evidence: the metric is not frozen. A miss measured on plausible
     /// readings cites none, and is never void.
     pub fn voided(&self, venture: &str, seq: Seq) -> bool {
-        let Some(e) = self.get(seq) else {
-            return false;
-        };
-        let metric = e
-            .record
-            .cites()
-            .iter()
-            .find_map(|c| match &self.get(*c)?.record {
-                Record::Report {
-                    metric,
-                    claim,
-                    implausible: Some(why),
-                    ..
-                } if claim.authorizes() && why.starts_with("stuck") => Some(metric.as_str()),
-                _ => None,
-            });
-        metric.is_some_and(|m| self.evidence(venture, m, Some(seq)).is_some())
+        self.stuck_cited(seq)
+            .is_some_and(|m| self.evidence(venture, m, Some(seq)).is_some())
     }
 
     /// New measured evidence about a metric since a record: a plausible

@@ -144,11 +144,16 @@ pub enum Step {
     /// A tripped guard's declared unwind: the measured reading past the
     /// bound, and the adopted mandate whose text names this lever with
     /// this payload. The payload is the mandate's, never a record's.
+    /// `past_stuck`: the lever is suspended only on readings flagged
+    /// stuck, which do not hold an unwind, and the run is never judged
+    /// on that frozen sensor.
     Unwind {
         guard: String,
         report: Seq,
         mandate: Seq,
         summary: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        past_stuck: bool,
     },
 }
 
@@ -327,6 +332,19 @@ impl Proof {
         })
     }
 
+    /// Did this unwind pass a suspension seen only on stuck readings?
+    pub fn past_stuck(&self) -> bool {
+        self.steps.iter().any(|s| {
+            matches!(
+                s,
+                Step::Unwind {
+                    past_stuck: true,
+                    ..
+                }
+            )
+        })
+    }
+
     /// The declared decision the proof rests on, if any.
     pub fn decision(&self) -> Option<Seq> {
         self.steps.iter().find_map(|s| match s {
@@ -474,11 +492,16 @@ ascent! {
     // declared decision has answered it, or a measured relapse suspended
     // it again
     relation suspended(String, String);
+    // venture, action: suspended, and every record that holds it cites a
+    // reading flagged stuck
+    relation suspended_on_stuck(String, String);
     relation needs_decision(String, String);
     // A suspended lever needs a declared decision for each run, whatever
     // its reversibility or delegation. The kernel refuses it and asks
-    // once an episode, not once a run.
-    needs_decision(v, a) <-- candidate(v, a), suspended(v, a), !approved(v, a, _, _);
+    // once an episode, not once a run. One exception: a suspension seen
+    // only on stuck readings does not hold a tripped guard's unwind.
+    needs_decision(v, a) <--
+        candidate(v, a), suspended(v, a), !approved(v, a, _, _), !unwinding_past_stuck(v, a);
     needs_decision(v, a) <-- candidate(v, a), permitted(v, a, _, false, _), !irreversible_ok(v, a);
 
     // Non-negotiable 9: content a model produced is inferred until a human
@@ -534,6 +557,11 @@ ascent! {
     justified(v, a) <-- unwinding(v, a);
     irreversible_ok(v, a) <-- permitted(v, a, _, false, _), unwinding(v, a);
     payload_ok(v, a) <-- takes(v, a), unwinding(v, a);
+    // A frozen sensor could not see the lever act; the guard's reading,
+    // from its own sensor, is measured and plausible. A suspension that
+    // rests on measured, plausible readings still holds the unwind.
+    relation unwinding_past_stuck(String, String);
+    unwinding_past_stuck(v, a) <-- unwinding(v, a), suspended_on_stuck(v, a);
     relation held(String, String);
     held(v, a) <-- candidate(v, a), guarded(v), !unwinding(v, a);
 
@@ -969,7 +997,11 @@ pub fn gate_in(
         now,
         |venture, action, since| index.used(venture, action, since),
         |venture| effective_thresholds_in(index, mandates, venture),
-        |venture, action| index.suspended(venture, action),
+        |venture, action| {
+            index
+                .suspended(venture, action)
+                .then(|| index.suspended_on_stuck(venture, action))
+        },
     );
     load_family_mandates(&mut p, &adopted);
     let budget = budget_of_in(index, &adopted, v);
@@ -1017,13 +1049,15 @@ fn adopts(e: &Entry, m: &Adopted) -> bool {
 
 /// The adopted mandates as facts: what each permits and forbids, how much
 /// of each cap is used, the thresholds, and what self may never do.
+/// `suspended` says whether a lever is suspended, and if so whether only
+/// on readings flagged stuck.
 fn load_mandates(
     p: &mut Rules,
     adopted: &[&Adopted],
     now: i64,
     used: impl Fn(&str, &str, i64) -> u32,
     thresholds: impl Fn(&str) -> Vec<Threshold>,
-    suspended: impl Fn(&str, &str) -> bool,
+    suspended: impl Fn(&str, &str) -> Option<bool>,
 ) {
     for m in adopted {
         let venture = m.venture.clone();
@@ -1036,8 +1070,12 @@ fn load_mandates(
                 perm.reversible,
                 perm.delegated,
             ));
-            if suspended(&venture, &perm.name) {
+            if let Some(on_stuck) = suspended(&venture, &perm.name) {
                 p.suspended.push((venture.clone(), perm.name.clone()));
+                if on_stuck {
+                    p.suspended_on_stuck
+                        .push((venture.clone(), perm.name.clone()));
+                }
             }
             let window = perm.cap.per.as_secs() as i64;
             let n = used(&venture, &perm.name, now - window);
@@ -1638,6 +1676,7 @@ fn assemble<'a>(
                 report: e.seq,
                 mandate: m.seq,
                 summary,
+                past_stuck: p.unwinding_past_stuck.iter().any(|(x, y)| x == v && y == a),
             });
         }
         cited.insert(*s);
@@ -2081,9 +2120,15 @@ impl fmt::Display for Step {
                 report,
                 mandate,
                 summary,
+                past_stuck,
             } => write!(
                 f,
-                "unwind     guard {guard} past its bound at #{report}; mandate #{mandate} declares this lever with {summary}: a delegation of exactly this payload, so no ask"
+                "unwind     guard {guard} past its bound at #{report}; mandate #{mandate} declares this lever with {summary}: a delegation of exactly this payload, so no ask{}",
+                if *past_stuck {
+                    "; its suspension rests only on readings flagged stuck, which cannot show it act, so it does not hold the unwind"
+                } else {
+                    ""
+                }
             ),
         }
     }
@@ -2767,7 +2812,10 @@ pub mod reference {
                     .count() as u32
             },
             |venture| effective_thresholds(ledger, mandates, venture),
-            |venture, action| suspended(ledger, venture, action),
+            |venture, action| {
+                suspended(ledger, venture, action)
+                    .then(|| suspended_on_stuck(ledger, venture, action))
+            },
         );
         load_family(&mut p, ledger, &adopted);
         let budget = budget_of(ledger, &adopted, v);
@@ -2806,21 +2854,7 @@ pub mod reference {
     /// it is further from the last plausible one before it than the noise
     /// of those before it?
     fn voided(ledger: &[Entry], venture: &str, e: &Entry) -> bool {
-        let get = |s: Seq| ledger.iter().find(|x| x.seq == s);
-        let Some(metric) = e
-            .record
-            .cites()
-            .iter()
-            .find_map(|c| match &get(*c)?.record {
-                Record::Report {
-                    metric,
-                    claim,
-                    implausible: Some(why),
-                    ..
-                } if claim.authorizes() && why.starts_with("stuck") => Some(metric.clone()),
-                _ => None,
-            })
-        else {
+        let Some(metric) = stuck_cited(ledger, e.seq) else {
             return false;
         };
         let series: Vec<(Seq, f64)> = ledger
@@ -2852,8 +2886,43 @@ pub mod reference {
     /// measured relapse after the latest such ask and after any adoption
     /// suspend it again? An ask or relapse that is void is neither.
     pub fn suspended(ledger: &[Entry], venture: &str, action: &str) -> bool {
-        let (latest, relapsed) = governing(ledger, venture, action);
-        relapsed || latest.is_some_and(|q| approval_of(ledger, venture, q).is_none())
+        !holding(ledger, venture, action).is_empty()
+    }
+
+    /// Does every measured record that holds the lever suspended cite a
+    /// reading flagged stuck? Asked only of a suspended lever.
+    pub fn suspended_on_stuck(ledger: &[Entry], venture: &str, action: &str) -> bool {
+        holding(ledger, venture, action)
+            .iter()
+            .all(|s| stuck_cited(ledger, *s).is_some())
+    }
+
+    /// The measured records that hold the lever suspended: the latest
+    /// ask while no declared approval answers it, and every relapse
+    /// since.
+    fn holding(ledger: &[Entry], venture: &str, action: &str) -> Vec<Seq> {
+        let (latest, mut relapses) = governing(ledger, venture, action);
+        relapses.extend(latest.filter(|q| approval_of(ledger, venture, *q).is_none()));
+        relapses
+    }
+
+    /// The metric of a trusted reading flagged stuck that this record
+    /// cites, if it cites one.
+    fn stuck_cited(ledger: &[Entry], seq: Seq) -> Option<String> {
+        let get = |s: Seq| ledger.iter().find(|x| x.seq == s);
+        get(seq)?
+            .record
+            .cites()
+            .iter()
+            .find_map(|c| match &get(*c)?.record {
+                Record::Report {
+                    metric,
+                    claim,
+                    implausible: Some(why),
+                    ..
+                } if claim.authorizes() && why.starts_with("stuck") => Some(metric.clone()),
+                _ => None,
+            })
     }
 
     /// The ask and declared decision that restored a once-suspended
@@ -2862,7 +2931,9 @@ pub mod reference {
     /// cited, and no relapse since.
     pub fn restored(ledger: &[Entry], venture: &str, action: &str) -> Option<(Seq, Seq)> {
         match governing(ledger, venture, action) {
-            (Some(q), false) => approval_of(ledger, venture, q).map(|d| (q, d)),
+            (Some(q), relapses) if relapses.is_empty() => {
+                approval_of(ledger, venture, q).map(|d| (q, d))
+            }
             _ => None,
         }
     }
@@ -2884,9 +2955,9 @@ pub mod reference {
     }
 
     /// The latest non-void ineffective ask after the last adoption, and
-    /// whether a non-void measured relapse after the latest ask and after
-    /// any adoption suspended the lever again.
-    fn governing(ledger: &[Entry], venture: &str, action: &str) -> (Option<Seq>, bool) {
+    /// the non-void measured relapses after the latest ask and after any
+    /// adoption that suspended the lever again.
+    fn governing(ledger: &[Entry], venture: &str, action: &str) -> (Option<Seq>, Vec<Seq>) {
         let is_ask = |e: &Entry| {
             matches!(&e.record, Record::Ask {
                 claim: Claim::Measured,
@@ -2909,7 +2980,7 @@ pub mod reference {
             .map(|d| d.seq)
             .max()
             .unwrap_or(0);
-        let relapsed = ledger.iter().any(|r| {
+        let relapses = ledger.iter().filter(|r| {
             matches!(&r.record, Record::Report {
                 claim: Claim::Measured,
                 venture: v,
@@ -2930,7 +3001,7 @@ pub mod reference {
             .filter(|e| is_ask(e) && e.seq > adopted && !voided(ledger, venture, e))
             .map(|e| e.seq)
             .max();
-        (latest, relapsed)
+        (latest, relapses.map(|r| r.seq).collect())
     }
 
     /// Parents and children as facts, and every pause and resume a parent

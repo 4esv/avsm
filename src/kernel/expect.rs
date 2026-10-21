@@ -17,7 +17,12 @@
 //! the run holds the lever only while the metric stays frozen. Its ask
 //! cites those readings, and the first plausible reading since that is
 //! away from the frozen value voids it: the lever runs again on its own
-//! premises, with no human. A frozen sensor never gives one.
+//! premises, with no human. A frozen sensor never gives one. Nor does
+//! such a miss hold a tripped guard's declared unwind: the guard's own
+//! reading is measured and plausible, and the frozen one cannot show
+//! what the lever did. For the same reason an unwind that ran past it is
+//! never judged, and never a miss that suspends the lever once the
+//! sensor reads again.
 
 use crate::expect::{self, Judgement};
 use crate::index::{EXPECTATION, SUSPENSION};
@@ -103,8 +108,17 @@ impl Kernel {
                             })
                             .map(|(seq, x, _)| (seq, x))
                     });
+                    // An unwind that passed a suspension seen only on
+                    // stuck readings ran while the metric's sensor was
+                    // found frozen: that sensor cannot judge it, whatever
+                    // it reads next.
+                    let past_stuck = index.get(intent).is_some_and(
+                        |e| matches!(&e.record, Record::Intent { proof, .. } if proof.past_stuck()),
+                    );
                     let result = if !ok {
                         Run::Failed
+                    } else if past_stuck {
+                        Run::Unjudged
                     } else if let Some((seen, x)) = stuck {
                         Run::Frozen(
                             format!(
