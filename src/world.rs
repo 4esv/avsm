@@ -374,14 +374,44 @@ fn median(mut xs: Vec<f64>) -> Option<f64> {
     })
 }
 
+/// The mean drift a second at each hour of the day (UTC), learnt from
+/// these steps, each spread over the hours it covers: so steps longer
+/// than an hour still tell the hours apart. None unless every hour is
+/// covered by at least `MIN_SAMPLES` steps.
+fn daily_profile(steps: &[Drift]) -> Option<[f64; 24]> {
+    let mut change = [0.0; 24];
+    let mut time = [0i64; 24];
+    let mut count = [0usize; 24];
+    for d in steps.iter().filter(|d| d.gap > 0) {
+        let mut t = d.at;
+        let end = d.at + d.gap;
+        while t < end {
+            let upto = ((t.div_euclid(HOUR) + 1) * HOUR).min(end);
+            let h = hour_of(t);
+            change[h] += d.change * (upto - t) as f64 / d.gap as f64;
+            time[h] += upto - t;
+            count[h] += 1;
+            t = upto;
+        }
+    }
+    if count.iter().any(|n| *n < MIN_SAMPLES) {
+        return None;
+    }
+    Some(std::array::from_fn(|h| change[h] / time[h] as f64))
+}
+
 /// What the metric would have moved on its own over `dt` seconds from
 /// `t0`, and how far it strays from that: the counterfactual a run of a
 /// lever is judged against. It is local: the median rate of the latest
 /// `RECENT` lever-free steps within the day before `upto`, and the spread
 /// of those same steps, so a regime that has changed (a heat wave that
-/// ended in a dead plant) does not stand in for now. With fewer than
-/// `MIN_SAMPLES` such steps, the baseline's drift from all the history
-/// before `upto`.
+/// ended in a dead plant) does not stand in for now. Where the history
+/// before `upto` holds a daily cycle (`daily_profile`), it is taken out
+/// of those steps before their median and put back over `dt`: the half
+/// of a day the latest steps fell in does not stand in for the whole
+/// horizon. With fewer than `MIN_SAMPLES` such steps, the baseline's
+/// drift from all the history before `upto`. Either way the drift stops
+/// at the mandate's `range:`.
 pub fn counterfactual(
     index: &Index,
     venture: &str,
@@ -400,19 +430,43 @@ pub fn counterfactual(
         .take(RECENT)
         .copied()
         .collect();
-    if local.len() >= MIN_SAMPLES {
-        let rate = median(local.iter().map(|d| d.change / d.gap as f64).collect()).unwrap_or(0.0);
+    let (drift, spread) = if local.len() >= MIN_SAMPLES {
+        // The history's drift by hour over a span, nothing without it.
+        // Its level cancels: what it adds over `dt` the median of the
+        // local steps less it takes back, so only its shape is kept.
+        let cycle = Baseline {
+            by_hour: daily_profile(&steps),
+            ..Baseline::default()
+        };
+        let own = |d: &Drift| d.change - cycle.integrate(d.at, d.gap);
+        let rate = median(local.iter().map(|d| own(d) / d.gap as f64).collect()).unwrap_or(0.0);
+        // The spread is the steps' own, cycle and all: the cycle taken
+        // out is inferred from the history, and a judge that trusts it
+        // to narrow the noise would call a lever ineffective on it.
+        let raw = median(local.iter().map(|d| d.change / d.gap as f64).collect()).unwrap_or(0.0);
         let spread = median(
             local
                 .iter()
-                .map(|d| ((d.change - rate * d.gap as f64) / (d.gap as f64).sqrt()).abs())
+                .map(|d| ((d.change - raw * d.gap as f64) / (d.gap as f64).sqrt()).abs())
                 .collect(),
         )
         .unwrap_or(0.0);
-        return (rate * dt as f64, spread * (dt.max(0) as f64).sqrt());
+        (
+            rate * dt as f64 + cycle.integrate(t0, dt),
+            spread * (dt.max(0) as f64).sqrt(),
+        )
+    } else {
+        let base = Baseline::drift_before(index, venture, mandate, upto);
+        (base.integrate(t0, dt), base.spread(dt))
+    };
+    // The metric cannot drift past its declared range: a stock that would
+    // fall a week's demand from 200 falls 200.
+    let series = index.series(venture, mandate.metric_name());
+    let last = series[..series.partition_point(|(s, _)| *s < upto)].last();
+    match (mandate.range, last) {
+        (Some([lo, hi]), Some((_, x))) => ((x + drift).clamp(lo.min(*x), hi.max(*x)) - x, spread),
+        _ => (drift, spread),
     }
-    let base = Baseline::drift_before(index, venture, mandate, upto);
-    (base.integrate(t0, dt), base.spread(dt))
 }
 
 impl Baseline {
@@ -1399,6 +1453,108 @@ mod tests {
         let from_ledger = Baseline::from_index(&Index::from_entries(&l.entries), V, &m);
         let now = from_ledger.step(&Value::Null, None, 1, 0, 0).unwrap();
         assert!((now.guards["dd"] - 19.0 / 120.0 * 100.0).abs() < 1e-9);
+    }
+
+    /// Reports every `step` hours of `f` of the hours since the first,
+    /// up to `hours`, then a run of `boost`; the run's intent, which a
+    /// run is judged from, and the time of the last report before it.
+    fn series(step: i64, hours: i64, f: impl Fn(i64) -> f64) -> (Index, Seq, i64) {
+        let mut l = Ledger {
+            entries: vec![],
+            at: 1_800_000_000,
+        };
+        for h in (0..=hours).step_by(step as usize) {
+            if h > 0 {
+                l.at += (step - 1) * HOUR;
+            }
+            l.report(f(h));
+        }
+        let now = l.at;
+        l.run("boost");
+        let upto = l.entries[l.entries.len() - 2].seq;
+        (Index::from_entries(&l.entries), upto, now)
+    }
+
+    /// No trend, a swing of ±50 a day.
+    fn daily(h: i64) -> f64 {
+        100.0 + 50.0 * (std::f64::consts::TAU * h as f64 / 24.0).cos()
+    }
+
+    #[test]
+    fn a_daily_cycle_is_not_a_trend_over_the_horizon() {
+        let m = mandate();
+        // Read every 2 hours, judged at a trough after the falling half
+        // of the day: those steps all fall, and still whole days net
+        // nothing, and half a day climbs back to the peak.
+        for step in [1, 2] {
+            let (index, upto, now) = series(step, 3 * 24 + 12, daily);
+            let (drift, spread) = counterfactual(&index, V, &m, upto, now, 3 * DAY);
+            assert!(drift.abs() < 1.0, "every {step}h, over 3 days: {drift:+}");
+            // The noise is still the steps' own: the cycle is inferred.
+            assert!(spread > 10.0, "every {step}h: {spread}");
+            let (half, _) = counterfactual(&index, V, &m, upto, now, DAY / 2);
+            assert!(
+                (half - 100.0).abs() < 5.0,
+                "every {step}h, half a day: {half:+}"
+            );
+        }
+        // A sawtooth, up 1 an hour for 20 hours and down 5 an hour for
+        // 4: most steps rise, and still a day nets nothing.
+        let saw = |h: i64| {
+            let x = h % 24;
+            if x <= 20 {
+                x as f64
+            } else {
+                20.0 - 5.0 * (x - 20) as f64
+            }
+        };
+        let (index, upto, now) = series(1, 3 * 24, saw);
+        let (drift, _) = counterfactual(&index, V, &m, upto, now, 3 * DAY);
+        assert!(drift.abs() < 1.0, "a sawtooth over 3 days: {drift:+}");
+        // Two days hold under `MIN_SAMPLES` of each hour: no cycle is
+        // known, and the latest steps' fall stands, as it always has.
+        let (index, upto, now) = series(1, 36, daily);
+        let (drift, _) = counterfactual(&index, V, &m, upto, now, 3 * DAY);
+        assert!(drift < -500.0, "{drift:+}");
+    }
+
+    #[test]
+    fn the_drift_a_run_is_judged_against_stays_in_the_range() {
+        let m = Mandate::parse(
+            "purpose: p\nmetric: count\ncontroller: {kind: model}\ncadence: 1h\n\
+             range: [0, 1000]\n\
+             permitted:\n- {name: boost, run: ./boost, cap: 9/day, reversible: true}\n",
+        )
+        .unwrap();
+        let stock = |h: i64| 600.0 - 100.0 * (h / 24) as f64;
+        // A stock counted once a day and read every 6 hours, down 100 a
+        // day to 200: on its own it falls 200 over 5 days, not 500.
+        let (index, upto, now) = series(6, 4 * 24, stock);
+        let (drift, _) = counterfactual(&index, V, &m, upto, now, 5 * DAY);
+        assert_eq!(drift, -200.0);
+        // Read once a day: too few steps within a day for the local drift.
+        let (index, upto, now) = series(24, 4 * 24, stock);
+        let (drift, _) = counterfactual(&index, V, &m, upto, now, 5 * DAY);
+        assert_eq!(drift, -200.0);
+        // A reading past the range, as one from before the range was
+        // narrowed: its drift is not cut to the range at once.
+        let (index, upto, now) = series(6, 4 * 24, |h| 1000.0 + stock(h));
+        let (drift, _) = counterfactual(&index, V, &m, upto, now, DAY);
+        assert_eq!(drift, -100.0);
+    }
+
+    #[test]
+    fn a_regime_change_under_a_daily_cycle_is_seen_within_hours() {
+        let m = mandate();
+        // The same cycle, falling a further 10 an hour since 12 hours
+        // ago: the local steps say so, and the cycle is not counted in.
+        let fall = |h: i64| daily(h) - 10.0 * (h - 72).max(0) as f64;
+        let (index, upto, now) = series(2, 3 * 24 + 12, fall);
+        let (drift, _) = counterfactual(&index, V, &m, upto, now, 3 * DAY);
+        assert!(
+            (drift + 720.0).abs() < 0.2 * 720.0,
+            "10 an hour for 3 days: {drift:+}"
+        );
     }
 
     #[test]
