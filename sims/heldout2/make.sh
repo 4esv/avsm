@@ -41,13 +41,18 @@
 #     irreversible and a needless release costs only water, so waiting
 #     costs more than a misreading: confirm: false. The weir gauge, a
 #     separate device, is a guard: any flow over the crest asks and
-#     unwinds by releasing.
+#     unwinds by releasing. No max_rise or max_fall: a storm raises the
+#     level and a release lowers it by about as much in two hours (under 5
+#     either way), so neither way earns a bound of its own.
 #   - pantry: below 500 (three days of demand, the supplier's lead time, and
 #     200 of safety stock for a late count) order a pallet of 600. An order can
 #     be cancelled until it ships: reversible, cost 3. The count is daily, so cadence 6h, and the order
 #     should show within 20 reports (lead time, a day for the count, a day
-#     of margin). range [0, 1500], the shelves; max_step 800: a pallet in,
-#     less than two days of demand out, between two reports.
+#     of margin). range [0, 1500], the shelves. Stock arrives by the pallet
+#     and leaves by the day, so each way has its own bound: max_rise 800, a
+#     pallet in, less than two days of demand out, between two reports;
+#     max_fall 300, two days of a weekend's demand (130 a day) and margin,
+#     for a count that was missed. No day takes hundreds more than that.
 #   - queue: a model picks overtime (cost 1, 1/day, down within 3: a
 #     six-hour shift) or a contractor (cost 3, 1/week, down within 36: two
 #     days to start, then a day to show). Purge is irreversible, needs my
@@ -98,7 +103,8 @@ controller: {kind: threshold, below: 500, action: reorder}
 cadence: 6h
 parent: coop
 range: [0, 1500]
-max_step: 800
+max_rise: 800
+max_fall: 300
 permitted:
   - {name: reorder, run: ./reorder, cap: 1/day, reversible: true, cost: 3, expects: up within 20}
 EOF

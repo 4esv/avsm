@@ -18,25 +18,28 @@ import math, random
 STEP = 7200
 DAY_S = 86400
 
-SCHEDULE = {
+# Each day holds every event scheduled on it: two spans that meet on a day
+# (the jam and the irregular counts on 30 and 31, the irregular counts and
+# the delay on 40) both happen.
+SCHEDULE = {}
+for _days, _event in [
     # reservoir: the level sensor's float jams against its housing and reads
     # at most 84.0 for ten days of the first wet season; storms in it and in
     # the second wet season.
-    **{d: ["res:saturate"] for d in range(22, 32)},
+    (range(22, 32), "res:saturate"),
+    ([24, 28, 83], "res:storm"),
     # pantry: the cycle count comes in at irregular hours, or not at all.
-    **{d: ["pan:irregular"] for d in range(30, 41)},
+    (range(30, 41), "pan:irregular"),
     # pantry: the supplier's lead time goes from 3 days to 7 for orders placed
     # on these days.
-    **{d: ["pan:delay"] for d in range(40, 55)},
+    (range(40, 55), "pan:delay"),
     # queue: a viral incident triples arrivals.
-    46: ["q:spike"], 47: ["q:spike"],
+    ([46, 47], "q:spike"),
     # the shared sensor gateway reboots: reservoir and pantry read 0 together.
-    62: ["gateway"],
-}
-SCHEDULE[24] = SCHEDULE[24] + ["res:storm"]
-SCHEDULE[28] = SCHEDULE[28] + ["res:storm"]
-SCHEDULE[40] = SCHEDULE[40] + ["pan:irregular"]
-SCHEDULE[83] = ["res:storm"]
+    ([62], "gateway"),
+]:
+    for _d in _days:
+        SCHEDULE.setdefault(_d, []).append(_event)
 SATURATE_AT = 84.0          # what the jammed float reads at most
 GATEWAY_HOURS = {10, 12}    # the gateway's reboot: two readings of 0
 LEAK_DAY = 55               # pantry shrinkage starts and grows from here
