@@ -23,9 +23,21 @@
 //! what the lever did. For the same reason an unwind that ran past it is
 //! never judged, and never a miss that suspends the lever once the
 //! sensor reads again.
+//!
+//! A run is judged first at the `within` its mandate declares. A miss
+//! there may be late, not ineffective: a lever whose own cap holds it
+//! once a period (its window) is judged again, within that window, at
+//! the delay its runs have shown (learned from the metric, inferred), and
+//! after a move the wrong way at any delay, since a lagging reading shows
+//! the course from before the run. It is a miss only if no span meets.
+//! A run that met at its declared horizon is never judged later, so a
+//! learned delay only waits on or withholds a miss; it never authorizes,
+//! and a run met at a delay its lever's runs had not shown asks, inferred,
+//! with nothing to run on the answer.
 
 use crate::expect::{self, Judgement};
-use crate::index::{EXPECTATION, SUSPENSION};
+use crate::index::{Index, EXPECTATION, SUSPENSION};
+use crate::mandate::{Expects, Mandate, Permitted};
 use crate::record::{Claim, Record, Seq, Signal};
 use crate::world;
 
@@ -64,6 +76,9 @@ impl Kernel {
             let mut records: Vec<Record> = Vec::new();
             let mut ask: Option<(String, Option<Seq>)> = None;
             let mut cites: Vec<Seq> = Vec::new();
+            // Runs that showed their effect only at a delay their lever's
+            // runs had not shown: the run, the delay, the learned one.
+            let mut late: Vec<(Seq, usize, usize)> = Vec::new();
             {
                 let Ok(index) = self.index() else { return };
                 let floor = index.last_suspension(venture, &perm.name).unwrap_or(0);
@@ -132,36 +147,17 @@ impl Kernel {
                             seen,
                         )
                     } else if let Some(expects) = &perm.expects {
-                        let series = index.series(venture, &metric);
-                        let b = series.partition_point(|(s, _)| *s < intent);
-                        let a = series.partition_point(|(s, _)| *s <= outcome);
-                        let before: Vec<f64> = series[..b].iter().map(|(_, x)| *x).collect();
-                        let after: Vec<f64> = series[a..].iter().map(|(_, x)| *x).collect();
-                        // The counterfactual: what the metric would have
-                        // moved on its own from the last report before the
-                        // run to the one judged, by the recent drift before
-                        // the run.
-                        let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
-                        let ends = (
-                            b.checked_sub(1).map(|i| series[i].0),
-                            series.get(a + expects.within as usize - 1).map(|p| p.0),
-                        );
-                        let span = match ends {
-                            (Some(s0), Some(s1)) => Some((at(s0), at(s1) - at(s0))),
-                            _ => None,
+                        let Some(seen) =
+                            judged(&index, venture, &v.mandate, perm, expects, intent, outcome)
+                        else {
+                            break;
                         };
-                        // A step that spans an implausible reading says
-                        // nothing about the run: the sensor, not the lever.
-                        let doubted = match ends {
-                            (Some(s0), Some(s1)) => index.doubted_between(venture, &metric, s0, s1),
-                            _ => false,
-                        };
-                        let (drift, noise) = span.map_or((0.0, 0.0), |(t0, dt)| {
-                            world::counterfactual(&index, venture, &v.mandate, intent, t0, dt)
-                        });
-                        match expect::judge(expects, &before, &after, drift, noise) {
+                        if let Some((d, learned)) = seen.late.filter(|(d, l)| d != l) {
+                            late.push((intent, d, learned));
+                        }
+                        match seen.judgement {
                             Judgement::Waiting => break,
-                            _ if doubted => Run::Unjudged,
+                            _ if seen.doubted => Run::Unjudged,
                             Judgement::Unknown | Judgement::Met => Run::Hit,
                             Judgement::WrongSize { observed, noise, .. } => {
                                 if !index.expectation_reported(intent) {
@@ -268,6 +264,9 @@ impl Kernel {
                     log(&format!("{venture}: cannot write expectation: {e}"));
                 }
             }
+            for (intent, d, learned) in late {
+                self.ask_late(venture, &perm.name, intent, d, learned);
+            }
             match ask {
                 Some((why, None)) => self.ask_ineffective(venture, &perm.name, why, cites),
                 Some((why, Some(q))) => {
@@ -293,6 +292,54 @@ impl Kernel {
                 }
                 None => {}
             }
+        }
+    }
+
+    /// Ask about a run whose effect showed `d` reports late where its
+    /// lever's runs had shown it `learned` late: the delay is inferred,
+    /// and so is the ask. It cites the run, once, and nothing runs on it.
+    fn ask_late(&mut self, venture: &str, lever: &str, intent: Seq, d: usize, learned: usize) {
+        let (asked, may_ask, metric, expects) = {
+            let Ok(index) = self.index() else { return };
+            let Some(v) = self.ventures.get(venture) else {
+                return;
+            };
+            let asked = index.of(venture).any(|e| {
+                matches!(&e.record, Record::Ask { cites, action: None, signal: None, .. }
+                    if cites.contains(&intent))
+            });
+            let expects = v
+                .mandate
+                .permitted(lever)
+                .and_then(|p| p.expects.as_ref())
+                .map_or_else(String::new, ToString::to_string);
+            (
+                asked,
+                self.may_ask(&index),
+                v.mandate.metric_name().to_string(),
+                expects,
+            )
+        };
+        if asked || !may_ask {
+            return;
+        }
+        let question = format!(
+            "{lever} ran at #{intent} and {metric} showed what it expects ({expects}) {d} reports late, where its runs have shown it {learned} late: the sensor may lag, or {lever} works slower; a run that shows late is not ineffective, and nothing runs on this ask"
+        );
+        let packet = self.packet(venture, None, &[intent], None, false);
+        match self.append(Record::Ask {
+            cites: vec![intent],
+            claim: Claim::Inferred,
+            venture: venture.to_string(),
+            action: None,
+            question,
+            refusal: None,
+            payload: None,
+            signal: None,
+            packet,
+        }) {
+            Ok(e) => log(&e.line()),
+            Err(e) => log(&format!("{venture}: cannot write ask: {e}")),
         }
     }
 
@@ -353,4 +400,242 @@ impl Kernel {
             self.ask_ineffective(venture, lever, why, vec![]);
         }
     }
+}
+
+/// A run judged at the delay its effect shows.
+struct Seen {
+    judgement: Judgement,
+    /// An implausible reading falls in the span the declared horizon reads.
+    doubted: bool,
+    /// The delay, in reports, at which a run that missed at its declared
+    /// horizon showed its effect, and the delay its lever's runs had
+    /// shown before.
+    late: Option<(usize, usize)>,
+}
+
+/// One span a run is judged over.
+enum Span {
+    /// No report before the run to compare with.
+    Unknown,
+    /// Its last report has not come yet.
+    Waiting,
+    /// It ends after the lever may next run: past the run's window.
+    Past,
+    /// What the metric moved over it, the drift and noise over it, and
+    /// whether a reading it spans is implausible.
+    Read {
+        observed: f64,
+        drift: f64,
+        noise: f64,
+        doubted: bool,
+    },
+}
+
+/// How long after a run its lever's own cap keeps it from running
+/// again, in seconds: the window its effect may show late in. A lever
+/// that may run once a period has that period; one that may run again
+/// sooner (two a day may be two in a row) has none, since a run waited
+/// on past the gate's own hold of `within` reports could be run again
+/// before it is judged: acting twice on one error. A late judgement
+/// never lets the lever run before it.
+fn window(perm: &Permitted) -> i64 {
+    match perm.cap.count {
+        1 => perm.cap.per.as_secs() as i64,
+        _ => 0,
+    }
+}
+
+/// The span of a run, `intent` to `outcome`, `d` reports late: from the
+/// last report before the run (`d` 0, the declared horizon) or the
+/// `d`-th after it, to `within` reports on. A late span ends inside the
+/// run's window or is past it.
+#[allow(clippy::too_many_arguments)]
+fn span(
+    index: &Index,
+    venture: &str,
+    mandate: &Mandate,
+    perm: &Permitted,
+    expects: &Expects,
+    intent: Seq,
+    outcome: Seq,
+    d: usize,
+) -> Span {
+    let metric = mandate.metric_name();
+    let series = index.series(venture, metric);
+    let b = series.partition_point(|(s, _)| *s < intent);
+    let a = series.partition_point(|(s, _)| *s <= outcome);
+    let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
+    let base = match d {
+        0 => match b.checked_sub(1) {
+            Some(i) => i,
+            None => return Span::Unknown,
+        },
+        _ => a + d - 1,
+    };
+    let end = at(intent) + window(perm);
+    let Some(&(s0, x0)) = series.get(base) else {
+        return Span::Waiting;
+    };
+    if d > 0 && at(s0) >= end {
+        return Span::Past;
+    }
+    let Some(&(s1, x1)) = series.get(a + d + expects.within as usize - 1) else {
+        return Span::Waiting;
+    };
+    if d > 0 && at(s1) > end {
+        return Span::Past;
+    }
+    // The counterfactual: what the metric would have moved on its own
+    // over the span, by the recent drift before the run.
+    let (drift, noise) =
+        world::counterfactual(index, venture, mandate, intent, at(s0), at(s1) - at(s0));
+    Span::Read {
+        observed: x1 - x0,
+        drift,
+        noise,
+        // A step that spans an implausible reading says nothing about
+        // the run: the sensor, not the lever.
+        doubted: index.doubted_between(venture, metric, s0, s1),
+    }
+}
+
+/// The delay at which the runs of `perm` before `intent` show their
+/// effect best (`expect::delay`), over the windows they have whole: a
+/// suspension does not forget how late its runs were. Inferred from the
+/// metric, never more.
+fn learned_delay(
+    index: &Index,
+    venture: &str,
+    mandate: &Mandate,
+    perm: &Permitted,
+    expects: &Expects,
+    intent: Seq,
+) -> usize {
+    // A lever with no window is judged at its declared horizon alone.
+    if window(perm) == 0 {
+        return 0;
+    }
+    let mut runs = Vec::new();
+    for &r in index.intents_of(venture, &perm.name) {
+        if r >= intent {
+            break;
+        }
+        let Some((outcome, true)) = index.settled(r) else {
+            continue;
+        };
+        let mut line = Vec::new();
+        for d in 0.. {
+            match span(index, venture, mandate, perm, expects, r, outcome, d) {
+                Span::Read {
+                    observed,
+                    drift,
+                    noise,
+                    doubted: false,
+                } => line.push((expect::toward(expects, observed - drift), noise)),
+                Span::Past => {
+                    runs.push(line);
+                    break;
+                }
+                // Not whole yet, or a reading in it is doubted.
+                _ => break,
+            }
+        }
+    }
+    expect::delay(&runs)
+}
+
+/// Judge a run at its declared horizon and, if it missed there, at the
+/// delay its effect shows: the delay its lever's runs have shown
+/// (`learned_delay`), and, after a move the wrong way, any delay inside
+/// the run's window. A move the wrong way is what a reading that has not
+/// caught up with the run shows; a lever that did nothing reads as
+/// nothing at any delay its runs have not shown. The first span that
+/// meets the expectation judges the run; if none does, the miss at the
+/// declared horizon stands. A delay only ever waits on or withholds a
+/// miss: a run that met at its horizon is never judged later. None while
+/// a span it waits on is not whole.
+#[allow(clippy::too_many_arguments)]
+fn judged(
+    index: &Index,
+    venture: &str,
+    mandate: &Mandate,
+    perm: &Permitted,
+    expects: &Expects,
+    intent: Seq,
+    outcome: Seq,
+) -> Option<Seen> {
+    let at = |d| span(index, venture, mandate, perm, expects, intent, outcome, d);
+    let (judgement, doubted) = match at(0) {
+        Span::Waiting => return None,
+        Span::Unknown | Span::Past => (Judgement::Unknown, false),
+        Span::Read {
+            observed,
+            drift,
+            noise,
+            doubted,
+        } => (
+            expect::judge_change(expects, observed, drift, noise),
+            doubted,
+        ),
+    };
+    let seen = |judgement| Seen {
+        judgement,
+        doubted,
+        late: None,
+    };
+    let wrong_way = match judgement {
+        Judgement::NoEffect { .. } => false,
+        Judgement::WrongDirection { .. } => true,
+        _ => return Some(seen(judgement)),
+    };
+    if doubted {
+        return Some(seen(judgement));
+    }
+    let learned = learned_delay(index, venture, mandate, perm, expects, intent);
+    // Past runs of a lever that shows its effect `learned` reports late
+    // moved the metric over that many more reports than `within`: those
+    // steps are not drift for a span judged late (as `drift_steps` keeps
+    // a run's horizon out of it). The declared span keeps the declared
+    // horizon, so a learned delay never makes a run that met there miss.
+    let longer = (learned > 0).then(|| {
+        let mut m = mandate.clone();
+        for p in m.permitted.iter_mut().filter(|p| p.name == perm.name) {
+            if let Some(e) = p.expects.as_mut() {
+                e.within += learned as u32;
+            }
+        }
+        m
+    });
+    let late = |d| {
+        let m = longer.as_ref().unwrap_or(mandate);
+        span(index, venture, m, perm, expects, intent, outcome, d)
+    };
+    let shifts: Box<dyn Iterator<Item = usize>> = if wrong_way {
+        Box::new(1..)
+    } else {
+        Box::new((learned > 0).then_some(learned).into_iter())
+    };
+    for d in shifts {
+        match late(d) {
+            Span::Waiting => return None,
+            Span::Past | Span::Unknown => break,
+            Span::Read { doubted: true, .. } => continue,
+            Span::Read {
+                observed,
+                drift,
+                noise,
+                ..
+            } => {
+                let shown = expect::judge_change(expects, observed, drift, noise);
+                if matches!(shown, Judgement::Met | Judgement::WrongSize { .. }) {
+                    return Some(Seen {
+                        judgement: shown,
+                        doubted,
+                        late: Some((d, learned)),
+                    });
+                }
+            }
+        }
+    }
+    Some(seen(judgement))
 }

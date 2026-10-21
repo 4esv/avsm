@@ -317,6 +317,11 @@ fn the_wrong_direction_suspends_the_delegation() {
     f.report(2.0);
     assert!(!f.suspended(), "one report is not enough to judge");
     f.report(1.0); // down 2 where up 5 was expected
+                   // The wrong way may be a reading that has not caught up with the run:
+                   // it has until boost may run again to show its effect late, and is
+                   // judged on the first report past that, before it may run.
+    assert!(!f.suspended(), "waits out the window");
+    f.report_tomorrow(1.0);
     missed(&mut f);
 }
 
@@ -510,7 +515,9 @@ fn an_approval_after_a_denial_restores_the_lever() {
     f.report_tomorrow(4.0);
     assert_eq!(f.intents(), runs + 1, "delegated again: it runs");
     // It misses again on readings that say nothing new: a relapse after
-    // the approved ask suspends it, measured.
+    // the approved ask suspends it, measured. Its first run read +1 a
+    // report late, so this one is judged there too: a report more.
+    f.report(4.0);
     f.report(4.0);
     f.report(4.0);
     assert!(f.suspended(), "{:#?}", f.entries());
@@ -610,7 +617,9 @@ fn a_run_of_a_restored_lever_cites_the_restoring_approval() {
         why.contains(&format!("restored   #{decision}")),
         "why shows it: {why}"
     );
-    // A relapse suspends it again: no longer restored.
+    // A relapse suspends it again, at the delay its first run showed:
+    // no longer restored.
+    f.report(4.0);
     f.report(4.0);
     f.report(4.0);
     assert!(f.suspended());
@@ -1285,4 +1294,372 @@ fn a_declared_approval_of_this_run_overrides_the_wait() {
     assert_eq!(proof.decision(), Some(approval));
     // Not cited, the approval loosens nothing.
     assert!(gate_now(&f, vec![]).is_err());
+}
+
+// ----- the delay a lever's effect shows at -----
+
+/// A lever that may run once a day and expects the count up 5 within one
+/// report: its run has a day to show its effect.
+fn daily() -> Fixture {
+    daily_in("", 1)
+}
+
+/// The same, with more to the mandate's head, expecting it within `within`.
+fn daily_in(head: &str, within: u32) -> Fixture {
+    fixture_in(
+        &format!("controller: {{kind: threshold, below: 5, action: boost}}\ncadence: 1h\n{head}"),
+        &format!(
+            "{{name: boost, run: echo boost >> boosts, cap: 1/day, reversible: true, \
+             delegated: true, expects: up 5 within {within}}}"
+        ),
+    )
+}
+
+/// Restart the kernel on the same home, with this more to its config.
+fn reopen(f: &mut Fixture, config: &str) {
+    let home = f._tmp.path().join("home");
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "nightly: never\ndefault: k\nbackends:\n  k: {{kind: command, run: echo nothing}}\n{config}"
+        ),
+    )
+    .unwrap();
+    let warden = LocalWarden::open(&home).unwrap();
+    f.k = Kernel::with(&home, Box::new(FakeRole(VecDeque::new())), Box::new(warden)).unwrap();
+}
+
+/// Approve every open ask that says boost is ineffective.
+fn restore(f: &mut Fixture) {
+    f.approve_open(|r| {
+        matches!(
+            r,
+            Record::Ask {
+                signal: Some(Signal::Ineffective { .. }),
+                ..
+            }
+        )
+    });
+    assert!(!f.suspended());
+}
+
+/// The inferred asks about a run that showed its effect late.
+fn late_asks(f: &Fixture) -> Vec<Entry> {
+    f.entries()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                &e.record,
+                Record::Ask {
+                    claim: Claim::Inferred,
+                    action: None,
+                    signal: None,
+                    ..
+                }
+            )
+        })
+        .collect()
+}
+
+/// The latest intent's seq.
+fn last_intent(f: &Fixture) -> Seq {
+    f.entries()
+        .iter()
+        .rev()
+        .find(|e| e.record.kind() == Kind::Intent)
+        .unwrap()
+        .seq
+}
+
+/// A run on a fall from 9 to 3, a day after the last, whose effect shows
+/// on the fourth report after it: three reports late. `between` are the
+/// readings in its place before that.
+fn late_run(f: &mut Fixture, between: &[f64]) {
+    let runs = f.intents();
+    f.report_tomorrow(9.0);
+    f.report(3.0);
+    assert_eq!(f.intents(), runs + 1, "{:#?}", f.entries());
+    for v in between {
+        f.report(*v);
+    }
+    f.report(9.0);
+}
+
+#[test]
+fn a_lever_whose_effect_shows_late_is_judged_at_its_learned_delay() {
+    let _c = clock();
+    let mut f = daily();
+    for _ in 0..4 {
+        f.report(9.0);
+    }
+    // Its effect shows on the fourth report after it: three reports late.
+    f.report(3.0);
+    assert_eq!(f.intents(), 1);
+    for v in [3.0, 3.0, 3.0, 9.0] {
+        f.report(v);
+    }
+    // Nothing on the next report: judged at the horizon it declares, with
+    // no runs before to learn from, it is no effect, and a human restores it.
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.entries());
+    restore(&mut f);
+    // The next day the same: the first run showed its effect three
+    // reports late, so this one is judged there too.
+    f.report_tomorrow(9.0);
+    f.report(3.0);
+    assert_eq!(f.intents(), 2);
+    for v in [3.0, 3.0, 3.0] {
+        f.report(v);
+        assert!(!f.suspended(), "{:#?}", f.entries());
+    }
+    f.report(9.0);
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.ineffective().len(), 1, "no second miss");
+    assert!(late_asks(&f).is_empty(), "the delay its runs have shown");
+}
+
+#[test]
+fn a_restart_never_suspends_a_run_judged_late() {
+    let _c = clock();
+    let mut f = daily();
+    for _ in 0..4 {
+        f.report(9.0);
+    }
+    late_run(&mut f, &[3.0, 3.0, 3.0]);
+    restore(&mut f);
+    late_run(&mut f, &[3.0, 3.0, 3.0]);
+    assert!(
+        !f.suspended(),
+        "judged three reports late: {:#?}",
+        f.entries()
+    );
+    // Three runs that show it at once.
+    for _ in 0..3 {
+        f.report_tomorrow(9.0);
+        f.report(3.0);
+        f.report(9.0);
+        f.report(9.0);
+    }
+    assert_eq!(f.intents(), 5);
+    assert!(!f.suspended());
+    // A restart judges the runs since the suspension again, from the
+    // ledger: the second still shows its effect late, and nothing misses.
+    reopen(&mut f, "");
+    f.report(9.0);
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.ineffective().len(), 1);
+}
+
+/// A run with its effect three reports late after a history of runs that
+/// showed it at once: the sensor started lagging.
+fn lagging() -> Fixture {
+    let mut f = lag_after(daily());
+    for v in [0.0, 0.0, 0.0] {
+        f.report(v);
+    }
+    f
+}
+
+/// Three days of runs that show their effect at once, then a run on a
+/// fall: the readings after it are the caller's.
+fn lag_after(mut f: Fixture) -> Fixture {
+    for _ in 0..4 {
+        f.report(9.0);
+    }
+    for day in 0..3 {
+        if day > 0 {
+            f.report_tomorrow(9.0);
+        }
+        f.report(3.0);
+        f.report(9.0); // at once
+        f.report(9.0);
+    }
+    assert_eq!(f.intents(), 3);
+    assert!(f.ineffective().is_empty(), "{:#?}", f.entries());
+    // The sensor lags three reports: after the run it reads the fall that
+    // came before it, the wrong way, then the run.
+    f.report_tomorrow(9.0);
+    f.report(6.0);
+    f.report(3.0);
+    assert_eq!(f.intents(), 4);
+    f
+}
+
+#[test]
+fn a_sensor_that_starts_lagging_asks_and_never_suspends_the_lever() {
+    let _c = clock();
+    let mut f = lagging();
+    assert!(!f.suspended(), "waits for the window, not a miss");
+    assert!(f.ineffective().is_empty());
+    f.report(8.0);
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    assert!(f.ineffective().is_empty(), "{:#?}", f.ineffective());
+    let asks = late_asks(&f);
+    assert_eq!(asks.len(), 1, "{:#?}", f.entries());
+    match &asks[0].record {
+        Record::Ask {
+            cites, question, ..
+        } => {
+            assert_eq!(cites, &vec![last_intent(&f)]);
+            assert!(question.contains("3 reports late"), "{question}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // Once: the next report asks nothing more, nor does a restart that
+    // judges the run again.
+    f.report(8.0);
+    assert_eq!(late_asks(&f).len(), 1);
+    reopen(&mut f, "");
+    f.report(8.0);
+    assert_eq!(late_asks(&f).len(), 1, "{:#?}", f.entries());
+}
+
+#[test]
+fn an_ask_about_a_late_run_keeps_to_the_asks_quota() {
+    let _c = clock();
+    let mut f = lagging();
+    reopen(&mut f, "quotas: {asks: 1/day}\n");
+    f.k.append(Record::Ask {
+        claim: Claim::Inferred,
+        venture: "raiser".into(),
+        action: Some("boost".into()),
+        question: "boost now?".into(),
+        refusal: None,
+        payload: None,
+        signal: None,
+        cites: vec![],
+        packet: None,
+    })
+    .unwrap();
+    f.report(8.0);
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    assert!(late_asks(&f).is_empty(), "the quota is spent");
+}
+
+#[test]
+fn a_late_span_over_an_implausible_reading_is_skipped() {
+    let _c = clock();
+    let mut f = lag_after(daily_in("range: [0, 100]\nconfirm: false\n", 1));
+    // 200 is out of range: the span over it says nothing either way.
+    for v in [0.0, 200.0, 0.0, 0.0] {
+        f.report(v);
+    }
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    f.report(8.0);
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    assert_eq!(late_asks(&f).len(), 1, "{:#?}", f.entries());
+}
+
+#[test]
+fn a_run_its_horizon_cannot_judge_asks_nothing_late() {
+    let _c = clock();
+    let mut f = lag_after(daily_in("range: [0, 100]\nconfirm: false\n", 1));
+    // The reading right after the run is implausible: the run is never
+    // judged, so it shows no delay either.
+    for v in [200.0, 0.0, 0.0, 0.0, 8.0, 8.0] {
+        f.report(v);
+    }
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    assert!(late_asks(&f).is_empty(), "{:#?}", late_asks(&f));
+}
+
+#[test]
+fn a_run_with_an_implausible_reading_in_its_window_teaches_no_delay() {
+    let _c = clock();
+    let mut f = daily_in("range: [0, 100]\nconfirm: false\n", 1);
+    for _ in 0..4 {
+        f.report(9.0);
+    }
+    // Three reports late, with a reading code doubts in its window: the
+    // run is a miss at its horizon, and says nothing whole of its delay.
+    late_run(&mut f, &[3.0, 200.0, 3.0, 3.0]);
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.entries());
+    restore(&mut f);
+    // So the next late run has nothing to be judged late on: a relapse.
+    late_run(&mut f, &[3.0, 3.0, 3.0]);
+    assert!(f.suspended(), "{:#?}", f.entries());
+    // Adopted again, the third is judged late on the second alone.
+    let dir = f.dir.clone();
+    f.k.add(&dir).unwrap();
+    assert!(!f.suspended());
+    late_run(&mut f, &[3.0, 3.0, 3.0]);
+    assert!(!f.suspended(), "{:#?}", f.entries());
+}
+
+#[test]
+fn a_late_effect_is_not_drift_for_the_next_run_judged_late() {
+    let _c = clock();
+    // Expects up 5 within 4: a ramp of 2 a report, twenty reports late.
+    let mut f = daily_in("", 4);
+    for v in [9.0, 9.1, 8.9, 9.0, 9.2, 8.8, 9.0] {
+        f.report(v);
+    }
+    let ramp = |f: &mut Fixture| {
+        for i in 0..20 {
+            f.report(if i % 2 == 0 { 3.1 } else { 2.9 });
+        }
+        for v in [5.0, 7.0, 9.0, 11.0] {
+            f.report(v);
+        }
+    };
+    f.report(3.0);
+    assert_eq!(f.intents(), 1);
+    ramp(&mut f);
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.entries());
+    restore(&mut f);
+    // The next run comes on the fall right after the ramp. Taken for drift,
+    // the ramp would expect 8 of its own over a horizon: so a rise of 8 at
+    // once is no effect, and so would the ramp twenty reports late be. The
+    // ramp is the first run's, twenty reports late, not the metric's own.
+    f.report(3.0);
+    assert_eq!(f.intents(), 2, "{:#?}", f.entries());
+    for v in [5.0, 7.0, 9.0, 11.0] {
+        f.report(v);
+    }
+    for _ in 0..16 {
+        f.report(11.0);
+    }
+    for v in [13.0, 15.0, 17.0] {
+        f.report(v);
+    }
+    assert!(!f.suspended(), "waits for its learned delay");
+    f.report(19.0);
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.ineffective().len(), 1);
+}
+
+#[test]
+fn a_learned_delay_never_runs_a_lever() {
+    let _c = clock();
+    let mut f = lagging();
+    f.report(8.0);
+    let runs = f.intents();
+    // Approving the ask about the delay runs nothing: it is inferred, and
+    // names no lever.
+    f.approve_open(|r| {
+        matches!(
+            r,
+            Record::Ask {
+                claim: Claim::Inferred,
+                ..
+            }
+        )
+    });
+    f.report(8.0);
+    f.report(8.0);
+    assert_eq!(f.intents(), runs, "{:#?}", f.entries());
+}
+
+#[test]
+fn a_lever_that_never_moves_the_metric_is_still_no_effect_at_once() {
+    let _c = clock();
+    let mut f = daily();
+    for _ in 0..4 {
+        f.report(9.0);
+    }
+    f.report(3.0);
+    f.report(3.0);
+    assert!(
+        f.suspended(),
+        "no effect waits on no delay its runs never showed"
+    );
 }

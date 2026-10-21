@@ -81,7 +81,12 @@ pub fn judge(
     let Some(&then) = after.get(expects.within as usize - 1) else {
         return Judgement::Waiting;
     };
-    let observed = then - base;
+    judge_change(expects, then - base, drift, noise)
+}
+
+/// Judge a change the metric made over a span a run is judged on, net of
+/// the `drift` over it, against the `noise`.
+pub fn judge_change(expects: &Expects, observed: f64, drift: f64, noise: f64) -> Judgement {
     let effect = observed - drift;
     if effect.abs() <= noise {
         return Judgement::NoEffect {
@@ -90,10 +95,7 @@ pub fn judge(
             noise,
         };
     }
-    let toward = match expects.direction {
-        Direction::Up => effect,
-        Direction::Down => -effect,
-    };
+    let toward = toward(expects, effect);
     if toward < 0.0 {
         return Judgement::WrongDirection {
             observed,
@@ -109,6 +111,44 @@ pub fn judge(
         },
         _ => Judgement::Met,
     }
+}
+
+/// An effect read the way the lever expects it: positive is the right way.
+pub fn toward(expects: &Expects, effect: f64) -> f64 {
+    match expects.direction {
+        Direction::Up => effect,
+        Direction::Down => -effect,
+    }
+}
+
+/// The delay a lever's effect shows at: the shift, in reports, at which
+/// the metric's response best lines up with its runs. `runs` holds, for
+/// each run, its effect the right way (net of drift) and the noise, over
+/// `within` reports starting at each shift: the 0th from the last report
+/// before the run, the `d`-th from the `d`-th after it. Only the shifts
+/// every run has count. The response at a shift is the runs' effects
+/// summed over their noise pooled (a z-score), so a shift that lines up
+/// in every run beats one that a single run pulls; ties go to the
+/// earlier shift, and with no runs it is 0, the declared horizon.
+pub fn delay(runs: &[Vec<(f64, f64)>]) -> usize {
+    let shifts = runs.iter().map(Vec::len).min().unwrap_or(0);
+    let mut best = (0, f64::NEG_INFINITY);
+    for d in 0..shifts {
+        let effect: f64 = runs.iter().map(|r| r[d].0).sum();
+        let noise = runs.iter().map(|r| r[d].1 * r[d].1).sum::<f64>().sqrt();
+        // With no noise at all, any effect the right way is certain.
+        let score = if noise > 0.0 {
+            effect / noise
+        } else if effect == 0.0 {
+            0.0
+        } else {
+            effect.signum() * f64::INFINITY
+        };
+        if score > best.1 {
+            best = (d, score);
+        }
+    }
+    best.0
 }
 
 #[cfg(test)]
@@ -156,6 +196,28 @@ mod tests {
             size,
             within,
         }
+    }
+
+    #[test]
+    fn the_delay_is_where_the_runs_line_up_best() {
+        assert_eq!(delay(&[]), 0, "no runs: the declared horizon");
+        let late = vec![(0.0, 1.0), (0.5, 1.0), (6.0, 1.0), (1.0, 1.0)];
+        assert_eq!(delay(std::slice::from_ref(&late)), 2);
+        // A shift every run shows beats one a single run pulls.
+        let pulled = vec![(0.0, 1.0), (3.0, 1.0), (10.0, 1.0)];
+        let steady = vec![(0.0, 1.0), (3.0, 1.0), (-6.0, 1.0)];
+        assert_eq!(delay(&[pulled, steady]), 1);
+        // Only the shifts every run has whole count.
+        assert_eq!(delay(&[late, vec![(1.0, 1.0), (0.0, 1.0)]]), 0);
+        // Ties go to the earlier shift; with no noise any effect is sure.
+        assert_eq!(delay(&[vec![(2.0, 1.0), (2.0, 1.0)]]), 0);
+        assert_eq!(delay(&[vec![(0.0, 0.0), (0.1, 0.0)]]), 1);
+        assert_eq!(delay(&[vec![(0.0, 0.0), (-0.1, 0.0)]]), 0);
+        // Noise pools as independent strays do: 6 over √2 beats 4 over
+        // √1.45, though 6 over 2 would not beat 4 over 1.3.
+        let a = vec![(3.0, 1.0), (4.0, 1.2)];
+        let b = vec![(3.0, 1.0), (0.0, 0.1)];
+        assert_eq!(delay(&[a, b]), 0);
     }
 
     #[test]
