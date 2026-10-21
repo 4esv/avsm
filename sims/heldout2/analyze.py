@@ -446,11 +446,29 @@ delay_days = sorted(d for d, e in P.SCHEDULE.items() if "pan:delay" in e)
 pan_ineff = [f"#{s} day {dayf(a)}" for s, a, r in asks if r["venture"] == "pantry" and signal(r) == "ineffective"]
 
 # --- the gateway: two ventures' sensors read 0 together ------------------------------------
+# A zero that repeats an earlier flagged zero is believed when a human
+# declared an approval of the implausible ask about that metric between the
+# two: the approval vouches for the reading it answers, so the step is
+# measured from it (kernel anchored_before). That is the human's word, the
+# way a restored lever is: reported as `vouched`, not counted against avsm.
+def vouched_zero(v, metric, s):
+    before = [(s2, r2) for s2, a2, r2 in metric_reports(v, metric) if s2 < s]
+    if not before or before[-1][0] not in flagged or before[-1][1].get("value") != 0: return False
+    for sd, ad, d in decisions:
+        ask = by_seq.get((d.get("verdict") or {}).get("ask"))
+        if (before[-1][0] < sd < s and d.get("claim") == "declared" and (d.get("verdict") or {}).get("verdict") == "approve"
+                and ask is not None and kind(ask) == "ask" and ask.get("venture") == v
+                and signal(ask) == "implausible" and ask["signal"].get("metric") == metric):
+            return True
+    return False
+
+
 gw_reports = {}
 for v, metric in (("reservoir", "level"), ("pantry", "stock")):
     on = [(s, r) for s, a, r in metric_reports(v, metric) if gw and any(g <= a < g + STEP for g in gw) and r.get("value") == 0]
-    gw_reports[v] = {"zero_reports": len(on), "flagged": sum(1 for s, r in on if s in flagged),
-                     "unflagged": [s for s, r in on if s not in flagged]}
+    vouch = [s for s, r in on if s not in flagged and vouched_zero(v, metric, s)]
+    gw_reports[v] = {"zero_reports": len(on), "flagged": sum(1 for s, r in on if s in flagged), "vouched": vouch,
+                     "unflagged": [s for s, r in on if s not in flagged and s not in vouch]}
 gw_flag_pass = None if not any(x["zero_reports"] for x in gw_reports.values()) else all(not x["unflagged"] for x in gw_reports.values())
 gw_orders = [f"#{s} day {dayf(a)} with stock at {truth_for(a)['stock']}" for s, a, r in orders
              if in_gw(a) and truth_for(a)["stock"] >= REORDER_AT]
