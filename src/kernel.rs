@@ -1545,7 +1545,7 @@ impl Kernel {
             &metric,
             value,
             v.mandate.range,
-            v.mandate.max_step,
+            v.mandate.steps(),
             v.mandate.confirm,
         );
         let entry = match self.append(Record::Report {

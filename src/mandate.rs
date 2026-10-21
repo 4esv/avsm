@@ -83,6 +83,13 @@ pub struct Mandate {
     /// The largest plausible change from one report to the next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_step: Option<f64>,
+    /// The largest plausible rise from one report to the next, where it
+    /// differs from the largest fall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rise: Option<f64>,
+    /// The largest plausible fall from one report to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fall: Option<f64>,
     /// With max_step: a plausible report right after an implausible one
     /// is unconfirmed, never a premise, until the next agrees with it
     /// within max_step. False lets it act at once, where waiting costs
@@ -243,6 +250,12 @@ pub struct Guard {
     /// The largest plausible change from one reading to the next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_step: Option<f64>,
+    /// The largest plausible rise from one reading to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rise: Option<f64>,
+    /// The largest plausible fall from one reading to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fall: Option<f64>,
     /// With max_step: a reading right after an implausible one waits for
     /// the next to agree with it. False lets it count at once.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
@@ -325,6 +338,11 @@ impl Guard {
         format!("guard.{}", self.name)
     }
 
+    /// How far its readings may plausibly move from one to the next.
+    pub fn steps(&self) -> Option<Steps> {
+        Steps::of(self.max_step, self.max_rise, self.max_fall)
+    }
+
     /// Whether the guard trips above its bound, and the bound. A drawdown
     /// trips at or above its percent.
     pub fn bound(&self) -> (bool, f64) {
@@ -384,6 +402,12 @@ pub struct Audit {
     /// The largest plausible change from one reading to the next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_step: Option<f64>,
+    /// The largest plausible rise from one reading to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rise: Option<f64>,
+    /// The largest plausible fall from one reading to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fall: Option<f64>,
     /// With max_step: a reading right after an implausible one waits for
     /// the next to agree with it. False lets it count at once.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
@@ -413,6 +437,11 @@ impl Audit {
         format!("audit.{}", self.name)
     }
 
+    /// How far its readings may plausibly move from one to the next.
+    pub fn steps(&self) -> Option<Steps> {
+        Steps::of(self.max_step, self.max_rise, self.max_fall)
+    }
+
     /// How much worse the audit got for a change of `delta`.
     pub fn worsened(&self, delta: f64) -> f64 {
         match self.worse {
@@ -430,12 +459,14 @@ impl Audit {
     }
 }
 
-/// A range is low then high, and a max_step is above 0. `who` prefixes
+/// A range is low then high, and each step bound is above 0. A max_rise
+/// or max_fall is tighter than a max_step beside it: max_step already
+/// bounds both ways, so a looser one would say nothing. `who` prefixes
 /// the message for a guard or an audit.
 fn check_plausibility(
     who: &str,
     range: Option<[f64; 2]>,
-    max_step: Option<f64>,
+    steps: Option<Steps>,
 ) -> Result<(), MandateError> {
     if let Some([lo, hi]) = range {
         if !lo.is_finite() || !hi.is_finite() || lo >= hi {
@@ -444,12 +475,95 @@ fn check_plausibility(
             ));
         }
     }
-    if let Some(s) = max_step {
-        if !s.is_finite() || s <= 0.0 {
-            return fail(format!("{who}max_step must be a number above 0, not {s}"));
+    let Some(Steps { step, rise, fall }) = steps else {
+        return Ok(());
+    };
+    for (key, bound) in [("max_step", step), ("max_rise", rise), ("max_fall", fall)] {
+        if let Some(s) = bound {
+            if !s.is_finite() || s <= 0.0 {
+                return fail(format!("{who}{key} must be a number above 0, not {s}"));
+            }
+        }
+    }
+    if let Some(s) = step {
+        for (key, bound) in [("max_rise", rise), ("max_fall", fall)] {
+            if let Some(b) = bound.filter(|b| *b >= s) {
+                return fail(format!(
+                    "{who}{key} {b} is not below max_step {s}, which already bounds a step either way; drop {key}, or make it smaller to bound that way tighter"
+                ));
+            }
         }
     }
     Ok(())
+}
+
+/// How far a reading may plausibly move from the one before it: max_step
+/// either way, max_rise up and max_fall down, the tightest declared
+/// bounding each way. A way with no bound declared is unbounded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Steps {
+    pub step: Option<f64>,
+    pub rise: Option<f64>,
+    pub fall: Option<f64>,
+}
+
+impl Steps {
+    /// The bounds declared, or None when none is.
+    pub fn of(step: Option<f64>, rise: Option<f64>, fall: Option<f64>) -> Option<Steps> {
+        (step.is_some() || rise.is_some() || fall.is_some()).then_some(Steps { step, rise, fall })
+    }
+
+    /// The bound on a change of `d`, its way's, and the key that set it. A
+    /// valid mandate's max_rise and max_fall are below its max_step.
+    fn bound(&self, d: f64) -> (f64, &'static str) {
+        let (way, key) = if d > 0.0 {
+            (self.rise, "max_rise")
+        } else {
+            (self.fall, "max_fall")
+        };
+        match (way, self.step) {
+            (Some(w), _) => (w, key),
+            (None, Some(s)) => (s, "max_step"),
+            (None, None) => (f64::INFINITY, key),
+        }
+    }
+
+    /// Is a change of `d` past the bound its way?
+    pub fn past(&self, d: f64) -> bool {
+        d.abs() > self.bound(d).0
+    }
+
+    /// Why a change of `d` from `prev` is past its bound, if it is: a step
+    /// past max_step, or a rise or a fall past the bound that way.
+    pub fn too_far(&self, prev: f64, d: f64) -> Option<String> {
+        let (b, key) = self.bound(d);
+        if d.abs() <= b {
+            return None;
+        }
+        let what = match key {
+            "max_step" => "step",
+            _ if d > 0.0 => "rise",
+            _ => "fall",
+        };
+        Some(format!(
+            "a {what} of {} from {prev} is more than {key} {b}",
+            d.abs()
+        ))
+    }
+}
+
+impl fmt::Display for Steps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let declared: Vec<String> = [
+            ("max_step", self.step),
+            ("max_rise", self.rise),
+            ("max_fall", self.fall),
+        ]
+        .into_iter()
+        .filter_map(|(k, b)| b.map(|b| format!("{k} {b}")))
+        .collect();
+        f.write_str(&declared.join(", "))
+    }
 }
 
 /// The prefix of an audit's readings: never shown to a model.
@@ -1158,6 +1272,8 @@ const FIELDS: &[&str] = &[
     "readings",
     "range",
     "max_step",
+    "max_rise",
+    "max_fall",
     "confirm",
     "escalate",
     "world",
@@ -1169,7 +1285,7 @@ const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadban
 const BAND_FIELDS: &[&str] = &["kind", "low", "high", "below", "above", "deadband", "hold"];
 const GUARD_FIELDS: &[&str] = &[
     "name", "run", "adapter", "above", "below", "then", "drawdown", "of", "range", "max_step",
-    "confirm", "unwind",
+    "max_rise", "max_fall", "confirm", "unwind",
 ];
 const UNWIND_FIELDS: &[&str] = &["action", "payload"];
 const AUDIT_FIELDS: &[&str] = &[
@@ -1182,6 +1298,8 @@ const AUDIT_FIELDS: &[&str] = &[
     "window",
     "range",
     "max_step",
+    "max_rise",
+    "max_fall",
     "confirm",
 ];
 const READING_FIELDS: &[&str] = &["name", "run", "lines", "audit"];
@@ -1675,7 +1793,7 @@ impl Mandate {
         self.check_guards()?;
         self.check_audits()?;
         self.check_readings()?;
-        check_plausibility("", self.range, self.max_step)?;
+        check_plausibility("", self.range, self.steps())?;
         if let Some(world) = &self.world {
             if world.trim().is_empty() {
                 return fail("world is a command like ./world; it is empty");
@@ -1800,7 +1918,7 @@ impl Mandate {
             if let Some(cmd) = g.run.as_deref().or(g.adapter.as_deref()) {
                 self.apart(&who, cmd)?;
             }
-            check_plausibility(&format!("{who}: "), g.range, g.max_step)?;
+            check_plausibility(&format!("{who}: "), g.range, g.steps())?;
             if let Some(u) = &g.unwind {
                 self.check_unwind(&who, u)?;
             }
@@ -1888,7 +2006,7 @@ impl Mandate {
                     ))
                 }
             }
-            check_plausibility(&format!("{who}: "), a.range, a.max_step)?;
+            check_plausibility(&format!("{who}: "), a.range, a.steps())?;
             if !a.tolerance.is_finite() || a.tolerance < 0.0 {
                 return fail(format!(
                     "{who}: tolerance is a number 0 or more, not {}",
@@ -2002,6 +2120,8 @@ impl Mandate {
             readings: vec![],
             range: None,
             max_step: None,
+            max_rise: None,
+            max_fall: None,
             confirm: true,
             escalate: None,
             world: None,
@@ -2057,6 +2177,12 @@ impl Mandate {
     /// The permitted action with this name, if any.
     pub fn permitted(&self, name: &str) -> Option<&Permitted> {
         self.permitted.iter().find(|p| p.name == name)
+    }
+
+    /// How far reports of the metric may plausibly move from one to the
+    /// next.
+    pub fn steps(&self) -> Option<Steps> {
+        Steps::of(self.max_step, self.max_rise, self.max_fall)
     }
 
     /// The metric's name: the word before any adapter argument, as reports
@@ -2369,13 +2495,19 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
             ))
         }
     }
-    match map.get("max_step") {
-        None | Some(Value::Null) | Some(Value::Number(_)) => {}
-        Some(other) => {
-            return fail(format!(
-                "max_step is a number like 50, the largest plausible change between two reports, not {}",
-                describe(other)
-            ))
+    for (key, what) in [
+        ("max_step", "change"),
+        ("max_rise", "rise"),
+        ("max_fall", "fall"),
+    ] {
+        match map.get(key) {
+            None | Some(Value::Null) | Some(Value::Number(_)) => {}
+            Some(other) => {
+                return fail(format!(
+                    "{key} is a number like 50, the largest plausible {what} between two reports, not {}",
+                    describe(other)
+                ))
+            }
         }
     }
     match map.get("confirm") {
@@ -3492,6 +3624,20 @@ max_step: 5000
             ("range: 5\n", "two numbers"),
             ("max_step: 0\n", "above 0"),
             ("max_step: big\n", "max_step is a number"),
+            ("max_rise: 0\n", "max_rise must be a number above 0"),
+            ("max_fall: big\n", "max_fall is a number"),
+            (
+                "max_step: 100\nmax_rise: 100\n",
+                "max_rise 100 is not below max_step 100, which already bounds a step either way",
+            ),
+            (
+                "guards:\n  - {name: g, run: ./g, above: 1, max_step: 5, max_fall: 9}\n",
+                "guard \"g\": max_fall 9 is not below max_step 5",
+            ),
+            (
+                "audits:\n  - {name: a, run: ./a, worse: up, max_fall: -1}\n",
+                "audit \"a\": max_fall must be a number above 0",
+            ),
         ] {
             let msg = with(extra);
             assert!(msg.contains(says), "{extra:?}: {msg}");
@@ -3577,7 +3723,7 @@ max_step: 5000
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, readings, range, max_step, confirm, escalate, world, calibration, early_warning, better"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, readings, range, max_step, max_rise, max_fall, confirm, escalate, world, calibration, early_warning, better"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");

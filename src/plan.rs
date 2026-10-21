@@ -472,6 +472,8 @@ mod tests {
             of: None,
             range: None,
             max_step: None,
+            max_rise: None,
+            max_fall: None,
             confirm: true,
             unwind: None,
         }

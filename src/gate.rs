@@ -3178,6 +3178,8 @@ mod tests {
             readings: vec![],
             range: None,
             max_step: None,
+            max_rise: None,
+            max_fall: None,
             confirm: true,
             escalate: None,
             world: None,

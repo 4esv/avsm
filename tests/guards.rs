@@ -1441,3 +1441,204 @@ fn a_reading_without_an_audit_keeps_addresses_and_a_failure_says_nothing() {
     // A reading is not the nightly cycle: it never says the cycle ran.
     assert!(k.index().unwrap().inferred_at("shop").is_empty());
 }
+
+/// The flags on a counter in range [0, 1000] with these step bounds, fed
+/// these readings.
+fn stepped(bounds: &str, values: &[&str]) -> Vec<Option<String>> {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = venture(
+        tmp.path(),
+        "counter",
+        &format!(
+            "purpose: Keep it low.\nmetric: count\ncontroller: {{kind: threshold, above: 900, action: reset}}\n\
+             cadence: 1h\nrange: [0, 1000]\n{bounds}\
+             permitted:\n- {{name: reset, run: echo reset >> resets, cap: 99/day, reversible: true}}\n"
+        ),
+    );
+    let mut k = kernel(&home, Box::new(Silent));
+    k.add(&dir).unwrap();
+    for v in values {
+        report(&mut k, &dir, "counter", v);
+    }
+    flags(&k, "counter", "count")
+}
+
+#[test]
+fn a_fall_past_max_fall_is_implausible_and_the_same_rise_is_not() {
+    // The held-out pantry: stock arrives by the pallet and leaves by the
+    // day's demand. A gateway's 0 is a fall no day can make.
+    let bounds = "max_rise: 800\nmax_fall: 100\n";
+    assert_eq!(stepped(bounds, &["500", "650"]), vec![None, None]);
+    assert_eq!(stepped(bounds, &["500", "400"]), vec![None, None]);
+    assert_eq!(stepped(bounds, &["500", "1000"])[1], None);
+    let f = stepped(bounds, &["500", "350"]);
+    assert_eq!(
+        f[1].as_deref(),
+        Some("a fall of 150 from 500 is more than max_fall 100"),
+        "{f:?}"
+    );
+    let f = stepped(bounds, &["398", "0"]);
+    assert!(
+        f[1].as_deref().is_some_and(|w| w.contains("max_fall")),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn a_rise_past_max_rise_is_implausible_and_the_same_fall_is_not() {
+    // No max_fall and no max_step: a fall of any size is plausible.
+    let bounds = "max_rise: 100\n";
+    assert_eq!(stepped(bounds, &["500", "350"]), vec![None, None]);
+    assert_eq!(stepped(bounds, &["500", "0"])[1], None);
+    let f = stepped(bounds, &["500", "650"]);
+    assert_eq!(
+        f[1].as_deref(),
+        Some("a rise of 150 from 500 is more than max_rise 100"),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn max_step_alone_bounds_both_ways_as_before() {
+    let bounds = "max_step: 100\n";
+    assert_eq!(stepped(bounds, &["500", "580", "500"]), vec![None; 3]);
+    for to in ["650", "350"] {
+        let f = stepped(bounds, &["500", to]);
+        assert_eq!(
+            f[1].as_deref(),
+            Some("a step of 150 from 500 is more than max_step 100"),
+            "{f:?}"
+        );
+    }
+}
+
+#[test]
+fn the_tighter_of_max_step_and_max_fall_bounds_each_way() {
+    let bounds = "max_step: 100\nmax_fall: 50\n";
+    assert_eq!(stepped(bounds, &["500", "570"]), vec![None, None]);
+    let f = stepped(bounds, &["500", "430"]);
+    assert!(
+        f[1].as_deref()
+            .is_some_and(|w| w.contains("more than max_fall 50")),
+        "{f:?}"
+    );
+    let f = stepped(bounds, &["500", "620"]);
+    assert!(
+        f[1].as_deref()
+            .is_some_and(|w| w.contains("more than max_step 100")),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn readings_agree_when_each_is_a_plausible_step_from_those_before_it() {
+    // A fall of 200 past max_fall 100, then two that fall within it: three
+    // agreeing readings re-anchor. Three that rise by 40 each do not agree
+    // where a rise past 10 is implausible, though they are closer together
+    // than the falls.
+    let bounds = "max_rise: 10\nmax_fall: 100\n";
+    let f = stepped(bounds, &["500", "300", "250", "200"]);
+    assert!(f[1].is_some() && f[2].is_some(), "{f:?}");
+    assert_eq!(f[3], None, "{f:?}");
+    let f = stepped(bounds, &["500", "300", "340", "380"]);
+    assert!(
+        f[3].as_deref()
+            .is_some_and(|w| w.starts_with("a fall of 120")),
+        "{f:?}"
+    );
+    // Right after an implausible reading, the next confirms the one before
+    // it only by a plausible step from it.
+    let f = stepped(bounds, &["500", "0", "495", "480"]);
+    assert!(
+        f[2].as_deref()
+            .is_some_and(|w| w.starts_with("unconfirmed")),
+        "{f:?}"
+    );
+    assert_eq!(f[3], None, "{f:?}");
+    let f = stepped(bounds, &["500", "0", "480", "495"]);
+    assert!(
+        f[3].as_deref()
+            .is_some_and(|w| w.starts_with("unconfirmed")),
+        "{f:?}"
+    );
+    // A plausible fall from the last believed reading, right after an
+    // implausible one, waits for the next like any other.
+    let f = stepped(bounds, &["500", "0", "460"]);
+    assert!(
+        f[2].as_deref()
+            .is_some_and(|w| w.starts_with("unconfirmed")),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn a_flap_is_judged_by_the_bound_each_way() {
+    // Each raw step past the bound its way, each the other way: a flap,
+    // though the falls are within max_step's old symmetric reading of 100.
+    let bounds = "max_rise: 10\nmax_fall: 100\n";
+    let f = stepped(bounds, &["500", "550", "400", "450"]);
+    assert!(
+        f[3].as_deref().is_some_and(|w| w.starts_with("flapping")),
+        "{f:?}"
+    );
+    // Reversed by more than both bounds twice in a row is a flap; by more
+    // than one of them only, as a delivery between two days of demand,
+    // is not. Either way round.
+    for (bounds, values) in [
+        (
+            "max_rise: 100\nmax_fall: 10\n",
+            ["500", "491", "591", "582"],
+        ),
+        (
+            "max_rise: 10\nmax_fall: 100\n",
+            ["500", "509", "409", "418"],
+        ),
+    ] {
+        let f = stepped(bounds, &values);
+        assert!(
+            f[3].as_deref().is_some_and(|w| w.starts_with("flapping")),
+            "{bounds}: {f:?}"
+        );
+    }
+    for (bounds, values) in [
+        (
+            "max_rise: 100\nmax_fall: 10\n",
+            ["500", "492", "587", "585"],
+        ),
+        (
+            "max_rise: 10\nmax_fall: 100\n",
+            ["500", "508", "413", "415"],
+        ),
+    ] {
+        assert_eq!(stepped(bounds, &values), vec![None; 4], "{bounds}");
+    }
+}
+
+#[test]
+fn a_guard_reading_takes_max_rise_and_max_fall() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = venture(
+        tmp.path(),
+        "shop",
+        &format!(
+            "{SHOP}permitted:\n- {{name: tidy, run: touch tidied, cap: 99/day, reversible: true}}\n\
+             guards:\n- {{name: soil, run: cat soil, below: 20, then: ask, range: [0, 100], max_rise: 60, max_fall: 10}}\n"
+        ),
+    );
+    let mut k = kernel(&home, Box::new(Silent));
+    k.add(&dir).unwrap();
+    for soil in ["40", "90", "88", "60"] {
+        set(&dir, "soil", soil);
+        report(&mut k, &dir, "shop", "5");
+    }
+    let f = flags(&k, "shop", "guard.soil");
+    let (last, before) = f.split_last().unwrap();
+    assert!(before.iter().all(Option::is_none), "{f:?}");
+    assert!(
+        last.as_deref()
+            .is_some_and(|w| w.contains("a fall of 28 from 88 is more than max_fall 10")),
+        "{f:?}"
+    );
+}
