@@ -239,6 +239,14 @@ pub enum Reason {
         budget: u32,
         floor: u32,
     },
+    /// A budget that raises the children's budgets past the parent's
+    /// total.
+    OverTotal {
+        child: String,
+        budget: u32,
+        sum: u64,
+        total: u32,
+    },
     /// A cut to a child while a lower-priority child sits above its floor.
     Priority {
         child: String,
@@ -1785,9 +1793,9 @@ fn payload_entry<'a>(
 type Budgeted = (Seq, i64, u32);
 
 /// What a parent lever, about to be pulled, would break: a venture that is
-/// not the parent's child, a budget under a floor, a cut that spares a
-/// lower-priority child above its floor, a change inside the deadband, a
-/// reversal inside the hold. These hold whatever the proof rests on,
+/// not the parent's child, a budget under a floor, a raise past the
+/// parent's total, a cut that spares a lower-priority child above its
+/// floor, a change inside the deadband, a reversal inside the hold. These hold whatever the proof rests on,
 /// declared approvals included. `budgets` lists what the parent has set for
 /// a child: seq, when, amount; oldest first.
 fn allocation_reasons<'a>(
@@ -1839,6 +1847,31 @@ fn allocation_reasons<'a>(
         });
     }
     let history = budgets(child);
+    let total = parent.mandate.allocation.as_ref().and_then(|a| a.total);
+    if let Some(total) = total {
+        // The budgets in force with this one in its child's place, a
+        // child with none set at its floor. A cut is a correction and
+        // passes whatever the sum: only a raise is held to the total.
+        let sum: u64 = parent
+            .mandate
+            .children
+            .iter()
+            .map(|c| match budgets(&c.name).last() {
+                _ if c.name == child => u64::from(amount),
+                Some(&(_, _, theirs)) => u64::from(theirs),
+                None => u64::from(c.floor),
+            })
+            .sum();
+        let cut = history.last().is_some_and(|&(_, _, set)| amount < set);
+        if sum > u64::from(total) && !cut {
+            reasons.push(Reason::OverTotal {
+                child: child.to_string(),
+                budget: amount,
+                sum,
+                total,
+            });
+        }
+    }
     let Some(&(last, last_at, current)) = history.last() else {
         return reasons;
     };
@@ -1878,7 +1911,10 @@ fn allocation_reasons<'a>(
             let went = current.cmp(&before);
             let goes = amount.cmp(&current);
             let inside = now - last_at < alloc.hold.as_secs() as i64;
-            if inside && went.is_ne() && goes.is_ne() && went != goes {
+            // Under a total, a cut is never held: a budget the parent
+            // should not have set is undone at once.
+            let correction = total.is_some() && goes.is_lt();
+            if inside && went.is_ne() && goes.is_ne() && went != goes && !correction {
                 reasons.push(Reason::Reversal {
                     child: child.to_string(),
                     last,
@@ -2128,6 +2164,15 @@ impl fmt::Display for Reason {
             } => write!(
                 f,
                 "a budget of {budget} is below {child}'s floor of {floor}"
+            ),
+            Reason::OverTotal {
+                child,
+                budget,
+                sum,
+                total,
+            } => write!(
+                f,
+                "a budget of {budget} for {child} brings the children's budgets to {sum}, past the total of {total}"
             ),
             Reason::Priority {
                 child,
@@ -4196,7 +4241,144 @@ mod tests {
     }
 
     fn allocation(deadband: u32, hold: Duration) -> Option<Allocation> {
-        Some(Allocation { deadband, hold })
+        Some(Allocation {
+            deadband,
+            hold,
+            total: None,
+        })
+    }
+
+    fn total(total: u32, hold: Duration) -> Option<Allocation> {
+        Some(Allocation {
+            deadband: 1,
+            hold,
+            total: Some(total),
+        })
+    }
+
+    #[test]
+    fn a_budget_that_raises_the_sum_past_the_total_is_refused_even_with_a_declared_approval() {
+        let mut fx = Fx::new();
+        siblings(
+            &mut fx,
+            term("shop", 1, 3),
+            term("farm", 0, 1),
+            total(6, Duration::ZERO),
+        );
+        // The farm has no budget yet: it counts at its floor of 1.
+        let refusal = parent_gate(&mut fx, "budget", "shop 6").unwrap_err();
+        assert!(
+            has(
+                &refusal,
+                |r| matches!(r, Reason::OverTotal { child, budget: 6, sum: 7, total: 6 } if child == "shop")
+            ),
+            "{refusal}"
+        );
+        assert!(
+            reasons(&refusal).contains(
+                &"a budget of 6 for shop brings the children's budgets to 7, past the total of 6"
+                    .to_string()
+            ),
+            "{refusal}"
+        );
+        assert!(parent_gate(&mut fx, "budget", "shop 5").is_ok());
+        set_budget(&mut fx, "shop", 3);
+        set_budget(&mut fx, "farm", 2);
+        // At the total it passes; one past, refused.
+        assert!(parent_gate(&mut fx, "budget", "farm 3").is_ok());
+        let refusal = parent_gate(&mut fx, "budget", "farm 4").unwrap_err();
+        assert!(
+            has(
+                &refusal,
+                |r| matches!(r, Reason::OverTotal { child, sum: 7, .. } if child == "farm")
+            ),
+            "{refusal}"
+        );
+        set_budget(&mut fx, "farm", 3);
+        let refusal = parent_gate(&mut fx, "budget", "farm 20").unwrap_err();
+        assert!(
+            has(
+                &refusal,
+                |r| matches!(r, Reason::OverTotal { child, sum: 23, .. } if child == "farm")
+            ),
+            "{refusal}"
+        );
+        // A human approves the ask. The total still holds: only a human
+        // editing the mandate moves it.
+        let q = fx.push(Record::Ask {
+            packet: None,
+            cites: vec![],
+            claim: Claim::Inferred,
+            venture: "portfolio".into(),
+            action: Some("budget".into()),
+            question: "budget farm 20?".into(),
+            refusal: None,
+            signal: None,
+            payload: Some(text("farm 20")),
+        });
+        let d = fx.push(Record::Decision {
+            claim: Claim::Declared,
+            venture: "portfolio".into(),
+            verdict: approve(q),
+            by: None,
+        });
+        let refusal = fx.gate("portfolio", "budget", &[d]).unwrap_err();
+        assert!(
+            has(&refusal, |r| matches!(r, Reason::OverTotal { .. })),
+            "{refusal}"
+        );
+        // Without a total, the same budget passes.
+        let mut fx = Fx::new();
+        siblings(
+            &mut fx,
+            term("shop", 1, 3),
+            term("farm", 0, 1),
+            allocation(1, Duration::ZERO),
+        );
+        set_budget(&mut fx, "shop", 3);
+        set_budget(&mut fx, "farm", 3);
+        assert!(parent_gate(&mut fx, "budget", "farm 20").is_ok());
+    }
+
+    #[test]
+    fn a_cut_under_a_total_is_not_held_and_one_past_it_is_allowed() {
+        // Budgets set past the total (before it was declared): the cut
+        // that brings them back runs at once, inside the hold.
+        let mut fx = Fx::new();
+        siblings(
+            &mut fx,
+            term("shop", 1, 3),
+            term("farm", 0, 1),
+            total(6, Duration::from_secs(5 * DAY as u64)),
+        );
+        set_budget(&mut fx, "shop", 3);
+        set_budget(&mut fx, "farm", 3);
+        set_budget(&mut fx, "farm", 20);
+        assert!(parent_gate(&mut fx, "budget", "farm 3").is_ok());
+        // A cut that leaves the sum past the total is still a correction.
+        assert!(parent_gate(&mut fx, "budget", "farm 10").is_ok());
+        // Raising it again inside the hold is a reversal, and past the total.
+        set_budget(&mut fx, "farm", 3);
+        let refusal = parent_gate(&mut fx, "budget", "farm 5").unwrap_err();
+        assert!(
+            has(&refusal, |r| matches!(r, Reason::Reversal { .. })),
+            "{refusal}"
+        );
+        // Without a total the hold holds a cut too.
+        let mut fx = Fx::new();
+        siblings(
+            &mut fx,
+            term("shop", 1, 3),
+            term("farm", 0, 1),
+            allocation(1, Duration::from_secs(5 * DAY as u64)),
+        );
+        set_budget(&mut fx, "farm", 3);
+        set_budget(&mut fx, "farm", 20);
+        let refusal = parent_gate(&mut fx, "budget", "farm 3").unwrap_err();
+        assert!(
+            has(&refusal, |r| matches!(r, Reason::Reversal { .. })),
+            "{refusal}"
+        );
     }
 
     #[test]

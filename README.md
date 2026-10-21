@@ -257,6 +257,13 @@ above 25` moves the line a child's reports cross. Parents allocate; children
 act. A parent never runs a child's lever, and its nightly call sees its
 children's numbers and records, not what the world told them.
 
+A parent may say `allocation: {deadband: 2, hold: 5d, total: 6}`: a budget
+change under 2 is refused, so is moving a budget back inside five days, and
+so is any budget that brings its children's budgets past 6 (a child with
+none set counts at its floor). Approving the ask does not lift the total;
+only you change it, in the mandate. A cut is never held when there is a
+total, so a budget that should not have been set is undone at once.
+
 Limits shared by every venture go in the config as `quotas: {asks: 20/day,
 spend: 100/day, sends: 10/day}`; avsm refuses what would pass one before the
 gate is even asked, and `avsm why` shows the quota.

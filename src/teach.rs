@@ -122,6 +122,7 @@ pub fn enforced(m: &Mandate) -> Vec<f64> {
             v.push(f64::from(c.floor));
         }
     }
+    v.extend(m.allocation.as_ref().and_then(|a| a.total).map(f64::from));
     if let Some([lo, hi]) = m.range {
         v.push(lo);
         v.push(hi);
@@ -396,6 +397,11 @@ pub fn render(m: &Mandate) -> String {
             a.deadband,
             every(a.hold)
         ));
+        if let Some(t) = a.total {
+            line(format!(
+                "allocation: a budget that brings the children's budgets past {t} is refused"
+            ));
+        }
     }
     if let Some(p) = &m.parent {
         line(format!("child of {p}"));

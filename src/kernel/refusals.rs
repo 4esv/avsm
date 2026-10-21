@@ -80,6 +80,7 @@ fn reason_key(r: &Reason) -> String {
         Reason::Waiting { action, .. } => format!("Waiting({action})"),
         Reason::NotAChild { venture, child } => format!("NotAChild({venture},{child})"),
         Reason::BelowFloor { child, floor, .. } => format!("BelowFloor({child},{floor})"),
+        Reason::OverTotal { child, total, .. } => format!("OverTotal({child},{total})"),
         Reason::Priority { child, spared, .. } => format!("Priority({child},{spared})"),
         Reason::InDeadband {
             child, deadband, ..

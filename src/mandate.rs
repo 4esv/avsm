@@ -552,7 +552,7 @@ impl<'de> Deserialize<'de> for Child {
 }
 
 /// `allocation:` on a parent: the deadband and hold that keep it from
-/// thrashing its children's budgets.
+/// thrashing its children's budgets, and the total they may add up to.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Allocation {
@@ -560,9 +560,16 @@ pub struct Allocation {
     #[serde(default)]
     pub deadband: u32,
     /// Inside this long after a child's budget moved, moving it back the
-    /// other way is refused. Left out, no reversal is refused.
+    /// other way is refused. Left out, no reversal is refused. With a
+    /// total, a cut is never held: a budget past the total is undone at
+    /// once.
     #[serde(default, with = "duration")]
     pub hold: Duration,
+    /// The most the children's budgets may add up to, a child with none
+    /// set counted at its floor. A budget that raises the sum past it is
+    /// refused. Left out, no sum is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u32>,
 }
 
 /// `network:` as `none`, or a list of hosts.
@@ -1549,6 +1556,14 @@ impl Mandate {
                 return fail("self cannot be a child; it belongs to no one".to_string());
             }
         }
+        if let Some(total) = self.allocation.as_ref().and_then(|a| a.total) {
+            let floors: u64 = self.children.iter().map(|c| u64::from(c.floor)).sum();
+            if floors > u64::from(total) {
+                return fail(format!(
+                    "the children's floors add up to {floors}, past the allocation total of {total}; no budgets could be set"
+                ));
+            }
+        }
         if let Some(p) = &self.parent {
             if !is_word(p) {
                 return fail(format!("parent names a venture, one word, not {p:?}"));
@@ -2415,9 +2430,9 @@ fn check_child(terms: &Mapping) -> Result<(), MandateError> {
     }
 }
 
-const ALLOCATION_FIELDS: &[&str] = &["deadband", "hold"];
+const ALLOCATION_FIELDS: &[&str] = &["deadband", "hold", "total"];
 
-/// `allocation: {deadband: 2, hold: 1d}`.
+/// `allocation: {deadband: 2, hold: 1d, total: 6}`.
 fn check_allocation(v: Option<&Value>) -> Result<(), MandateError> {
     let terms = match v {
         None | Some(Value::Null) => return Ok(()),
@@ -2446,10 +2461,20 @@ fn check_allocation(v: Option<&Value>) -> Result<(), MandateError> {
         }
     }
     match terms.get("hold") {
-        None => Ok(()),
-        Some(Value::String(s)) if humantime::parse_duration(s.trim()).is_ok() => Ok(()),
+        None => {}
+        Some(Value::String(s)) if humantime::parse_duration(s.trim()).is_ok() => {}
+        Some(other) => {
+            return fail(format!(
+                "hold is a length of time, like 1d, not {}",
+                describe(other)
+            ))
+        }
+    }
+    match terms.get("total") {
+        None | Some(Value::Null) => Ok(()),
+        Some(v) if v.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => Ok(()),
         Some(other) => fail(format!(
-            "hold is a length of time, like 1d, not {}",
+            "total is a whole number, the most the children's budgets add up to, not {}",
             describe(other)
         )),
     }
@@ -4144,7 +4169,8 @@ max_step: 5000
             m.allocation,
             Some(Allocation {
                 deadband: 2,
-                hold: Duration::from_secs(86_400)
+                hold: Duration::from_secs(86_400),
+                total: None,
             })
         );
         let m = Mandate::parse(&with("{deadband: 2}")).unwrap();
@@ -4157,7 +4183,7 @@ max_step: 5000
         );
         assert_eq!(
             fails(&with("{deadbnd: 2}")),
-            "unknown allocation field \"deadbnd\"; allocation has: deadband, hold"
+            "unknown allocation field \"deadbnd\"; allocation has: deadband, hold, total"
         );
         assert_eq!(
             fails(&with("{deadband: -2}")),
@@ -4170,6 +4196,47 @@ max_step: 5000
         assert_eq!(
             fails(&with("3")),
             "allocation is {deadband: 2, hold: 1d}, not the number 3"
+        );
+    }
+
+    #[test]
+    fn an_allocation_total_parses_and_holds_the_floors() {
+        let parent = |terms: &str| {
+            format!(
+                "{VALID}children:\n  - {{name: shop, floor: 3}}\n  - {{name: farm, floor: 1}}\n\
+                 allocation: {terms}\n"
+            )
+        };
+        let m = Mandate::parse(&parent("{deadband: 2, hold: 5d, total: 6}")).unwrap();
+        assert_eq!(m.allocation.as_ref().and_then(|a| a.total), Some(6));
+        assert_eq!(
+            Mandate::parse(&serde_yaml::to_string(&m).unwrap()).unwrap(),
+            m
+        );
+        // The floors alone may fill the total, not pass it.
+        assert!(Mandate::parse(&parent("{total: 4}")).is_ok());
+        assert_eq!(
+            fails(&parent("{total: 3}")),
+            "the children's floors add up to 4, past the allocation total of 3; no budgets could be set"
+        );
+        assert_eq!(
+            fails(&parent("{total: -6}")),
+            "total is a whole number, the most the children's budgets add up to, not the number -6"
+        );
+        assert_eq!(
+            fails(&parent("{total: lots}")),
+            "total is a whole number, the most the children's budgets add up to, not the text \"lots\""
+        );
+        // The total is a limit: the improving loop never edits it.
+        let raised = Mandate::parse(&parent("{deadband: 2, hold: 5d, total: 20}")).unwrap();
+        assert_eq!(
+            edits_limits(&m, &raised).as_deref(),
+            Some("allocation.total")
+        );
+        let dropped = Mandate::parse(&parent("{deadband: 2, hold: 5d}")).unwrap();
+        assert_eq!(
+            edits_limits(&m, &dropped).as_deref(),
+            Some("allocation.total")
         );
     }
 

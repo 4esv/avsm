@@ -56,8 +56,9 @@
 #     1000: the worst spike hour brings under 400 items in two hours.
 #   - coop: a spend of 6 a day for both, held by the config's spend quota;
 #     the pantry first (priority 1, floor 3), the queue's floor 1.
-#     allocation deadband 2, hold 5d. Budgets and pauses delegated; resume
-#     asks.
+#     allocation deadband 2, hold 5d, and a total of 6: the budgets never
+#     promise more than the one quota they share. Budgets and pauses
+#     delegated; resume asks.
 set -eu
 [ $# -ge 2 ] || { echo "usage: make.sh <run dir> <model command> [escalate command]" >&2; exit 2; }
 R=$1; MODEL=$2; K=$(cd "$(dirname "$0")" && pwd)
@@ -147,7 +148,7 @@ range: [0, 1000]
 children:
   - {name: pantry, priority: 1, floor: 3}
   - {name: queue, floor: 1}
-allocation: {deadband: 2, hold: 5d}
+allocation: {deadband: 2, hold: 5d, total: 6}
 permitted:
   - {name: budget, cap: 4/day, reversible: true, delegated: true}
   - {name: pause, cap: 2/day, reversible: true, delegated: true}

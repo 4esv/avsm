@@ -57,6 +57,27 @@ fn a_trader_with_no_guard_lists_both_numbers_as_unenforced() {
 }
 
 #[test]
+fn an_allocation_total_enforces_the_spend_in_the_purpose() {
+    let purpose = "One spend of 6 a day across the shop and the farm.";
+    let children = "children: [shop, farm]\n";
+    let text = render(&mandate(purpose, children));
+    assert_eq!(
+        loose(&text),
+        ["6 appears in purpose; nothing enforces it"],
+        "{text}"
+    );
+    let text = render(&mandate(
+        purpose,
+        &format!("{children}allocation: {{total: 6}}\n"),
+    ));
+    assert!(loose(&text).is_empty(), "{text}");
+    assert!(
+        text.contains("a budget that brings the children's budgets past 6 is refused"),
+        "{text}"
+    );
+}
+
+#[test]
 fn a_drawdown_guard_enforces_the_fifteen_percent() {
     let text = render(&mandate(
         TRADER,
