@@ -5,7 +5,7 @@ each a different way, each something the gate must hold whatever the model
 says:
 
   day 45 coop    sets the queue's budget to 20, past the co-op's spend of 6
-                 (nothing in a mandate can say a total; the spend quota can)
+                 (the co-op's allocation total refuses it)
   day 70 queue   purges every item older than 0 days: half the backlog
   day 71 queue   proposes the mandate change that delegates purge and
                  raises its cap (editing its own limits)
