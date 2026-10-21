@@ -115,8 +115,13 @@ pub struct Index {
     /// metric, by number.
     series: HashMap<String, HashMap<String, Vec<(Seq, f64)>>>,
     /// The same series as stretches of exactly equal readings: value and
-    /// how many, oldest first.
+    /// how many, oldest first, with the readings a stuck ask's approval
+    /// vouched for among them.
     stretches: HashMap<String, HashMap<String, Vec<(f64, usize)>>>,
+    /// Readings flagged implausible that a declared approval of a stuck
+    /// ask about their metric vouched for, per venture and metric, by
+    /// number.
+    vouched: HashMap<String, HashMap<String, Vec<(Seq, f64)>>>,
     /// Reports of what a run did to the metric, by the intent they cite.
     expected: HashSet<Seq>,
     /// Every intent per venture and action, by number.
@@ -266,20 +271,17 @@ impl Index {
                         .or_default();
                     let i = list.partition_point(|(s, _)| *s <= seq);
                     list.insert(i, (seq, *x));
-                    let st = self
-                        .stretches
-                        .entry(venture.clone())
-                        .or_default()
-                        .entry(metric.clone())
-                        .or_default();
                     if i + 1 == list.len() {
+                        let st = self
+                            .stretches
+                            .entry(venture.clone())
+                            .or_default()
+                            .entry(metric.clone())
+                            .or_default();
                         stretch(st, *x);
                     } else {
                         // Out of order: rare, so built again.
-                        st.clear();
-                        for (_, v) in list.iter() {
-                            stretch(st, *v);
-                        }
+                        self.restretch(&venture, metric);
                     }
                     if x.is_finite() {
                         let peak = self
@@ -372,6 +374,7 @@ impl Index {
                                     .or_default()
                                     .entry(venture.clone())
                                     .or_insert(seq);
+                                self.vouch(*ask, seq);
                             }
                             self.answers.entry(venture).or_default().push(seq);
                             if matches!(verdict, Verdict::Approve { .. })
@@ -488,6 +491,113 @@ impl Index {
             _ => {}
         }
         self.entries.push(Arc::new(e));
+    }
+
+    /// A declared approval, `decision`, of a stuck ask: the human says
+    /// the run of repeats it flagged is real. The run is the reading
+    /// before the ask and the ones after it, to the approval, exactly
+    /// equal to it, missing ones skipped; those code flagged join the
+    /// stretches as zero steps, so the stuck test learns how long the
+    /// metric sits flat. Only this loosens it: a denial or no answer
+    /// leaves the run out, and any other implausible ask vouches for its
+    /// anchor only.
+    fn vouch(&mut self, ask: Seq, decision: Seq) {
+        let Some(Record::Ask {
+            venture,
+            signal: Some(Signal::Implausible { metric, why }),
+            ..
+        }) = self.get(ask).map(|e| &e.record)
+        else {
+            return;
+        };
+        if !why.starts_with("stuck") {
+            return;
+        }
+        let (venture, metric) = (venture.clone(), metric.clone());
+        let Some(seqs) = self.of.get(&venture) else {
+            return;
+        };
+        let report = |s: &Seq| match self.get(*s).map(|e| &e.record) {
+            Some(Record::Report {
+                metric: m,
+                claim,
+                value,
+                ..
+            }) if *m == metric && claim.authorizes() => Some((*s, *value)),
+            _ => None,
+        };
+        // The ask follows the stuck reading that starts its episode; every
+        // repeat after a stuck one is stuck too, as the run only grows and
+        // its chance only falls. So the run is all flagged.
+        let i = seqs.partition_point(|s| *s < ask);
+        let Some((first, Some(x))) = seqs[..i].iter().rev().find_map(report) else {
+            return;
+        };
+        let from = seqs.partition_point(|s| *s < first);
+        let mut run = Vec::new();
+        for (s, value) in seqs[from..]
+            .iter()
+            .take_while(|s| **s < decision)
+            .filter_map(report)
+        {
+            match value {
+                None => continue,
+                Some(v) if v != x => break,
+                Some(_) => run.push((s, x)),
+            }
+        }
+        let list = self
+            .vouched
+            .entry(venture.clone())
+            .or_default()
+            .entry(metric.clone())
+            .or_default();
+        let before = list.len();
+        for r in run {
+            let i = list.partition_point(|(s, _)| *s < r.0);
+            if list.get(i).is_none_or(|(s, _)| *s != r.0) {
+                list.insert(i, r);
+            }
+        }
+        if list.len() > before {
+            self.restretch(&venture, &metric);
+        }
+    }
+
+    /// Build a metric's stretches again from its plausible readings and
+    /// the ones vouched for, by number.
+    fn restretch(&mut self, venture: &str, metric: &str) {
+        let empty = Vec::new();
+        let series = self
+            .series
+            .get(venture)
+            .and_then(|m| m.get(metric))
+            .unwrap_or(&empty);
+        let vouched = self
+            .vouched
+            .get(venture)
+            .and_then(|m| m.get(metric))
+            .unwrap_or(&empty);
+        let mut all: Vec<(Seq, f64)> = series.iter().chain(vouched).copied().collect();
+        all.sort_by_key(|(s, _)| *s);
+        let mut st = Vec::new();
+        for (_, v) in all {
+            stretch(&mut st, v);
+        }
+        self.stretches
+            .entry(venture.to_string())
+            .or_default()
+            .insert(metric.to_string(), st);
+    }
+
+    /// The latest reading of a metric a stuck ask's approval vouched for:
+    /// a run of repeats is judged from after it.
+    pub fn last_vouched(&self, venture: &str, metric: &str) -> Option<Seq> {
+        self.vouched
+            .get(venture)
+            .and_then(|m| m.get(metric))
+            .and_then(|l| l.last())
+            .map(|(s, _)| *s)
     }
 
     /// A declared decision on a canary ask, counted once for whoever gave
@@ -628,7 +738,8 @@ impl Index {
     }
 
     /// The trusted reports of a venture's metric with a value, as
-    /// stretches of exactly equal readings, oldest first.
+    /// stretches of exactly equal readings, oldest first: the plausible
+    /// ones and those a stuck ask's approval vouched for.
     pub fn stretches(&self, venture: &str, metric: &str) -> &[(f64, usize)] {
         self.stretches
             .get(venture)

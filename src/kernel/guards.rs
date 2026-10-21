@@ -20,6 +20,8 @@
 //! max_step: the third re-anchors, so a sensor that was stuck and then
 //! reads the truth is not locked out forever. A declared approval of the
 //! ask vouches for one reading, the anchor; its repeats are still checked.
+//! An approval of a stuck ask vouches for the run it flagged: its repeats
+//! join the history as zero steps, and the run after it starts over.
 //! With max_step, a reading right after an implausible one is unconfirmed,
 //! marked like one and never a premise, until the next reading agrees with
 //! it within max_step (not by an exact repeat where the metric varies); a
@@ -73,7 +75,8 @@ pub const ALPHA: f64 = 0.01;
 
 /// How many of the latest steps of the plausible history say how often
 /// the metric repeats exactly. Stuck readings are implausible and never
-/// enter it, and a repeat at a bound of the range says nothing of the
+/// enter it unless a declared approval of their ask vouched for them,
+/// and a repeat at a bound of the range says nothing of the
 /// sensor and is no step of it, so a metric frozen for weeks, or dry at
 /// its floor, is still judged by the history from when it varied. 256
 /// steps let a clean history make one repeat less likely than ALPHA by
@@ -581,16 +584,19 @@ impl Kernel {
         let recent = recent(&index, venture, metric, RECENT);
         // The readings just before that equal this one exactly. A missing
         // or out-of-range reading says nothing about the value and is
-        // skipped. Did a lever that expects to move this metric run, ok,
-        // since the first of them?
+        // skipped. A run a stuck ask's approval vouched for is history,
+        // not the run: it ends at the last reading vouched for. Did a
+        // lever that expects to move this metric run, ok, since the first
+        // of them?
         let inside = |v: f64| v.is_finite() && range.is_none_or(|[lo, hi]| v >= lo && v <= hi);
+        let vouched = index.last_vouched(venture, metric);
         let plateau: Vec<Seq> = value.map_or_else(Vec::new, |x| {
             reports(&index, venture, metric)
                 .filter_map(|e| match &e.record {
                     Record::Report { value: Some(v), .. } if inside(*v) => Some((e.seq, *v)),
                     _ => None,
                 })
-                .take_while(|(_, v)| *v == x)
+                .take_while(|(s, v)| *v == x && vouched.is_none_or(|last| *s > last))
                 .take(PLATEAU)
                 .map(|(seq, _)| seq)
                 .collect()

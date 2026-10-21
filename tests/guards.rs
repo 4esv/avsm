@@ -881,8 +881,11 @@ fn stuck_at_60() -> (Kernel, PathBuf, tempfile::TempDir, Seq) {
 }
 
 #[test]
-fn a_declared_approval_vouches_for_one_reading_and_a_denial_for_none() {
-    // Approving a stuck reading accepts that reading, not its repeats.
+fn a_declared_approval_vouches_for_a_stuck_run_and_a_denial_for_none() {
+    // Approving a stuck ask says the run is real: its repeats join the
+    // history as zero steps, and the run after the approval starts over.
+    // The two flagged 60s make 5 repeats in 9 steps: a run of 11 more has
+    // chance 6/11 * 7/12 * ... * 16/21 = 0.012, of 12 0.0096.
     let (mut k, dir, _tmp, ask) = stuck_at_60();
     report(&mut k, &dir, "counter", "60");
     assert!(
@@ -890,14 +893,20 @@ fn a_declared_approval_vouches_for_one_reading_and_a_denial_for_none() {
         "code never re-anchors"
     );
     k.approve(ask, None).unwrap();
-    for _ in 0..5 {
+    for _ in 0..12 {
         report(&mut k, &dir, "counter", "60");
     }
     let f = flags(&k, "counter", "count");
+    assert!(f[f.len() - 12..].iter().all(Option::is_none), "{f:?}");
+    // The history still says how rare a run is: one long enough is
+    // stuck again.
+    report(&mut k, &dir, "counter", "60");
+    let f = flags(&k, "counter", "count");
     assert!(
-        f[f.len() - 5..]
-            .iter()
-            .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
+        f.last()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|w| w.contains("after 5 repeats in 9 steps, a run of 12")),
         "{f:?}"
     );
 
@@ -917,15 +926,101 @@ fn a_declared_approval_vouches_for_one_reading_and_a_denial_for_none() {
         assert_eq!(f[6].is_none(), approve, "approved {approve}: {f:?}");
     }
 
-    let (mut k, dir, _tmp, ask) = stuck_at_60();
-    k.deny(ask, "not real").unwrap();
-    for _ in 0..3 {
+    // A denial, or no answer, vouches for nothing: the frozen sensor
+    // stays stuck.
+    for deny in [true, false] {
+        let (mut k, dir, _tmp, ask) = stuck_at_60();
+        if deny {
+            k.deny(ask, "not real").unwrap();
+        }
+        for _ in 0..12 {
+            report(&mut k, &dir, "counter", "60");
+        }
+        let f = flags(&k, "counter", "count");
+        assert!(
+            f[f.len() - 12..]
+                .iter()
+                .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
+            "denied {deny}: {f:?}"
+        );
+    }
+}
+
+#[test]
+fn a_second_approval_of_the_ask_vouches_for_the_run_once() {
+    let (mut k, dir, tmp, ask) = stuck_at_60();
+    report(&mut k, &dir, "counter", "60");
+    k.approve(ask, None).unwrap();
+    let mut ledger =
+        avsmd::ledger::Ledger::open(&tmp.path().join("home").join("ledger.db")).unwrap();
+    ledger
+        .append(Record::Decision {
+            claim: Claim::Declared,
+            venture: "counter".into(),
+            verdict: Verdict::Approve { ask, payload: None },
+            by: None,
+        })
+        .unwrap();
+    drop(ledger);
+    for _ in 0..13 {
         report(&mut k, &dir, "counter", "60");
     }
     let f = flags(&k, "counter", "count");
     assert!(
-        f[f.len() - 3..].iter().all(Option::is_some),
-        "denied: {f:?}"
+        f.last()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|w| w.contains("after 5 repeats in 9 steps, a run of 12")),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn an_approval_vouches_for_the_run_its_ask_flagged_not_a_later_one() {
+    // The ask is about the first run of 60. The metric moves on, then
+    // sits at 60 again and that run is flagged too, with the ask still
+    // open. Approving it vouches for the first run only: the second is
+    // still the run, and still stuck.
+    let (mut k, dir, _tmp, ask) = stuck_at_60();
+    for v in [
+        "61", "62", "60", "60", "60", "60", "60", "60", "60", "60", "60", "60",
+    ] {
+        report(&mut k, &dir, "counter", v);
+    }
+    let f = flags(&k, "counter", "count");
+    assert!(f[f.len() - 2..].iter().all(Option::is_some), "{f:?}");
+    k.approve(ask, None).unwrap();
+    report(&mut k, &dir, "counter", "60");
+    let f = flags(&k, "counter", "count");
+    assert!(
+        f.last()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|w| w.starts_with("stuck")),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn approving_a_jump_vouches_for_that_reading_not_for_its_repeats() {
+    // Only a stuck ask vouches for a run. A jump's ask vouches for the
+    // anchor; its repeats are judged by the history before it: after 0
+    // repeats in 4 steps, a run of 4 has chance 0.0079.
+    let none = "{kind: threshold, above: 900, action: reset}";
+    let values = ["60", "62", "61", "63", "60", "200", "200", "200"];
+    let (mut k, dir, _tmp) = plausibility_in("[0, 1000]", none, &values);
+    let ask = signals(&k, |s| matches!(s, Signal::Implausible { .. }))[0].seq;
+    k.approve(ask, None).unwrap();
+    for _ in 0..4 {
+        report(&mut k, &dir, "counter", "200");
+    }
+    let f = flags(&k, "counter", "count");
+    assert!(
+        f.last()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|w| w.starts_with("stuck")),
+        "{f:?}"
     );
 }
 
@@ -947,9 +1042,12 @@ fn a_measured_or_inferred_approval_never_re_anchors() {
         for _ in 0..3 {
             report(&mut k, &dir, "counter", "60");
         }
+        // Still stuck: the run was not vouched for.
         let f = flags(&k, "counter", "count");
         assert!(
-            f[f.len() - 3..].iter().all(Option::is_some),
+            f[f.len() - 3..]
+                .iter()
+                .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
             "{claim:?}: {f:?}"
         );
     }
