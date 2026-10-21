@@ -1583,6 +1583,7 @@ impl Kernel {
         }
         self.enforce_guards(name, readings);
         self.check_audits(&v);
+        self.read_readings(&v);
         // Forecasts this report resolves are scored, by code, before
         // anything acts on it.
         let forecast = name != SELF && predict::predicts(&v.mandate);
@@ -1629,6 +1630,27 @@ impl Kernel {
         // One step ahead, with the lever that just ran, if any.
         if forecast {
             self.predict(name, ran.as_deref());
+        }
+    }
+
+    /// Read every reading of a venture through the warden and write each
+    /// as an inferred report: it reads the open world, so a model may see
+    /// it and nothing may act on it. The note is the fields the warden
+    /// kept, or empty when the reading failed.
+    fn read_readings(&mut self, v: &Venture) {
+        for r in &v.mandate.readings {
+            let metric = r.metric();
+            let (value, note) = self.warden.read(&v.name, &metric).unwrap_or_default();
+            let record = Record::report(
+                Claim::Inferred,
+                &v.name,
+                &metric,
+                value.filter(|x| x.is_finite()),
+                &note,
+            );
+            if let Err(e) = self.append(record) {
+                log(&format!("{}: cannot write {metric}: {e}", v.name));
+            }
         }
     }
 

@@ -220,8 +220,14 @@ impl Index {
         let r = &e.record;
         let venture = r.venture().to_string();
         self.of.entry(venture.clone()).or_default().push(seq);
-        // A forecast is not the nightly cycle: it does not say the cycle ran.
-        if r.claim() == Claim::Inferred && !matches!(r.kind(), Kind::Prediction | Kind::Forecast) {
+        // A forecast is not the nightly cycle, nor is a reading: neither
+        // says the cycle ran.
+        let reading = matches!(r, Record::Report { metric, .. }
+            if metric.starts_with(crate::mandate::READING_PREFIX));
+        if r.claim() == Claim::Inferred
+            && !reading
+            && !matches!(r.kind(), Kind::Prediction | Kind::Forecast)
+        {
             by_time(
                 self.inferred_at.entry(venture.clone()).or_default(),
                 at,

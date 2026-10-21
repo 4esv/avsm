@@ -130,6 +130,23 @@ audit acts on it at once, where waiting costs more than a misreading. On a thres
 and again only after the metric comes back past the bound by 2; `hold: 3` acts
 after three crossed reports in a row.
 
+A reading is what a model may see that it could not otherwise: its command
+prints lines and then a number, and the warden keeps only the lines that are
+fields of the kind `lines` names (`address`, the one kind: text, an @, text,
+no spaces or `<>,;:`, at most 254 characters), at most 50 of them, joined by
+spaces. With `audit:`, a field is kept only when that audit's latest reading
+names it, so the model learns who is waiting and never what they wrote. A
+failed reading keeps no note at all. Its record, `reading.<name>`, is
+inferred: it reads the open world, so it shows and never authorizes, and a
+payload check that wants a sender still reads the audit:
+
+```yaml
+audits:
+  - {name: customers, run: ./customers, worse: up, better: down}
+readings:
+  - {name: waiting, run: ./waiting, lines: address, audit: customers}
+```
+
 A band holds the metric between two bounds, with a lever for each side:
 
 ```yaml
@@ -278,8 +295,9 @@ Each of these is in `examples/` and runs end to end with nothing but stubs.
   issues and comments on its own, and asks before a pull request.
 - `stripe-store`: one file. Reads monthly revenue through the Stripe key,
   researches freely, and asks before every mail to a customer.
-- `mail-inbox`: one file. Counts unread mail over IMAP and drafts replies;
-  every send is an ask, so nothing leaves without your word.
+- `mail-inbox`: counts unread mail over IMAP and drafts replies; every send
+  is an ask, so nothing leaves without your word. The `waiting` reading
+  shows the model the addresses with unread mail and nothing else of it.
 - `paper-trader`: a book that follows a wandering price. Past ten percent
   of drawdown the built-in stop halts it, and only you can resume it.
 - `greenhouse`: a thermometer that follows the clock and a vent that cools

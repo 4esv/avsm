@@ -715,6 +715,35 @@ impl LocalWarden {
             .get(venture)
             .ok_or_else(|| format!("no venture named {venture}"))?;
         let m = &v.mandate;
+        if let Some(name) = metric.strip_prefix(crate::mandate::READING_PREFIX) {
+            let r = m
+                .readings
+                .iter()
+                .find(|r| r.name == name)
+                .ok_or_else(|| format!("{venture} has no reading {name}"))?;
+            let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
+            // The note is the fields the reading names and nothing else of
+            // what its command printed: not its other lines, and not why
+            // it failed, since a model sees it.
+            let ran = run_command_raw(&dir, &r.run, ACTION_TIMEOUT);
+            let n = match adapter::number_from(&ran.stdout) {
+                Ok(n) if ran.ok => n,
+                _ => return Ok((None, String::new())),
+            };
+            // An audit names what may be kept: its latest trusted reading,
+            // written by the kernel just before.
+            let named = r.audit.as_deref().map(|a| {
+                let at = self
+                    .index
+                    .latest_report(venture, &format!("{}{a}", crate::mandate::AUDIT_PREFIX));
+                match at.and_then(|s| self.index.get(s)).map(|e| &e.record) {
+                    Some(Record::Report { note, .. }) => note.as_str(),
+                    _ => "",
+                }
+            });
+            // The number is no field, so `keep` drops it with the rest.
+            return Ok((Some(n), r.keep(&ran.stdout, named)));
+        }
         let audit = metric.starts_with(crate::mandate::AUDIT_PREFIX);
         let (run, spec) = if let Some(name) = metric.strip_prefix("guard.") {
             let g = m

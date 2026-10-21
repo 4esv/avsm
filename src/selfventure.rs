@@ -192,6 +192,7 @@ pub fn canary() -> Result<(), String> {
         allocation: None,
         guards: vec![],
         audits: vec![],
+        readings: vec![],
         range: None,
         max_step: None,
         confirm: true,

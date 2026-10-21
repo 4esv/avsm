@@ -73,6 +73,10 @@ pub struct Mandate {
     /// sees them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audits: Vec<Audit>,
+    /// Readings a model may see: the lines above each number are kept
+    /// only as the fields the reading names, and the record is inferred.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readings: Vec<Reading>,
     /// The values the metric can plausibly take, low and high.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<[f64; 2]>,
@@ -450,6 +454,85 @@ fn check_plausibility(
 
 /// The prefix of an audit's readings: never shown to a model.
 pub const AUDIT_PREFIX: &str = "audit.";
+
+/// What each line of a reading's note must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lines {
+    /// A mail address: text, one @, text, with no space and none of
+    /// `<>,;:` on either side.
+    Address,
+}
+
+impl Lines {
+    /// The kind, as a model is told it.
+    pub fn plural(self) -> &'static str {
+        match self {
+            Lines::Address => "addresses",
+        }
+    }
+
+    /// Is this line one field of this kind?
+    pub fn holds(self, line: &str) -> bool {
+        match self {
+            Lines::Address => {
+                let part = |s: &str| {
+                    !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || "@<>,;:".contains(c))
+                };
+                line.split_once('@')
+                    .is_some_and(|(user, host)| part(user) && part(host))
+            }
+        }
+    }
+}
+
+/// A reading a model may see: a command the warden runs, whose last line
+/// is its number. The lines above it are kept only where each is a field
+/// of the kind `lines` names and, with `audit`, a word of that audit's
+/// latest reading. It reads the open world, so its record is inferred:
+/// it shows and never authorizes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reading {
+    pub name: String,
+    pub run: String,
+    pub lines: Lines,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<String>,
+}
+
+/// The prefix of a reading's records.
+pub const READING_PREFIX: &str = "reading.";
+
+impl Reading {
+    /// The most fields a reading's note keeps.
+    pub const MAX_FIELDS: usize = 50;
+    /// The longest field kept, in characters: the longest a mail address
+    /// may be.
+    pub const MAX_FIELD: usize = 254;
+
+    /// The metric its records carry: `reading.<name>`.
+    pub fn metric(&self) -> String {
+        format!("{READING_PREFIX}{}", self.name)
+    }
+
+    /// The note a record keeps of `text`, the lines above the number: the
+    /// lines that are fields, trimmed and in order, at most `MAX_FIELDS`,
+    /// joined by one space. With `named`, the audit's note, a field is
+    /// kept only when it is a word of that note, ignoring case. Nothing
+    /// else of the text is kept.
+    pub fn keep(&self, text: &str, named: Option<&str>) -> String {
+        let named: Option<Vec<String>> =
+            named.map(|n| n.split_whitespace().map(str::to_lowercase).collect());
+        text.lines()
+            .map(str::trim)
+            .filter(|l| l.chars().count() <= Self::MAX_FIELD && self.lines.holds(l))
+            .filter(|l| named.as_ref().is_none_or(|n| n.contains(&l.to_lowercase())))
+            .take(Self::MAX_FIELDS)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
 
 /// `drawdown:` as `15%`.
 pub mod percent {
@@ -1072,6 +1155,7 @@ const FIELDS: &[&str] = &[
     "allocation",
     "guards",
     "audits",
+    "readings",
     "range",
     "max_step",
     "confirm",
@@ -1100,6 +1184,7 @@ const AUDIT_FIELDS: &[&str] = &[
     "max_step",
     "confirm",
 ];
+const READING_FIELDS: &[&str] = &["name", "run", "lines", "audit"];
 const BACKEND_FIELDS: &[&str] = &["kind", "backend"];
 const PLAN_FIELDS: &[&str] = &[
     "kind", "horizon", "depth", "members", "explore", "backend", "better",
@@ -1589,6 +1674,7 @@ impl Mandate {
         }
         self.check_guards()?;
         self.check_audits()?;
+        self.check_readings()?;
         check_plausibility("", self.range, self.max_step)?;
         if let Some(world) = &self.world {
             if world.trim().is_empty() {
@@ -1819,6 +1905,38 @@ impl Mandate {
         Ok(())
     }
 
+    /// Readings: each named once, with a command, and an audit that is
+    /// the venture's own.
+    fn check_readings(&self) -> Result<(), MandateError> {
+        let mut names: Vec<&str> = Vec::new();
+        for r in &self.readings {
+            let who = format!("reading {:?}", r.name);
+            if !is_word(&r.name) {
+                return fail(format!(
+                    "a reading's name is one word like waiting, not {:?}",
+                    r.name
+                ));
+            }
+            if names.contains(&r.name.as_str()) {
+                return fail(format!(
+                    "{who} is listed twice; each reading needs its own name"
+                ));
+            }
+            names.push(&r.name);
+            if r.run.trim().is_empty() {
+                return fail(format!(
+                    "{who}: run is a command like ./waiting; it is empty"
+                ));
+            }
+            if let Some(a) = r.audit.as_deref().filter(|a| self.audit(a).is_none()) {
+                return fail(format!(
+                    "{who}: audit {a:?} is not an audit of this venture"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The guard with this name, if any.
     pub fn guard(&self, name: &str) -> Option<&Guard> {
         self.guards.iter().find(|g| g.name == name)
@@ -1881,6 +1999,7 @@ impl Mandate {
             allocation: None,
             guards: vec![],
             audits: vec![],
+            readings: vec![],
             range: None,
             max_step: None,
             confirm: true,
@@ -2232,6 +2351,13 @@ fn check_shape(value: &Value) -> Result<(), MandateError> {
         "name, run or adapter, worse: up or down, tolerance",
     )?;
     check_directions(map.get("audits"))?;
+    check_list(
+        map.get("readings"),
+        "readings",
+        "a reading",
+        READING_FIELDS,
+        "name, run, lines: address, and the audit that names them",
+    )?;
     match map.get("range") {
         None | Some(Value::Null) => {}
         Some(Value::Sequence(items))
@@ -3229,6 +3355,79 @@ max_step: 5000
     }
 
     #[test]
+    fn readings_parse_and_say_what_is_wrong() {
+        let audit = "audits:\n  - {name: customers, run: ./customers, worse: up}\n";
+        let m = Mandate::parse(&format!(
+            "{VALID}{audit}readings:\n  - {{name: waiting, run: ./waiting, lines: address, audit: customers}}\n"
+        ))
+        .unwrap();
+        assert_eq!(m.readings[0].metric(), "reading.waiting");
+        assert_eq!(m.readings[0].audit.as_deref(), Some("customers"));
+        for (extra, says) in [
+            (
+                "readings:\n  - {name: w, run: ./w, lines: subject}\n",
+                "unknown choice subject, expected address",
+            ),
+            (
+                "readings:\n  - {name: w, run: ./w, lines: address, audit: nope}\n",
+                "audit \"nope\" is not an audit of this venture",
+            ),
+            (
+                "readings:\n  - {name: w, run: ./w, lines: address, note: x}\n",
+                "unknown field \"note\" in readings",
+            ),
+            (
+                "readings:\n  - {name: w, run: ' ', lines: address}\n",
+                "run is a command",
+            ),
+            (
+                "readings:\n  - {name: 'a b', run: ./w, lines: address}\n",
+                "one word like waiting",
+            ),
+            (
+                "readings:\n  - {name: w, run: ./w, lines: address}\n  - {name: w, run: ./v, lines: address}\n",
+                "listed twice",
+            ),
+        ] {
+            let msg = Mandate::parse(&format!("{VALID}{audit}{extra}"))
+                .expect_err(extra)
+                .0;
+            assert!(msg.contains(says), "{extra}: {msg}");
+        }
+    }
+
+    /// A reading keeps only fields: an address, no longer than an address
+    /// may be, at most MAX_FIELDS of them, and with an audit only one the
+    /// audit's note names, whatever its case.
+    #[test]
+    fn a_reading_keeps_only_fields() {
+        let r = |audit: Option<&str>| Reading {
+            name: "waiting".into(),
+            run: "./waiting".into(),
+            lines: Lines::Address,
+            audit: audit.map(str::to_string),
+        };
+        let at_most = format!("{}@b", "a".repeat(Reading::MAX_FIELD - 2));
+        let over = format!("{}@b", "a".repeat(Reading::MAX_FIELD - 1));
+        let text = format!(
+            "Subject: hi\n a@b \nx y@z\n<a@b>\na@b,c@d\n@b\na@\na@b@c\n{at_most}\n{over}\n7\n"
+        );
+        assert_eq!(r(None).keep(&text, None), format!("a@b {at_most}"));
+        let many: String = (0..Reading::MAX_FIELDS + 5)
+            .map(|i| format!("c{i}@x\n"))
+            .collect();
+        let kept = r(None).keep(&many, None);
+        assert_eq!(kept.split(' ').count(), Reading::MAX_FIELDS);
+        assert!(
+            kept.starts_with("c0@x c1@x") && kept.ends_with("c49@x"),
+            "{kept}"
+        );
+        let named = "from A@b  from e@f";
+        assert_eq!(r(Some("c")).keep("a@b\nc@d\ne@f\n", Some(named)), "a@b e@f");
+        assert_eq!(r(Some("c")).keep("a@b\n", Some("")), "");
+    }
+
+    #[test]
     fn guards_audits_and_ranges_say_what_is_wrong() {
         let with = |extra: &str| fails(&format!("{VALID}{extra}"));
         for (extra, says) in [
@@ -3378,7 +3577,7 @@ max_step: 5000
         let msg = fails(&edit("metric: count", "metrik: count"));
         assert_eq!(
             msg,
-            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, range, max_step, confirm, escalate, world, calibration, early_warning, better"
+            "unknown field \"metrik\"; a mandate has these fields: purpose, metric, controller, permitted, forbidden, cadence, context_budget, summarize_after, restart, network, children, parent, allocation, guards, audits, readings, range, max_step, confirm, escalate, world, calibration, early_warning, better"
         );
         let msg = fails("1: a\n");
         assert_eq!(msg, "fields are named with words, not the number 1");

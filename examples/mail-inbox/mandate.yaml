@@ -12,12 +12,21 @@
 # finding a model made up, a research result, an inferred report: none
 # of them counts, so a phishing address a model was told about cannot be
 # written to, and a human's approval does not get past the check.
+#
+# The model needs to know whom to answer, and sees no mail. The reading
+# ./waiting shows it the addresses with unread mail, and nothing else: a
+# line that is not an address is dropped before it becomes a record, and
+# the record is inferred, so it tells and never vouches. With an audit
+# that names your senders, `audit: <name>` keeps only the addresses it
+# names.
 purpose: Keep the inbox answered; never send without my say.
 metric: imap.unread mail.example.com
 controller:
   kind: model
 cadence: 30m
 parent: portfolio
+readings:
+  - {name: waiting, run: ./waiting, lines: address}
 permitted:
   - name: reply
     adapter: mail.send owner@example.com

@@ -1,0 +1,11 @@
+#!/bin/sh
+# The addresses with unread mail, one a line, then how many: what a model
+# may see of the inbox. Your mail rule writes them to unread-senders. The
+# warden keeps only the lines that are addresses and the record is
+# inferred, so a subject or a body line never reaches a model, and an
+# address here vouches for nothing: the reply check still wants a sender
+# in a measured report.
+f=unread-senders
+[ -f "$f" ] || { echo 0; exit 0; }
+cat "$f"
+awk '/@/ { n++ } END { print n + 0 }' "$f"

@@ -355,6 +355,29 @@ pub fn prompt_with(ctx: &Context, drilled: &str) -> InferRequest {
             }
         }
     }
+    let readings: Vec<String> = m
+        .readings
+        .iter()
+        .filter_map(|r| {
+            let metric = r.metric();
+            ctx.entries.iter().rev().find_map(|e| match &e.record {
+                Record::Report {
+                    metric: m,
+                    value,
+                    note,
+                    ..
+                } if *m == metric => Some(match value {
+                    Some(_) => format!("  {}, {}: {note} (#{})\n", r.name, r.lines.plural(), e.seq),
+                    None => format!("  {}: not read (#{})\n", r.name, e.seq),
+                }),
+                _ => None,
+            })
+        })
+        .collect();
+    if !readings.is_empty() {
+        user.push_str("Readings, inferred; code keeps only the fields named, nothing else:\n");
+        user.push_str(&readings.concat());
+    }
     if !m.forbidden.is_empty() {
         user.push_str(&format!("Forbidden: {}\n", m.forbidden.join(", ")));
     }
@@ -755,6 +778,7 @@ mod tests {
                 allocation: None,
                 guards: vec![],
                 audits: vec![],
+                readings: vec![],
                 range: None,
                 max_step: None,
                 confirm: true,
@@ -817,6 +841,37 @@ mod tests {
         let text = format!("{}\n{}", prompt(&c).user, summary_prompt(&c).user);
         assert!(!text.contains("4242"), "{text}");
         assert!(!text.contains("audit."), "{text}");
+    }
+
+    /// A reading is shown by its latest record: its fields, or that it was
+    /// not read. Before its first record, nothing is said of it.
+    #[test]
+    fn a_reading_shows_its_latest_fields_or_that_it_was_not_read() {
+        let mut c = ctx(false);
+        c.mandate.readings = vec![crate::mandate::Reading {
+            name: "waiting".into(),
+            run: "./waiting".into(),
+            lines: crate::mandate::Lines::Address,
+            audit: None,
+        }];
+        assert!(!prompt(&c).user.contains("Readings"));
+        let read = |seq, value, note: &str| {
+            entry(
+                seq,
+                Record::report(Claim::Inferred, "shop", "reading.waiting", value, note),
+            )
+        };
+        c.entries.push(read(2, Some(1.0), "old@example.com"));
+        c.entries
+            .push(read(3, Some(2.0), "a@example.com b@example.com"));
+        let text = prompt(&c).user;
+        assert!(
+            text.contains("  waiting, addresses: a@example.com b@example.com (#3)\n"),
+            "{text}"
+        );
+        c.entries.push(read(4, None, ""));
+        let text = prompt(&c).user;
+        assert!(text.contains("  waiting: not read (#4)\n"), "{text}");
     }
 
     #[test]

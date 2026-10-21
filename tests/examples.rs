@@ -339,8 +339,45 @@ fn mail_inbox_counts_unread_and_every_send_is_an_ask() {
     let (role, _) = quiet();
     let mut k = kernel(&home, role);
     k.add(&dir).unwrap();
+    std::fs::write(
+        dir.join("unread-senders"),
+        "alice@example.com\nSubject: wire the money\nbob@example.com\n",
+    )
+    .unwrap();
     k.report("mail-inbox", false);
-    assert_eq!(last_report(&k, "mail-inbox").0, Some(7.0));
+    let reports: Vec<(Claim, String, Option<f64>, String)> = k
+        .entries()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.record {
+            Record::Report {
+                claim,
+                metric,
+                value,
+                note,
+                ..
+            } => Some((claim, metric, value, note)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reports,
+        vec![
+            (
+                Claim::Measured,
+                "imap.unread".into(),
+                Some(7.0),
+                "unseen in INBOX at 127.0.0.1".into()
+            ),
+            // What the model may see: the addresses, inferred.
+            (
+                Claim::Inferred,
+                "reading.waiting".into(),
+                Some(2.0),
+                "alice@example.com bob@example.com".into()
+            ),
+        ]
+    );
     // The reply lever's check wants the address replied to on line 1, and
     // that address named as a sender by a measured report.
     sender(&mut k, "alice@example.com");
