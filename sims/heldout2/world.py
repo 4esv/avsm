@@ -131,12 +131,8 @@ released = pend["release"] > 0
 res["level"], spill = P.res_next(res["level"], NOW, DAY, released)
 res["spilled"] += spill
 if spill > 0: say(f"EVENT day {DAY}: spilled {spill:.2f}% over the crest", echo=False)
-reading = min(100.0, res["level"] + random.Random(f"level{NOW}").gauss(0, 0.05))
-if "res:saturate" in ev:
-    reading = min(reading, P.SATURATE_AT)
-if gateway:
-    reading = 0.0
-write(p("sensors", "level"), f"{max(0.0, reading):.1f}\n")
+reading = P.res_reading(res["level"], NOW, DAY)
+write(p("sensors", "level"), f"{reading:.1f}\n")
 write(p("sensors", "spill"), f"{spill:.2f}\n")
 
 # --- the pantry --------------------------------------------------------------------

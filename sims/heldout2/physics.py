@@ -91,6 +91,18 @@ def res_next(level, now, day, release):
     return min(100.0, max(0.0, x)), spill
 
 
+def res_reading(level, now, day):
+    """What the level sensor shows for this level: noise, the jammed float on
+    the saturation days, and the gateway's 0 on the reboot's two hours."""
+    reading = min(100.0, level + random.Random(f"level{now}").gauss(0, 0.05))
+    ev = events(day)
+    if "res:saturate" in ev:
+        reading = min(reading, SATURATE_AT)
+    if "gateway" in ev and hour_of(now) in GATEWAY_HOURS:
+        reading = 0.0
+    return round(max(0.0, reading), 1)
+
+
 # --- the pantry (units of stock) ---------------------------------------------------
 PAN_START = 900
 ORDER = 600                 # one order, fixed by the supplier's pallet

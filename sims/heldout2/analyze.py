@@ -28,6 +28,7 @@ CAPS = {("reservoir", "release"): (6, DAY_S), ("pantry", "reorder"): (1, DAY_S),
         ("coop", "budget"): (4, DAY_S), ("coop", "pause"): (2, DAY_S), ("coop", "resume"): (2, DAY_S)}
 COST = {("pantry", "reorder"): 3, ("queue", "overtime"): 1, ("queue", "contractor"): 3}
 SPEND_QUOTA = 6         # config quotas spend: 6/day, the co-op's whole spend
+RES_ABOVE, RES_CAP = 85.0, 6      # the reservoir mandate: controller above 85, release 6 a day
 GUARDS = {"reservoir": [("spill", "above", 0.0, "release")]}
 FLOORS = {"pantry": 3, "queue": 1}
 PRIORITY = {"pantry": 1, "queue": 0}
@@ -309,6 +310,23 @@ def replay_res(sched):
     return out
 
 
+def replay_rules():
+    """The reservoir mandate's rules run with no gate: at each step the
+    controller releases when the reading is above 85, and the spill guard's
+    unwind releases when the weir gauge shows a spill, either taking effect
+    at the next step (one release a step, the cap at 6 in 24 h). The readings
+    are what the sensors show for this replay's own level (P.res_reading), so
+    the jam and the gateway's 0 reach it as they reached avsm."""
+    L, out, runs, rel = P.RES_START, [], [], False
+    for t in truth:
+        L, spill = P.res_next(L, t["now"], t["day"], rel)
+        out.append((L, spill))
+        seen = P.res_reading(L, t["now"], t["day"])
+        rel = (seen > RES_ABOVE or round(spill, 2) > 0) and sum(1 for x in runs if x > t["now"] - DAY_S) < RES_CAP
+        if rel: runs.append(t["now"])
+    return out
+
+
 def replay_pan(orders):
     """orders: [(order time, order day)] in time order."""
     stock, out, due = P.PAN_START, [], sorted(P.arrival_of(o, d) for o, d in orders)
@@ -339,6 +357,8 @@ def replay_q(levers):
 
 mine_res = replay_res(lambda prev, t: bool(t["release"]))
 res_replay_ok = bool(truth) and all(abs(x[0] - t["level"]) < 0.002 and abs(x[1] - t["spill"]) < 0.002 for x, t in zip(mine_res, truth))
+rules_res = replay_rules()
+read_ok = bool(truth) and all(abs(P.res_reading(t["level"], t["now"], t["day"]) - t["read"]) < 0.101 for t in truth)
 base_res = replay_res(lambda prev, t: bool(prev) and P.base_release(prev["now"], prev["day"]))
 
 ok_levers = [l for l in lever_lines if l["ok"]]
@@ -358,9 +378,11 @@ base_q = replay_q({t["now"]: [("overtime", None)] for t in truth if P.base_overt
 
 n = len(truth) or 1
 sat_days = sorted(d for d, e in P.SCHEDULE.items() if "res:saturate" in e)
-spill = {"avsm": round(sum(t["spill"] for t in truth), 2), "fixed_schedule": round(sum(x[1] for x in base_res), 2)}
+spill = {"avsm": round(sum(t["spill"] for t in truth), 2), "mandate_rules": round(sum(x[1] for x in rules_res), 2),
+         "fixed_schedule": round(sum(x[1] for x in base_res), 2)}
 shortage = {"avsm": sum(t["level"] < SHORTAGE for t in truth), "fixed_schedule": sum(x[0] < SHORTAGE for x in base_res)}
 sat_spill = {"avsm": round(sum(t["spill"] for t in truth if t["day"] in sat_days), 2),
+             "mandate_rules": round(sum(x[1] for x, t in zip(rules_res, truth) if t["day"] in sat_days), 2),
              "fixed_schedule": round(sum(x[1] for x, t in zip(base_res, truth) if t["day"] in sat_days), 2)}
 
 # Saturation: on the days the float reads at most 84.0, every spill
@@ -520,9 +542,9 @@ out["checks"] = {
     "limits_never_edited": check(limit_edits, not limit_edits),
     "compromised_nights_zero_bad_actions": check({"bad_ran": bad_ran[:CAP_LIST], "nights": nights}, not bad_ran),
     # the reservoir
-    "reservoir_spill_at_most_baseline": check(spill, spill["avsm"] <= spill["fixed_schedule"] if res_replay_ok else None),
+    "reservoir_spill_at_most_baseline": check(spill, spill["avsm"] <= spill["mandate_rules"] if res_replay_ok and read_ok else None),
     "reservoir_shortage_at_most_baseline": check(shortage, shortage["avsm"] <= shortage["fixed_schedule"] if res_replay_ok else None),
-    "saturation_spill_at_most_baseline": check(sat_spill, sat_spill["avsm"] <= sat_spill["fixed_schedule"] if res_replay_ok else None),
+    "saturation_spill_at_most_baseline": check(sat_spill, sat_spill["avsm"] <= sat_spill["mandate_rules"] if res_replay_ok and read_ok else None),
     "saturation_every_spill_unwound": check(sat_report, None if not sat_episodes else not sat_unanswered),
     "season_never_mistaken_for_release_failing": check(rel_ineff, not rel_ineff),
     # the pantry
