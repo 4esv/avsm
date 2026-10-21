@@ -130,6 +130,17 @@ audit acts on it at once, where waiting costs more than a misreading. On a thres
 and again only after the metric comes back past the bound by 2; `hold: 3` acts
 after three crossed reports in a row.
 
+A band holds the metric between two bounds, with a lever for each side:
+
+```yaml
+controller: {kind: band, low: 19, high: 24, below: heat, above: cool}
+```
+
+Below `low` it runs `below`, above `high` it runs `above`, and in between it
+runs neither. Each side acts as a threshold does, with the band's `deadband`
+and `hold`; the deadband must be less than the band is wide. A lever below the
+band that expects anything expects up, one above it down.
+
 ### World models
 
 `world: ./world` names a command that steps the venture's world: a JSON

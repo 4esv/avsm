@@ -625,6 +625,19 @@ pub enum Controller {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hold: Option<u32>,
     },
+    /// Hold the metric between `low` and `high`: run `below` when it is
+    /// under `low` and `above` when it is over `high`. Each side is a
+    /// threshold of its own, with the same deadband and hold.
+    Band {
+        low: f64,
+        high: f64,
+        below: String,
+        above: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadband: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold: Option<u32>,
+    },
     /// A backend picks one label: nothing, a permitted action, or ask.
     Classifier {
         #[serde(default)]
@@ -1062,6 +1075,7 @@ const FIELDS: &[&str] = &[
     "better",
 ];
 const THRESHOLD_FIELDS: &[&str] = &["kind", "above", "below", "action", "deadband", "hold"];
+const BAND_FIELDS: &[&str] = &["kind", "low", "high", "below", "above", "deadband", "hold"];
 const GUARD_FIELDS: &[&str] = &[
     "name", "run", "adapter", "above", "below", "then", "drawdown", "of", "range", "max_step",
     "confirm", "unwind",
@@ -1202,16 +1216,20 @@ pub const RESEARCH: &str = "research";
 /// it only reads, and takes no payload.
 pub const FORECAST: &str = "forecast";
 
-const KINDS: &str = "threshold, classifier, model or plan";
+const KINDS: &str = "threshold, band, classifier, model or plan";
 const NEEDS_PURPOSE: &str = "mandate needs a purpose: what the venture is for, in your own words";
 const NEEDS_METRIC: &str =
     "mandate needs a metric: the name of the number the report prints, like count";
 const NEEDS_CONTROLLER: &str =
-    "mandate needs a controller: what decides when to act, with a kind of threshold, classifier, model or plan";
+    "mandate needs a controller: what decides when to act, with a kind of threshold, band, classifier, model or plan";
 const NEEDS_CADENCE: &str =
     "mandate needs a cadence: how often the report runs, like 30s, 5m or 1h";
 const NEEDS_ACTION: &str =
     "a threshold controller needs an action: the name of a permitted action, or stop";
+const NEEDS_BOUNDS: &str =
+    "a band controller needs low and high: the bounds the metric is held between, numbers like 19 and 24";
+const NEEDS_LEVERS: &str =
+    "a band controller needs below and above: the action to run below low and the one to run above high, each a permitted action or stop";
 const BUDGET: &str = "context_budget must be a whole number of tokens greater than 0, like 4000";
 const SUMMARIZE: &str = "summarize_after must be a whole number of records, at least 2, like 200";
 
@@ -1457,19 +1475,57 @@ impl Mandate {
             if action.trim().is_empty() {
                 return fail(NEEDS_ACTION);
             }
-            if action != STOP && !names.contains(&action.as_str()) {
-                let choices = if names.is_empty() {
-                    "this mandate permits no actions, so the only choice is the built-in stop"
-                        .to_string()
-                } else {
-                    format!(
-                        "name one of the permitted actions ({}) or the built-in stop",
-                        names.join(", ")
-                    )
-                };
+            check_lever("threshold action", action, &names)?;
+        }
+        if let Controller::Band {
+            low,
+            high,
+            below,
+            above,
+            deadband,
+            ..
+        } = &self.controller
+        {
+            for (which, bound, like) in [("low", low, 19), ("high", high, 24)] {
+                if !bound.is_finite() {
+                    return fail(format!(
+                        "band {which} must be an ordinary number like {like}, not {bound}"
+                    ));
+                }
+            }
+            if low >= high {
                 return fail(format!(
-                    "threshold action {action:?} is not permitted; {choices}"
+                    "band low must be less than high; low is {low} and high is {high}"
                 ));
+            }
+            if below.trim().is_empty() || above.trim().is_empty() {
+                return fail(NEEDS_LEVERS);
+            }
+            check_lever("band below", below, &names)?;
+            check_lever("band above", above, &names)?;
+            // A side's lever brings the metric back into the band; one
+            // that expects to push it further out was named on the wrong
+            // side.
+            let metric = self.metric_name();
+            for (side, lever, way, past, bound, want) in [
+                ("below", below, Direction::Up, "under", low, "up"),
+                ("above", above, Direction::Down, "over", high, "down"),
+            ] {
+                if let Some(e) = self.permitted(lever).and_then(|p| p.expects.as_ref()) {
+                    if e.direction != way {
+                        return fail(format!(
+                            "band {side} runs {lever} when {metric} is {past} {bound}, but {lever} expects {e}; a lever {side} the band expects {want}, or nothing"
+                        ));
+                    }
+                }
+            }
+            if let Some(d) = deadband {
+                let wide = high - low;
+                if !d.is_finite() || *d < 0.0 || *d >= wide {
+                    return fail(format!(
+                        "band deadband must be a number 0 or more and less than the band is wide ({wide}), like 1, not {d}"
+                    ));
+                }
             }
         }
         if self.cadence < Duration::from_secs(1) {
@@ -1758,11 +1814,12 @@ impl Mandate {
         self.audits.iter().find(|a| a.name == name)
     }
 
-    /// The threshold's deadband and hold: 0 and 1 when unset or not a
-    /// threshold.
+    /// The threshold's or band's deadband and hold: 0 and 1 when unset or
+    /// neither.
     pub fn deadband_hold(&self) -> (f64, u32) {
         match &self.controller {
-            Controller::Threshold { deadband, hold, .. } => {
+            Controller::Threshold { deadband, hold, .. }
+            | Controller::Band { deadband, hold, .. } => {
                 (deadband.unwrap_or(0.0), hold.unwrap_or(1).max(1))
             }
             _ => (0.0, 1),
@@ -1822,12 +1879,39 @@ impl Mandate {
 
     /// Which way the target improves, as the mandate declares it: the
     /// threshold's side (below an `above` bound is better), else
-    /// `better`. None when neither says.
+    /// `better`. None when neither says. A band has two sides and so no
+    /// one way of its own.
     pub fn direction(&self) -> Option<Worse> {
         match &self.controller {
             Controller::Threshold { above: Some(_), .. } => Some(Worse::Down),
             Controller::Threshold { below: Some(_), .. } => Some(Worse::Up),
             _ => self.better,
+        }
+    }
+
+    /// The bounds the controller acts past: a threshold's one, a band's
+    /// two (below first), each with whether it acts above it and the
+    /// action it runs. Empty for any other controller.
+    pub fn sides(&self) -> Vec<(bool, f64, &str)> {
+        match &self.controller {
+            Controller::Threshold {
+                above: Some(b),
+                action,
+                ..
+            } => vec![(true, *b, action)],
+            Controller::Threshold {
+                below: Some(b),
+                action,
+                ..
+            } => vec![(false, *b, action)],
+            Controller::Band {
+                low,
+                high,
+                below,
+                above,
+                ..
+            } => vec![(false, *low, below), (true, *high, above)],
+            _ => vec![],
         }
     }
 
@@ -2466,6 +2550,23 @@ fn check_metric(v: Option<&Value>) -> Result<(), MandateError> {
     }
 }
 
+/// A controller's action: a permitted one or the built-in stop. `who` is
+/// how a message names it, like threshold action.
+fn check_lever(who: &str, action: &str, names: &[&str]) -> Result<(), MandateError> {
+    if action == STOP || names.contains(&action) {
+        return Ok(());
+    }
+    let choices = if names.is_empty() {
+        "this mandate permits no actions, so the only choice is the built-in stop".to_string()
+    } else {
+        format!(
+            "name one of the permitted actions ({}) or the built-in stop",
+            names.join(", ")
+        )
+    };
+    fail(format!("{who} {action:?} is not permitted; {choices}"))
+}
+
 fn check_controller(v: Option<&Value>) -> Result<(), MandateError> {
     let map = match v {
         None | Some(Value::Null) => return fail(NEEDS_CONTROLLER),
@@ -2480,7 +2581,10 @@ fn check_controller(v: Option<&Value>) -> Result<(), MandateError> {
     let kind = match map.get("kind") {
         None | Some(Value::Null) => return fail(format!("controller needs a kind: {KINDS}")),
         Some(Value::String(kind))
-            if matches!(kind.as_str(), "threshold" | "classifier" | "model" | "plan") =>
+            if matches!(
+                kind.as_str(),
+                "threshold" | "band" | "classifier" | "model" | "plan"
+            ) =>
         {
             kind.as_str()
         }
@@ -2496,6 +2600,7 @@ fn check_controller(v: Option<&Value>) -> Result<(), MandateError> {
     };
     let fields = match kind {
         "threshold" => THRESHOLD_FIELDS,
+        "band" => BAND_FIELDS,
         "plan" => PLAN_FIELDS,
         _ => BACKEND_FIELDS,
     };
@@ -2550,7 +2655,7 @@ fn check_controller(v: Option<&Value>) -> Result<(), MandateError> {
             }
         }
     }
-    if kind != "threshold" {
+    if !matches!(kind, "threshold" | "band") {
         return match map.get("backend") {
             None | Some(Value::Null) | Some(Value::String(_)) => Ok(()),
             Some(other) => fail(format!(
@@ -2559,12 +2664,20 @@ fn check_controller(v: Option<&Value>) -> Result<(), MandateError> {
             )),
         };
     }
-    for which in ["above", "below"] {
-        match map.get(which) {
+    // A threshold's bounds are numbers it may leave out; a band's are
+    // numbers it needs.
+    let bounds: &[(&str, &str)] = if kind == "band" {
+        &[("low", "19"), ("high", "24")]
+    } else {
+        &[("above", "10"), ("below", "10")]
+    };
+    for (which, like) in bounds {
+        match map.get(*which) {
+            None | Some(Value::Null) if kind == "band" => return fail(NEEDS_BOUNDS),
             None | Some(Value::Null) | Some(Value::Number(_)) => {}
             Some(other) => {
                 return fail(format!(
-                    "threshold {which} must be a number like 10, not {}",
+                    "{kind} {which} must be a number like {like}, not {}",
                     describe(other)
                 ))
             }
@@ -2574,7 +2687,7 @@ fn check_controller(v: Option<&Value>) -> Result<(), MandateError> {
         None | Some(Value::Null) | Some(Value::Number(_)) => {}
         Some(other) => {
             return fail(format!(
-                "threshold deadband must be a number like 2, not {}",
+                "{kind} deadband must be a number like 2, not {}",
                 describe(other)
             ))
         }
@@ -2584,10 +2697,25 @@ fn check_controller(v: Option<&Value>) -> Result<(), MandateError> {
         Some(Value::Number(n)) if n.as_u64().is_some_and(|n| (1..=1000).contains(&n)) => {}
         Some(other) => {
             return fail(format!(
-                "threshold hold must be a whole number of reports from 1 to 1000, like 3, not {}",
+                "{kind} hold must be a whole number of reports from 1 to 1000, like 3, not {}",
                 describe(other)
             ))
         }
+    }
+    if kind == "band" {
+        for which in ["below", "above"] {
+            match map.get(which) {
+                None | Some(Value::Null) => return fail(NEEDS_LEVERS),
+                Some(Value::String(_)) => {}
+                Some(other) => {
+                    return fail(format!(
+                        "band {which} must be the name of a permitted action, or stop, not {}",
+                        describe(other)
+                    ))
+                }
+            }
+        }
+        return Ok(());
     }
     match map.get("action") {
         None | Some(Value::Null) => fail(NEEDS_ACTION),
@@ -3420,17 +3548,17 @@ max_step: 5000
         );
         assert_eq!(
             fails(&text),
-            "controller must be a set of fields starting with kind: threshold, classifier, model or plan, not the text \"threshold\""
+            "controller must be a set of fields starting with kind: threshold, band, classifier, model or plan, not the text \"threshold\""
         );
         let msg = fails(&edit("  kind: threshold\n", ""));
         assert_eq!(
             msg,
-            "controller needs a kind: threshold, classifier, model or plan"
+            "controller needs a kind: threshold, band, classifier, model or plan"
         );
         let msg = fails(&edit("kind: threshold", "kind: magic"));
         assert_eq!(
             msg,
-            "controller kind must be threshold, classifier, model or plan, not \"magic\""
+            "controller kind must be threshold, band, classifier, model or plan, not \"magic\""
         );
         let msg = fails(&edit("kind: threshold", "kind: 3"));
         assert!(msg.ends_with("not the number 3"), "{msg}");

@@ -43,12 +43,16 @@
 #     between two reports on overload, and no faster. The error rate is a
 #     guard: above 5% it asks, and unwinds by adding an instance. Scaling
 #     down is mine (avsm propose service scale_down); nothing here does it
-#     on its own.
-#   - thermostat: the band is 19 to 24 C. A threshold is one-sided, so the
-#     heater is the controller (below 19) and the top of the band is a
-#     guard on the unit's own sensor, a separate device, which unwinds by
-#     cooling. range [-5, 45] for a room indoors; max_step 8: two hours of
-#     the worst weather and the unit together move the room less than 8 C.
+#     on its own. Not a band: no low p95 says an instance can go. At night
+#     two instances read about 140 ms and one reads 480, so any low bound
+#     two instances fall under scales down into a breach.
+#   - thermostat: the band is 19 to 24 C, so the controller is a band:
+#     heat below 19, cool above 24, each expected to bring the room back.
+#     The room sensor is one device; the unit's own sensor is another, so
+#     the top of the band is also a guard on it, which unwinds by cooling:
+#     a room sensor that reads a hot room as cold never runs the heater.
+#     range [-5, 45] for a room indoors; max_step 8: two hours of the worst
+#     weather and the unit together move the room less than 8 C.
 #   - savings: transfer is irreversible and needs my say; its json payload
 #     is {amount}, and the check ./bound holds an amount to (0, 500] and
 #     leaves checking at 1000 or more by the latest measured floor reading.
@@ -98,9 +102,9 @@ permitted:
   - {name: scale_down, run: ./scale_down, cap: 4/day, reversible: true}
 EOF
 cat > "$V/thermostat/mandate.yaml" <<'EOF'
-purpose: Keep the room between 19 and 24 C. Heat below 19; above 24 the unit's own sensor has it cool.
+purpose: Keep the room between 19 and 24 C. Heat below 19, cool above 24.
 metric: temperature
-controller: {kind: threshold, below: 19, action: heat}
+controller: {kind: band, low: 19, high: 24, below: heat, above: cool}
 cadence: 2h
 parent: ops
 range: [-5, 45]

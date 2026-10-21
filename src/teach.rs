@@ -101,7 +101,7 @@ fn close(a: f64, b: f64) -> bool {
 }
 
 /// Every number the mandate holds the venture to: guard bounds and
-/// drawdowns, threshold bounds, cap counts, costs, floors, range bounds,
+/// drawdowns, threshold and band bounds, cap counts, costs, floors, range bounds,
 /// the largest step.
 pub fn enforced(m: &Mandate) -> Vec<f64> {
     let mut v = Vec::new();
@@ -110,10 +110,7 @@ pub fn enforced(m: &Mandate) -> Vec<f64> {
         v.extend(g.below);
         v.extend(g.drawdown);
     }
-    if let Controller::Threshold { above, below, .. } = &m.controller {
-        v.extend(*above);
-        v.extend(*below);
-    }
+    v.extend(m.sides().into_iter().map(|(_, bound, _)| bound));
     for p in &m.permitted {
         v.push(f64::from(p.cap.count));
         if p.cost > 0 {
@@ -159,6 +156,20 @@ fn way(w: Worse) -> &'static str {
     }
 }
 
+/// A controller's sentence with its hold and deadband, when set.
+fn held(mut s: String, hold: Option<u32>, deadband: Option<f64>, bound: &str) -> String {
+    if let Some(h) = hold.filter(|h| *h > 1) {
+        s.push_str(&format!(", after {h} reports in a row"));
+    }
+    if let Some(d) = deadband {
+        s.push_str(&format!(
+            "; after acting it must come back {} past {bound} before it acts again",
+            num(d)
+        ));
+    }
+    s
+}
+
 /// The mandate as plain sentences, one line each, indented two spaces.
 pub fn render(m: &Mandate) -> String {
     let mut out = String::new();
@@ -192,20 +203,27 @@ pub fn render(m: &Mandate) -> String {
                 (_, Some(b)) => ("below", num(*b)),
                 _ => ("past", "its bound".to_string()),
             };
-            let mut s = format!(
+            let s = format!(
                 "controller threshold: runs {action} when {} is {side} {bound}",
                 m.metric_name()
             );
-            if let Some(h) = hold.filter(|h| *h > 1) {
-                s.push_str(&format!(", after {h} reports in a row"));
-            }
-            if let Some(d) = deadband {
-                s.push_str(&format!(
-                    "; after acting it must come back {} past the bound before it acts again",
-                    num(*d)
-                ));
-            }
-            line(s);
+            line(held(s, *hold, *deadband, "the bound"));
+        }
+        Controller::Band {
+            low,
+            high,
+            below,
+            above,
+            deadband,
+            hold,
+        } => {
+            let s = format!(
+                "controller band: runs {below} when {metric} is below {}, {above} when it is above {}, and neither in between",
+                num(*low),
+                num(*high),
+                metric = m.metric_name()
+            );
+            line(held(s, *hold, *deadband, "its bound"));
         }
         Controller::Classifier { backend } => line(format!(
             "controller classifier: a {}backend picks nothing, a permitted action, or ask",

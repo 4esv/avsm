@@ -1605,13 +1605,14 @@ impl Kernel {
         if name != SELF && (plans || v.mandate.early_warning) {
             self.early_warning(name, &metric);
         }
-        // The bound is the mandate's, or the one the parent set.
-        let threshold = match self.index() {
-            Ok(index) => gate::effective_threshold_in(&index, &self.adopted(), name),
+        // The bound is the mandate's, or the one the parent set; a band
+        // has one on each side, and a report crosses at most one of them.
+        let thresholds = match self.index() {
+            Ok(index) => gate::effective_thresholds_in(&index, &self.adopted(), name),
             Err(_) => return,
         };
         let mut ran = None;
-        if let Some(t) = threshold {
+        for t in thresholds {
             if self.threshold_fires(&v, &t) {
                 self.forget_refusal();
                 let before = self.ledger_last();
@@ -2296,7 +2297,7 @@ impl Kernel {
         if v.problem.is_some()
             || matches!(
                 v.mandate.controller,
-                Controller::Threshold { .. } | Controller::Plan { .. }
+                Controller::Threshold { .. } | Controller::Band { .. } | Controller::Plan { .. }
             )
         {
             return false;
@@ -2330,7 +2331,9 @@ impl Kernel {
         };
         let wanted = match &v.mandate.controller {
             Controller::Classifier { backend } | Controller::Model { backend } => backend.clone(),
-            Controller::Threshold { .. } | Controller::Plan { .. } => return,
+            Controller::Threshold { .. } | Controller::Band { .. } | Controller::Plan { .. } => {
+                return
+            }
         };
         let index = match self.index() {
             Ok(i) => i,

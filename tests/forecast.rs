@@ -628,6 +628,31 @@ fn a_controller_asked_once_a_night_counts_once_a_day_against_the_drift() {
 }
 
 #[test]
+fn a_band_turns_either_of_its_levers_once_a_report() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture(
+        "inbox",
+        "unread",
+        "controller: {kind: band, low: 0, high: 100, below: stop, above: reply}\ncadence: 1d\nbetter: down\n\
+         permitted:\n- {name: reply, run: echo ran >> invoked, cap: 20/day, reversible: true, delegated: true, expects: down 1 within 1}\n",
+    );
+    f.history("inbox", &[3.0, 10.0, 17.0, 24.0], DAY);
+    let gap = forecast::capacity(
+        &f.k.index().unwrap(),
+        "inbox",
+        &f.k.ventures["inbox"].mandate,
+    )
+    .expect("one a day cannot keep up with seven");
+    assert!(
+        gap.describe()
+            .ends_with("reply can remove at most 1/day: the band acts at most once a report"),
+        "{}",
+        gap.describe()
+    );
+}
+
+#[test]
 fn a_sweep_reports_its_trial_count_and_a_pbo() {
     let _c = clock();
     let mut f = fixture("");
@@ -1194,9 +1219,47 @@ fn a_cap_spent_two_days_running_with_the_metric_past_its_threshold_asks_once_nam
     // The packet rests on the runs and the readings, never on a model.
     let packet = packet.as_ref().unwrap();
     assert!(packet.premises.len() > 1, "{packet:?}");
+    // Back past a below bound is up.
+    let gap = forecast::cap_spent(
+        &f.k.index().unwrap(),
+        "tomato",
+        &f.k.ventures["tomato"].mandate,
+        f.now,
+    )
+    .expect("the cap is still spent");
+    assert_eq!(gap.toward, avsmd::mandate::Direction::Up);
     // Not again within the episode, however long the cap stays spent.
     tomato_days(&mut f, 3, |_| vec![30.0; 12]);
     assert_eq!(capacity_asks(&f).len(), 1);
+}
+
+#[test]
+fn a_cap_spent_on_a_bands_upper_side_names_that_side() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture(
+        "tomato",
+        "moisture",
+        "controller: {kind: band, low: 35, high: 80, below: water, above: drain}\ncadence: 2h\n\
+         permitted:\n- {name: water, run: echo ran >> invoked, cap: 4/day, reversible: true, delegated: true}\n\
+         - {name: drain, run: echo ran >> drained, cap: 3/day, reversible: true, delegated: true}\n",
+    );
+    // Soaked all day, every day: drain runs until its cap is spent.
+    tomato_days(&mut f, 3, |_| vec![90.0; 12]);
+    let asks = capacity_asks(&f);
+    assert_eq!(asks.len(), 1, "{:#?}", f.entries());
+    let q = question(&asks[0]);
+    assert!(q.contains("drain's cap 3/day"), "{q}");
+    assert!(q.contains("above 80"), "{q}");
+    // Back into the band from above is down.
+    let gap = forecast::cap_spent(
+        &f.k.index().unwrap(),
+        "tomato",
+        &f.k.ventures["tomato"].mandate,
+        f.now,
+    )
+    .expect("the cap is still spent");
+    assert_eq!(gap.toward, avsmd::mandate::Direction::Down);
 }
 
 #[test]

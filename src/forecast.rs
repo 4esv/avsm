@@ -1341,6 +1341,11 @@ fn turns(mandate: &Mandate, lever: &str) -> (f64, &'static str) {
             "the threshold acts at most once a report",
         ),
         Controller::Threshold { .. } => (0.0, "the threshold runs only its own action"),
+        Controller::Band { below, above, .. } if below == lever || above == lever => (
+            86_400.0 / mandate.cadence.as_secs().max(1) as f64,
+            "the band acts at most once a report",
+        ),
+        Controller::Band { .. } => (0.0, "the band runs only its own two actions"),
         Controller::Plan { .. } => (
             86_400.0 / mandate.cadence.as_secs().max(1) as f64,
             "the planner acts at most once a report",
@@ -1515,30 +1520,28 @@ const DAY_SECS: i64 = 86_400;
 /// metric was read past a threshold controller's bound while its lever had
 /// already been run its cap's count in the cap window before the reading,
 /// so the reading went unanswered. Zero margin, measured; nothing here
-/// foresees what the world does next.
+/// foresees what the world does next. A band's sides are checked each on
+/// its own, the lower first.
 pub fn cap_spent(index: &Index, venture: &str, mandate: &Mandate, now: i64) -> Option<Gap> {
-    let Controller::Threshold {
-        above,
-        below,
-        action,
-        ..
-    } = &mandate.controller
-    else {
-        return None;
-    };
+    mandate
+        .sides()
+        .into_iter()
+        .find_map(|(above, bound, action)| {
+            cap_spent_past(index, venture, mandate, now, (above, bound, action))
+        })
+}
+
+/// `cap_spent` for one side: past `bound` (above it or below), unanswered
+/// by `action`.
+fn cap_spent_past(
+    index: &Index,
+    venture: &str,
+    mandate: &Mandate,
+    now: i64,
+    (above, bound, action): (bool, f64, &str),
+) -> Option<Gap> {
     let p = mandate.permitted(action)?;
-    let (bound, side) = match (above, below) {
-        (Some(b), _) => (*b, "above"),
-        (None, Some(b)) => (*b, "below"),
-        (None, None) => return None,
-    };
-    let past = |x: f64| {
-        if side == "above" {
-            x > bound
-        } else {
-            x < bound
-        }
-    };
+    let past = |x: f64| if above { x > bound } else { x < bound };
     let metric = mandate.metric_name();
     let per = p.cap.per.as_secs().max(1) as i64;
     let series = index.series(venture, metric);
@@ -1589,13 +1592,20 @@ pub fn cap_spent(index: &Index, venture: &str, mandate: &Mandate, now: i64) -> O
         metric: metric.to_string(),
         drift: 0.0,
         most: effect * cap,
-        levers: vec![action.clone()],
-        toward: target(mandate)?,
+        levers: vec![action.to_string()],
+        // Back inside the bound: down from above it, up from below. For a
+        // threshold this is the mandate's own direction.
+        toward: if above {
+            Direction::Down
+        } else {
+            Direction::Up
+        },
         limit: "the cap".to_string(),
         cites,
         said: Some(format!(
-            "{action}'s cap {} was spent in each of the last {windows} with {metric} still {side} {} (latest {}): no margin; the cap is the limit",
+            "{action}'s cap {} was spent in each of the last {windows} with {metric} still {} {} (latest {}): no margin; the cap is the limit",
             p.cap,
+            if above { "above" } else { "below" },
             num(bound),
             num(latest?)
         )),

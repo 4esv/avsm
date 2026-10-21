@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Quotas;
 use crate::index::{Index, Pulled};
-use crate::mandate::{Cap, Controller, Mandate, ParentCall, Permitted};
+use crate::mandate::{Cap, Mandate, ParentCall, Permitted};
 use crate::record::{Claim, Entry, Kind, Packet, Payload, Record, Seq, Signal, Takes, Verdict};
 
 /// The action that always passes.
@@ -664,61 +664,61 @@ fn pulled_by_parent<'a>(
     index.pulled(child, &parent)
 }
 
-/// The threshold a venture's controller starts from, before its parent
-/// moves it.
-fn mandate_threshold(mandates: &[&Adopted], venture: &str) -> Option<Threshold> {
-    let m = mandates.iter().find(|m| m.venture == venture)?;
-    let Controller::Threshold {
-        above,
-        below,
-        action,
-        ..
-    } = &m.mandate.controller
-    else {
-        return None;
+/// The thresholds a venture's controller starts from, before its parent
+/// moves them: a threshold's one, a band's two, each side held as a
+/// threshold of its own.
+fn mandate_thresholds(mandates: &[&Adopted], venture: &str) -> Vec<Threshold> {
+    let Some(m) = mandates.iter().find(|m| m.venture == venture) else {
+        return vec![];
     };
-    match (above, below) {
-        (Some(b), _) => Some(Threshold {
-            above: true,
-            bound: *b,
-            action: action.clone(),
+    m.mandate
+        .sides()
+        .into_iter()
+        .map(|(above, bound, action)| Threshold {
+            above,
+            bound,
+            action: action.to_string(),
             from: None,
-        }),
-        (_, Some(b)) => Some(Threshold {
-            above: false,
-            bound: *b,
-            action: action.clone(),
-            from: None,
-        }),
-        _ => None,
-    }
+        })
+        .collect()
 }
 
-/// The threshold that applies to a venture now, if its controller is one.
-pub fn effective_threshold(
-    ledger: &[Entry],
-    mandates: &[Adopted],
-    venture: &str,
-) -> Option<Threshold> {
-    effective_threshold_in(&Index::from_entries(ledger), mandates, venture)
-}
-
-/// The threshold that applies to a venture now, from the index.
-pub fn effective_threshold_in(
-    index: &Index,
-    mandates: &[Adopted],
-    venture: &str,
-) -> Option<Threshold> {
-    let refs: Vec<&Adopted> = mandates.iter().collect();
-    let mut t = mandate_threshold(&refs, venture)?;
-    if let Some((seq, above, bound)) =
-        pulled_by_parent(index, &refs, venture).and_then(|p| p.threshold)
-    {
+/// Move the thresholds by the parent's `threshold` lever, pulled in
+/// `seq`. A threshold's one bound is the parent's, on whichever side it
+/// names; a band's side of that name moves and the other stays.
+fn moved(thresholds: &mut [Threshold], seq: Seq, above: bool, bound: f64) {
+    let band = thresholds.len() > 1;
+    for t in thresholds.iter_mut().filter(|t| !band || t.above == above) {
         t.above = above;
         t.bound = bound;
         t.from = Some(seq);
     }
-    Some(t)
+}
+
+/// The thresholds that apply to a venture now: none unless its
+/// controller is a threshold or a band.
+pub fn effective_thresholds(
+    ledger: &[Entry],
+    mandates: &[Adopted],
+    venture: &str,
+) -> Vec<Threshold> {
+    effective_thresholds_in(&Index::from_entries(ledger), mandates, venture)
+}
+
+/// The thresholds that apply to a venture now, from the index.
+pub fn effective_thresholds_in(
+    index: &Index,
+    mandates: &[Adopted],
+    venture: &str,
+) -> Vec<Threshold> {
+    let refs: Vec<&Adopted> = mandates.iter().collect();
+    let mut ts = mandate_thresholds(&refs, venture);
+    if let Some((seq, above, bound)) =
+        pulled_by_parent(index, &refs, venture).and_then(|p| p.threshold)
+    {
+        moved(&mut ts, seq, above, bound);
+    }
+    ts
 }
 
 /// The budget a venture's parent set for it, and the action that set it.
@@ -960,7 +960,7 @@ pub fn gate_in(
         &adopted,
         now,
         |venture, action, since| index.used(venture, action, since),
-        |venture| effective_threshold_in(index, mandates, venture),
+        |venture| effective_thresholds_in(index, mandates, venture),
         |venture, action| index.suspended(venture, action),
     );
     load_family_mandates(&mut p, &adopted);
@@ -1014,7 +1014,7 @@ fn load_mandates(
     adopted: &[&Adopted],
     now: i64,
     used: impl Fn(&str, &str, i64) -> u32,
-    threshold: impl Fn(&str) -> Option<Threshold>,
+    thresholds: impl Fn(&str) -> Vec<Threshold>,
     suspended: impl Fn(&str, &str) -> bool,
 ) {
     for m in adopted {
@@ -1076,7 +1076,7 @@ fn load_mandates(
                 }
             }
         }
-        if let Some(t) = threshold(&venture) {
+        for t in thresholds(&venture) {
             p.threshold.push((
                 venture.clone(),
                 m.mandate.metric_name().to_string(),
@@ -2591,22 +2591,26 @@ pub mod reference {
             .collect()
     }
 
-    /// The threshold that applies to a venture now, if its controller is one.
-    pub fn effective_threshold(
+    /// The thresholds that apply to a venture now: the parent's latest
+    /// `threshold` call moves them.
+    pub fn effective_thresholds(
         ledger: &[Entry],
         mandates: &[Adopted],
         venture: &str,
-    ) -> Option<Threshold> {
+    ) -> Vec<Threshold> {
         let refs: Vec<&Adopted> = mandates.iter().collect();
-        let mut t = mandate_threshold(&refs, venture)?;
-        for (seq, call) in parent_calls(ledger, &refs, venture) {
-            if let ParentCall::Threshold { above, bound, .. } = call {
-                t.above = above;
-                t.bound = bound;
-                t.from = Some(seq);
-            }
+        let mut ts = mandate_thresholds(&refs, venture);
+        let latest = parent_calls(ledger, &refs, venture)
+            .into_iter()
+            .filter_map(|(seq, call)| match call {
+                ParentCall::Threshold { above, bound, .. } => Some((seq, above, bound)),
+                _ => None,
+            })
+            .next_back();
+        if let Some((seq, above, bound)) = latest {
+            moved(&mut ts, seq, above, bound);
         }
-        Some(t)
+        ts
     }
 
     /// The budget a venture's parent set for it, and the action that set it.
@@ -2717,7 +2721,7 @@ pub mod reference {
                     })
                     .count() as u32
             },
-            |venture| effective_threshold(ledger, mandates, venture),
+            |venture| effective_thresholds(ledger, mandates, venture),
             |venture, action| suspended(ledger, venture, action),
         );
         load_family(&mut p, ledger, &adopted);
@@ -3010,7 +3014,7 @@ pub mod reference {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mandate::{Allocation, Child, Restart};
+    use crate::mandate::{Allocation, Child, Controller, Restart};
     use crate::record::{Payload, GENESIS};
     use std::time::Duration;
 
@@ -4357,13 +4361,13 @@ mod tests {
             &format!("{V} above 25"),
         ));
         assert_eq!(
-            effective_threshold(&fx.entries, &fx.adopted, V),
-            Some(Threshold {
+            effective_thresholds(&fx.entries, &fx.adopted, V),
+            vec![Threshold {
                 above: true,
                 bound: 25.0,
                 action: "vent".into(),
                 from: Some(t)
-            })
+            }]
         );
         let r = fx.push(report(Claim::Measured, 27.0));
         let proof = fx.gate(V, "vent", &[r]).expect("over the parent's bound");
@@ -4373,6 +4377,95 @@ mod tests {
             )),
             "{proof}"
         );
+    }
+
+    fn band(low: f64, high: f64) -> Controller {
+        Controller::Band {
+            low,
+            high,
+            below: "heat".to_string(),
+            above: "cool".to_string(),
+            deadband: None,
+            hold: None,
+        }
+    }
+
+    #[test]
+    fn a_band_calls_for_each_lever_only_past_its_own_side() {
+        let mut fx = Fx::new();
+        fx.adopt(
+            V,
+            mandate(
+                band(19.0, 24.0),
+                vec![
+                    permit("heat", 9, true, false),
+                    permit("cool", 9, true, false),
+                ],
+                &[],
+            ),
+        );
+        let nothing = |l: &str| format!("nothing measured or declared calls for {l}");
+        let cold = fx.push(report(Claim::Measured, 15.0));
+        let proof = fx.gate(V, "heat", &[cold]).expect("below the band: heat");
+        assert!(
+            proof.to_string().contains("threshold  count below 19"),
+            "{proof}"
+        );
+        let refusal = fx.gate(V, "cool", &[cold]).unwrap_err();
+        assert!(reasons(&refusal).contains(&nothing("cool")), "{refusal}");
+        let hot = fx.push(report(Claim::Measured, 26.0));
+        let proof = fx.gate(V, "cool", &[hot]).expect("above the band: cool");
+        assert!(
+            proof.to_string().contains("threshold  count above 24"),
+            "{proof}"
+        );
+        let refusal = fx.gate(V, "heat", &[hot]).unwrap_err();
+        assert!(reasons(&refusal).contains(&nothing("heat")), "{refusal}");
+        for x in [19.0, 21.0, 24.0] {
+            let inside = fx.push(report(Claim::Measured, x));
+            for l in ["heat", "cool"] {
+                let refusal = fx.gate(V, l, &[inside]).unwrap_err();
+                assert!(reasons(&refusal).contains(&nothing(l)), "{x}: {refusal}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_parent_moves_the_side_of_a_band_it_names() {
+        let mut fx = Fx::new();
+        family(
+            &mut fx,
+            vec![parent_lever("threshold", true)],
+            mandate(
+                band(19.0, 24.0),
+                vec![
+                    permit("heat", 9, true, false),
+                    permit("cool", 9, true, false),
+                ],
+                &[],
+            ),
+        );
+        let t = fx.push(parent_action(
+            "portfolio",
+            "threshold",
+            &format!("{V} above 22"),
+        ));
+        let side = |above, bound, action: &str, from| Threshold {
+            above,
+            bound,
+            action: action.into(),
+            from,
+        };
+        assert_eq!(
+            effective_thresholds(&fx.entries, &fx.adopted, V),
+            vec![
+                side(false, 19.0, "heat", None),
+                side(true, 22.0, "cool", Some(t))
+            ]
+        );
+        let r = fx.push(report(Claim::Measured, 23.0));
+        assert!(fx.gate(V, "cool", &[r]).is_ok(), "over the parent's high");
+        assert!(fx.gate(V, "heat", &[r]).is_err());
     }
 
     #[test]

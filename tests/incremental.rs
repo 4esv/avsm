@@ -756,8 +756,8 @@ proptest! {
                 "state of {}", v
             );
             prop_assert_eq!(
-                gate::effective_threshold_in(&index, &mandates, v),
-                reference::effective_threshold(&entries, &mandates, v)
+                gate::effective_thresholds_in(&index, &mandates, v),
+                reference::effective_thresholds(&entries, &mandates, v)
             );
             let refs: Vec<&Adopted> = mandates.iter().collect();
             prop_assert_eq!(

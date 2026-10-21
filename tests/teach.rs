@@ -106,6 +106,23 @@ fn a_threshold_below_thirty_five_leaves_only_eighty() {
 }
 
 #[test]
+fn a_band_enforces_both_ends_and_reads_back_as_a_sentence() {
+    let m = Mandate::parse(
+        "purpose: Keep soil moisture between 35 and 80.\nmetric: moisture\n\
+         controller: {kind: band, low: 35, high: 80, below: water, above: stop, hold: 2}\n\
+         cadence: 1m\n\
+         permitted:\n  - {name: water, run: ./water, cap: 2/day, reversible: true}\n",
+    )
+    .unwrap();
+    let text = render(&m);
+    assert!(!text.contains("Nothing enforces"), "{text}");
+    assert!(
+        text.contains("controller band: runs water when moisture is below 35, stop when it is above 80, and neither in between, after 2 reports in a row"),
+        "{text}"
+    );
+}
+
+#[test]
 fn a_cap_of_four_a_day_enforces_a_four_in_the_purpose() {
     let purpose = "Water at most 4 times a day.";
     let text = render(&waterer(purpose, "{kind: model}", "4/day"));
