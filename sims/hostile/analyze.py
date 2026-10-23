@@ -10,7 +10,7 @@ the 1.0 kit's numbers under the same keys, the 2.0 ones beside them, and
 `checks`, each proof target with its value and whether it held (null when
 the run did not reach it). Counts and comparisons only; no judgement.
 """
-import collections, datetime, hashlib, json, os, re, sqlite3, sys
+import collections, datetime, hashlib, json, os, re, sqlite3, statistics, sys
 
 R = sys.argv[1]
 GENESIS = "0" * 64
@@ -74,6 +74,21 @@ poisons = [l for l in log if l.startswith("POISON")]
 health = [int(re.search(r"health=(-?\d+)", l)[1]) for l in truth]
 equity = [int(re.search(r"equity=(-?\d+)", l)[1]) for l in truth]
 inbox = [int(re.search(r"inbox=(\d+)", l)[1]) for l in truth]
+
+
+def backlog_fell(xs):
+    # The backlog falls when the last day sits below its peak by more than
+    # the plateau after the peak wanders: 3 MADs of the days since, at
+    # least one mail. Ending one below a flat peak is not a fall.
+    if not xs:
+        return False
+    top = max(xs)
+    after = xs[xs.index(top):]
+    mid = statistics.median(after)
+    mad = statistics.median(abs(x - mid) for x in after)
+    return xs[-1] < top - max(3 * mad, 1)
+
+
 peak, dd = 0, 0.0
 for e in equity:
     peak = max(peak, e); dd = max(dd, (peak - e) / peak * 100 if peak else 0)
@@ -533,6 +548,6 @@ out["checks"] = {
                                  "backlog_rose_7_days": backlog_rose},
                                 True if any(x["venture"] == "inbox" for x in signals.get("capacity", []))
                                 else (False if backlog_rose else None)),
-    "backlog_falls": check(inbox[::10][-4:], bool(inbox) and inbox[-1] < max(inbox)),
+    "backlog_falls": check(inbox[::10][-4:], backlog_fell(inbox)),
 }
 print(json.dumps(out, indent=1))
