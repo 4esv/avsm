@@ -998,8 +998,8 @@ pub fn gate_in(
         .filter(|m| index.get(m.seq).is_some_and(|e| adopts(e, m)))
         .collect();
     let pending = index.pending_of(v, a);
-    let waiting =
-        expects_of(&adopted, v, a).and_then(|(metric, within)| index.waiting(v, a, metric, within));
+    let waiting = expects_of(&adopted, v, a)
+        .and_then(|(metric, within, range)| index.waiting(v, a, metric, within, range));
     load_mandates(
         &mut p,
         &adopted,
@@ -1043,10 +1043,12 @@ pub fn gate_in(
 }
 
 /// The metric and `within` of what an adopted mandate's lever expects.
-fn expects_of<'a>(adopted: &[&'a Adopted], v: &str, a: &str) -> Option<(&'a str, u32)> {
+type ExpectsOf<'a> = (&'a str, u32, Option<[f64; 2]>);
+
+fn expects_of<'a>(adopted: &[&'a Adopted], v: &str, a: &str) -> Option<ExpectsOf<'a>> {
     let m = adopted.iter().find(|m| m.venture == v)?;
     let within = m.mandate.permitted(a)?.expects.as_ref()?.within;
-    Some((m.mandate.metric_name(), within))
+    Some((m.mandate.metric_name(), within, m.mandate.range))
 }
 
 /// Is this entry the declared decision that adopted this mandate?
@@ -2598,6 +2600,7 @@ pub mod reference {
         action: &str,
         metric: &str,
         within: u32,
+        range: Option<[f64; 2]>,
     ) -> Option<Seq> {
         let reading = |e: &Entry, plausible_only: bool| {
             matches!(&e.record, Record::Report {
@@ -2629,8 +2632,9 @@ pub mod reference {
             .iter()
             .filter(|e| e.seq > outcome && reading(e, false))
             .count();
-        // A span of exact repeats waits as long as the metric has held a
-        // value before (`expect::horizon`).
+        // A span of exact repeats waits while a sensor that repeats as
+        // often as the metric has would plausibly still hold it
+        // (`expect::horizon`).
         let value = |e: &Entry| match &e.record {
             Record::Report { value: Some(x), .. } => Some(*x),
             _ => None,
@@ -2657,7 +2661,9 @@ pub mod reference {
             .filter(|e| e.seq > outcome && reading(e, true))
             .filter_map(value)
             .collect();
-        let held = crate::expect::horizon(within as usize, &before, &ran, &after, since).is_none();
+        let bound = |x: f64| range.is_some_and(|[lo, hi]| x == lo || x == hi);
+        let held = crate::expect::horizon(within as usize, &before, &ran, &after, since, bound)
+            == crate::expect::Horizon::Waiting;
         (since < within as usize || held).then_some(intent)
     }
 
@@ -2884,8 +2890,9 @@ pub mod reference {
             &adopted,
             (
                 pending(ledger, v, a),
-                expects_of(&adopted, v, a)
-                    .and_then(|(metric, within)| waiting(ledger, v, a, metric, within)),
+                expects_of(&adopted, v, a).and_then(|(metric, within, range)| {
+                    waiting(ledger, v, a, metric, within, range)
+                }),
             ),
             extra_steps,
             extra_reasons,

@@ -116,6 +116,17 @@ impl Fixture {
         self.k.report("raiser", false);
     }
 
+    /// A history the lever is judged by: twenty readings around `around`,
+    /// a step of 0.5 each, none an exact repeat of the one before, the last
+    /// one up, so the fall that crosses leaves the drift at 0. Absence
+    /// of evidence is not evidence of no effect: with no history, no
+    /// drift is known, nor how long the sensor holds a reading.
+    fn history(&mut self, around: f64) {
+        for i in 0..20 {
+            self.report(around + if i % 2 == 0 { -0.25 } else { 0.25 });
+        }
+    }
+
     /// The same, on the next day, when the cap allows another run.
     fn report_tomorrow(&mut self, value: f64) {
         self.now += DAY;
@@ -234,6 +245,7 @@ const TEST_DELEGATED: &str = "delegated: true, expects: up 5 within 2";
 fn within_tolerance_writes_nothing() {
     let _c = clock();
     let mut f = fixture(TEST_DELEGATED, "echo boost >> boosts");
+    f.history(7.0);
     f.report(3.0); // crosses: boost runs
     f.report(6.0);
     f.report(8.0); // up 5 from 3, as expected
@@ -248,6 +260,7 @@ fn within_tolerance_writes_nothing() {
 fn the_right_way_by_the_wrong_size_is_one_measured_report() {
     let _c = clock();
     let mut f = fixture(TEST_DELEGATED, "echo boost >> boosts");
+    f.history(7.0);
     f.report(3.0);
     f.report(12.0);
     f.report(13.0); // up 10 where 5 was expected
@@ -313,6 +326,7 @@ fn missed(f: &mut Fixture) {
 fn the_wrong_direction_suspends_the_delegation() {
     let _c = clock();
     let mut f = fixture(TEST_DELEGATED, "echo boost >> boosts");
+    f.history(7.0);
     f.report(3.0);
     f.report(2.0);
     assert!(!f.suspended(), "one report is not enough to judge");
@@ -329,6 +343,7 @@ fn the_wrong_direction_suspends_the_delegation() {
 fn no_effect_suspends_the_delegation() {
     let _c = clock();
     let mut f = fixture(TEST_DELEGATED, "echo boost >> boosts");
+    f.history(7.0);
     f.report(3.0);
     f.report(3.0);
     f.report(3.0);
@@ -378,9 +393,15 @@ fn a_reversible_lever_that_does_nothing_is_suspended_after_one_miss() {
     // The tomato died and the water ran on: a reversible lever, fired by
     // a threshold, whose runs do not move the metric.
     let mut f = fixture_of(true, "expects: up 5 within 1", "echo boost >> boosts");
+    f.history(7.0);
     f.report(3.0); // crosses: runs, reversibly
     assert_eq!(f.intents(), 1);
-    f.report(3.0); // no effect: suspended
+    f.report(3.0);
+    assert!(
+        !f.suspended(),
+        "one exact repeat in 21 steps is no evidence"
+    );
+    f.report(3.0); // two are: no effect, suspended
     assert!(f.suspended());
     for _ in 0..50 {
         f.report_tomorrow(3.0);
@@ -392,7 +413,7 @@ fn a_reversible_lever_that_does_nothing_is_suspended_after_one_miss() {
         .entries()
         .into_iter()
         .find_map(|e| match e.record {
-            Record::Refusal { detail, .. } => Some(detail),
+            Record::Refusal { detail, .. } if detail.contains("ineffective") => Some(detail),
             _ => None,
         })
         .unwrap();
@@ -407,6 +428,8 @@ fn a_reversible_lever_that_does_nothing_is_suspended_after_one_miss() {
 fn a_lever_that_is_not_delegated_can_be_suspended() {
     let _c = clock();
     let mut f = fixture_of(true, "expects: up 5 within 1", "echo boost >> boosts");
+    f.history(7.0);
+    f.report(3.0);
     f.report(3.0);
     f.report(3.0);
     assert!(f.suspended());
@@ -430,6 +453,7 @@ fn a_declared_adoption_after_the_ask_restores_the_lever() {
 /// A suspended lever, and the ask that suspended it.
 fn suspended() -> (Fixture, Seq) {
     let mut f = fixture(TEST_DELEGATED, "echo boost >> boosts");
+    f.history(7.0);
     f.report(3.0);
     f.report(3.0);
     f.report(3.0);
@@ -636,6 +660,10 @@ fn a_fresh_miss_after_a_restore_suspends_again() {
     f.k.approve(ask, None).unwrap();
     f.report_tomorrow(3.0); // runs
     f.report(3.0);
+    f.report(3.0);
+    // The repeats after the first run are holds the sensor has shown: two
+    // more are not yet rare enough to call this one no effect.
+    assert!(!f.suspended());
     f.report(3.0); // no effect again
     assert!(f.suspended());
     // Nothing new was measured since the ask: a relapse, not a new ask.
@@ -721,8 +749,12 @@ fn after_a_heat_wave_a_dead_plant_is_no_effect_within_two_runs() {
 }
 
 #[test]
-fn a_dead_metric_with_no_drift_is_no_effect() {
+fn a_metric_that_never_moved_judges_no_run() {
     let _c = clock();
+    // Absence of evidence: a metric that has read 0 at every report cannot
+    // say whether a lever that left it at 0 did nothing or its sensor has
+    // not refreshed. No run is judged on it, and the lever runs on at its
+    // cap: a redundant run costs less than a false stop.
     let mut f = fixture(TEST_DELEGATED, "echo boost >> boosts");
     for _ in 0..4 {
         f.report(0.0);
@@ -730,13 +762,9 @@ fn a_dead_metric_with_no_drift_is_no_effect() {
     f.report_tomorrow(0.0); // runs again, with a history of no drift
     f.report(0.0);
     f.report(0.0);
-    assert!(f.suspended(), "{:?}", f.entries());
-    let asks = f.ineffective();
-    assert!(
-        matches!(&asks[0].record, Record::Ask { signal: Some(Signal::Ineffective { why, .. }), .. }
-            if why.contains("no effect")),
-        "{asks:?}"
-    );
+    assert!(!f.suspended(), "{:?}", f.entries());
+    assert!(f.ineffective().is_empty());
+    assert_eq!(f.intents(), 2);
 }
 
 #[test]
@@ -1403,9 +1431,7 @@ fn late_run(f: &mut Fixture, between: &[f64]) {
 fn a_lever_whose_effect_shows_late_is_judged_at_its_learned_delay() {
     let _c = clock();
     let mut f = daily();
-    for _ in 0..4 {
-        f.report(9.0);
-    }
+    f.history(9.0);
     // Its effect shows on the fourth report after it: three reports late.
     f.report(3.0);
     assert_eq!(f.intents(), 1);
@@ -1435,9 +1461,7 @@ fn a_lever_whose_effect_shows_late_is_judged_at_its_learned_delay() {
 fn a_restart_never_suspends_a_run_judged_late() {
     let _c = clock();
     let mut f = daily();
-    for _ in 0..4 {
-        f.report(9.0);
-    }
+    f.history(9.0);
     late_run(&mut f, &[3.0, 3.0, 3.0]);
     restore(&mut f);
     late_run(&mut f, &[3.0, 3.0, 3.0]);
@@ -1580,9 +1604,7 @@ fn a_run_its_horizon_cannot_judge_asks_nothing_late() {
 fn a_run_with_an_implausible_reading_in_its_window_teaches_no_delay() {
     let _c = clock();
     let mut f = daily_in("range: [0, 100]\nconfirm: false\n", 1);
-    for _ in 0..4 {
-        f.report(9.0);
-    }
+    f.history(9.0);
     // Three reports late, with a reading code doubts in its window: the
     // run is a miss at its horizon, and says nothing whole of its delay.
     late_run(&mut f, &[3.0, 200.0, 3.0, 3.0]);
@@ -1664,13 +1686,16 @@ fn a_learned_delay_never_runs_a_lever() {
 }
 
 #[test]
-fn a_lever_that_never_moves_the_metric_is_still_no_effect_at_once() {
+fn a_lever_that_never_moves_the_metric_is_no_effect_once_a_hold_is_rare() {
     let _c = clock();
     let mut f = daily();
-    for _ in 0..4 {
-        f.report(9.0);
-    }
+    f.history(9.0);
     f.report(3.0);
+    f.report(3.0);
+    assert!(
+        !f.suspended(),
+        "one exact repeat in 21 steps: may be the sensor"
+    );
     f.report(3.0);
     assert!(
         f.suspended(),
@@ -1740,11 +1765,18 @@ fn a_later_reading_that_shows_the_effect_judges_the_run() {
 fn a_dead_lever_behind_a_late_sensor_is_still_suspended() {
     let _c = clock();
     let mut f = late_sensor();
-    // Four unchanged readings: longer than the metric has ever held one
-    // value, so the sensor would have shown a change by now.
-    for _ in 0..4 {
+    // Unchanged readings, until a sensor that has held a reading as
+    // often as this one would have refreshed: 9 repeats in 12 steps
+    // make that the run whose posterior predictive is below ALPHA.
+    let rare = (1..)
+        .find(|r| avsmd::expect::hold_chance(12, 9, *r) < avsmd::expect::ALPHA)
+        .unwrap();
+    for _ in 1..rare {
         f.report(3.0);
     }
+    assert!(!f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.intents(), 1, "held while waited on, never run twice");
+    f.report(3.0);
     assert!(f.suspended(), "{:#?}", f.entries());
     assert_eq!(f.ineffective().len(), 1);
     assert_eq!(f.intents(), 1, "held until judged, never run twice");
@@ -2067,4 +2099,55 @@ fn a_packet_cites_no_miss_from_before_the_lever_last_worked() {
     assert_eq!(asks.len(), 2, "{:#?}", f.entries());
     let p = premises(&asks[1]);
     assert!(!p.contains(&old), "it worked since #{old}: {p:?}");
+}
+
+// ----- issue #53: absence of evidence is not evidence of no effect -----
+
+#[test]
+fn a_run_with_too_little_history_for_the_drift_is_not_judged_yet() {
+    let _c = clock();
+    // Power 2's svc: errors climb 3 a report, and a restart that does
+    // nothing ran on the third report. With two steps of history the
+    // drift is not known: judged against none, +6 would be the wrong
+    // way; it is not judged at all.
+    let mut f = fixture_in(
+        "controller: {kind: threshold, above: 10, action: boost}\ncadence: 1h\n",
+        "{name: boost, run: echo boost >> boosts, cap: 1/day, reversible: true, \
+         delegated: true, expects: down 1 within 2}",
+    );
+    let mut errors = 6.0;
+    let mut read = |f: &mut Fixture| {
+        f.report(errors);
+        errors += 3.0;
+    };
+    for _ in 0..3 {
+        read(&mut f);
+    }
+    assert_eq!(f.intents(), 1, "12 crossed: the restart ran");
+    for _ in 0..3 {
+        read(&mut f);
+    }
+    assert!(f.ineffective().is_empty(), "{:#?}", f.ineffective());
+    assert!(!f.suspended());
+    // A day of the climb is history enough: the next run is judged, and
+    // a climb of 6 over its horizon is the drift, no effect.
+    while f.intents() < 2 {
+        read(&mut f);
+    }
+    read(&mut f);
+    read(&mut f);
+    assert!(
+        f.suspended(),
+        "{}",
+        f.entries()
+            .iter()
+            .map(|e| e.line() + "\n")
+            .collect::<String>()
+    );
+    assert!(
+        matches!(&f.ineffective()[0].record, Record::Ask { signal: Some(Signal::Ineffective { why, .. }), .. }
+            if why.contains("no effect")),
+        "{:?}",
+        f.ineffective()
+    );
 }

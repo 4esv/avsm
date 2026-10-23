@@ -62,67 +62,120 @@ pub fn noise(before: &[f64]) -> f64 {
     }
 }
 
-/// How long the metric's sensor has shown it holds a reading: exact
-/// repeats in a row, among the last 20 of `before` (the reports the noise
-/// is read from), as long as at least two stretches that ended in a
-/// change have. A sensor read more often than it refreshes (df every
-/// 20 s, read every 5) repeats that many times while the world moves
-/// under it, and shows it again at every refresh. One flat stretch is the
-/// world sitting still as much as a sensor that lags; the stretch the
-/// reports end in has not shown that it ends; and a stretch a run of the
-/// lever fell in, or ended, is what the lever did, not the sensor (`ran`
-/// says, for each step between reports, whether one did): none counts.
-pub fn held(before: &[f64], ran: &[bool]) -> usize {
-    let from = before.len().saturating_sub(NOISE_WINDOW);
-    let mut ended = Vec::new();
-    let (mut run, mut lever) = (0, false);
+/// The significance level a span of exact repeats after a run is judged
+/// at, the stuck test's (`kernel::ALPHA`).
+pub use crate::kernel::ALPHA;
+
+/// How many of the latest steps before a run say how often the metric
+/// repeats exactly, the stuck test's (`kernel::WINDOW`).
+pub use crate::kernel::WINDOW;
+
+/// The fewest steps a history of repeats is read from, as for the drift
+/// (`world::MIN_SAMPLES`).
+pub use crate::world::MIN_SAMPLES;
+
+/// How often the metric's readings repeat exactly: of the latest WINDOW
+/// steps between consecutive readings of `before` (oldest first), how
+/// many there are and how many are exact repeats. A step a run of the
+/// lever fell in (`ran` says, for each step, whether one did) is what the
+/// lever did, not the sensor, and a repeat at a bound of the range
+/// (`bound`) says nothing of the sensor: neither is a step.
+pub fn repeats(before: &[f64], ran: &[bool], bound: impl Fn(f64) -> bool) -> (usize, usize) {
+    let from = before.len().saturating_sub(WINDOW + 1);
+    let (mut steps, mut zero) = (0, 0);
     for (i, w) in before.windows(2).enumerate().skip(from) {
-        lever |= ran.get(i).copied().unwrap_or(false);
-        if w[1] == w[0] {
-            run += 1;
+        if ran.get(i).copied().unwrap_or(false) {
             continue;
         }
-        if !lever {
-            ended.push(run);
+        if w[1] == w[0] {
+            if bound(w[0]) {
+                continue;
+            }
+            zero += 1;
         }
-        (run, lever) = (0, false);
+        steps += 1;
     }
-    ended.sort_unstable();
-    ended.iter().rev().nth(1).copied().unwrap_or(0)
+    (steps, zero)
 }
 
-/// How many reports after a run it is judged at: `within`, unless every
-/// one of those exactly repeats the last report before the run (`before`
-/// oldest first, `ran` whether the lever ran in each step between them
-/// (`held`), `after` the plausible reports since its ok outcome,
-/// `since` how many trusted ones came, plausible or not). Such a span
-/// holds no fresh reading, and is evidence of no effect only once it is
-/// longer than the metric has ever held a value (`held`): before that it
-/// is what a sensor that has not refreshed shows. Then the run is judged
-/// at the first reading that differs, if it comes within that many, and
-/// None while waiting for it. Unchanged past that many, the sensor would
-/// have refreshed: judged at `within`, the miss stands.
+/// The chance that a sensor holds a reading `r` more times in a row, after
+/// `zero` exact repeats in `steps` steps of its history, under no prior
+/// belief about how often it repeats (uniform): the posterior predictive,
+/// prod_{i<r} (zero+1+i)/(steps+2+i), as the stuck test reads it. Each
+/// repeat is evidence for the next, so a thin history never makes a hold
+/// look rarer than it can say. It stops once below ALPHA, the only
+/// question asked of it.
+pub fn hold_chance(steps: usize, zero: usize, r: usize) -> f64 {
+    let mut chance = 1.0;
+    for i in 0..r {
+        chance *= (zero + 1 + i) as f64 / (steps + 2 + i) as f64;
+        if chance < ALPHA {
+            break;
+        }
+    }
+    chance
+}
+
+/// When a run is judged, as far as a span of exact repeats goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Horizon {
+    /// At this many plausible reports after the run.
+    At(usize),
+    /// Every report since repeats the last before the run, and a sensor
+    /// that has not refreshed shows a span that long at least as often as
+    /// ALPHA: waiting on a reading that differs.
+    Waiting,
+    /// Every report through the declared horizon repeats the last before
+    /// the run, and the history cannot say how often the sensor holds a
+    /// reading: fewer than MIN_SAMPLES steps, or none that changed. No
+    /// evidence either way; not judged.
+    Thin,
+}
+
+/// When a run is judged (`before` the plausible reports before its intent,
+/// oldest first; `ran` whether the lever ran in each step between them;
+/// `after` the plausible reports since its ok outcome; `since` how many
+/// trusted ones came, plausible or not; `bound` whether a value is a
+/// bound of the range): at `within`, unless every one of those exactly
+/// repeats the last report before the run. Such a span holds no fresh
+/// reading. It is evidence of no effect only once a sensor that repeats
+/// as often as the metric's history says would have refreshed: once the
+/// chance of that many repeats in a row (`hold_chance`) is below ALPHA.
+/// Before that the run waits, and the first reading that differs judges
+/// it; past it, the miss at `within` stands. A history too thin to say
+/// how often the sensor repeats judges nothing (`Thin`). Readings flagged
+/// implausible count toward the wait, so no sensor holds a lever for ever.
 pub fn horizon(
     within: usize,
     before: &[f64],
     ran: &[bool],
     after: &[f64],
     since: usize,
-) -> Option<usize> {
+    bound: impl Fn(f64) -> bool,
+) -> Horizon {
     let Some(&base) = before.last() else {
-        return Some(within);
+        return Horizon::At(within);
     };
     let same = after.iter().take_while(|x| **x == base).count();
-    let held = held(before, ran);
-    if same < within || same > held {
-        return Some(within);
+    if same < within {
+        return Horizon::At(within);
+    }
+    let (steps, zero) = repeats(before, ran, bound);
+    if steps < MIN_SAMPLES || zero >= steps {
+        return Horizon::Thin;
+    }
+    let rare = |r: usize| hold_chance(steps, zero, r) < ALPHA;
+    if rare(same) {
+        return Horizon::At(within);
     }
     if same < after.len() {
-        return Some(same + 1);
+        return Horizon::At(same + 1);
     }
-    // Readings flagged implausible count toward the wait, so no sensor
-    // holds a run for ever.
-    (since > held).then_some(within)
+    if rare(since) {
+        Horizon::At(within)
+    } else {
+        Horizon::Waiting
+    }
 }
 
 /// Judge one run. `before` is the trusted reports of the metric before
@@ -283,50 +336,122 @@ mod tests {
         assert_eq!(delay(&[a, b]), 0);
     }
 
-    #[test]
-    fn held_is_a_hold_shown_twice() {
-        assert_eq!(held(&[], &[]), 0);
-        assert_eq!(held(&[3.0], &[]), 0);
-        // One flat stretch, then the one the reports end in: neither.
-        assert_eq!(held(&[1.0, 1.0, 1.0, 2.0, 2.0], &[]), 0);
-        assert_eq!(held(&[9.0, 9.0, 9.0, 9.0, 3.0], &[]), 0);
-        assert_eq!(held(&[3.0; 6], &[]), 0);
-        // Two that ended: the shorter of the two longest.
-        assert_eq!(held(&[1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0], &[]), 2);
-        assert_eq!(
-            held(&[1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0], &[]),
-            2
-        );
-        // Only the last twenty count.
-        let mut before = vec![5.0, 5.0, 5.0, 6.0, 6.0, 6.0];
-        before.extend((0..20).map(f64::from));
-        assert_eq!(held(&before, &[]), 0);
+    /// A sensor read five times a refresh: four exact repeats, then a
+    /// change, `n` times over, from 60 up by 10.
+    fn lagging(n: usize) -> Vec<f64> {
+        (0..n)
+            .flat_map(|k| std::iter::repeat_n(60.0 + 10.0 * k as f64, 5))
+            .collect()
+    }
+
+    fn unbounded(_: f64) -> bool {
+        false
     }
 
     #[test]
-    fn an_unchanged_span_waits_as_long_as_the_metric_has_held() {
-        let stale = [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 1.0];
-        assert_eq!(held(&stale, &[]), 3);
+    fn repeats_count_the_steps_the_lever_did_not_run_in() {
+        assert_eq!(repeats(&[], &[], unbounded), (0, 0));
+        assert_eq!(repeats(&[3.0], &[], unbounded), (0, 0));
+        assert_eq!(repeats(&lagging(3), &[], unbounded), (14, 12));
+        // A step a run fell in is the lever's, whatever it read.
+        let mut ran = vec![false; 14];
+        ran[4] = true;
+        ran[6] = true;
+        assert_eq!(repeats(&lagging(3), &ran, unbounded), (12, 11));
+        // A repeat at a bound is no step of the sensor.
+        let at = |x: f64| x == 70.0;
+        assert_eq!(repeats(&lagging(3), &[], at), (10, 8));
+        // Only the latest WINDOW steps count.
+        let mut long = vec![1.0; 1000];
+        long.extend((0..WINDOW).map(|i| i as f64 + 2.0));
+        assert_eq!(repeats(&long, &[], unbounded), (WINDOW, 0));
+    }
+
+    #[test]
+    fn the_hold_chance_is_the_posterior_predictive() {
+        assert_eq!(hold_chance(10, 3, 0), 1.0);
+        // No history: 1/2, then 1/2 * 2/3.
+        assert!((hold_chance(0, 0, 2) - 1.0 / 3.0).abs() < 1e-12);
+        // 3 repeats in 10: 4/12 * 5/13.
+        assert!((hold_chance(10, 3, 2) - 4.0 / 12.0 * 5.0 / 13.0).abs() < 1e-12);
+        // 20 steps that never repeated: one repeat is 1/22, two 1/22 * 2/23.
+        assert!(hold_chance(20, 0, 1) > ALPHA);
+        assert!(hold_chance(20, 0, 2) < ALPHA);
+    }
+
+    #[test]
+    fn a_span_of_repeats_waits_while_the_sensor_may_still_hold() {
+        // Three refreshes, four repeats each: a hold of 4 is likely.
+        let before = lagging(4);
+        let base = *before.last().unwrap();
+        let same = |n: usize| vec![base; n];
+        let h =
+            |after: &[f64], since: usize| horizon(3, &before[..16], &[], after, since, unbounded);
         // A change inside the declared horizon: judged as declared.
-        assert_eq!(horizon(2, &stale, &[], &[1.0, 5.0], 2), Some(2));
-        // Unchanged through it: waits, then the first change judges.
-        assert_eq!(horizon(2, &stale, &[], &[1.0, 1.0], 2), None);
-        assert_eq!(horizon(2, &stale, &[], &[1.0, 1.0, 1.0], 3), None);
-        assert_eq!(horizon(2, &stale, &[], &[1.0, 1.0, 1.0, 7.0], 4), Some(4));
-        // Longer than the metric has held: the miss at `within` stands.
-        assert_eq!(horizon(2, &stale, &[], &[1.0; 4], 4), Some(2));
-        // Implausible readings close the wait too.
-        assert_eq!(horizon(2, &stale, &[], &[1.0, 1.0], 4), Some(2));
-        // A metric that never held a value twice: judged as declared.
-        assert_eq!(horizon(2, &[1.0, 2.0, 3.0], &[], &[3.0, 3.0], 2), Some(2));
-        assert_eq!(horizon(2, &[], &[], &[3.0, 3.0], 2), Some(2));
-        // A stretch the lever ran in, or that a run ended, is the lever's.
-        let mut ran = [false; 8];
-        ran[5] = true;
-        assert_eq!(horizon(2, &stale, &ran, &[1.0, 1.0], 2), Some(2));
-        let mut ran = [false; 8];
-        ran[7] = true;
-        assert_eq!(held(&stale, &ran), 0);
+        assert_eq!(h(&[90.0, 75.0], 2), Horizon::At(3));
+        assert_eq!(h(&[90.0, 75.0, 75.0], 3), Horizon::At(3));
+        // Unchanged through it: waits, and the first change judges.
+        assert_eq!(h(&same(3), 3), Horizon::Waiting);
+        assert_eq!(h(&same(4), 4), Horizon::Waiting);
+        assert_eq!(h(&[90.0, 90.0, 90.0, 90.0, 75.0], 5), Horizon::At(5));
+        // Held so long that a sensor this one would have refreshed: the
+        // miss at the declared horizon stands.
+        let r = (3..).find(|r| hold_chance(15, 12, *r) < ALPHA).unwrap();
+        assert_eq!(h(&same(r - 1), r - 1), Horizon::Waiting);
+        assert_eq!(h(&same(r), r), Horizon::At(3));
+        let mut late = same(r);
+        late.push(75.0);
+        assert_eq!(h(&late, r + 1), Horizon::At(3));
+        // Readings flagged implausible count toward the wait.
+        assert_eq!(h(&same(3), r), Horizon::At(3));
+    }
+
+    #[test]
+    fn a_history_that_cannot_say_how_long_the_sensor_holds_judges_nothing() {
+        // No history, a step or two, or one that never changed: no
+        // evidence either way.
+        assert_eq!(
+            horizon(2, &[], &[], &[3.0, 3.0], 2, unbounded),
+            Horizon::At(2)
+        );
+        assert_eq!(
+            horizon(2, &[3.0], &[], &[3.0, 3.0], 2, unbounded),
+            Horizon::Thin
+        );
+        assert_eq!(
+            horizon(2, &[1.0, 2.0, 3.0], &[], &[3.0, 3.0], 2, unbounded),
+            Horizon::Thin
+        );
+        assert_eq!(
+            horizon(2, &[3.0; 9], &[], &[3.0, 3.0], 2, unbounded),
+            Horizon::Thin
+        );
+        // A change inside the horizon is judged whatever the history.
+        assert_eq!(
+            horizon(2, &[3.0], &[], &[3.0, 4.0], 2, unbounded),
+            Horizon::At(2)
+        );
+        // A metric that never repeated in 20 steps: two repeats are rare
+        // enough to judge, one is not.
+        let varied: Vec<f64> = (0..21).map(f64::from).collect();
+        assert_eq!(
+            horizon(2, &varied, &[], &[20.0, 20.0], 2, unbounded),
+            Horizon::At(2)
+        );
+        assert_eq!(
+            horizon(1, &varied, &[], &[20.0], 1, unbounded),
+            Horizon::Waiting
+        );
+        assert_eq!(
+            horizon(1, &varied, &[], &[20.0, 20.0], 2, unbounded),
+            Horizon::At(1)
+        );
+        // Steps the lever ran in say nothing of the sensor.
+        let ran = vec![true; 20];
+        assert_eq!(
+            horizon(2, &varied, &ran, &[20.0, 20.0], 2, unbounded),
+            Horizon::Thin
+        );
     }
 
     #[test]

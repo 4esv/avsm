@@ -788,11 +788,13 @@ proptest! {
                 "restored {} {}", v, a
             );
             for within in [1, 2] {
-                prop_assert_eq!(
-                    index.waiting(v, a, "count", within),
-                    reference::waiting(&entries, v, a, "count", within),
-                    "waiting {} {} within {}", v, a, within
-                );
+                for range in [None, Some([0.0, 10.0])] {
+                    prop_assert_eq!(
+                        index.waiting(v, a, "count", within, range),
+                        reference::waiting(&entries, v, a, "count", within, range),
+                        "waiting {} {} within {} range {:?}", v, a, within, range
+                    );
+                }
             }
         }
         prop_assert_eq!(index.open_asks(), reference::open_asks(&entries));

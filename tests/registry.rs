@@ -464,9 +464,9 @@ fn alarm_fatigue_a_saturation_ask_is_written_past_the_asks_quota_and_only_once()
 /// suspends the delegation of a lever that missed (`src/kernel/expect.rs`,
 /// `src/expect.rs`). Only a declared approval gives it back.
 ///
-/// SHOWN: a lever runs, the metric does not move, and at the horizon an
-/// ineffective ask is written and the next crossing is refused, with no
-/// ask of its own.
+/// SHOWN: after a day of history, a lever runs, the metric does not
+/// move, and at the horizon an ineffective ask is written and the next
+/// crossing is refused, with no ask of its own.
 /// One report short of the horizon, nothing is judged.
 #[test]
 fn hindsight_a_lever_that_does_nothing_is_judged_ineffective_and_loses_its_delegation() {
@@ -490,6 +490,11 @@ fn hindsight_a_lever_that_does_nothing_is_judged_ineffective_and_loses_its_deleg
         k.report("raiser", false);
     };
     let suspended = |k: &Kernel| k.index().unwrap().suspended("raiser", "boost");
+    // A history to judge it by: with none, no drift is known, nor how
+    // long the sensor holds a reading, and nothing is judged.
+    for i in 0..20 {
+        report(&mut k, if i % 2 == 0 { 6.75 } else { 7.25 }, HOUR);
+    }
     report(&mut k, 3.0, HOUR); // crosses: the delegated lever runs
     assert_eq!(intents(&k, "raiser", "boost"), 1);
     report(&mut k, 3.0, HOUR);

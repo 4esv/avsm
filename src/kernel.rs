@@ -35,6 +35,8 @@ pub mod plan;
 pub mod predict;
 mod refusals;
 
+pub use guards::{ALPHA, WINDOW};
+
 /// What a canary ask asks, each plausibly wrong on its face: it rests on
 /// nothing measured. Taken in turn.
 const CANARIES: [&str; 5] = [

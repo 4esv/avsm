@@ -206,7 +206,14 @@ successful outcome, not minutes or runs. The count-th such report is compared
 with the last reading before the run, net of what the metric was doing anyway,
 and avsm writes whether the run did what was expected; until then the verdict
 is waiting. Without a size, any move the right way beyond the metric's own
-noise is enough; with one, a move far off it is the wrong size. With
+noise is enough; with one, a move far off it is the wrong size. Absence of
+evidence is not a miss. With fewer than 3 steps of history the metric's drift
+is not known, and the run is not judged. A span of exact repeats of the reading
+before the run may be a sensor that has not refreshed, as a cached `df` read
+more often than it updates is. The run waits, and its lever with it, until a
+reading differs or the metric's own history makes that many repeats in a row
+less likely than 1%. A metric that has never changed is no evidence either way,
+and its runs are not judged. With
 `revoke_after: n` on a delegated lever, n misses in a row suspend the
 delegation until you approve the ask it raises. A lever with `expects` also
 gives the forecast and the capacity check an effect to start from before it

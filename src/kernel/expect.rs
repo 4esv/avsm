@@ -36,13 +36,21 @@
 //! with nothing to run on the answer.
 //!
 //! A run whose declared horizon reads nothing but exact repeats of the
-//! value from before it saw no fresh reading. While those repeats are no
-//! more than the metric's sensor has shown it holds a value
-//! (`expect::held`), the run is waited on, and the gate holds the lever:
-//! the first reading that differs judges it. Repeated longer than that,
-//! the sensor would have refreshed, and the miss stands.
+//! value from before it saw no fresh reading. While a sensor that repeats
+//! as often as the metric's history says would plausibly still hold that
+//! value (the posterior predictive of that many repeats is at least
+//! ALPHA, `expect::horizon`), the run is waited on, and the gate holds
+//! the lever: the first reading that differs judges it. Repeated longer
+//! than that, the sensor would have refreshed, and the miss stands.
+//!
+//! Absence of evidence is not evidence of no effect. A run whose history
+//! is too thin to judge by, fewer than `world::MIN_SAMPLES` steps the
+//! metric took on its own to learn its drift from, or too few steps to
+//! say how long its sensor holds a reading, is not judged yet: neither a
+//! hit nor a miss, and the lever may run again once its declared horizon
+//! has read.
 
-use crate::expect::{self, Judgement};
+use crate::expect::{self, Horizon, Judgement};
 use crate::index::{Index, EXPECTATION, SUSPENSION};
 use crate::mandate::{Expects, Mandate, Permitted};
 use crate::record::{Claim, Record, Seq, Signal};
@@ -173,7 +181,7 @@ impl Kernel {
                         }
                         match seen.judgement {
                             Judgement::Waiting => break,
-                            _ if seen.doubted => Run::Unjudged,
+                            _ if seen.doubted || seen.thin => Run::Unjudged,
                             Judgement::Unknown | Judgement::Met => Run::Hit,
                             Judgement::WrongSize { observed, noise, .. } => {
                                 if !index.expectation_reported(intent) {
@@ -496,6 +504,10 @@ struct Seen {
     judgement: Judgement,
     /// An implausible reading falls in the span the declared horizon reads.
     doubted: bool,
+    /// The history before the run is too thin to judge it by: too few
+    /// steps to learn the drift from, or to say how long the sensor holds
+    /// a reading (`Horizon::Thin`). Not judged yet.
+    thin: bool,
     /// The delay, in reports, at which a run that missed at its declared
     /// horizon showed its effect, and the delay its lever's runs had
     /// shown before.
@@ -654,16 +666,28 @@ fn judged(
     outcome: Seq,
 ) -> Option<Seen> {
     // A span of exact repeats is judged at the first reading that
-    // differs, while it is no longer than the metric has held a value
-    // before: a sensor that has not refreshed is no evidence of no effect.
-    let w = index.horizon(
+    // differs, while a sensor that repeats as often as the metric has
+    // would plausibly still hold it: a sensor that has not refreshed is
+    // no evidence of no effect, and nor is a history too thin to say.
+    let thin = Seen {
+        judgement: Judgement::Unknown,
+        doubted: false,
+        thin: true,
+        late: None,
+    };
+    let w = match index.horizon(
         venture,
         &perm.name,
         mandate.metric_name(),
         intent,
         outcome,
         expects.within,
-    )?;
+        mandate.range,
+    ) {
+        Horizon::Waiting => return None,
+        Horizon::Thin => return Some(thin),
+        Horizon::At(w) => w,
+    };
     let extended;
     let (mandate, perm, expects) = if w > expects.within as usize {
         let mut m = mandate.clone();
@@ -680,7 +704,21 @@ fn judged(
         (mandate, perm, expects)
     };
     let at = |d| span(index, venture, mandate, perm, expects, intent, outcome, d);
-    let (judgement, doubted) = match at(0) {
+    let first = at(0);
+    if matches!(first, Span::Waiting) {
+        return None;
+    }
+    // Too few steps the metric took on its own to learn its drift from:
+    // the counterfactual would be no drift at all, which is no evidence
+    // either way. Not judged yet.
+    let quiet = world::drift_steps(index, venture, mandate, Some(intent))
+        .iter()
+        .filter(|d| d.gap > 0)
+        .count();
+    if quiet < world::MIN_SAMPLES {
+        return Some(thin);
+    }
+    let (judgement, doubted) = match first {
         Span::Waiting => return None,
         Span::Unknown | Span::Past => (Judgement::Unknown, false),
         Span::Read {
@@ -696,6 +734,7 @@ fn judged(
     let seen = |judgement| Seen {
         judgement,
         doubted,
+        thin: false,
         late: None,
     };
     let wrong_way = match judgement {
@@ -746,6 +785,7 @@ fn judged(
                     return Some(Seen {
                         judgement: shown,
                         doubted,
+                        thin: false,
                         late: Some((d, learned)),
                     });
                 }

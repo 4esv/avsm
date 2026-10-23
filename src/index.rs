@@ -981,7 +981,14 @@ impl Index {
     /// compare with is never waited on, and the window closes with the
     /// readings that come, whether or not the sensor is believed, so no
     /// sensor holds a lever for ever.
-    pub fn waiting(&self, venture: &str, action: &str, metric: &str, within: u32) -> Option<Seq> {
+    pub fn waiting(
+        &self,
+        venture: &str,
+        action: &str,
+        metric: &str,
+        within: u32,
+        range: Option<[f64; 2]>,
+    ) -> Option<Seq> {
         let intent = self
             .intents_of(venture, action)
             .iter()
@@ -996,10 +1003,9 @@ impl Index {
         let plausible = series.len() - series.partition_point(|(s, _)| *s <= outcome);
         let doubted = self.doubted_since(venture, metric, outcome);
         ((plausible + doubted) < within as usize
-            || self
-                .horizon(venture, action, metric, intent, outcome, within)
-                .is_none())
-        .then_some(intent)
+            || self.horizon(venture, action, metric, intent, outcome, within, range)
+                == crate::expect::Horizon::Waiting)
+            .then_some(intent)
     }
 
     /// How many trusted reports of a metric after `outcome` are flagged
@@ -1015,9 +1021,11 @@ impl Index {
 
     /// How many plausible reports after a run, `intent` to `outcome`, it
     /// is judged at (`expect::horizon`): `within`, or later while every
-    /// report since repeats the last before it no longer than the metric
-    /// has shown its sensor holds one while `action` does not run. None
-    /// while waiting on that.
+    /// report since repeats the last before it, as long as a sensor that
+    /// repeats as often as the metric has, in the steps `action` did not
+    /// run in, would plausibly still hold it. Waiting on that, or Thin
+    /// when the history cannot say.
+    #[allow(clippy::too_many_arguments)]
     pub fn horizon(
         &self,
         venture: &str,
@@ -1026,7 +1034,8 @@ impl Index {
         intent: Seq,
         outcome: Seq,
         within: u32,
-    ) -> Option<usize> {
+        range: Option<[f64; 2]>,
+    ) -> crate::expect::Horizon {
         let series = self.series(venture, metric);
         let b = series.partition_point(|(s, _)| *s < intent);
         let a = series.partition_point(|(s, _)| *s <= outcome);
@@ -1041,7 +1050,8 @@ impl Index {
             .collect();
         let after: Vec<f64> = series[a..].iter().map(|(_, x)| *x).collect();
         let since = after.len() + self.doubted_since(venture, metric, outcome);
-        crate::expect::horizon(within as usize, &before, &ran, &after, since)
+        let bound = |x: f64| range.is_some_and(|[lo, hi]| x == lo || x == hi);
+        crate::expect::horizon(within as usize, &before, &ran, &after, since, bound)
     }
 
     /// Is this measured ineffective ask or relapse void? It is when the
