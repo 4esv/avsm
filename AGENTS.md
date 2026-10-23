@@ -36,7 +36,7 @@ Use these words and no synonyms.
 12. Self-modification is a proposal. Only a declared decision adopts one.
 13. The only listener is the Tailscale one, off by default, bound to the tailnet interface only, identity from tailscaled, never from the client.
 14. World models, rollouts and forecasts are inferred. They rank, veto and ask, and never authorize.
-15. Simulation never runs a real lever. In simulate and forecast every lever goes to a world model or the simulation's world, and a simulation's world is never a venture's world model.
+15. Simulation never runs a venture's programs: no lever, report, guard, audit or reading runs for real. In simulate and forecast every lever goes to a world model or the simulation's world, and a simulation's world is never a venture's world model.
 16. Every side effect is recorded, then done: an intent with an idempotency key before the run, an outcome after. An intent with no outcome is never run again blindly.
 17. The improving loop never edits limits. It may only propose delegating a reversible lever; caps, costs, guards, budgets and everything else change only by a human.
 
