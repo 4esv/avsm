@@ -5,6 +5,8 @@
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use avsmd::gate::{Candidate, Proof};
 use avsmd::kernel::Kernel;
@@ -392,4 +394,79 @@ fn a_model_turn_that_chooses_nothing_leaves_an_inferred_record() {
         "{}",
         written[0].line()
     );
+}
+
+/// The real warden, except that a run of `fails` cannot start: the
+/// error a warden gives before it writes an intent. It counts the tries.
+struct CannotStart {
+    inner: LocalWarden,
+    fails: &'static str,
+    tries: Arc<AtomicUsize>,
+}
+
+impl Warden for CannotStart {
+    fn execute(&mut self, c: &Candidate) -> Result<Vec<Entry>, avsmd::warden::Failure> {
+        if c.action == self.fails {
+            self.tries.fetch_add(1, Ordering::SeqCst);
+            return Err("cannot start".to_string().into());
+        }
+        self.inner.execute(c)
+    }
+    fn infer(&mut self, r: &InferRequest) -> Result<String, String> {
+        self.inner.infer(r)
+    }
+    fn measure(&mut self, v: &str) -> Result<(Option<f64>, String), String> {
+        self.inner.measure(v)
+    }
+    fn confirm(&mut self, i: Seq) -> Result<Option<(bool, String)>, String> {
+        self.inner.confirm(i)
+    }
+}
+
+#[test]
+fn an_approval_that_did_not_run_is_not_tried_again_after_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, dir) = setup(tmp.path(), "echo nothing");
+    let tries = Arc::new(AtomicUsize::new(0));
+    let start = |home: &Path| {
+        let warden = CannotStart {
+            inner: LocalWarden::open(home).unwrap(),
+            fails: "wipe",
+            tries: tries.clone(),
+        };
+        Kernel::with(home, quiet(), Box::new(warden)).unwrap()
+    };
+    let mut k = start(&home);
+    k.add(&dir).unwrap();
+    k.propose("shop", "wipe", None).unwrap();
+    let ask = k.open_asks().unwrap()[0];
+    k.approve(ask, None).unwrap();
+    let decision = k.entries().unwrap().last().unwrap().seq;
+    k.tick();
+    let failed = |k: &Kernel| {
+        k.entries()
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                matches!(&e.record, Record::Report { metric, value: None, cites, .. }
+                    if metric == "wipe" && cites.contains(&decision))
+            })
+            .count()
+    };
+    assert_eq!(
+        failed(&k),
+        1,
+        "the gate said yes and nothing ran: one record"
+    );
+    assert_eq!(tries.load(Ordering::SeqCst), 1);
+    drop(k);
+    // Two restarts: the approval has its outcome and is not tried again.
+    for _ in 0..2 {
+        let mut k = start(&home);
+        k.tick();
+        k.tick();
+        assert_eq!(failed(&k), 1);
+    }
+    assert_eq!(tries.load(Ordering::SeqCst), 1);
+    assert_eq!(runs(&dir, "wipes"), 0);
 }

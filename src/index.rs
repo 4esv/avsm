@@ -331,6 +331,18 @@ impl Index {
                         *slot = (seq, implausible.is_some());
                     }
                 }
+                // The record the kernel writes when the gate said yes to an
+                // approval and the lever did not start: no intent cites the
+                // approval, so this report is its outcome and spends it. A
+                // start never runs it again.
+                if *claim == Claim::Measured && value.is_none() {
+                    let spent: Vec<Seq> = cites
+                        .iter()
+                        .copied()
+                        .filter(|d| self.approves(*d, &venture, metric))
+                        .collect();
+                    self.cite(spent);
+                }
                 if metric == EXPECTATION && *claim == Claim::Measured {
                     self.expected.extend(cites.iter().copied());
                 }
@@ -973,6 +985,24 @@ impl Index {
                 }
             }
         }
+    }
+
+    /// Is `decision` a declared approval of `venture`'s ask to run `action`?
+    fn approves(&self, decision: Seq, venture: &str, action: &str) -> bool {
+        let Some(Record::Decision {
+            claim: Claim::Declared,
+            venture: v,
+            verdict: Verdict::Approve { ask, .. },
+            ..
+        }) = self.get(decision).map(|e| &e.record)
+        else {
+            return false;
+        };
+        v == venture
+            && self
+                .get(*ask)
+                .and_then(|e| e.record.action())
+                .is_some_and(|a| a == action)
     }
 
     fn cite(&mut self, decisions: Vec<Seq>) {

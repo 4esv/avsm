@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use avsmd::kernel::Kernel;
 use avsmd::ledger::Ledger;
-use avsmd::record::{Record, Verdict};
+use avsmd::record::{Entry, Record, Verdict};
 
 fn open_copy(tmp: &Path) -> PathBuf {
     let home = tmp.join("home");
@@ -83,4 +83,48 @@ fn a_1_0_adoption_whose_directory_is_gone_is_reported() {
     let status = k.status().unwrap();
     assert!(status.contains("cannot read /nowhere/vanished"), "{status}");
     assert!(k.adopted().is_empty(), "nothing is permitted to it");
+}
+
+/// The measured reports that say an approved lever did not run, citing
+/// `decision`.
+fn did_not_run(k: &Kernel, decision: u64) -> Vec<u64> {
+    k.entries()
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            matches!(&e.record, Record::Report { value: None, note, cites, .. }
+                if note.starts_with("did not run") && cites.contains(&decision))
+        })
+        .map(|e| e.seq)
+        .collect()
+}
+
+#[test]
+fn a_1_0_approval_that_already_did_not_run_is_not_run_again_on_start() {
+    // #356 approves trader's delegate; #359 is its outcome, written by 1.0:
+    // it did not run. Two starts of 2.0 write nothing more for it.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = open_copy(tmp.path());
+    {
+        let k = Kernel::open(&home).unwrap();
+        assert_eq!(did_not_run(&k, 356), vec![359]);
+    }
+    for start in 1..=2 {
+        let mut k = Kernel::open(&home).unwrap();
+        let from = k.entries().unwrap().len();
+        k.tick();
+        assert_eq!(did_not_run(&k, 356), vec![359], "start {start}");
+        if start == 2 {
+            // Whatever the first start tried and failed, the second does
+            // not try again.
+            let again: Vec<_> = k.entries().unwrap()[from..]
+                .iter()
+                .filter(|e| {
+                    matches!(&e.record, Record::Report { note, .. } if note.starts_with("did not run"))
+                })
+                .map(Entry::line)
+                .collect();
+            assert!(again.is_empty(), "{again:?}");
+        }
+    }
 }
