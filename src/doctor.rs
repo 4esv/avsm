@@ -225,8 +225,11 @@ pub fn ledger_before_start(home: &Path) -> Result<(), exit::Exit> {
 
 /// `avsm doctor --cut <seq>`: with no daemon running, copy the ledger
 /// whole to a backup beside it, cut it just before `seq`, and record the
-/// cut as declared. The only thing doctor writes.
-pub fn cut(home: &Path, seq: Seq) -> Result<String, exit::Exit> {
+/// cut as declared. The only thing doctor writes. A ledger with no bad
+/// record, and a cut at record 1, are cut only with `force`; a cut at or
+/// before the record of an earlier cut is never made, for it would erase
+/// the proof of that cut.
+pub fn cut(home: &Path, seq: Seq, force: bool) -> Result<String, exit::Exit> {
     let path = home.join(LEDGER_FILE);
     if !path.is_file() {
         return Err(exit::Exit::new(
@@ -252,8 +255,43 @@ pub fn cut(home: &Path, seq: Seq) -> Result<String, exit::Exit> {
         crate::clock::now()
     ));
     let last = ledger.len().map_err(data)?;
+    // NOTE: a ledger that does not read cannot list its cuts; the cut then
+    // goes by the bad record alone, which ledger.cut checks.
+    let earlier = ledger
+        .all()
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| is_cut(&e.record))
+        .map(|e| e.seq)
+        .max();
+    if let Some(at) = earlier.filter(|at| seq <= *at) {
+        return Err(exit::Exit::new(
+            exit::USAGE,
+            format!(
+                "record #{at} is the record of an earlier cut; a cut before #{seq} would erase it. \
+                 Cut after #{at}, or not at all"
+            ),
+        ));
+    }
+    let bad = ledger.first_bad().map_err(data)?;
+    if bad.is_none() && !force {
+        return Err(exit::Exit::new(
+            exit::USAGE,
+            format!(
+                "the ledger has no bad record; cutting before #{seq} would remove {} sound records \
+                 (kept in the backup, but gone from the ledger). Pass --force to cut anyway",
+                last.saturating_sub(seq) + 1
+            ),
+        ));
+    }
+    if seq == 1 && !force {
+        return Err(exit::Exit::new(
+            exit::USAGE,
+            "cutting before #1 removes every record; pass --force to do it".to_string(),
+        ));
+    }
     let cut = ledger.cut(seq, &backup).map_err(data)?;
-    let by = std::env::var("USER").unwrap_or_else(|_| "a human".to_string());
+    let by = account_name();
     let note = format!(
         "the ledger was cut before #{seq} by {by}: #{seq}..#{last} ({cut} records) removed, \
          the whole ledger kept in {}",
@@ -268,13 +306,42 @@ pub fn cut(home: &Path, seq: Seq) -> Result<String, exit::Exit> {
             &note,
         ))
         .map_err(data)?;
+    let kept = if seq > 1 {
+        format!("kept #1..#{}", seq - 1)
+    } else {
+        "kept nothing".to_string()
+    };
     Ok(format!(
-        "backed up {} to {}\ncut {cut} records, #{seq}..#{last}; kept #1..#{}\n{}\n",
+        "backed up {} to {}\ncut {cut} records, #{seq}..#{last}; {kept}\n{}\n",
         path.display(),
         backup.display(),
-        seq - 1,
         entry.line()
     ))
+}
+
+/// The record `cut` writes.
+fn is_cut(record: &crate::record::Record) -> bool {
+    matches!(record, crate::record::Record::Report { claim: crate::record::Claim::Declared, venture, metric, .. }
+        if venture == crate::gate::SELF && metric == "cut")
+}
+
+/// The name of the account this process runs as, from its uid, not from
+/// an environment variable anyone can set to anything.
+fn account_name() -> String {
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: passwd is plain data; all zeroes is a valid value.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: pw, buf and found outlive the call; buf's length is passed.
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut found) };
+    if rc == 0 && !found.is_null() {
+        // SAFETY: on success pw_name points to a NUL-terminated string in buf.
+        let name = unsafe { std::ffi::CStr::from_ptr(pw.pw_name) };
+        return name.to_string_lossy().into_owned();
+    }
+    format!("uid {uid}")
 }
 
 /// The ventures a human adopted, self left out.

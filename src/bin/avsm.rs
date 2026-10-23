@@ -118,6 +118,9 @@ enum Command {
         /// recorded. The one thing doctor writes
         #[arg(long, value_name = "NUMBER", conflicts_with = "since")]
         cut: Option<String>,
+        /// Cut a ledger that has no bad record, or cut before record 1
+        #[arg(long, requires = "cut")]
+        force: bool,
     },
     /// Run the ventures in a home of their own over simulated days
     #[command(hide = true)]
@@ -292,7 +295,7 @@ fn main() -> ExitCode {
         }
     };
     let args: Vec<String> = match cli.command {
-        Command::Doctor { since, cut } => {
+        Command::Doctor { since, cut, force } => {
             if remote.is_some() {
                 return done(Err(Exit::new(
                     exit::USAGE,
@@ -310,7 +313,7 @@ fn main() -> ExitCode {
                     }
                 };
                 return done(
-                    avsmd::doctor::cut(&home, seq).map(|text| avsmd::protocol::emit(&text)),
+                    avsmd::doctor::cut(&home, seq, force).map(|text| avsmd::protocol::emit(&text)),
                 );
             }
             let since = match since.as_deref().map(avsmd::doctor::parse_anchor) {

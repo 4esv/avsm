@@ -344,6 +344,94 @@ fn a_cut_refuses_while_avsmd_runs_and_refuses_nonsense() {
     );
 }
 
+fn cut_out(tmp: &Path, home: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let mut a = vec!["--home", home.to_str().unwrap(), "doctor"];
+    a.extend_from_slice(args);
+    let out = Command::new(env!("CARGO_BIN_EXE_avsm"))
+        .args(&a)
+        .env("HOME", tmp)
+        .env("USER", "mallory")
+        .env_remove("AVSMD_HOME")
+        .output()
+        .unwrap();
+    let (o, e) = text(&out);
+    (out.status.code(), format!("{o}{e}"))
+}
+
+#[test]
+fn a_cut_needs_a_bad_record_or_force_and_never_erases_a_cut() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = adopted_home(tmp.path());
+    let n = Ledger::open(&home.join("ledger.db"))
+        .unwrap()
+        .len()
+        .unwrap();
+    // A sound ledger is not cut without --force, and nothing is written.
+    let (code, out) = cut_out(tmp.path(), &home, &["--cut", "3"]);
+    assert_eq!(code, Some(64), "{out}");
+    assert!(
+        out.contains("no bad record") && out.contains("--force"),
+        "{out}"
+    );
+    assert_eq!(
+        Ledger::open(&home.join("ledger.db"))
+            .unwrap()
+            .len()
+            .unwrap(),
+        n
+    );
+    // Record 1 is not cut without --force either.
+    let (code, out) = cut_out(tmp.path(), &home, &["--cut", "1"]);
+    assert_eq!(code, Some(64), "{out}");
+
+    // With --force it is cut; the account is the uid's, not $USER.
+    let (code, out) = cut_out(tmp.path(), &home, &["--cut", "3", "--force"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("kept #1..#2"), "{out}");
+    let ledger = Ledger::open(&home.join("ledger.db")).unwrap();
+    let note = ledger.all().unwrap().pop().unwrap().record.summary();
+    assert!(!note.contains("mallory"), "{note}");
+    assert!(note.contains(" by "), "{note}");
+    drop(ledger);
+
+    // The cut's own record is #3: a cut at or before it is refused.
+    for at in ["3", "2"] {
+        let (code, out) = cut_out(tmp.path(), &home, &["--cut", at, "--force"]);
+        assert_ne!(code, Some(0), "{at}: {out}");
+        assert!(out.contains("earlier cut"), "{at}: {out}");
+    }
+    let ledger = Ledger::open(&home.join("ledger.db")).unwrap();
+    assert_eq!(ledger.len().unwrap(), 3);
+    assert!(ledger.all().unwrap()[2]
+        .record
+        .summary()
+        .contains("was cut"));
+}
+
+#[test]
+fn a_cut_before_record_one_says_so_and_needs_force_even_on_a_bad_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = adopted_home(tmp.path());
+    let conn = rusqlite::Connection::open(home.join("ledger.db")).unwrap();
+    let (seq, hash) = last(&conn);
+    conn.execute(
+        "INSERT INTO records (seq, at, prev, hash, weight, record) \
+         VALUES (?1, 0, ?2, 'x2', 1, '{\"kind\":\"action\"}')",
+        rusqlite::params![seq + 1, hash],
+    )
+    .unwrap();
+    drop(conn);
+    let (code, out) = cut_out(tmp.path(), &home, &["--cut", "1"]);
+    assert_eq!(code, Some(64), "{out}");
+    assert!(out.contains("--force"), "{out}");
+    let (code, out) = cut_out(tmp.path(), &home, &["--cut", "1", "--force"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("kept nothing") && !out.contains("#1..#0"),
+        "{out}"
+    );
+}
+
 /// Run a second avsmd on the home and wait at most ten seconds for it to
 /// exit: one that starts is killed and fails the test, not left hanging.
 fn bounded(tmp: &Path, h: &str) -> (Option<i32>, String) {
