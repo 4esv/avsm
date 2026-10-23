@@ -1353,7 +1353,7 @@ const ACTION_FIELDS: &[&str] = &[
 ];
 
 /// Names no permitted action may take: they are built in.
-pub const BUILT_IN: &[&str] = &[STOP, "delegate"];
+pub const BUILT_IN: &[&str] = &[STOP, "delegate", "canary"];
 
 /// The levers a parent pulls on its children, by name alone, each taking
 /// text: `budget <child> <amount>`, `pause <child>`, `resume <child>`,
@@ -4393,6 +4393,8 @@ max_step: 5000
         assert!(msg.starts_with("delegate is built in"), "{msg}");
         let msg = fails(&edit("  - name: deploy\n", "  - name: resume\n"));
         assert!(msg.starts_with("resume is built in"), "{msg}");
+        let msg = fails(&edit("  - name: deploy\n", "  - name: canary\n"));
+        assert!(msg.starts_with("canary is built in"), "{msg}");
     }
 
     #[test]
