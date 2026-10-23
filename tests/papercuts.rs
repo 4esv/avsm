@@ -37,8 +37,7 @@ impl Drop for Daemon {
 }
 
 pub fn start(home: &Path) -> Daemon {
-    std::fs::create_dir_all(home).unwrap();
-    if !home.join("config.yaml").exists() {
+    if home.is_dir() && !home.join("config.yaml").exists() {
         std::fs::write(home.join("config.yaml"), SMALL_FORECASTS).unwrap();
     }
     let child = Command::new(env!("CARGO_BIN_EXE_avsmd"))
@@ -128,4 +127,54 @@ fn text_a_model_wrote_is_escaped_where_it_is_shown() {
         assert!(!avsmd::protocol::display(&c).contains(&c), "{n:x}");
     }
     assert_eq!(avsmd::protocol::display("naïve café ✓"), "naïve café ✓");
+}
+
+fn mode(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn a_new_home_and_ledger_are_for_their_owner_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("fresh");
+    let _daemon = start(&home);
+    let dir = counter_venture(tmp.path());
+    assert!(avsm(&home, &["add", dir.to_str().unwrap()]).0);
+    assert_eq!(mode(&home), 0o700);
+    assert_eq!(mode(&home.join("ledger.db")), 0o600);
+    let journal = home.join("ledger.db-journal");
+    assert!(journal.exists(), "the journal is the file to check");
+    assert_eq!(mode(&journal), 0o600);
+}
+
+#[test]
+fn an_existing_home_and_ledger_are_left_as_they_are_and_doctor_warns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("old");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    {
+        let _ = avsmd::kernel::Kernel::open(&home).unwrap();
+    }
+    let ledger = home.join("ledger.db");
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (_, out, _) = avsm_out(&home, &["doctor"]);
+    assert!(
+        out.contains("warn  ") && out.contains("ledger.db is mode 644"),
+        "{out}"
+    );
+    assert!(out.contains("fix: chmod 600"), "{out}");
+    assert_eq!(mode(&ledger), 0o644, "doctor changes nothing");
+    assert_eq!(mode(&home), 0o755);
+    for m in [0o640, 0o604] {
+        std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(m)).unwrap();
+        let (_, out, _) = avsm_out(&home, &["doctor"]);
+        assert!(
+            out.contains(&format!("ledger.db is mode {m:o}")),
+            "{m:o}: {out}"
+        );
+    }
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (_, out, _) = avsm_out(&home, &["doctor"]);
+    assert!(!out.contains("warn  "), "{out}");
 }

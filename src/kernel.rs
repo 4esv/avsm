@@ -315,8 +315,7 @@ impl Kernel {
         warden: Box<dyn Warden + Send>,
         seed: Option<&Index>,
     ) -> Result<Kernel, String> {
-        std::fs::create_dir_all(home)
-            .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
+        make_home(home).map_err(|e| format!("cannot create {}: {e}", home.display()))?;
         let ledger = Ledger::open(&home.join("ledger.db")).map_err(|e| e.to_string())?;
         let config = Config::load(home)?;
         let index = match seed {
@@ -5088,6 +5087,16 @@ impl Kernel {
     }
 }
 
+/// Make the home directory, for its owner alone (0700) when it is made
+/// here; one that exists is left as it is.
+pub fn make_home(home: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(home)
+}
+
 /// Run avsmd in the foreground: spawn the warden and the roles process,
 /// answer commands on the socket, and tick once a second until SIGTERM or
 /// SIGINT; then drain and return.
@@ -5095,7 +5104,7 @@ pub fn start(home: &Path) -> Result<(), Exit> {
     if let Some(e) = crate::protocol::socket_too_long(&socket_path(home)) {
         return Err(Exit::new(exit::USAGE, e));
     }
-    std::fs::create_dir_all(home).map_err(|e| {
+    make_home(home).map_err(|e| {
         Exit::new(
             exit::CANTCREAT,
             format!("cannot create {}: {e}", home.display()),

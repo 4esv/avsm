@@ -397,7 +397,8 @@ ledger is append-only. A record that still does not read stops avsmd, which
 names it; `avsm doctor --cut <number>` copies the whole ledger to
 `ledger.db.before-cut-<number>-<time>` beside it, cuts it just before that
 record, keeping every record before it, and appends a declared record of the
-cut.
+cut. It refuses a ledger with no bad record, and a cut before record 1, unless you add
+`--force`, and it never cuts at or before the record of an earlier cut.
 
 What the chain proves, plainly: it catches corruption, an accidental edit and
 anyone who can change the file without rehashing it. It does not catch a

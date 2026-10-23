@@ -39,6 +39,16 @@ impl Found {
         self.out.push('\n');
     }
 
+    /// A warning: worth fixing, with the command, and it does not change
+    /// the exit code.
+    fn warn(&mut self, line: impl AsRef<str>, fix: impl AsRef<str>) {
+        self.out.push_str("warn  ");
+        self.out.push_str(line.as_ref());
+        self.out.push_str("\n      fix: ");
+        self.out.push_str(fix.as_ref());
+        self.out.push('\n');
+    }
+
     /// A failure, with the exact command that fixes it.
     fn fail(&mut self, code: u8, line: impl AsRef<str>, fix: impl AsRef<str>) {
         self.out.push_str("FAIL  ");
@@ -291,6 +301,8 @@ pub fn cut(home: &Path, seq: Seq, force: bool) -> Result<String, exit::Exit> {
         ));
     }
     let cut = ledger.cut(seq, &backup).map_err(data)?;
+    // The backup holds every record the ledger did.
+    let _ = std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600));
     let by = account_name();
     let note = format!(
         "the ledger was cut before #{seq} by {by}: #{seq}..#{last} ({cut} records) removed, \
@@ -533,6 +545,21 @@ pub fn doctor(
 
     // The ledger and its chain.
     let ledger = home.join(LEDGER_FILE);
+    let journal = home.join(format!("{LEDGER_FILE}-journal"));
+    for file in [&ledger, &journal] {
+        if let Ok(m) = std::fs::metadata(file) {
+            if m.permissions().mode() & 0o077 != 0 {
+                found.warn(
+                    format!(
+                        "{} is mode {:o}: other accounts can read every record, including what levers and models said",
+                        file.display(),
+                        m.permissions().mode() & 0o777
+                    ),
+                    format!("chmod 600 {}", sh(file)),
+                );
+            }
+        }
+    }
     let entries = match read_ledger(home) {
         Ok(Some(entries)) => {
             found.ok(format!(

@@ -122,6 +122,22 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 impl Ledger {
     /// Open or create a ledger file. The directory must already exist.
     pub fn open(path: &Path) -> Result<Ledger, LedgerError> {
+        // A new ledger is for its owner alone, and SQLite gives its journal
+        // the mode of the file. One that exists is left as it is.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+            {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // Let SQLite say what is wrong with the path.
+                Err(_) => {}
+            }
+        }
         let mut ledger = Ledger::prepare(Connection::open(path)?)?;
         let meta = std::fs::metadata(path)
             .map_err(|e| LedgerError::Gone(format!("cannot stat {}: {e}", path.display())))?;
