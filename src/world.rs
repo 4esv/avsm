@@ -557,6 +557,22 @@ impl Baseline {
                 let i = series.partition_point(|(s, _)| *s < intent);
                 let a = series.partition_point(|(s, _)| *s <= outcome);
                 let base = i.checked_sub(1).and_then(|i| series.get(i));
+                // At the horizon the expectation judge uses: past a span
+                // of stale repeats, the first reading the sensor
+                // refreshed. A run still waiting on one, or on a history
+                // too thin to say, is no sample yet.
+                let within = match index.horizon(
+                    venture,
+                    &p.name,
+                    metric,
+                    intent,
+                    outcome,
+                    within as u32,
+                    mandate.range,
+                ) {
+                    crate::expect::Horizon::At(w) => w,
+                    crate::expect::Horizon::Waiting | crate::expect::Horizon::Thin => continue,
+                };
                 let then = series.get(a + within - 1);
                 // What the metric would have moved over the horizon anyway.
                 let carried = match (base, then) {
@@ -1644,5 +1660,70 @@ mod tests {
             .step(&Value::Null, None, 0, 0, 0)
             .unwrap_err()
             .contains("world failed"));
+    }
+
+    /// A cleanup behind a sensor that refreshes every 5 reports (#53, and
+    /// Power 3 of #55): usage grows 2 a report, a run right after a
+    /// refresh frees 25, and the next 4 reports repeat the stale reading.
+    /// `cap` runs a day at most.
+    fn lagging(cap: u32) -> (Index, Mandate) {
+        let m = Mandate::parse(&format!(
+            "purpose: p\nmetric: count\ncontroller: {{kind: threshold, above: 80, action: cleanup}}\n\
+             cadence: 1h\npermitted:\n- {{name: cleanup, run: ./c, cap: {cap}/day, reversible: true, \
+             expects: down within 3}}\n"
+        ))
+        .unwrap();
+        let mut l = Ledger {
+            entries: vec![],
+            at: 1_800_000_000,
+        };
+        let (mut actual, mut cached) = (10.0, 10.0);
+        let mut n = 0;
+        let mut report = |l: &mut Ledger, actual: &mut f64, cached: &mut f64| {
+            n += 1;
+            *actual += 2.0;
+            if n % 5 == 0 {
+                *cached = *actual;
+            }
+            l.report(*cached);
+        };
+        // A history of the sensor's holds before any run.
+        for _ in 0..20 {
+            report(&mut l, &mut actual, &mut cached);
+        }
+        for _ in 0..6 {
+            l.run("cleanup");
+            actual -= 25.0;
+            for _ in 0..30 {
+                report(&mut l, &mut actual, &mut cached);
+            }
+        }
+        // A last run whose effect the sensor has not shown yet: waiting.
+        l.run("cleanup");
+        actual -= 25.0;
+        for _ in 0..3 {
+            report(&mut l, &mut actual, &mut cached);
+        }
+        (Index::from_entries(&l.entries), m)
+    }
+
+    #[test]
+    fn a_run_behind_a_lagging_sensor_is_measured_at_the_reading_that_refreshed() {
+        let (index, m) = lagging(2);
+        let b = Baseline::from_index(&index, V, &m);
+        // Each run is measured at the first refreshed reading: 25 freed,
+        // net of the drift, not 0 from the stale reading at `within`; the
+        // last run, still waiting on a refresh, is no sample yet.
+        let effects = &b.effects["cleanup"];
+        assert_eq!(effects.len(), 6, "{effects:?}");
+        for e in effects {
+            assert!(*e < -15.0, "{effects:?}");
+        }
+        // Two runs a day free more than the usage grows: no false 'out
+        // of reach'.
+        assert_eq!(crate::forecast::capacity(&index, V, &m), None);
+        // One a day does not, and the check still says so.
+        let (index, m) = lagging(1);
+        assert!(crate::forecast::capacity(&index, V, &m).is_some());
     }
 }
