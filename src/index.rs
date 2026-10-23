@@ -947,14 +947,54 @@ impl Index {
             return None;
         }
         let plausible = series.len() - series.partition_point(|(s, _)| *s <= outcome);
-        let doubted = self
-            .doubted
+        let doubted = self.doubted_since(venture, metric, outcome);
+        ((plausible + doubted) < within as usize
+            || self
+                .horizon(venture, action, metric, intent, outcome, within)
+                .is_none())
+        .then_some(intent)
+    }
+
+    /// How many trusted reports of a metric after `outcome` are flagged
+    /// implausible.
+    fn doubted_since(&self, venture: &str, metric: &str, outcome: Seq) -> usize {
+        self.doubted
             .get(venture)
             .and_then(|m| m.get(metric))
             .map_or(0, |list| {
                 list.len() - list.partition_point(|s| *s <= outcome)
-            });
-        ((plausible + doubted) < within as usize).then_some(intent)
+            })
+    }
+
+    /// How many plausible reports after a run, `intent` to `outcome`, it
+    /// is judged at (`expect::horizon`): `within`, or later while every
+    /// report since repeats the last before it no longer than the metric
+    /// has shown its sensor holds one while `action` does not run. None
+    /// while waiting on that.
+    pub fn horizon(
+        &self,
+        venture: &str,
+        action: &str,
+        metric: &str,
+        intent: Seq,
+        outcome: Seq,
+        within: u32,
+    ) -> Option<usize> {
+        let series = self.series(venture, metric);
+        let b = series.partition_point(|(s, _)| *s < intent);
+        let a = series.partition_point(|(s, _)| *s <= outcome);
+        let before: Vec<f64> = series[..b].iter().map(|(_, x)| *x).collect();
+        let intents = self.intents_of(venture, action);
+        let ran: Vec<bool> = series[..b]
+            .windows(2)
+            .map(|w| {
+                let i = intents.partition_point(|s| *s <= w[0].0);
+                intents.get(i).is_some_and(|s| *s < w[1].0)
+            })
+            .collect();
+        let after: Vec<f64> = series[a..].iter().map(|(_, x)| *x).collect();
+        let since = after.len() + self.doubted_since(venture, metric, outcome);
+        crate::expect::horizon(within as usize, &before, &ran, &after, since)
     }
 
     /// Is this measured ineffective ask or relapse void? It is when the

@@ -62,6 +62,69 @@ pub fn noise(before: &[f64]) -> f64 {
     }
 }
 
+/// How long the metric's sensor has shown it holds a reading: exact
+/// repeats in a row, among the last 20 of `before` (the reports the noise
+/// is read from), as long as at least two stretches that ended in a
+/// change have. A sensor read more often than it refreshes (df every
+/// 20 s, read every 5) repeats that many times while the world moves
+/// under it, and shows it again at every refresh. One flat stretch is the
+/// world sitting still as much as a sensor that lags; the stretch the
+/// reports end in has not shown that it ends; and a stretch a run of the
+/// lever fell in, or ended, is what the lever did, not the sensor (`ran`
+/// says, for each step between reports, whether one did): none counts.
+pub fn held(before: &[f64], ran: &[bool]) -> usize {
+    let from = before.len().saturating_sub(NOISE_WINDOW);
+    let mut ended = Vec::new();
+    let (mut run, mut lever) = (0, false);
+    for (i, w) in before.windows(2).enumerate().skip(from) {
+        lever |= ran.get(i).copied().unwrap_or(false);
+        if w[1] == w[0] {
+            run += 1;
+            continue;
+        }
+        if !lever {
+            ended.push(run);
+        }
+        (run, lever) = (0, false);
+    }
+    ended.sort_unstable();
+    ended.iter().rev().nth(1).copied().unwrap_or(0)
+}
+
+/// How many reports after a run it is judged at: `within`, unless every
+/// one of those exactly repeats the last report before the run (`before`
+/// oldest first, `ran` whether the lever ran in each step between them
+/// (`held`), `after` the plausible reports since its ok outcome,
+/// `since` how many trusted ones came, plausible or not). Such a span
+/// holds no fresh reading, and is evidence of no effect only once it is
+/// longer than the metric has ever held a value (`held`): before that it
+/// is what a sensor that has not refreshed shows. Then the run is judged
+/// at the first reading that differs, if it comes within that many, and
+/// None while waiting for it. Unchanged past that many, the sensor would
+/// have refreshed: judged at `within`, the miss stands.
+pub fn horizon(
+    within: usize,
+    before: &[f64],
+    ran: &[bool],
+    after: &[f64],
+    since: usize,
+) -> Option<usize> {
+    let Some(&base) = before.last() else {
+        return Some(within);
+    };
+    let same = after.iter().take_while(|x| **x == base).count();
+    let held = held(before, ran);
+    if same < within || same > held {
+        return Some(within);
+    }
+    if same < after.len() {
+        return Some(same + 1);
+    }
+    // Readings flagged implausible count toward the wait, so no sensor
+    // holds a run for ever.
+    (since > held).then_some(within)
+}
+
 /// Judge one run. `before` is the trusted reports of the metric before
 /// the run's intent, oldest first; `after` those since its ok outcome.
 /// The change is the `within`-th report after, minus the last before.
@@ -218,6 +281,52 @@ mod tests {
         let a = vec![(3.0, 1.0), (4.0, 1.2)];
         let b = vec![(3.0, 1.0), (0.0, 0.1)];
         assert_eq!(delay(&[a, b]), 0);
+    }
+
+    #[test]
+    fn held_is_a_hold_shown_twice() {
+        assert_eq!(held(&[], &[]), 0);
+        assert_eq!(held(&[3.0], &[]), 0);
+        // One flat stretch, then the one the reports end in: neither.
+        assert_eq!(held(&[1.0, 1.0, 1.0, 2.0, 2.0], &[]), 0);
+        assert_eq!(held(&[9.0, 9.0, 9.0, 9.0, 3.0], &[]), 0);
+        assert_eq!(held(&[3.0; 6], &[]), 0);
+        // Two that ended: the shorter of the two longest.
+        assert_eq!(held(&[1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0], &[]), 2);
+        assert_eq!(
+            held(&[1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0], &[]),
+            2
+        );
+        // Only the last twenty count.
+        let mut before = vec![5.0, 5.0, 5.0, 6.0, 6.0, 6.0];
+        before.extend((0..20).map(f64::from));
+        assert_eq!(held(&before, &[]), 0);
+    }
+
+    #[test]
+    fn an_unchanged_span_waits_as_long_as_the_metric_has_held() {
+        let stale = [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 1.0];
+        assert_eq!(held(&stale, &[]), 3);
+        // A change inside the declared horizon: judged as declared.
+        assert_eq!(horizon(2, &stale, &[], &[1.0, 5.0], 2), Some(2));
+        // Unchanged through it: waits, then the first change judges.
+        assert_eq!(horizon(2, &stale, &[], &[1.0, 1.0], 2), None);
+        assert_eq!(horizon(2, &stale, &[], &[1.0, 1.0, 1.0], 3), None);
+        assert_eq!(horizon(2, &stale, &[], &[1.0, 1.0, 1.0, 7.0], 4), Some(4));
+        // Longer than the metric has held: the miss at `within` stands.
+        assert_eq!(horizon(2, &stale, &[], &[1.0; 4], 4), Some(2));
+        // Implausible readings close the wait too.
+        assert_eq!(horizon(2, &stale, &[], &[1.0, 1.0], 4), Some(2));
+        // A metric that never held a value twice: judged as declared.
+        assert_eq!(horizon(2, &[1.0, 2.0, 3.0], &[], &[3.0, 3.0], 2), Some(2));
+        assert_eq!(horizon(2, &[], &[], &[3.0, 3.0], 2), Some(2));
+        // A stretch the lever ran in, or that a run ended, is the lever's.
+        let mut ran = [false; 8];
+        ran[5] = true;
+        assert_eq!(horizon(2, &stale, &ran, &[1.0, 1.0], 2), Some(2));
+        let mut ran = [false; 8];
+        ran[7] = true;
+        assert_eq!(held(&stale, &ran), 0);
     }
 
     #[test]

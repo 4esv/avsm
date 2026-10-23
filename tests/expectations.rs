@@ -1663,3 +1663,75 @@ fn a_lever_that_never_moves_the_metric_is_still_no_effect_at_once() {
         "no effect waits on no delay its runs never showed"
     );
 }
+
+/// A cleanup-like lever behind a sensor that refreshes less often than
+/// it is read: the count is read every hour, but it holds each value for
+/// four reports (df every 20 s, read every 5). The lever may run six
+/// times an hour, so no cap window covers it.
+fn late_sensor() -> Fixture {
+    let mut f = fixture_in(
+        "controller: {kind: threshold, below: 5, action: boost}\ncadence: 1h\n",
+        "{name: boost, run: echo boost >> boosts, cap: 6/hour, reversible: true, \
+         delegated: true, expects: up 5 within 2}",
+    );
+    for x in [
+        10.0, 10.0, 10.0, 10.0, 9.0, 9.0, 9.0, 9.0, 10.0, 10.0, 10.0, 10.0,
+    ] {
+        f.report(x);
+    }
+    assert_eq!(f.intents(), 0);
+    f.report(3.0); // crosses: boost runs
+    assert_eq!(f.intents(), 1);
+    f
+}
+
+#[test]
+fn a_late_sensor_does_not_suspend_a_working_lever() {
+    let _c = clock();
+    let mut f = late_sensor();
+    // The sensor has not refreshed: two unchanged readings, where the
+    // metric has held a value for three repeats before.
+    f.report(3.0);
+    f.report(3.0);
+    assert!(
+        !f.suspended(),
+        "two repeats are no evidence: {:#?}",
+        f.entries()
+    );
+    assert!(f.ineffective().is_empty());
+    f.report(3.0);
+    f.report(9.0); // the refresh shows the run's effect
+    assert!(!f.suspended());
+    assert!(f.ineffective().is_empty(), "{:#?}", f.ineffective());
+}
+
+#[test]
+fn a_later_reading_that_shows_the_effect_judges_the_run() {
+    let _c = clock();
+    let mut f = late_sensor();
+    f.report(3.0);
+    f.report(3.0); // the declared horizon: unchanged, so not judged yet
+    assert!(!f.suspended());
+    // Waited on, the run holds the lever: no second run on one error.
+    f.report(3.0);
+    assert_eq!(f.intents(), 1, "held while waited on");
+    f.report(9.0); // the effect shows: judged met at this reading
+    f.report(3.0); // crosses again: the lever is free to run
+    assert_eq!(f.intents(), 2, "{:#?}", f.entries());
+    assert!(f.ineffective().is_empty());
+    assert!(!f.suspended());
+}
+
+#[test]
+fn a_dead_lever_behind_a_late_sensor_is_still_suspended() {
+    let _c = clock();
+    let mut f = late_sensor();
+    // Four unchanged readings: longer than the metric has ever held one
+    // value, so the sensor would have shown a change by now.
+    for _ in 0..4 {
+        f.report(3.0);
+    }
+    assert!(f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.ineffective().len(), 1);
+    assert_eq!(f.intents(), 1, "held until judged, never run twice");
+}

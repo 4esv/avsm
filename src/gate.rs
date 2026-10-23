@@ -2624,7 +2624,36 @@ pub mod reference {
             .iter()
             .filter(|e| e.seq > outcome && reading(e, false))
             .count();
-        (since < within as usize).then_some(intent)
+        // A span of exact repeats waits as long as the metric has held a
+        // value before (`expect::horizon`).
+        let value = |e: &Entry| match &e.record {
+            Record::Report { value: Some(x), .. } => Some(*x),
+            _ => None,
+        };
+        let earlier: Vec<(Seq, f64)> = ledger
+            .iter()
+            .filter(|e| e.seq < intent && reading(e, true))
+            .filter_map(|e| value(e).map(|x| (e.seq, x)))
+            .collect();
+        let before: Vec<f64> = earlier.iter().map(|(_, x)| *x).collect();
+        let ran: Vec<bool> = earlier
+            .windows(2)
+            .map(|w| {
+                ledger.iter().any(|e| {
+                    e.seq > w[0].0
+                        && e.seq < w[1].0
+                        && matches!(&e.record, Record::Intent { venture: v, action: a, .. }
+                            if v == venture && a == action)
+                })
+            })
+            .collect();
+        let after: Vec<f64> = ledger
+            .iter()
+            .filter(|e| e.seq > outcome && reading(e, true))
+            .filter_map(value)
+            .collect();
+        let held = crate::expect::horizon(within as usize, &before, &ran, &after, since).is_none();
+        (since < within as usize || held).then_some(intent)
     }
 
     /// The parent levers pulled on `child` by its parent, oldest first:

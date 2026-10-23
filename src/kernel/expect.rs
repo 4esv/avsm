@@ -34,6 +34,13 @@
 //! learned delay only waits on or withholds a miss; it never authorizes,
 //! and a run met at a delay its lever's runs had not shown asks, inferred,
 //! with nothing to run on the answer.
+//!
+//! A run whose declared horizon reads nothing but exact repeats of the
+//! value from before it saw no fresh reading. While those repeats are no
+//! more than the metric's sensor has shown it holds a value
+//! (`expect::held`), the run is waited on, and the gate holds the lever:
+//! the first reading that differs judges it. Repeated longer than that,
+//! the sensor would have refreshed, and the miss stands.
 
 use crate::expect::{self, Judgement};
 use crate::index::{Index, EXPECTATION, SUSPENSION};
@@ -564,6 +571,32 @@ fn judged(
     intent: Seq,
     outcome: Seq,
 ) -> Option<Seen> {
+    // A span of exact repeats is judged at the first reading that
+    // differs, while it is no longer than the metric has held a value
+    // before: a sensor that has not refreshed is no evidence of no effect.
+    let w = index.horizon(
+        venture,
+        &perm.name,
+        mandate.metric_name(),
+        intent,
+        outcome,
+        expects.within,
+    )?;
+    let extended;
+    let (mandate, perm, expects) = if w > expects.within as usize {
+        let mut m = mandate.clone();
+        for p in m.permitted.iter_mut().filter(|p| p.name == perm.name) {
+            if let Some(e) = p.expects.as_mut() {
+                e.within = w as u32;
+            }
+        }
+        let p = m.permitted(&perm.name).cloned()?;
+        let e = p.expects?;
+        extended = (m, p, e);
+        (&extended.0, &extended.1, &extended.2)
+    } else {
+        (mandate, perm, expects)
+    };
     let at = |d| span(index, venture, mandate, perm, expects, intent, outcome, d);
     let (judgement, doubted) = match at(0) {
         Span::Waiting => return None,
