@@ -234,18 +234,16 @@ pub fn render(m: &Mandate) -> String {
             line(held(s, *hold, *deadband, "its bound"));
         }
         Controller::Classifier { backend } => line(format!(
-            "controller classifier: a {}backend picks nothing, a permitted action, or ask",
+            "controller classifier: {} backend picks nothing, a permitted action, or ask",
             backend
                 .as_ref()
-                .map(|b| format!("{b} "))
-                .unwrap_or_default()
+                .map_or("a".to_string(), |b| format!("the {b}"))
         )),
         Controller::Model { backend } => line(format!(
-            "controller model: a {}backend proposes an action or asks",
+            "controller model: {} backend proposes an action or asks",
             backend
                 .as_ref()
-                .map(|b| format!("{b} "))
-                .unwrap_or_default()
+                .map_or("a".to_string(), |b| format!("the {b}"))
         )),
         Controller::Plan {
             horizon,

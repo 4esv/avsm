@@ -541,6 +541,47 @@ impl Kernel {
                 crate::adapter::METRICS.join(", ")
             ));
         }
+        // Worth saying, not worth refusing: a child is legitimately added
+        // before its parent, and a program may be put in place after.
+        let mut warnings = venture::missing_programs(&dir, &mandate);
+        // The config in force is the daemon's, not the file's now: say so
+        // when they differ, and refuse a backend only the file has.
+        let on_disk = Config::load(&self.home);
+        let changed = match &on_disk {
+            Ok(d) if *d != self.config => {
+                warnings.push("config.yaml changed on disk; restart avsmd to apply it".into());
+                true
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "config.yaml on disk does not read ({e}); avsmd keeps the one in force"
+                ));
+                false
+            }
+            _ => false,
+        };
+        let named = match &mandate.controller {
+            crate::mandate::Controller::Classifier { backend }
+            | crate::mandate::Controller::Model { backend } => backend.as_deref(),
+            crate::mandate::Controller::Plan { backend, .. } => backend.as_deref(),
+            _ => None,
+        };
+        if let Some(b) = named.filter(|b| !self.config.backends.contains_key(*b)) {
+            let known = on_disk.as_ref().is_ok_and(|d| d.backends.contains_key(b));
+            return Err(format!(
+                "{name}'s controller names the {b} backend, which the config in force does not have{}",
+                if known && changed {
+                    "; config.yaml changed on disk; restart avsmd to apply it"
+                } else {
+                    "; add it under backends in config.yaml, then restart avsmd"
+                }
+            ));
+        }
+        if let Some(p) = &mandate.parent {
+            if !self.ventures.contains_key(p) {
+                warnings.push(format!("{p} is not a venture yet"));
+            }
+        }
         let entry = self.append(self.decision(
             &name,
             Verdict::Adopt {
@@ -564,6 +605,9 @@ impl Kernel {
             kill(&mut rt);
         }
         let mut out = format!("added {name} from {}\n", dir.display());
+        for warning in warnings {
+            out.push_str(&format!("  warning: {warning}\n"));
+        }
         out.push_str(&crate::teach::render(&mandate));
         // What the mandate can keep up with, before anything runs under
         // it. It follows the adoption in the ledger; the adoption stays the
@@ -842,10 +886,13 @@ impl Kernel {
             out.push_str(&master);
         }
         for (v, (_, state)) in self.ventures.values().zip(&states) {
+            // The metric's own latest reading, not another fact of the
+            // venture (a guard's, an expectation's).
+            let metric = v.mandate.metric_name();
             let last = index
                 .of(&v.name)
                 .rev()
-                .find(|e| matches!(e.record, Record::Report { .. }));
+                .find(|e| matches!(&e.record, Record::Report { metric: m, .. } if m == metric));
             let mut detail = match &v.problem {
                 Some(p) => p.clone(),
                 None => match last {
@@ -886,6 +933,9 @@ impl Kernel {
 
     /// The last `n` records, one line each.
     pub fn tail(&self, n: usize) -> Result<String, String> {
+        if n == 0 {
+            return Err("tail takes a count of 1 or more; 0 shows nothing".to_string());
+        }
         let entries = self.ledger.tail(n).map_err(|e| e.to_string())?;
         if entries.is_empty() {
             return Ok("the ledger is empty\n".to_string());
@@ -937,8 +987,27 @@ impl Kernel {
 
     fn open_ask(&self, seq: Seq) -> Result<Entry, String> {
         let entry = self.entry(seq)?;
-        if !self.index()?.is_open(seq) {
-            return Err(format!("#{seq} is not an open ask\n{}", entry.line()));
+        let index = self.index()?;
+        if !index.is_open(seq) {
+            let answered = index
+                .of(entry.record.venture())
+                .find_map(|e| match &e.record {
+                    Record::Decision {
+                        verdict: Verdict::Approve { ask, .. },
+                        ..
+                    } if *ask == seq => Some((e.seq, "approved")),
+                    Record::Decision {
+                        verdict: Verdict::Deny { ask, .. },
+                        ..
+                    } if *ask == seq => Some((e.seq, "denied")),
+                    _ => None,
+                });
+            return Err(match answered {
+                Some((by, what)) => {
+                    format!("#{seq} was already {what} by #{by}\n{}", entry.line())
+                }
+                None => format!("#{seq} is not an open ask\n{}", entry.line()),
+            });
         }
         Ok(entry)
     }
@@ -1147,11 +1216,24 @@ impl Kernel {
             payload,
         })?;
         let mut out = entry.line() + "\n";
+        let mut refused = false;
+        let prefix = format!("{name}: {lever} ");
         for line in self.act(name, lever, vec![entry.seq], Claim::Declared) {
+            // The gate, a quota or the warden said no: the proposal is
+            // recorded, the command fails, and the client exits 65.
+            refused |= line.strip_prefix(&prefix).is_some_and(|rest| {
+                rest.starts_with("refused")
+                    || rest.starts_with("did not run")
+                    || rest.starts_with("not run:")
+            }) || line.contains("asks quota is used up; not asking");
             out.push_str(&line);
             out.push('\n');
         }
-        Ok(out)
+        if refused {
+            Err(out)
+        } else {
+            Ok(out)
+        }
     }
 
     fn known(&self, name: &str) -> Result<(), String> {
@@ -1638,13 +1720,10 @@ impl Kernel {
                 let confine =
                     wants_none && *self.namespaces.get_or_insert_with(namespaces_available);
                 let note = match &v.mandate.network {
-                    Some(hosts) if hosts.is_empty() && !confine => Some(
-                        "network: none is not enforced here; this Linux allows no network namespace, so run has network"
-                            .to_string(),
-                    ),
-                    Some(hosts) if !hosts.is_empty() => Some(
-                        "network list holds adapters only; run is not held to it".to_string(),
-                    ),
+                    Some(hosts) if hosts.is_empty() && !confine => Some(network_none_note()),
+                    Some(hosts) if !hosts.is_empty() => {
+                        Some("network list holds adapters only; run is not held to it".to_string())
+                    }
                     _ => None,
                 };
                 let rt = self.runtime.entry(name.to_string()).or_default();
@@ -2422,14 +2501,10 @@ impl Kernel {
             .and_then(Permitted::takes);
         let (mut approve, mut deny) = (None, None);
         if let Some(a) = action {
-            if let (true, true, Some(settings)) = (
-                a != DELEGATE,
-                self.forecasts,
-                self.config.automatic_forecast(),
-            ) {
+            if let (true, true, Some(settings)) =
+                (a != DELEGATE, self.forecasts, self.config.packet_forecast())
+            {
                 let mut opts = crate::forecast::Options::new(vec![venture.to_string()], settings);
-                opts.days = packet::DAYS;
-                opts.seeds = packet::SEEDS;
                 // A packet reads approve-all against deny-all, and the
                 // same of every ask of the venture: one forecast per
                 // reading of its metric serves them all.
@@ -2502,7 +2577,7 @@ impl Kernel {
     /// the same reading that has every policy is reused here. Empty when
     /// forecasts are off or it fails.
     fn policy_forecasts(&self, v: &Venture) -> Vec<crate::record::PolicyForecast> {
-        let (true, Some(settings)) = (self.forecasts, self.config.automatic_forecast()) else {
+        let (true, Some(settings)) = (self.forecasts, self.config.packet_forecast()) else {
             return vec![];
         };
         let reading = self.index().ok().and_then(|i| {
@@ -2526,8 +2601,6 @@ impl Kernel {
             Some(o) => o,
             None => {
                 let mut opts = crate::forecast::Options::new(vec![v.name.clone()], settings);
-                opts.days = packet::DAYS;
-                opts.seeds = packet::SEEDS;
                 opts.policies = crate::forecast::Policy::EVERY.to_vec();
                 let ran = self
                     .index()
@@ -3238,6 +3311,20 @@ fn read_report(dir: &Path, report: &Path) -> (Option<f64>, String) {
                 ran.detail(REPORT_TIMEOUT)
             ),
         ),
+    }
+}
+
+/// Why `network: none` is not enforced on this system, naming it.
+pub fn network_none_note() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        other => other,
+    };
+    if cfg!(target_os = "linux") {
+        format!("network: none is not enforced here; this {os} allows no network namespace, so run has network")
+    } else {
+        format!("network: none is not enforced here; {os} has no network namespaces, so run has network")
     }
 }
 
@@ -4407,6 +4494,9 @@ impl Kernel {
 /// answer commands on the socket, and tick once a second until SIGTERM or
 /// SIGINT; then drain and return.
 pub fn start(home: &Path) -> Result<(), Exit> {
+    if let Some(e) = crate::protocol::socket_too_long(&socket_path(home)) {
+        return Err(Exit::new(exit::USAGE, e));
+    }
     std::fs::create_dir_all(home).map_err(|e| {
         Exit::new(
             exit::CANTCREAT,

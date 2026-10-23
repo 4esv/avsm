@@ -223,12 +223,12 @@ const BLOG: &str = "purpose: Grow.\nmetric: posts\ncontroller: {kind: model}\nca
      permitted:\n- {name: announce, run: echo ran >> invoked, cap: 9/day, reversible: true, takes: text}\n";
 
 fn blog_ask(forecasts: bool) -> Packet {
+    blog_ask_in(forecasts, "forecast: {days: 1, seeds: 2}\n")
+}
+
+fn blog_ask_in(forecasts: bool, config: &str) -> Packet {
     let tmp = tempfile::tempdir().unwrap();
-    let mut k = kernel(
-        tmp.path(),
-        "forecast: {days: 1, seeds: 2}\n",
-        Box::new(Announcer { n: 0 }),
-    );
+    let mut k = kernel(tmp.path(), config, Box::new(Announcer { n: 0 }));
     k.forecasts = forecasts;
     let dir = tmp.path().join("blog");
     std::fs::create_dir_all(&dir).unwrap();
@@ -259,7 +259,11 @@ fn with_forecasts_on_each_option_carries_a_forecast_and_with_them_off_it_says_no
             .forecast
             .as_ref()
             .unwrap_or_else(|| panic!("{} has no forecast: {on:?}", o.name));
-        assert_eq!((f.days, f.seeds), (7, 8));
+        assert_eq!(
+            (f.days, f.seeds),
+            (1, 2),
+            "forecast: in config.yaml sets it"
+        );
         assert_eq!(f.metric, "posts");
         assert!(f.p5 <= f.p50 && f.p50 <= f.p95);
         assert!((0.0..=1.0).contains(&f.breach));
@@ -279,6 +283,16 @@ fn with_forecasts_on_each_option_carries_a_forecast_and_with_them_off_it_says_no
         off.options.len(),
         "{shown}"
     );
+}
+
+#[test]
+fn a_packet_forecast_is_a_week_of_eight_seeds_unless_config_says_otherwise() {
+    let _c = clock();
+    let p = blog_ask_in(true, "");
+    for o in &p.options {
+        let f = o.forecast.as_ref().expect("a forecast");
+        assert_eq!((f.days, f.seeds), (7, 8));
+    }
 }
 
 // ----- canary asks -----

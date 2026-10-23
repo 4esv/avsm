@@ -102,6 +102,20 @@ impl Config {
     pub fn automatic_forecast(&self) -> Option<Forecast> {
         Some(self.forecast_settings()).filter(|f| f.seeds > 0)
     }
+
+    /// The settings of the short forecasts in a decision packet and a
+    /// capacity ask: what `forecast:` says when config.yaml has it, else
+    /// the packet's own, a week and a few seeds, so an ask stays quick.
+    /// None only when it says seeds 0.
+    pub fn packet_forecast(&self) -> Option<Forecast> {
+        match self.forecast {
+            Some(f) => Some(f).filter(|f| f.seeds > 0),
+            None => Some(Forecast {
+                days: crate::packet::DAYS,
+                seeds: crate::packet::SEEDS,
+            }),
+        }
+    }
 }
 
 /// `canary_asks:` in config.yaml.

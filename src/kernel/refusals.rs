@@ -292,6 +292,36 @@ impl Kernel {
         self.refusals.last = None;
     }
 
+    /// When every run of `lever` since `since` failed: how many, and what
+    /// the latest said. None when there were none or one succeeded.
+    fn failed_runs(&self, venture: &str, lever: &str, since: i64) -> Option<(usize, String)> {
+        let index = self.index().ok()?;
+        let (mut failed, mut detail) = (0usize, String::new());
+        for e in index.of(venture).filter(|e| e.at >= since) {
+            let (ok, text) = match &e.record {
+                Record::Action {
+                    action, ok, detail, ..
+                } if action == lever => (*ok, detail),
+                Record::Outcome {
+                    intent, ok, detail, ..
+                } if matches!(
+                    index.get(*intent).map(|i| &i.record),
+                    Some(Record::Intent { action, .. }) if action == lever
+                ) =>
+                {
+                    (*ok, detail)
+                }
+                _ => continue,
+            };
+            if ok {
+                return None;
+            }
+            failed += 1;
+            detail = text.lines().next().unwrap_or("").to_string();
+        }
+        (failed > 0).then_some((failed, detail))
+    }
+
     /// A threshold on `metric` was crossed and `lever` was tried. When
     /// that was refused for a cap, a budget or a quota, write a measured
     /// ask now, past the asks quota, unless one is open for this lever.
@@ -302,10 +332,6 @@ impl Kernel {
         if !last.limit || last.venture != venture || last.lever != lever {
             return;
         }
-        let question = format!(
-            "{metric} is past {bound} and {lever} is refused: {}{SATURATED}",
-            last.detail
-        );
         let now = super::now();
         let window = self
             .ventures
@@ -313,6 +339,20 @@ impl Kernel {
             .and_then(|v| v.mandate.permitted(lever))
             .map_or(86_400, |p| p.cap.per.as_secs() as i64)
             .max(1);
+        // A cap spent by runs that failed is not a limit that cannot keep
+        // up: the lever is what is wrong.
+        let failed = self.failed_runs(venture, lever, now - window);
+        let question = match &failed {
+            Some((n, detail)) => format!(
+                "{metric} is past {bound} and {lever} is refused: {}; but its last {n} run{} in the window failed ({detail}), so the cap is spent on failures: fix {lever}",
+                last.detail,
+                if *n == 1 { "" } else { "s" },
+            ),
+            None => format!(
+                "{metric} is past {bound} and {lever} is refused: {}{SATURATED}",
+                last.detail
+            ),
+        };
         let id = (venture.to_string(), lever.to_string());
         // When the episode was last seen: in memory, or after a restart
         // the latest saturation ask the ledger holds for this lever.

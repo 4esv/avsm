@@ -2343,6 +2343,11 @@ pub fn why(entry: &Entry) -> String {
             claim,
             by: Some(who),
             ..
+        } if who == crate::simulate::BY => format!("{head}\n  {claim} by {who}\n"),
+        Record::Decision {
+            claim,
+            by: Some(who),
+            ..
         } => format!("{head}\n  {claim} by {who}, over the tailnet\n"),
         Record::Decision { claim, .. } => format!("{head}\n  {claim} by {}\n", by(*claim)),
         Record::Outcome { intent, .. } => format!("{head}\n  outcome of intent #{intent}\n"),
