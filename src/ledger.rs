@@ -306,6 +306,8 @@ impl Ledger {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Another avsmd took the home: nothing more from this one (#56).
+        crate::lock::may_write().map_err(LedgerError::Gone)?;
         let last: Option<(i64, String)> = tx
             .query_row(
                 "SELECT seq, hash FROM records ORDER BY seq DESC LIMIT 1",

@@ -157,7 +157,8 @@ pub fn parse_anchor(text: &str) -> Result<(Option<Seq>, String), String> {
 /// process run as avsmd with `--home <home>` that is no warden or roles
 /// process, and the parent of each warden or roles process on it. A
 /// daemon started without `--home` is found by its warden, which always
-/// has one.
+/// has one. A child of one of them is never another: caught between its
+/// fork and its exec, a warden still shows its daemon's arguments.
 pub fn daemons_on(home: &Path, table: &[crate::procs::Proc]) -> Vec<i32> {
     let wanted: Vec<String> = [Some(home.to_path_buf()), std::fs::canonicalize(home).ok()]
         .into_iter()
@@ -165,6 +166,8 @@ pub fn daemons_on(home: &Path, table: &[crate::procs::Proc]) -> Vec<i32> {
         .map(|h| h.to_string_lossy().trim_end_matches('/').to_string())
         .collect();
     let mut found = std::collections::BTreeSet::new();
+    let mut on: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+    let mut seen = Vec::new();
     for p in table {
         let a = &p.args;
         let avsmd = a
@@ -177,17 +180,69 @@ pub fn daemons_on(home: &Path, table: &[crate::procs::Proc]) -> Vec<i32> {
         if !avsmd || !on_home {
             continue;
         }
-        match a.last().map(String::as_str) {
+        on.insert(p.pid);
+        seen.push(p);
+    }
+    for p in seen {
+        match p.args.last().map(String::as_str) {
             Some("warden" | "roles") if p.ppid > 1 => {
                 found.insert(p.ppid);
             }
             Some("warden" | "roles") => {}
+            _ if on.contains(&p.ppid) => {}
             _ => {
                 found.insert(p.pid);
             }
         }
     }
     found.into_iter().collect()
+}
+
+/// How long doctor waits out a warden or roles process being respawned.
+const RESPAWN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The daemon's own checks. A warden or roles process just gone is
+/// respawned within a tick or two: asked again for up to `RESPAWN_WAIT`
+/// before it is called gone, and said when it came back.
+fn daemon_doctor(sock: &Path) -> Result<crate::protocol::Response, exit::Exit> {
+    let ask = || crate::protocol::request(sock, &["doctor".to_string()]);
+    let gone = |r: &Result<crate::protocol::Response, exit::Exit>| {
+        r.as_ref().is_ok_and(|a| {
+            a.ok && a
+                .text
+                .lines()
+                .any(|l| l.starts_with("fail ") && l.contains("process is gone"))
+        })
+    };
+    let began = std::time::Instant::now();
+    let mut answer = ask();
+    let mut waited = false;
+    while gone(&answer) && began.elapsed() < RESPAWN_WAIT {
+        waited = true;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        answer = ask();
+    }
+    if waited && !gone(&answer) {
+        if let Ok(a) = answer.as_mut() {
+            a.text = a
+                .text
+                .lines()
+                .map(|l| match l.strip_prefix("ok ") {
+                    Some(w) if w.starts_with("warden ") || w.starts_with("roles ") => {
+                        format!(
+                            "ok {w} (respawning when doctor began)
+"
+                        )
+                    }
+                    _ => format!(
+                        "{l}
+"
+                    ),
+                })
+                .collect();
+        }
+    }
+    answer
 }
 
 /// Take the home's lock for the daemon's life, or say who holds it.
@@ -712,6 +767,32 @@ pub fn doctor(
     // The daemon.
     let sock = crate::kernel::socket_path(home);
     let holder = crate::lock::holder(home);
+    let daemons = daemons_on(home, &crate::procs::all());
+    // The lock file itself: anything but a file there keeps no second
+    // avsmd off the home, and says nothing of who runs.
+    let lock_path = home.join(crate::lock::LOCK_FILE);
+    if let Ok(m) = std::fs::symlink_metadata(&lock_path) {
+        if !m.is_file() {
+            let what = if m.is_dir() {
+                "a directory"
+            } else if m.file_type().is_symlink() {
+                "a symbolic link"
+            } else {
+                "not a plain file"
+            };
+            found.fail(
+                exit::CANTCREAT,
+                format!(
+                    "the lock file {} is {what}: nothing keeps a second avsmd off this home",
+                    lock_path.display()
+                ),
+                format!(
+                    "rm -r {}  # a running avsmd takes its lock again within a second",
+                    sh(&lock_path)
+                ),
+            );
+        }
+    }
     if let Some(e) = crate::protocol::socket_too_long(&sock) {
         found.fail(
             exit::USAGE,
@@ -723,7 +804,7 @@ pub fn doctor(
         // What only the daemon can tell: its warden and roles processes
         // alive, and the ledger taking its writes. A daemon too old to
         // say answers not ok, and is left at that.
-        let answer = crate::protocol::request(&sock, &["doctor".to_string()]);
+        let answer = daemon_doctor(&sock);
         if let Ok(crate::protocol::Response { ok: true, text }) = answer {
             let pid = text
                 .lines()
@@ -751,7 +832,7 @@ pub fn doctor(
                 }
             }
         }
-    } else if let Some(pid) = holder {
+    } else if let Some(pid) = holder.or_else(|| daemons.first().copied()) {
         let pid = if pid > 0 {
             pid.to_string()
         } else {
@@ -774,7 +855,6 @@ pub fn doctor(
 
     // One daemon per home: a second, started while the lock file and the
     // socket were gone, writes the same ledger unseen (#52).
-    let daemons = daemons_on(home, &crate::procs::all());
     if daemons.len() > 1 {
         let pids: Vec<String> = daemons.iter().map(i32::to_string).collect();
         let keep = holder.filter(|p| daemons.contains(p));

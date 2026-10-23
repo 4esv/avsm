@@ -1287,11 +1287,11 @@ pub struct Ran {
     pub stderr: String,
     /// Exit code, if it exited on its own.
     pub code: Option<i32>,
-    /// Killed: at the timeout, or because avsmd was stopping (`stopped`).
+    /// Killed: at the timeout, or because it was told to stop (`stopped`).
     pub killed: bool,
-    /// Killed because avsmd or its warden was stopping, not because the
-    /// run took too long: the timeout is no part of the story.
-    pub stopped: bool,
+    /// Told to stop, not timed out: why. The timeout is no part of the
+    /// story then.
+    pub stopped: Option<Stop>,
     /// The program could not be started at all; `stderr` says why and how
     /// to fix it.
     pub unstarted: bool,
@@ -1312,7 +1312,18 @@ impl Ran {
         let text = text.replace('\n', "  ");
         if self.unstarted {
             tail(&text)
-        } else if self.killed && self.stopped {
+        } else if self.stopped == Some(Stop::Paused) && !self.ok {
+            let how = Ran {
+                killed: false,
+                stopped: None,
+                code: self.code.or(Some(-1)),
+                ..self.clone()
+            }
+            .detail(timeout);
+            tail(&format!("stopped: its venture was paused  {how}"))
+        } else if self.stopped == Some(Stop::Died) && !self.ok {
+            tail(format!("killed: avsmd died (its pipe to the warden closed)  {text}").trim())
+        } else if self.killed && self.stopped == Some(Stop::Drain) {
             tail(format!("killed: avsmd was stopping  {text}").trim())
         } else if self.killed {
             tail(format!("killed after {}s  {text}", timeout.as_secs()).trim())
@@ -1345,6 +1356,20 @@ pub fn run_with(
 /// Set in the warden process when avsmd is stopping.
 static DRAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set in the warden process when its daemon died before it said stop.
+static DIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Why a run was told to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// avsmd was stopping: SIGTERM or SIGINT.
+    Drain,
+    /// avsmd died without a word: its warden saw its pipe close.
+    Died,
+    /// Its venture was paused.
+    Paused,
+}
+
 /// How long a run in flight has, once avsmd is stopping, between SIGTERM
 /// and SIGKILL: inside the daemon's drain bound, with time left to write
 /// the outcome.
@@ -1369,6 +1394,24 @@ pub fn drain_on_signals() {
 /// kernel hangs up with runs still going.
 pub fn drain_now() {
     DRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// In the warden process: the daemon is gone without having said stop.
+/// The runs drain, and their outcomes say avsmd died.
+pub fn daemon_died() {
+    if !draining() {
+        DIED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    drain_now();
+}
+
+/// Why runs are draining, once they are.
+fn drain_reason() -> Stop {
+    if DIED.load(std::sync::atomic::Ordering::SeqCst) {
+        Stop::Died
+    } else {
+        Stop::Drain
+    }
 }
 
 fn draining() -> bool {
@@ -1419,11 +1462,15 @@ fn run_draining(
     draining: &dyn Fn() -> bool,
 ) -> Ran {
     let mut command = Command::new(program);
-    // SAFETY: the hook only calls prctl and getppid, which are
+    // A session of its own, and so a group: a stop or a timeout reaches
+    // what it starts, a ^C at the terminal reaches only avsmd, and what
+    // it leaves behind still shows as avsmd's (#56).
+    // SAFETY: the hook only calls setsid, prctl and getppid, which are
     // async-signal-safe.
     unsafe {
-        command.pre_exec(crate::groups::die_with_parent);
+        command.pre_exec(crate::groups::lead_session);
     }
+    let mark = crate::groups::mark();
     let spawning = crate::groups::SPAWNING
         .read()
         .unwrap_or_else(|p| p.into_inner());
@@ -1438,6 +1485,7 @@ fn run_draining(
         .env("HOME", dir)
         // The time avsm reads: real, or a simulation's.
         .env("AVSM_NOW", crate::clock::now().to_string())
+        .env(crate::groups::MARK_VAR, &mark)
         .envs(env.iter().copied())
         .stdin(if stdin.is_empty() {
             Stdio::null()
@@ -1446,11 +1494,7 @@ fn run_draining(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // A group of its own, so a stop or a timeout reaches what it
-        // started too, and a ^C at the terminal reaches only avsmd.
-        .process_group(0)
         .spawn();
-    std::mem::drop(spawning);
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
@@ -1465,7 +1509,8 @@ fn run_draining(
     // warden that dies takes the run's timer with it, and the daemon ends
     // the group in its place.
     let pgid = child.id() as i32;
-    crate::groups::started(pgid);
+    crate::groups::started(pgid, &mark, dir);
+    std::mem::drop(spawning);
     if !stdin.is_empty() {
         if let Some(mut input) = child.stdin.take() {
             use std::io::Write;
@@ -1494,6 +1539,8 @@ fn run_draining(
     let mut exited = None;
     let mut killed = false;
     let mut stopped = false;
+    // Why it was told to stop, once it was.
+    let mut why = None;
     loop {
         if exited.is_none() {
             match child.try_wait() {
@@ -1521,6 +1568,11 @@ fn run_draining(
         if drained.is_none() && draining() {
             signal_group(&child, libc::SIGTERM);
             drained = Some(Instant::now());
+            why = Some(if self::draining() {
+                drain_reason()
+            } else {
+                Stop::Paused
+            });
             continue;
         }
         std::thread::sleep(wait);
@@ -1538,7 +1590,8 @@ fn run_draining(
         stderr,
         code: status.and_then(|s| s.code()),
         killed: status.is_none(),
-        stopped: stopped && status.is_none(),
+        // Timed out first, it says so; told to stop, it says why.
+        stopped: why.filter(|_| status.is_some() || stopped),
         unstarted: false,
     }
 }
@@ -1638,18 +1691,6 @@ pub fn run_lever_until(
         usize::MAX,
         &|| draining() || stop() || crate::groups::stopped(),
     );
-    if !ran.ok && stop() && !draining() {
-        let detail = Ran {
-            killed: false,
-            code: ran.code.or(Some(-1)),
-            ..ran
-        }
-        .detail(timeout);
-        return (
-            false,
-            tail(&format!("stopped: its venture was paused  {detail}")),
-        );
-    }
     (ran.ok, ran.detail(timeout))
 }
 
@@ -1799,7 +1840,7 @@ mod tests {
         let huge = Duration::from_secs(3_155_760_000);
         let stopped = Ran {
             killed: true,
-            stopped: true,
+            stopped: Some(Stop::Drain),
             ..Ran::default()
         };
         let d = stopped.detail(huge);
@@ -1807,6 +1848,22 @@ mod tests {
             !d.contains("killed after") && d.contains("avsmd was stopping"),
             "{d}"
         );
+        // Each reason in its own words, and only the drain's says stopping.
+        for (why, said) in [
+            (Stop::Paused, "stopped: its venture was paused"),
+            (Stop::Died, "killed: avsmd died"),
+        ] {
+            let d = Ran {
+                killed: true,
+                stopped: Some(why),
+                ..Ran::default()
+            }
+            .detail(huge);
+            assert!(
+                d.starts_with(said) && !d.contains("avsmd was stopping"),
+                "{d}"
+            );
+        }
         let late = Ran {
             killed: true,
             ..Ran::default()

@@ -266,6 +266,24 @@ fn approve_edited(sock: &std::path::Path, remote: Option<&str>, number: &str) ->
     }
 }
 
+/// Before Rust's runtime starts, which puts /dev/null on a standard
+/// descriptor found closed: was standard output closed? Then nothing
+/// printed reaches anyone, and `emit` says so and exits 74.
+extern "C" fn look_at_stdout() {
+    // SAFETY: fcntl F_GETFD only reads the flags of a descriptor.
+    if unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFD) } == -1 {
+        avsmd::protocol::STDOUT_CLOSED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[used]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    link_section = ".init_array"
+)]
+#[cfg_attr(target_vendor = "apple", link_section = "__DATA,__mod_init_func")]
+static LOOK_AT_STDOUT: extern "C" fn() = look_at_stdout;
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,

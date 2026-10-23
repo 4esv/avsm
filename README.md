@@ -395,9 +395,13 @@ its socket deleted a second one does not start, and `avsm doctor` says the
 first is running but its socket is missing. Each second avsmd checks that the
 lock file and the socket are still its own; one deleted or replaced is made
 again. Should a second avsmd take the lock first, the first stops with exit
-75 and says why. `avsm doctor` fails when it finds more than one avsmd on the
-home, and names the pids. Records go to
-standard output, diagnostics to standard error, and nothing is in color.
+75 and says why, and from the moment the lock is another's neither it nor its
+warden appends anything more, so the second raises no alarm over them.
+`avsm doctor` fails when it finds more than one avsmd on the home, and names
+the pids, and when the lock file is not a file. Records go to
+standard output, diagnostics to standard error, and nothing is in color. A
+standard output that cannot be written (closed, say) is said on standard
+error and exits 74; one whose reader went away ends quietly.
 `avsm tail --since <number>` prints every record after that one, for a script
 that follows the ledger.
 
@@ -596,10 +600,10 @@ warden, which hands them their one key and holds them to the mandate's network
 list. `network: none` cuts `run` off from the network where Linux allows it,
 and `avsm status` says so when it cannot.
 
-A `run` lever, a script lever and a `report` program run with your authority,
-as your user: anything you can do, they can do, the ledger and the socket
-included. avsmd cannot prevent that; it detects the two ways such a program
-could pass for you:
+A `run` lever, a script lever and a `report` program are trusted code: they
+run with your authority, as your user, and anything you can do, they can do,
+the ledger and the socket included. avsmd cannot prevent that; it detects the
+ways such a program could pass for you:
 
 - **A record avsmd did not write.** While it runs, avsmd is the ledger's only
   writer, and it knows every record it and its warden appended. Any other
@@ -608,24 +612,32 @@ could pass for you:
   everything, and says so on stderr, in `avsm status` and in `avsm doctor`
   (exit 65). Read the records it names with `avsm why`, then `avsm resume self`.
 - **A command from a process avsmd started.** `approve`, `deny`, `resume`,
-  `add` and `propose` from a lever, a report or a role (anything whose parent
-  chain leads back to avsmd) are refused and logged. Reading commands and
-  `pause` stay open to them. Where the system cannot say who the peer is, the
+  `add` and `propose` are refused and logged when they come from a lever, a
+  report, a run or a role: anything whose parent chain leads back to avsmd,
+  or anything in a process group or session avsmd made, alive or gone within
+  the last minute. Every lever, report, guard and run starts in a session of
+  its own, so a program that double-forks (`( ( avsm approve 12 ) & ) &`)
+  and leaves the tree is still refused: it keeps the session, and the group
+  too unless it changes it. On Linux avsmd and its warden are also child
+  subreapers (`PR_SET_CHILD_SUBREAPER`), so what a program leaves behind is
+  reparented to them and stays in the tree. Reading commands and `pause`
+  stay open to them. Where the system cannot say who the peer is, the
   command is allowed.
 
-What it does not detect: a program that leaves avsmd's process tree (by
-daemonizing) before it connects, and anything written while avsmd is stopped.
-The anchor kept off the machine covers the second. On Linux, making the
-warden a child subreaper (`PR_SET_CHILD_SUBREAPER`) would keep a daemonized
-lever in the tree; avsmd does not do that yet. A program that daemonizes
-into a session of its own also leaves the process group avsmd ends, so it
-outlives a stop or a pause. On Linux the first process of each group dies
-with the thread that started it (`PR_SET_PDEATHSIG`); macOS has no such
-call, so there avsmd ends a group only once the warden has told it of the
-group, which it does as soon as the group starts. If avsmd itself is killed
-with SIGKILL, the warden still ends its own runs, but a `report` program
-then running is not ended: on Linux only its first process dies with avsmd,
-and on macOS none does.
+What it does not detect: on macOS, a program that calls `setsid` itself and
+then talks to the socket (it is in no group or session of avsmd's, and its
+parent is the first process); and anything written while avsmd is stopped.
+The anchor kept off the machine covers the second.
+
+Nothing avsmd starts outlives it. Each group is written down in the home
+(`groups/`) with its leader's start time and a mark in its environment. If
+avsmd is killed outright, its warden sees the pipe from it close, ends its
+own runs (their outcomes say `killed: avsmd died`) and ends the daemon's
+reports and runs too; if all of them are killed at once, the next start ends
+whatever is left, once it has checked by the start time, the mark or the
+directory that each group is still the one written down. A program that
+calls `setsid` itself leaves the group avsmd ends, and outlives a stop or a
+pause.
 
 Only the first answer to an ask counts; a later one is kept and authorizes
 nothing. An approval refused for any reason (a pause, a cap, a budget, a

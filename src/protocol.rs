@@ -67,27 +67,59 @@ fn invisible(c: char) -> bool {
 pub fn emit(text: &str) {
     let mut out = std::io::stdout().lock();
     let shown = display(text);
+    if !shown.is_empty() {
+        stdout_open();
+    }
     if let Err(e) = out.write_all(shown.as_bytes()).and_then(|()| out.flush()) {
-        if e.kind() == ErrorKind::BrokenPipe {
-            std::process::exit(0);
-        }
+        stdout_failed(&e);
     }
 }
 
+/// Set by `avsm` before Rust's runtime starts when standard output was
+/// closed: the runtime then puts /dev/null there, and every write
+/// "succeeds".
+pub static STDOUT_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Standard output closed, when the program started or now, is an
+/// error: Rust's standard output takes a closed descriptor for a sink.
+fn stdout_open() {
+    if STDOUT_CLOSED.load(std::sync::atomic::Ordering::SeqCst) {
+        stdout_failed(&std::io::Error::from_raw_os_error(libc::EBADF));
+    }
+    // SAFETY: fcntl F_GETFD only reads the flags of a descriptor.
+    if unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFD) } == -1 {
+        stdout_failed(&std::io::Error::last_os_error());
+    }
+}
+
+/// Standard output cannot be written: a reader gone away ends the
+/// program quietly; anything else (a closed descriptor, a full disk) is
+/// said on standard error, if it is open, and exits 74.
+fn stdout_failed(e: &std::io::Error) -> ! {
+    if e.kind() == ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    elog(&format!("avsm: cannot write to standard output: {e}"));
+    std::process::exit(i32::from(crate::exit::IOERR));
+}
+
 /// A standard output that ends the program quietly when its reader has
-/// gone away.
+/// gone away, and with 74 when it cannot be written at all.
 pub struct Stdout;
 
 impl Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !buf.is_empty() {
+            stdout_open();
+        }
         match std::io::stdout().write(buf) {
-            Err(e) if e.kind() == ErrorKind::BrokenPipe => std::process::exit(0),
+            Err(e) if e.kind() != ErrorKind::Interrupted => stdout_failed(&e),
             other => other,
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match std::io::stdout().flush() {
-            Err(e) if e.kind() == ErrorKind::BrokenPipe => std::process::exit(0),
+            Err(e) if e.kind() != ErrorKind::Interrupted => stdout_failed(&e),
             other => other,
         }
     }
@@ -235,6 +267,9 @@ pub const HUMAN_ONLY: [&str; 5] = ["approve", "deny", "resume", "add", "propose"
 pub enum Peer {
     /// A process this daemon started, or one of theirs: pid.
     Started(u32),
+    /// Out of this daemon's tree, by a double fork, but in a process group
+    /// or session it made: pid, and the group or session.
+    Made(u32, i32),
     /// Gone before it could be looked up. A client of avsm waits for its
     /// answer, so a peer gone already is no human's.
     Gone(u32),
@@ -246,12 +281,37 @@ pub enum Peer {
 
 /// Look up the peer of a connection: its pid from the kernel
 /// (LOCAL_PEERPID on macOS, SO_PEERCRED on Linux), then its parents up
-/// to this daemon or to the first process.
+/// to this daemon or to the first process, then its process group and
+/// session.
 pub fn peer(stream: &UnixStream) -> Peer {
     use std::os::fd::AsRawFd;
     match peer_pid(stream.as_raw_fd()) {
-        Some(pid) => descends(pid, std::process::id()),
+        Some(pid) => match descends(pid, std::process::id()) {
+            Peer::Other | Peer::Unknown => made_by(pid, &crate::groups::made),
+            found => found,
+        },
         None => Peer::Unknown,
+    }
+}
+
+/// A peer out of this daemon's tree is still its own when its process
+/// group or its session is one avsmd made (`made`): a double fork keeps
+/// both, and only a setsid of its own leaves them (#56). Other when
+/// neither is; Unknown when neither can be read.
+pub fn made_by(pid: u32, made: &dyn Fn(i32) -> bool) -> Peer {
+    // SAFETY: getpgid and getsid take any pid and only read.
+    let (pgid, sid) = unsafe {
+        (
+            libc::getpgid(pid as libc::pid_t),
+            libc::getsid(pid as libc::pid_t),
+        )
+    };
+    if pgid == -1 && sid == -1 {
+        return Peer::Unknown;
+    }
+    match [pgid, sid].into_iter().find(|id| *id > 1 && made(*id)) {
+        Some(id) => Peer::Made(pid, id),
+        None => Peer::Other,
     }
 }
 
@@ -418,6 +478,10 @@ fn not_human(args: &[String], peer: Peer) -> Option<String> {
         )),
         Peer::Gone(pid) => Some(format!(
             "refused: `{cmd}` came from pid {pid}, gone before avsmd could see who started it"
+        )),
+        Peer::Made(pid, id) => Some(format!(
+            "refused: `{cmd}` came from pid {pid}, in process group or session {id} that avsmd \
+             made for a lever, a report or a run; only a human gives it"
         )),
         Peer::Other | Peer::Unknown => None,
     }

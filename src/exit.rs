@@ -12,6 +12,8 @@ pub const UNAVAILABLE: u8 = 69;
 pub const SOFTWARE: u8 = 70;
 /// A file or directory cannot be created.
 pub const CANTCREAT: u8 = 73;
+/// An input or output error: standard output cannot be written.
+pub const IOERR: u8 = 74;
 /// Try again later.
 pub const TEMPFAIL: u8 = 75;
 /// Not permitted.

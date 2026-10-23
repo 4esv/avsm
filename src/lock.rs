@@ -109,6 +109,61 @@ pub fn holder(home: &Path) -> Option<i32> {
     Some(pid_in(&mut file).unwrap_or(0))
 }
 
+/// The home whose lock a writer checks before each append, and the pid
+/// of the daemon it writes for.
+static GUARD: std::sync::OnceLock<(std::path::PathBuf, i32)> = std::sync::OnceLock::new();
+
+/// From now on, in this process, refuse every append to the ledger once
+/// another process than the daemon `daemon` holds `home`'s lock (#56).
+/// The daemon calls it for itself, the warden for its daemon.
+pub fn guard_writes(home: &Path, daemon: i32) {
+    let _ = GUARD.set((home.join(LOCK_FILE), daemon));
+}
+
+/// May this process append to its home's ledger? Err names the process
+/// holding the lock in its daemon's place. Called inside the append's
+/// write transaction, so a steal seen here lands nothing after it.
+///
+/// A lock file gone, or one nobody holds, keeps nobody out: the daemon
+/// takes it again within a tick, and until another takes it, no other
+/// writes. Only a file at the path that another process holds says the
+/// home is lost.
+pub fn may_write() -> Result<(), String> {
+    let Some((path, daemon)) = GUARD.get() else {
+        return Ok(());
+    };
+    let Ok(mut file) = File::open(path) else {
+        return Ok(());
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Ok(());
+    }
+    if flock(&file, libc::LOCK_SH) {
+        flock(&file, libc::LOCK_UN);
+        return Ok(());
+    }
+    // Held. A lock taken this moment has no pid in it yet: it is read
+    // again for a little while before it is called nobody's.
+    let mut holder = None;
+    for _ in 0..10 {
+        holder = pid_in(&mut file).filter(|p| *p > 0);
+        if holder.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    match holder {
+        Some(p) if p == *daemon => Ok(()),
+        Some(p) => Err(format!(
+            "avsmd (pid {p}) holds this home's lock now; this avsmd writes nothing more to its ledger"
+        )),
+        None => Err(
+            "another process holds this home's lock now; this avsmd writes nothing more to its ledger"
+                .to_string(),
+        ),
+    }
+}
+
 /// A file's device and inode, to tell it from one put in its place.
 pub fn identity(path: &Path) -> Option<(u64, u64)> {
     std::fs::symlink_metadata(path)

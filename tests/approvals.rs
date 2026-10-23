@@ -473,3 +473,111 @@ fn a_lever_that_runs_avsm_approve_is_refused() {
     assert_eq!(runs(&dir), 1, "{}", lines(&ledger(&home)));
     no_alarm(&ledger(&home));
 }
+
+/// A venture `w` whose report, the first time it runs, leaves behind a
+/// process that approves v1's ask over the socket: started by `escape`,
+/// a shell prefix that takes it out of avsmd's tree. What it was told is
+/// in `out`.
+fn escaping_reporter(tmp: &Path, home: &Path, escape: &str) -> (PathBuf, PathBuf) {
+    let w = tmp.join("w");
+    std::fs::create_dir_all(&w).unwrap();
+    std::fs::write(
+        w.join("mandate.yaml"),
+        "purpose: Tidy.\nmetric: m\ncontroller: {kind: threshold, above: 100, action: tidy}\n\
+         cadence: 1s\npermitted:\n  - {name: tidy, run: 'true', cap: 1/hour, reversible: true}\n",
+    )
+    .unwrap();
+    let avsm_bin = env!("CARGO_BIN_EXE_avsm");
+    let out = w.join("out");
+    script(
+        &w,
+        "approver",
+        &format!(
+            "#!/bin/sh\nexec </dev/null >/dev/null 2>&1\nA='{avsm_bin}'; H='{h}'\n\
+             i=0; while [ $i -lt 60 ]; do\n\
+               ASK=$(\"$A\" --home \"$H\" asks | awk '/bump\\?/{{print $1; exit}}' | tr -d '#')\n\
+               [ -n \"$ASK\" ] && break; i=$((i+1)); sleep 0.5\n\
+             done\n\
+             \"$A\" --home \"$H\" approve \"$ASK\" > '{o}.tmp' 2>&1; echo \"exit $?\" >> '{o}.tmp'\n\
+             mv '{o}.tmp' '{o}'\n",
+            h = home.display(),
+            o = out.display()
+        ),
+    );
+    script(
+        &w,
+        "report",
+        &format!(
+            "#!/bin/sh\nif [ ! -e forked ]; then touch forked; {escape} ./approver; fi\necho 9\n"
+        ),
+    );
+    (w, out)
+}
+
+/// Wait for what the escaped approver was told.
+fn told(out: &Path, home: &Path) -> String {
+    let began = Instant::now();
+    while !out.exists() {
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the approver never tried:\n{}",
+            lines(&ledger(home))
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::fs::read_to_string(out).unwrap()
+}
+
+#[test]
+fn a_report_that_double_forks_avsm_approve_is_refused_and_the_lever_never_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, dir) = daemon_home(tmp.path());
+    // `( ( approver ) & ) &`: the approver's parent exits at once, so it
+    // is no child of avsmd's by the time it connects.
+    let (w, out) = escaping_reporter(tmp.path(), &home, "( ( ./approver ) & ) & : ");
+    let d = start(tmp.path(), &home, "d.log");
+    ok(&avsm(tmp.path(), &home, &["add", dir.to_str().unwrap()]));
+    ok(&avsm(tmp.path(), &home, &["add", w.to_str().unwrap()]));
+    let said = told(&out, &home);
+    assert!(
+        !said.contains("exit 0"),
+        "the double-forked approve went through: {said}"
+    );
+    assert!(said.contains("refused"), "{said}");
+    std::thread::sleep(Duration::from_secs(3));
+    d.stop();
+    assert_eq!(runs(&dir), 0, "{}", lines(&ledger(&home)));
+    no_alarm(&ledger(&home));
+}
+
+/// A program that calls setsid itself leaves avsmd's session. On Linux
+/// avsmd is its subreaper, so it is still found in avsmd's tree and
+/// refused; on macOS nothing ties it to avsmd, and its approve goes
+/// through, as the README says.
+#[test]
+fn a_report_that_calls_setsid_to_approve_is_refused_on_linux_and_documented_on_macos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, dir) = daemon_home(tmp.path());
+    let escape = if cfg!(target_os = "linux") {
+        "setsid -f"
+    } else {
+        "perl -MPOSIX -e 'exit if fork; POSIX::setsid(); exit if fork; exec @ARGV'"
+    };
+    let (w, out) = escaping_reporter(tmp.path(), &home, escape);
+    let d = start(tmp.path(), &home, "d.log");
+    ok(&avsm(tmp.path(), &home, &["add", dir.to_str().unwrap()]));
+    ok(&avsm(tmp.path(), &home, &["add", w.to_str().unwrap()]));
+    let said = told(&out, &home);
+    if cfg!(target_os = "linux") {
+        assert!(!said.contains("exit 0"), "{said}");
+        assert!(said.contains("refused"), "{said}");
+    } else {
+        assert!(said.contains("exit 0"), "{said}");
+        let began = Instant::now();
+        while runs(&dir) < 1 && began.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(runs(&dir), 1, "{}", lines(&ledger(&home)));
+    }
+    d.stop();
+}

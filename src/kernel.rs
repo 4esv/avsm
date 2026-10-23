@@ -2467,7 +2467,9 @@ impl Kernel {
             match alive {
                 Ok(()) if pid == 0 => {}
                 Ok(()) => out.push_str(&format!("ok {which} pid {pid}\n")),
-                Err(why) => out.push_str(&format!("fail the {which} process is gone: {why}\n")),
+                Err(why) => out.push_str(&format!(
+                    "fail the {which} process is gone ({why}); avsmd is respawning it\n"
+                )),
             }
         }
         if let Some(f) = &self.fault {
@@ -3689,6 +3691,9 @@ fn kill(rt: &mut Runtime) {
         }
         let _ = child.kill();
         let _ = child.wait();
+        if !crate::groups::alive(child.id() as i32) {
+            crate::groups::ended(child.id() as i32);
+        }
     }
     rt.started = None;
 }
@@ -3816,13 +3821,25 @@ fn spawn_run(home: &Path, name: &str, path: &Path, confine: bool) -> Result<Chil
             cmd.pre_exec(unshare_network);
         }
     }
-    // A group of its own, so a stop or a pause reaches what it started.
-    cmd.process_group(0);
+    // A session of its own, and so a group: a stop or a pause reaches
+    // what it started, and what it leaves behind still shows as avsmd's.
+    // SAFETY: the hook only calls setsid, prctl and getppid, which are
+    // async-signal-safe.
+    unsafe {
+        cmd.pre_exec(crate::groups::lead_session);
+    }
+    let mark = crate::groups::mark();
+    cmd.env(crate::groups::MARK_VAR, &mark);
     let _spawning = crate::groups::SPAWNING
         .read()
         .unwrap_or_else(|p| p.into_inner());
-    cmd.spawn()
-        .map_err(|e| format!("cannot run {}: {e}", path.display()))
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", path.display()))?;
+    crate::groups::within(name, Arc::new(AtomicBool::new(false)), || {
+        crate::groups::started(child.id() as i32, &mark, dir)
+    });
+    Ok(child)
 }
 
 /// The intent an ask is about, when it asks whether a run with no outcome
@@ -4544,7 +4561,8 @@ impl Process {
             Ok(c) => c,
             Err(e) if drop && unprivileged().is_some() => {
                 log(&format!(
-                    "cannot start the {what} process as nobody ({e}); running it as root instead.                      Put avsmd somewhere nobody can read, like /usr/local/bin."
+                    "cannot start the {what} process as nobody ({e}); running it as root instead. \
+                     Put avsmd somewhere nobody can read, like /usr/local/bin."
                 ));
                 build(false)
                     .spawn()
@@ -4962,6 +4980,15 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
     warden::drain_on_signals();
     // The daemon's channel for what this warden appends and starts.
     crate::groups::take_notes();
+    // The daemon that started this warden: its groups are written down
+    // as its, and nothing is appended once another holds the home (#56).
+    // SAFETY: getppid has no preconditions.
+    let daemon = unsafe { libc::getppid() };
+    if daemon > 1 && crate::groups::noting() {
+        crate::lock::guard_writes(home, daemon);
+        crate::groups::keep_in(home, crate::groups::Daemon::of(daemon));
+        crate::groups::adopt_orphans();
+    }
     let mut warden = LocalWarden::open(home)?;
     let ledger = home.join("ledger.db");
     // Lever runs going on apart, each on a thread of its own.
@@ -5075,17 +5102,26 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
             .and_then(|_| out.flush())
             .map_err(|e| e.to_string())?;
     }
-    // The kernel hung up with work still going: it drains, as on a stop,
-    // and each lever's outcome is written before the warden goes.
+    // The kernel hung up. Without a stop first, the daemon died: what it
+    // started itself (its reports, its runs) has nobody left to end it,
+    // and is ended here. Work still going here drains, as on a stop, and
+    // each lever's outcome is written before the warden goes.
+    warden::daemon_died();
+    let orphans = crate::groups::left_by_my_daemon();
+    let ending = (!orphans.is_empty()).then(|| {
+        std::thread::spawn(move || {
+            crate::groups::end(&orphans, Instant::now() + warden::DRAIN_GRACE)
+        })
+    });
     let left: Vec<Apart> = runs
         .into_iter()
         .chain(readings.into_values().map(|r| r.apart))
         .collect();
-    if !left.is_empty() {
-        warden::drain_now();
-    }
     for a in left {
         let _ = a.handle.join();
+    }
+    if let Some(e) = ending {
+        let _ = e.join();
     }
     Ok(())
 }
@@ -5267,7 +5303,25 @@ pub fn start(home: &Path) -> Result<(), Exit> {
     // One daemon per home, and a ledger it can read, before anything
     // else: a second daemon must write nothing (#44).
     let mut lock = crate::doctor::hold_home(home)?;
+    // Nothing this process or its warden appends lands once another
+    // avsmd holds the home's lock (#56).
+    crate::lock::guard_writes(home, std::process::id() as i32);
     crate::doctor::ledger_before_start(home)?;
+    // What a daemon killed outright left running is ended, unless it is
+    // still alive to end it itself; each group this one starts is
+    // written down for the next.
+    let me = crate::groups::Daemon::of(std::process::id() as i32);
+    let left = crate::groups::left_by_the_dead(home);
+    if !left.is_empty() {
+        log(&format!(
+            "ending {} process {} a dead avsmd left running",
+            left.len(),
+            if left.len() == 1 { "group" } else { "groups" }
+        ));
+        crate::groups::end_apart(left, warden::DRAIN_GRACE);
+    }
+    crate::groups::keep_in(home, me);
+    crate::groups::adopt_orphans();
     let listener = crate::protocol::bind(&sock).map_err(|e| {
         let code = if crate::protocol::alive(&sock) {
             exit::TEMPFAIL
@@ -5374,11 +5428,14 @@ fn keep_home(
     ours: &mut Option<(u64, u64)>,
     kernel: &Arc<Mutex<Kernel>>,
 ) -> Result<(), String> {
+    // Said once while the lock file cannot be made again, not each tick.
+    static UNMADE: AtomicBool = AtomicBool::new(false);
     let path = home.join(crate::lock::LOCK_FILE);
     if !lock.still_at(&path) {
         match crate::lock::acquire(home) {
             Ok(held) => {
                 *lock = held;
+                UNMADE.store(false, Ordering::Relaxed);
                 log(&format!(
                     "the lock file {} was deleted or replaced; this avsmd holds it again",
                     path.display()
@@ -5387,15 +5444,18 @@ fn keep_home(
             Err(crate::lock::Refused::Running(pid)) => {
                 let who = pid.map_or("another avsmd".to_string(), |p| format!("avsmd (pid {p})"));
                 return Err(format!(
-                    "{who} took this home's lock after its lock file {} was deleted or replaced                      under this one; two daemons must never write one ledger",
+                    "{who} took this home's lock after its lock file {} was deleted or replaced \
+                     under this one; two daemons must never write one ledger",
                     path.display()
                 ));
             }
             Err(crate::lock::Refused::Io(e)) => {
-                log(&format!(
-                    "the lock file {} is gone and cannot be made again: {e}",
-                    path.display()
-                ));
+                if !UNMADE.swap(true, Ordering::Relaxed) {
+                    log(&format!(
+                        "the lock file {} is gone and cannot be made again: {e}",
+                        path.display()
+                    ));
+                }
                 return Ok(());
             }
         }

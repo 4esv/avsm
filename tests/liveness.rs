@@ -1071,3 +1071,299 @@ fn a_warden_killed_between_its_outcome_and_the_handover_raises_no_alarm() {
         || alarms(&home).contains(&vec![forged]),
     );
 }
+
+/// A report that ignores SIGTERM, says its pid and that it started, and
+/// never prints.
+const DEAF_REPORT_PID: &str = "trap '' TERM; echo $$ > rpid; touch started; sleep 100000";
+
+/// Is anything left in the process group `pgid` leads?
+fn group_alive(pgid: i32) -> bool {
+    // SAFETY: kill with signal 0 only checks.
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// Wait until none of `groups` has a process left, or fail naming them.
+fn groups_gone(what: &str, groups: &[i32], within: Duration, log: &dyn Fn() -> String) {
+    let began = Instant::now();
+    while groups.iter().any(|g| group_alive(*g)) {
+        let left: Vec<&i32> = groups.iter().filter(|g| group_alive(**g)).collect();
+        assert!(
+            began.elapsed() < within,
+            "{what}: groups {left:?} still running after {within:?}\n{}",
+            log()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A hung lever that ignores SIGTERM in `hung`, and a hung report that
+/// ignores it in `slow`, both started on `home`: their process groups.
+fn hang_both(tmp: &Path, home: &Path, d: &Daemon) -> (PathBuf, PathBuf, i32, i32) {
+    let hung = venture(tmp, "hung", "echo 11", DEAF, "", "1h");
+    let slow = venture(tmp, "slow", DEAF_REPORT_PID, "true", "", "1h");
+    for dir in [&hung, &slow] {
+        let out = avsm(tmp, home, &["add", dir.to_str().unwrap()]);
+        assert!(out.status.success(), "{}", text(&out));
+    }
+    wait_for("the hung lever and report", Duration::from_secs(30), || {
+        hung.join("pid").exists() && slow.join("rpid").exists()
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let lever = pid_in(&hung);
+    let report: i32 = std::fs::read_to_string(slow.join("rpid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(group_alive(lever) && group_alive(report), "{}", d.log());
+    (hung, slow, lever, report)
+}
+
+#[test]
+fn a_daemon_killed_alone_leaves_no_report_or_lever_behind_and_says_it_died() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let mut d = start(tmp.path(), &home);
+    let (hung, _slow, lever, report) = hang_both(tmp.path(), &home, &d);
+    stop_daemon(&mut d, libc::SIGKILL, Duration::from_secs(5));
+    groups_gone(
+        "the killed daemon's lever and report",
+        &[lever, report],
+        Duration::from_secs(15),
+        &|| d.log(),
+    );
+    // Its warden and roles go too.
+    none_left(
+        "the killed daemon's children",
+        &home,
+        Duration::from_secs(15),
+        &|| d.log(),
+    );
+    let i = intents(&home, "hung");
+    assert_eq!(i.len(), 1, "{}", d.log());
+    let (ok, detail) = outcome_of(&home, i[0]).expect("an outcome for the lever");
+    assert!(!ok, "{detail}");
+    assert!(detail.starts_with("killed: avsmd died"), "{detail}");
+    let _ = hung;
+}
+
+#[test]
+fn a_daemon_killed_with_its_warden_and_roles_leaves_nothing_once_it_starts_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let mut d = start(tmp.path(), &home);
+    let (hung, slow, lever, report) = hang_both(tmp.path(), &home, &d);
+    let (warden, roles) = (d.pid_of("warden"), d.pid_of("roles"));
+    // All three at once, as a kill -9 of the lot does.
+    // SAFETY: kill has no memory preconditions.
+    unsafe {
+        libc::kill(d.child.id() as i32, libc::SIGKILL);
+        libc::kill(warden, libc::SIGKILL);
+        libc::kill(roles, libc::SIGKILL);
+    }
+    let _ = d.child.wait();
+    // Nothing paused them, and nothing will run them again: the next
+    // start only has to end what was left.
+    std::fs::remove_file(hung.join("pid")).unwrap();
+    std::fs::remove_file(slow.join("rpid")).unwrap();
+    std::fs::write(hung.join("reset"), "#!/bin/sh\ntrue\n").unwrap();
+    std::fs::write(slow.join("report"), "#!/bin/sh\necho 1\n").unwrap();
+    let again = start(tmp.path(), &home);
+    groups_gone(
+        "what the killed daemon left, after the next start",
+        &[lever, report],
+        Duration::from_secs(15),
+        &|| again.log(),
+    );
+    assert!(
+        again.log().contains("left running"),
+        "the start says what it ended:\n{}",
+        again.log()
+    );
+}
+
+#[test]
+fn a_lock_taken_by_a_second_daemon_while_a_lever_runs_raises_no_alarm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let mut first = start(tmp.path(), &home);
+    let hung = venture(tmp.path(), "hung", "echo 11", DEAF, "", "1h");
+    let out = avsm(tmp.path(), &home, &["add", hung.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out));
+    wait_for("the hung lever to start", Duration::from_secs(30), || {
+        hung.join("started").exists()
+    });
+    // The lock file and socket go, and a second daemon takes the home.
+    std::fs::remove_file(home.join(avsmd::lock::LOCK_FILE)).unwrap();
+    std::fs::remove_file(avsmd::kernel::socket_path(&home)).unwrap();
+    let log = tmp.path().join("second.log");
+    let second = second_daemon(tmp.path(), &home, &log);
+    let second = Daemon {
+        child: second,
+        log,
+        tmp: tmp.path().join("nothing"),
+    };
+    // The first one stops, its lever with it.
+    let began = Instant::now();
+    let status = loop {
+        if let Some(s) = first.child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "the first daemon kept running\n{}\n{}",
+            first.log(),
+            second.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(75), "{}", first.log());
+    assert!(
+        first
+            .log()
+            .contains("was deleted or replaced under this one"),
+        "{}",
+        first.log()
+    );
+    // Whatever its warden still had to say is said by now.
+    std::thread::sleep(Duration::from_secs(3));
+    let alarms: Vec<String> = entries(&home)
+        .iter()
+        .filter(|e| matches!(&e.record, Record::Report { metric, .. } if metric == "foreign"))
+        .map(Entry::line)
+        .collect();
+    assert!(
+        alarms.is_empty(),
+        "a false alarm: {alarms:?}\nfirst:\n{}\nsecond:\n{}",
+        first.log(),
+        second.log()
+    );
+    let status = text(&avsm(tmp.path(), &home, &["status"]));
+    assert!(!status.contains("were not written"), "{status}");
+    let _ = &mut first;
+}
+
+#[test]
+fn a_lever_stopped_by_a_pause_says_so_even_when_it_ignores_sigterm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let d = start(tmp.path(), &home);
+    let hung = venture(tmp.path(), "hung", "echo 11", DEAF, "", "1h");
+    let out = avsm(tmp.path(), &home, &["add", hung.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out));
+    wait_for("the hung lever to start", Duration::from_secs(30), || {
+        hung.join("started").exists()
+    });
+    let out = avsm(tmp.path(), &home, &["pause", "hung"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let i = intents(&home, "hung");
+    wait_for(
+        "the outcome of the paused lever",
+        Duration::from_secs(20),
+        || outcome_of(&home, i[0]).is_some(),
+    );
+    let (_, detail) = outcome_of(&home, i[0]).unwrap();
+    assert!(
+        detail.starts_with("stopped: its venture was paused"),
+        "{detail}\n{}",
+        d.log()
+    );
+    assert!(!detail.contains("avsmd was stopping"), "{detail}");
+}
+
+#[test]
+fn doctor_waits_out_a_warden_respawn_instead_of_failing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let d = start(tmp.path(), &home);
+    for _ in 0..4 {
+        let warden = d.pid_of("warden");
+        // SAFETY: kill has no memory preconditions.
+        unsafe {
+            libc::kill(warden, libc::SIGKILL);
+        }
+        let out = avsm(tmp.path(), &home, &["doctor"]);
+        let doctor = text(&out);
+        assert!(!doctor.contains("FAIL"), "{doctor}\n{}", d.log());
+        assert!(out.status.success(), "{doctor}");
+        wait_for("the new warden", Duration::from_secs(10), || {
+            d.pid_of("warden") != warden
+        });
+    }
+}
+
+#[test]
+fn doctor_names_a_lock_path_that_is_a_directory_and_the_daemon_still_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let d = start(tmp.path(), &home);
+    let lock = home.join(avsmd::lock::LOCK_FILE);
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let out = avsm(tmp.path(), &home, &["doctor"]);
+    let doctor = text(&out);
+    assert!(!out.status.success(), "{doctor}");
+    assert!(
+        doctor.contains("avsmd.lock") && doctor.contains("is a directory"),
+        "{doctor}"
+    );
+    // Its socket gone too: the daemon is still named, not called stopped.
+    std::fs::remove_file(avsmd::kernel::socket_path(&home)).unwrap();
+    let doctor = text(&avsm(tmp.path(), &home, &["doctor"]));
+    assert!(!doctor.contains("avsmd is not running"), "{doctor}");
+    assert!(
+        doctor.contains(&format!("pid {}", d.child.id())),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn a_warden_caught_between_fork_and_exec_is_no_second_daemon() {
+    let home = Path::new("/h");
+    let p = |pid: i32, ppid: i32, args: &[&str]| avsmd::procs::Proc {
+        pid,
+        ppid,
+        pgid: 100,
+        cwd: None,
+        args: args.iter().map(|a| a.to_string()).collect(),
+        start: None,
+    };
+    let daemon = ["avsmd", "--home", "/h"];
+    // A child forked from the daemon that has not yet exec'd shows the
+    // daemon's own arguments.
+    let table = vec![
+        p(100, 1, &daemon),
+        p(101, 100, &daemon),
+        p(102, 100, &["avsmd", "--home", "/h", "roles"]),
+    ];
+    assert_eq!(avsmd::doctor::daemons_on(home, &table), vec![100]);
+    // Two daemons side by side are still two.
+    let table = vec![p(100, 1, &daemon), p(200, 1, &daemon)];
+    assert_eq!(avsmd::doctor::daemons_on(home, &table), vec![100, 200]);
+}
+
+#[test]
+fn a_closed_standard_output_exits_74_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let _d = start(tmp.path(), &home);
+    let out = Command::new("sh")
+        .args([
+            "-c",
+            "exec \"$0\" --home \"$1\" status >&-",
+            env!("CARGO_BIN_EXE_avsm"),
+            home.to_str().unwrap(),
+        ])
+        .env("HOME", tmp.path())
+        .env_remove("AVSMD_HOME")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(74), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("standard output"),
+        "{}",
+        text(&out)
+    );
+}

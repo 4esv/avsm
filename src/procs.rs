@@ -15,11 +15,22 @@ pub struct Proc {
     pub cwd: Option<PathBuf>,
     /// Its arguments, the program first; empty when they cannot be read.
     pub args: Vec<String>,
+    /// When it started, in a unit of the system's own: comparable only
+    /// with another start read here. None when it cannot be read.
+    pub start: Option<u64>,
 }
 
 /// Every process this user can see.
 pub fn all() -> Vec<Proc> {
     pids().into_iter().filter_map(one).collect()
+}
+
+/// One process, if this user can see it.
+pub fn get(pid: i32) -> Option<Proc> {
+    if pid <= 0 {
+        return None;
+    }
+    one(pid)
 }
 
 #[cfg(target_os = "macos")]
@@ -93,13 +104,28 @@ fn one(pid: i32) -> Option<Proc> {
         pgid: info.pbi_pgid as i32,
         cwd,
         args: args_of(pid),
+        start: Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec),
     })
 }
 
-/// A process's arguments from KERN_PROCARGS2: argc, the executable's
-/// path, padding, then argc NUL-terminated arguments.
+/// A process's arguments from KERN_PROCARGS2.
 #[cfg(target_os = "macos")]
 fn args_of(pid: i32) -> Vec<String> {
+    procargs(pid).0
+}
+
+/// A process's environment, `NAME=value` each, where this user may read
+/// it; empty when it cannot be.
+#[cfg(target_os = "macos")]
+pub fn env_of(pid: i32) -> Vec<String> {
+    procargs(pid).1
+}
+
+/// A process's arguments and environment from KERN_PROCARGS2: argc, the
+/// executable's path, padding, argc NUL-terminated arguments, then the
+/// environment up to an empty string.
+#[cfg(target_os = "macos")]
+fn procargs(pid: i32) -> (Vec<String>, Vec<String>) {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size: libc::size_t = 0;
     // SAFETY: a null buffer asks only for the size.
@@ -114,7 +140,7 @@ fn args_of(pid: i32) -> Vec<String> {
         )
     };
     if r != 0 || size < 4 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut buf = vec![0u8; size];
     // SAFETY: buf is valid for writes of `size` bytes.
@@ -129,24 +155,25 @@ fn args_of(pid: i32) -> Vec<String> {
         )
     };
     if r != 0 || size < 4 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     buf.truncate(size);
     let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
     let rest = &buf[4..];
     // Skip the executable's path and the NULs after it.
     let Some(end) = rest.iter().position(|b| *b == 0) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let start = rest[end..]
         .iter()
         .position(|b| *b != 0)
         .map_or(rest.len(), |p| end + p);
-    rest[start..]
+    let mut words = rest[start..]
         .split(|b| *b == 0)
-        .take(argc)
-        .map(|a| String::from_utf8_lossy(a).into_owned())
-        .collect()
+        .map(|a| String::from_utf8_lossy(a).into_owned());
+    let args: Vec<String> = words.by_ref().take(argc).collect();
+    let env = words.take_while(|w| !w.is_empty()).collect();
+    (args, env)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -167,6 +194,8 @@ fn one(pid: i32) -> Option<Proc> {
     let mut rest = stat.rsplit_once(')')?.1.split_whitespace();
     let ppid = rest.nth(1)?.parse().ok()?;
     let pgid = rest.next()?.parse().ok()?;
+    // The 22nd field: clock ticks from boot to its start.
+    let start = rest.nth(16).and_then(|t| t.parse().ok());
     let args = std::fs::read(format!("/proc/{pid}/cmdline"))
         .map(|b| {
             b.split(|c| *c == 0)
@@ -181,7 +210,27 @@ fn one(pid: i32) -> Option<Proc> {
         pgid,
         cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok(),
         args,
+        start,
     })
+}
+
+/// A process's environment, `NAME=value` each, where this user may read
+/// it; empty when it cannot be.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn env_of(pid: i32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .map(|b| {
+            b.split(|c| *c == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+pub fn env_of(_pid: i32) -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
@@ -236,6 +285,28 @@ mod tests {
         );
         let argv0 = std::env::args().next().unwrap();
         assert_eq!(p.args.first(), Some(&argv0), "{:?}", p.args);
+    }
+
+    #[test]
+    fn a_child_s_environment_and_start_are_read() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .env("AVSM_PROCS_TEST", "here")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let env = env_of(pid);
+        let p = get(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        // macOS shows no other process's environment for a system binary.
+        if cfg!(target_os = "linux") {
+            assert!(env.iter().any(|v| v == "AVSM_PROCS_TEST=here"), "{env:?}");
+        }
+        let me = get(std::process::id() as i32).unwrap();
+        let p = p.unwrap();
+        assert!(p.start.is_some() && p.start >= me.start, "{p:?} {me:?}");
     }
 
     #[test]
