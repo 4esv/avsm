@@ -1071,6 +1071,103 @@ impl Index {
             .map(|(_, x)| (frozen, *x))
     }
 
+    /// New evidence a suspended lever may be asked about again on: as
+    /// `evidence`, on readings no plausibility check doubts, then or
+    /// since. The frozen value is the latest trusted reading before the
+    /// record. The evidence is two plausible readings in a row after it,
+    /// each further from the frozen value than the metric's noise, with
+    /// nothing flagged between them or just before the first, that are
+    /// not an exact repeat: a stuck sensor's first reading is plausible
+    /// until its repeats are flagged, and it never reads two values. A
+    /// reading is doubted when a later report flags its run of exact
+    /// repeats stuck, or flags a flap right after it (`impugned`).
+    /// Returns the two values and the two readings. Only asks rest on
+    /// it; it never voids, so the gate's `voided` keeps `evidence`.
+    pub fn fresh_evidence(
+        &self,
+        venture: &str,
+        metric: &str,
+        since: Seq,
+    ) -> Option<(f64, f64, [Seq; 2])> {
+        let series = self.series(venture, metric);
+        let i = series.partition_point(|(s, _)| *s <= since);
+        let frozen = series[..i]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(j, _)| self.trusted(venture, metric, series, *j))
+            .map(|(_, r)| r.1)?;
+        let values: Vec<f64> = series[..i].iter().map(|(_, x)| *x).collect();
+        let noise = crate::expect::noise(&values);
+        let away = |x: f64| (x - frozen).abs() > noise;
+        (i..series.len().saturating_sub(1)).find_map(|j| {
+            let ((s0, x0), (s1, x1)) = (series[j], series[j + 1]);
+            let from = j.checked_sub(1).map_or(0, |k| series[k].0);
+            (away(x0)
+                && away(x1)
+                && x0 != x1
+                && !self.doubted_between(venture, metric, from, s1)
+                && self.impugned(venture, metric, s0).is_none()
+                && self.impugned(venture, metric, s1).is_none())
+            .then_some((frozen, x1, [s0, s1]))
+        })
+    }
+
+    /// Is the `j`th plausible reading of this series one no check doubts:
+    /// nothing flagged between the readings either side of it, and not
+    /// `impugned`?
+    fn trusted(&self, venture: &str, metric: &str, series: &[(Seq, f64)], j: usize) -> bool {
+        let from = j.checked_sub(1).map_or(0, |k| series[k].0);
+        let to = series.get(j + 1).map_or(Seq::MAX, |r| r.0);
+        !self.doubted_between(venture, metric, from, to)
+            && self.impugned(venture, metric, series[j].0).is_none()
+    }
+
+    /// The trusted report of a metric, flagged after this plausible
+    /// reading, that says it was a fault: one flagged stuck in the run of
+    /// exact repeats the reading starts, or flagged flapping among the
+    /// few reports right after it. A stuck sensor's first reading is
+    /// plausible when it comes; its repeats are flagged later.
+    pub fn impugned(&self, venture: &str, metric: &str, reading: Seq) -> Option<Seq> {
+        let x = match &self.get(reading)?.record {
+            Record::Report { value: Some(x), .. } => *x,
+            _ => return None,
+        };
+        let seqs = self.of.get(venture)?;
+        let after = seqs.partition_point(|s| *s <= reading);
+        let (mut n, mut run) = (0, true);
+        for e in seqs[after..].iter().filter_map(|s| self.get(*s)) {
+            let Record::Report {
+                metric: m,
+                claim,
+                value,
+                implausible,
+                ..
+            } = &e.record
+            else {
+                continue;
+            };
+            if m != metric || !claim.authorizes() {
+                continue;
+            }
+            n += 1;
+            let flag = implausible.as_deref().unwrap_or_default();
+            if n <= 3 && flag.starts_with("flapping") {
+                return Some(e.seq);
+            }
+            // A missing reading neither repeats nor ends the run.
+            match value {
+                Some(v) if run && *v == x && flag.starts_with("stuck") => return Some(e.seq),
+                Some(v) if *v != x => run = false,
+                _ => {}
+            }
+            if !run && n >= 3 {
+                return None;
+            }
+        }
+        None
+    }
+
     /// Is any trusted report of this metric between these two numbers,
     /// both excluded, marked implausible?
     pub fn doubted_between(&self, venture: &str, metric: &str, from: Seq, to: Seq) -> bool {

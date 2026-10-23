@@ -495,7 +495,9 @@ fn denied_then_asked_again() -> (Fixture, Seq) {
     let (mut f, ask) = suspended();
     f.k.deny(ask, "no").unwrap();
     assert!(f.suspended());
-    f.report_tomorrow(4.0); // refused; something new was measured: asks again
+    f.report_tomorrow(4.0); // refused; one reading somewhere new is not yet evidence
+    assert_eq!(f.ineffective().len(), 1);
+    f.report(4.5); // a second, not an exact repeat: asks again
     let asks = f.ineffective();
     assert_eq!(asks.len(), 2, "{asks:#?}");
     assert!(f.suspended(), "an open ask is no answer");
@@ -541,7 +543,8 @@ fn an_approval_of_an_old_ask_never_answers_a_newer_one() {
     let _c = clock();
     let (mut f, ask) = suspended();
     f.k.deny(ask, "no").unwrap();
-    f.report_tomorrow(4.0); // asks again
+    f.report_tomorrow(4.0);
+    f.report(4.5); // asks again
     assert_eq!(f.ineffective().len(), 2);
     // The first ask is decided and cannot be approved now; an approval
     // record of it, declared, still says nothing about the newer one.
@@ -644,8 +647,10 @@ fn a_fresh_miss_after_a_restore_suspends_again() {
         .expect("a relapse report");
     assert_eq!(relapse.record.claim(), Claim::Measured);
     assert!(matches!(&relapse.record, Record::Report { cites, .. } if cites == &vec![ask]));
-    // A reading somewhere new is evidence: the next crossing asks once.
+    // Two readings somewhere new, not an exact repeat, are evidence: the
+    // next crossing asks once.
     f.report_tomorrow(4.0);
+    f.report(4.5);
     assert_eq!(f.ineffective().len(), 2);
     assert!(f.suspended());
     // A re-adoption restores it as before.
@@ -886,9 +891,12 @@ fn a_frozen_metric_after_an_ineffective_lever_gets_no_runs_and_no_asks() {
     assert_eq!(f.intents(), 2, "no runs on a frozen metric");
     assert!(f.lever_asks().is_empty());
     assert_eq!(f.ineffective().len(), 1, "no ask without new evidence");
-    // A different reading is new evidence: one new ask, still no run.
+    // Two different readings are new evidence: one new ask, still no run.
+    // An exact repeat is what a stuck sensor reads, and is not.
     f.report(10.0);
     f.report(10.0);
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.ineffective());
+    f.report(11.0);
     assert_eq!(f.ineffective().len(), 2, "{:#?}", f.ineffective());
     assert_eq!(f.intents(), 2);
 }
@@ -905,8 +913,14 @@ fn a_denied_ineffective_lever_asks_again_only_on_new_evidence() {
     assert_eq!(f.ineffective().len(), 1, "frozen: nothing new to ask on");
     assert_eq!(f.intents(), 1);
     f.report(10.0);
-    assert_eq!(f.ineffective().len(), 2, "a new reading asks once");
+    assert_eq!(
+        f.ineffective().len(),
+        1,
+        "one new reading is not yet evidence"
+    );
     f.report(11.0);
+    assert_eq!(f.ineffective().len(), 2, "a second, different, asks once");
+    f.report(12.0);
     assert_eq!(f.ineffective().len(), 2, "one open at a time");
     assert_eq!(f.intents(), 1);
 }
@@ -1734,4 +1748,323 @@ fn a_dead_lever_behind_a_late_sensor_is_still_suspended() {
     assert!(f.suspended(), "{:#?}", f.entries());
     assert_eq!(f.ineffective().len(), 1);
     assert_eq!(f.intents(), 1, "held until judged, never run twice");
+}
+
+// ----- issue #49: the misses in the packet, no re-ask on a doubted reading -----
+
+/// The seqs a measured ask's packet rests on.
+fn premises(e: &Entry) -> Vec<Seq> {
+    match &e.record {
+        Record::Ask {
+            packet: Some(p), ..
+        } => p.premises.iter().map(|p| p.seq).collect(),
+        other => panic!("not an ask with a packet: {other:?}"),
+    }
+}
+
+/// The relapse reports of the lever.
+fn relapses(f: &Fixture) -> Vec<Entry> {
+    f.entries()
+        .into_iter()
+        .filter(|e| matches!(&e.record, Record::Report { metric, .. } if metric == "suspension"))
+        .collect()
+}
+
+/// The latest report of the metric.
+fn last_reading(f: &Fixture) -> Seq {
+    f.entries()
+        .into_iter()
+        .rev()
+        .find(|e| matches!(&e.record, Record::Report { metric, .. } if metric == "count"))
+        .unwrap()
+        .seq
+}
+
+/// The tomato with boost working twice (each run a measured report that
+/// it moved the right way by more than it said), then dead at 0: the
+/// first miss suspends it.
+fn worked_then_died() -> Fixture {
+    let mut f = tomato();
+    for v in [40.0, 42.0, 41.0, 43.0, 40.0] {
+        f.report(v);
+    }
+    f.report(20.0); // crosses: boost runs
+    f.report(40.0); // +20 where 5 was expected: worked
+    f.report(30.0); // runs again
+    f.report(45.0); // worked
+    assert_eq!(f.expectations().len(), 2, "{:#?}", f.entries());
+    f.report(20.0); // runs
+    f.report(0.0); // dead: down 20 where up 5 was expected
+    assert!(f.suspended(), "{:#?}", f.entries());
+    assert_eq!(f.ineffective().len(), 1);
+    f
+}
+
+#[test]
+fn a_restore_ask_cites_the_misses_not_the_successes_before_them() {
+    let _c = clock();
+    let mut f = worked_then_died();
+    let successes: Vec<Seq> = f.expectations().iter().map(|e| e.seq).collect();
+    let first = f.ineffective()[0].clone();
+    assert!(
+        premises(&first).iter().all(|s| !successes.contains(s)),
+        "the first ask rests on the dead reading, not on runs that worked: {:?}",
+        first.record
+    );
+    assert!(
+        premises(&first).contains(&last_reading(&f)),
+        "{:?}",
+        first.record
+    );
+    f.k.deny(first.seq, "no").unwrap();
+    // Something new, twice and not by an exact repeat: asked again.
+    f.report(20.0);
+    f.report(21.0);
+    let asks = f.ineffective();
+    assert_eq!(asks.len(), 2, "{asks:#?}");
+    let second = asks[1].clone();
+    let p = premises(&second);
+    assert!(p.contains(&first.seq), "the earlier miss: {p:?}");
+    assert!(p.iter().all(|s| !successes.contains(s)), "{p:?}");
+    // Restored, it runs, misses again, and relapses with no new evidence.
+    f.k.approve(second.seq, None).unwrap();
+    f.report(21.0); // crosses: runs
+    f.report(22.0); // no effect
+    assert!(f.suspended(), "{:#?}", f.entries());
+    let relapse = relapses(&f);
+    assert_eq!(relapse.len(), 1, "{:#?}", f.entries());
+    // Asked again on something new: the packet carries every miss since
+    // boost last worked, the relapse with them, and none of the runs that
+    // worked before.
+    f.report(5.0);
+    f.report(6.0);
+    let asks = f.ineffective();
+    assert_eq!(asks.len(), 3, "{asks:#?}");
+    let p = premises(&asks[2]);
+    for miss in [first.seq, second.seq, relapse[0].seq] {
+        assert!(p.contains(&miss), "#{miss} missing from {p:?}");
+    }
+    assert!(p.iter().all(|s| !successes.contains(s)), "{p:?}");
+}
+
+#[test]
+fn a_run_ask_of_a_restored_lever_cites_the_misses_and_says_its_forecast_assumes_an_effect() {
+    let _c = clock();
+    let mut f = worked_then_died();
+    let first = f.ineffective()[0].seq;
+    f.k.approve(first, None).unwrap();
+    assert!(!f.suspended());
+    // What any ask to run boost now rests on: the kernel's packet, here
+    // with a forecast of approving that has boost work as it did.
+    let forecast = avsmd::record::OptionForecast {
+        metric: "count".into(),
+        days: 7,
+        seeds: 8,
+        p5: 90.0,
+        p50: 100.0,
+        p95: 100.0,
+        breach: 0.0,
+        spend: 27.0,
+        assumes: None,
+    };
+    let index = f.k.index().unwrap();
+    let packet = avsmd::packet::build(
+        &index,
+        &[],
+        T0,
+        &avsmd::packet::Basis {
+            venture: "raiser",
+            action: Some("boost"),
+            metric: Some("count"),
+            approve: Some(forecast.clone()),
+            deny: Some(forecast),
+            ..Default::default()
+        },
+    );
+    let p: Vec<Seq> = packet.premises.iter().map(|p| p.seq).collect();
+    assert!(
+        p.contains(&first),
+        "the ask that found it ineffective: {p:?}"
+    );
+    let approve = packet.options[0].forecast.as_ref().unwrap();
+    let assumes = approve.assumes.clone().unwrap_or_default();
+    assert!(
+        assumes.contains(&format!("#{first}")) && assumes.contains("boost"),
+        "{assumes:?}"
+    );
+    assert!(packet.render().contains(&assumes), "{}", packet.render());
+    assert_eq!(
+        packet
+            .options
+            .last()
+            .unwrap()
+            .forecast
+            .as_ref()
+            .unwrap()
+            .assumes,
+        None,
+        "denying assumes nothing of boost"
+    );
+}
+
+#[test]
+fn a_stuck_or_flapping_reading_never_asks_again_about_a_dead_lever() {
+    let _c = clock();
+    let mut f = dead();
+    let ask = f.ineffective()[0].seq;
+    f.k.deny(ask, "no").unwrap();
+    for _ in 0..4 {
+        f.report(0.0);
+    }
+    // The hostile sensor and the stuck_low one: plausible from 0, then
+    // repeated until flagged stuck, then back to 0.
+    for fault in [15.0, 12.0] {
+        for _ in 0..12 {
+            f.report(fault);
+        }
+        assert!(
+            f.flags().iter().flatten().any(|w| w.starts_with("stuck")),
+            "{:?}",
+            f.flags()
+        );
+        for _ in 0..4 {
+            f.report(0.0);
+        }
+    }
+    // A flap.
+    for v in [5.0, 95.0, 5.0, 95.0, 5.0, 0.0, 0.0, 0.0] {
+        f.report(v);
+    }
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.ineffective());
+    // Two plausible readings that differ, a NaN between them: a doubted
+    // span, not evidence.
+    for v in [20.0, f64::NAN, 21.0, 22.0] {
+        f.report(v);
+    }
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.ineffective());
+    assert_eq!(f.intents(), 1);
+    assert!(f.suspended());
+}
+
+#[test]
+fn an_ask_on_readings_later_flagged_stuck_is_held_by_a_relapse() {
+    let _c = clock();
+    let mut f = dead();
+    let ask = f.ineffective()[0].seq;
+    f.k.deny(ask, "no").unwrap();
+    for _ in 0..4 {
+        f.report(0.0);
+    }
+    // Two readings that differ, crossing the threshold: refused, and
+    // evidence as far as anything can tell yet. Asked again.
+    f.report(14.0);
+    f.report(15.0);
+    assert_eq!(f.ineffective().len(), 2, "{:#?}", f.entries());
+    let again = f.ineffective()[1].seq;
+    // The 15 repeats until it is flagged stuck: the ask rested on a
+    // stuck sensor. A measured relapse after it holds the lever, so an
+    // approval of it no longer restores it.
+    for _ in 0..20 {
+        f.report(15.0);
+        if f.flags().iter().flatten().any(|w| w.starts_with("stuck")) {
+            break;
+        }
+    }
+    assert!(
+        f.flags().iter().flatten().any(|w| w.starts_with("stuck")),
+        "{:?}",
+        f.flags()
+    );
+    let relapse = relapses(&f);
+    assert_eq!(relapse.len(), 1, "{:#?}", f.entries());
+    assert!(
+        matches!(&relapse[0].record, Record::Report { cites, claim: Claim::Measured, .. }
+            if cites.first() == Some(&again)),
+        "{:?}",
+        relapse[0].record
+    );
+    f.k.approve(again, None).unwrap();
+    assert!(f.suspended(), "{:#?}", f.entries());
+    // Back to the dead reading, crossing the threshold: refused, not run,
+    // and not asked again on the stuck sensor's word.
+    let runs = f.intents();
+    for _ in 0..6 {
+        f.report(0.0);
+    }
+    assert_eq!(f.intents(), runs, "{:#?}", f.entries());
+    assert!(f.suspended());
+    assert_eq!(f.ineffective().len(), 2, "{:#?}", f.ineffective());
+}
+
+#[test]
+fn a_fault_seen_while_an_ask_was_open_is_no_evidence_after_it_is_answered() {
+    let _c = clock();
+    let mut f = dead();
+    let ask = f.ineffective()[0].seq;
+    // The ask stays open while the sensor reads 14, then 15 until its
+    // repeats are flagged stuck, then the dead 0 again.
+    f.report(14.0);
+    for _ in 0..20 {
+        f.report(15.0);
+        if f.flags().iter().flatten().any(|w| w.starts_with("stuck")) {
+            break;
+        }
+    }
+    assert!(
+        f.flags().iter().flatten().any(|w| w.starts_with("stuck")),
+        "{:?}",
+        f.flags()
+    );
+    for _ in 0..3 {
+        f.report(0.0);
+    }
+    // Denied now: 14 then 15 differ, but the 15 began a stuck run.
+    f.k.deny(ask, "no").unwrap();
+    for _ in 0..3 {
+        f.report(0.0);
+    }
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.ineffective());
+}
+
+#[test]
+fn the_frozen_value_is_the_last_reading_no_check_doubts() {
+    let _c = clock();
+    let mut f = tomato();
+    for v in [40.0, 42.0, 41.0, 43.0, 40.0] {
+        f.report(v);
+    }
+    f.report(20.0); // crosses: boost runs
+    f.report(0.0); // down 20: asks, at a reading a NaN then doubts
+    assert_eq!(f.ineffective().len(), 1);
+    let ask = f.ineffective()[0].seq;
+    f.report(f64::NAN);
+    f.report(0.0);
+    f.report(0.0);
+    f.k.deny(ask, "no").unwrap();
+    // Near 20, the last reading no check doubts: nothing new.
+    f.report(19.0);
+    f.report(21.0);
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.ineffective());
+}
+
+#[test]
+fn a_packet_cites_no_miss_from_before_the_lever_last_worked() {
+    let _c = clock();
+    let mut f = tomato();
+    for v in [40.0, 42.0, 41.0, 43.0, 40.0] {
+        f.report(v);
+    }
+    f.report(20.0); // crosses: boost runs
+    f.report(0.0); // down 20: suspended
+    let old = f.ineffective()[0].seq;
+    f.k.approve(old, None).unwrap();
+    f.report(10.0); // runs
+    f.report(25.0); // +15: worked
+    assert_eq!(f.expectations().len(), 1, "{:#?}", f.entries());
+    f.report(20.0); // runs
+    f.report(19.0); // no effect: asked again, on what moved since
+    let asks = f.ineffective();
+    assert_eq!(asks.len(), 2, "{:#?}", f.entries());
+    let p = premises(&asks[1]);
+    assert!(!p.contains(&old), "it worked since #{old}: {p:?}");
 }

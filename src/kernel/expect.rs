@@ -87,6 +87,7 @@ impl Kernel {
             if perm.expects.is_none() && perm.revoke_after.is_none() {
                 continue;
             }
+            self.hold_on_faults(venture, &perm.name, &metric);
             let mut memo: Vec<(Seq, Run)> = Vec::new();
             let mut records: Vec<Record> = Vec::new();
             let mut ask: Option<(String, Option<Seq>)> = None;
@@ -263,11 +264,16 @@ impl Kernel {
                         .filter(|q| *q > adopted);
                     ask = Some(match last {
                         None => (why, None),
-                        Some(q) => match index.evidence(venture, &metric, Some(q)) {
-                            Some((was, now)) => (
-                                format!("{why}; {metric} read {was} at ask #{q} and {now} since"),
-                                None,
-                            ),
+                        Some(q) => match index.fresh_evidence(venture, &metric, q) {
+                            Some((was, now, readings)) => {
+                                cites.extend(readings);
+                                (
+                                    format!(
+                                        "{why}; {metric} read {was} at ask #{q} and {now} since"
+                                    ),
+                                    None,
+                                )
+                            }
                             None => (why, Some(q)),
                         },
                     });
@@ -400,19 +406,87 @@ impl Kernel {
                 return;
             };
             let metric = v.mandate.metric_name().to_string();
-            let last = index.last_ineffective(venture, lever);
-            if last.is_some_and(|q| index.is_open(q)) {
+            let Some(last) = index.last_ineffective(venture, lever) else {
+                return;
+            };
+            if index.is_open(last) {
                 return;
             }
-            index.evidence(venture, &metric, last).map(|(was, now)| {
-                format!(
-                    "found ineffective before, at ask #{}; {metric} read {was} then and {now} since",
-                    last.unwrap_or(0)
-                )
+            index
+                .fresh_evidence(venture, &metric, last)
+                .map(|(was, now, readings)| {
+                    (
+                        format!(
+                            "found ineffective before, at ask #{last}; {metric} read {was} then and {now} since"
+                        ),
+                        readings.to_vec(),
+                    )
+                })
+        };
+        if let Some((why, readings)) = found {
+            self.ask_ineffective(venture, lever, why, readings);
+        }
+    }
+
+    /// An ineffective ask that may yet restore `lever`, open or approved,
+    /// rested on a reading a later report found a fault (`impugned`): a
+    /// stuck sensor's first reading is plausible when it comes. A measured
+    /// relapse after the ask holds the lever again, so that ask restores
+    /// nothing, and it is a miss the next packet cites. It cites the ask
+    /// and the reading, never the flagged report, so no reading voids it;
+    /// only a declared approval of a later ask restores the lever.
+    fn hold_on_faults(&mut self, venture: &str, lever: &str, metric: &str) {
+        let found = {
+            let Ok(index) = self.index() else { return };
+            let adopted = index.adoptions().get(venture).map_or(0, |a| a.seq);
+            let Some(q) = index
+                .last_ineffective(venture, lever)
+                .filter(|q| *q > adopted && !index.voided(venture, *q))
+            else {
+                return;
+            };
+            // Held already, by a relapse since or by an answer of no.
+            let relapsed = index.last_suspension(venture, lever) != Some(q);
+            let live = index.is_open(q) || index.restored(venture, lever).is_some();
+            if relapsed || !live {
+                return;
+            }
+            let cites = index.get(q).map(|e| e.record.cites().to_vec());
+            cites.into_iter().flatten().find_map(|s| {
+                let Record::Report {
+                    metric: m,
+                    value: Some(x),
+                    implausible: None,
+                    ..
+                } = &index.get(s)?.record
+                else {
+                    return None;
+                };
+                if m != metric {
+                    return None;
+                }
+                let flag = index.impugned(venture, metric, s)?;
+                Some((q, s, *x, flag))
             })
         };
-        if let Some(why) = found {
-            self.ask_ineffective(venture, lever, why, vec![]);
+        let Some((q, s, x, flag)) = found else { return };
+        let record = Record::Report {
+            claim: Claim::Measured,
+            venture: venture.to_string(),
+            metric: SUSPENSION.to_string(),
+            value: None,
+            note: format!(
+                "ask #{q} about {lever} rested on {metric}={x} at #{s}, which #{flag} found a fault of the sensor; {lever} is suspended again, and that ask restores nothing"
+            ),
+            source: None,
+            confidence: None,
+            cites: vec![q, s],
+            implausible: None,
+            facts: None,
+        };
+        match self.append(record) {
+            Ok(e) => log(&e.line()),
+            Err(e) => log(&format!("{venture}: cannot write relapse: {e}")),
         }
     }
 }
