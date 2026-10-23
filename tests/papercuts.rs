@@ -302,6 +302,48 @@ fn a_report_that_cannot_run_says_it_did_not_run_why_and_the_fix() {
 }
 
 #[test]
+fn a_guard_that_is_not_executable_gets_the_chmod_fix_with_a_clean_path() {
+    use avsmd::kernel::Kernel;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    struct Quiet;
+    impl avsmd::role::Role for Quiet {
+        fn decide(
+            &mut self,
+            _: &avsmd::role::Context,
+            _: &mut dyn FnMut(&avsmd::role::InferRequest) -> Result<String, String>,
+            _: &mut dyn FnMut(&str, &str) -> Result<String, String>,
+        ) -> Result<Vec<avsmd::record::Record>, String> {
+            Ok(vec![])
+        }
+    }
+    let warden = avsmd::warden::LocalWarden::open(&home).unwrap();
+    let mut k = Kernel::with(&home, Box::new(Quiet), Box::new(warden)).unwrap();
+    let dir = venture_with(tmp.path(), "gx", b"#!/bin/sh\necho 3\n", 0o755);
+    let mut mandate = std::fs::read_to_string(dir.join("mandate.yaml")).unwrap();
+    mandate.push_str("guards:\n  - {name: g, run: ./g, above: 5}\n");
+    std::fs::write(dir.join("mandate.yaml"), mandate).unwrap();
+    std::fs::write(dir.join("g"), "#!/bin/sh\necho 0\n").unwrap();
+    std::fs::set_permissions(dir.join("g"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let added = k.add(&dir).unwrap();
+    assert!(added.contains("chmod +x "), "{added}");
+    assert!(!added.contains("/./"), "{added}");
+    k.report("gx", false);
+    let lines: Vec<String> = k.entries().unwrap().iter().map(|e| e.line()).collect();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("guard.g failed"))
+        .unwrap_or_else(|| panic!("{lines:#?}"));
+    let want = format!(
+        "fix: chmod +x {}",
+        dir.canonicalize().unwrap().join("g").display()
+    );
+    assert!(line.contains(&want), "{line}");
+    assert!(!line.contains("/./"), "{line}");
+}
+
+#[test]
 fn a_lever_that_exists_without_the_execute_bit_gets_chmod_not_create() {
     use avsmd::kernel::Kernel;
     let tmp = tempfile::tempdir().unwrap();

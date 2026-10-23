@@ -1043,9 +1043,15 @@ impl LocalWarden {
             return Ok(Box::new(move || {
                 let ran = run_command_raw(&dir, &cmd, ACTION_TIMEOUT);
                 if !ran.ok {
+                    let fix = chmod_fix(&dir, &cmd, &ran)
+                        .map(|f| format!("  fix: {f}"))
+                        .unwrap_or_default();
                     return Ok((
                         None,
-                        format!("{metric} failed: {}", ran.detail(ACTION_TIMEOUT)),
+                        tail(&format!(
+                            "{metric} failed: {}{fix}",
+                            ran.detail(ACTION_TIMEOUT)
+                        )),
                     ));
                 }
                 Ok(match adapter::number_from(&ran.stdout) {
@@ -1629,6 +1635,24 @@ fn read_capped(from: &mut impl Read, cap: usize, into: &mut String) {
 /// Run a shell command in a directory; see `run`. Returns whether it
 /// exited 0 and one line of what happened.
 /// Run a command line with `sh -c` and keep what it printed.
+/// The fix for a command the shell could not run because its program is
+/// there and not executable (exit 126): `chmod +x` on that program, the
+/// same line a report that cannot run gets.
+fn chmod_fix(dir: &Path, command: &str, ran: &Ran) -> Option<String> {
+    if ran.code != Some(126) {
+        return None;
+    }
+    let word = command.split_whitespace().next()?;
+    if !word.contains('/') {
+        return None;
+    }
+    let path = crate::venture::program_path(dir, word);
+    let mode = std::fs::metadata(&path).ok()?.permissions();
+    use std::os::unix::fs::PermissionsExt;
+    (path.is_file() && mode.mode() & 0o111 == 0)
+        .then(|| format!("chmod +x {}", crate::doctor::sh(&path)))
+}
+
 fn run_command_raw(dir: &Path, command: &str, timeout: Duration) -> Ran {
     run(dir, "sh", &["-c", command], "", timeout)
 }

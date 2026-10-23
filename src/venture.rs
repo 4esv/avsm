@@ -75,6 +75,16 @@ pub struct ProgramProblem {
     pub fix: String,
 }
 
+/// The path of a program a command names, relative to the venture's
+/// directory, with no `./` in the middle: `./g` in `/v` is `/v/g`.
+pub fn program_path(dir: &Path, word: &str) -> PathBuf {
+    let mut word = word;
+    while let Some(rest) = word.strip_prefix("./") {
+        word = rest.trim_start_matches('/');
+    }
+    dir.join(word)
+}
+
 /// Does the file start with `#!` and end its first line in a carriage
 /// return? The system then looks for an interpreter named `/bin/sh\r`.
 pub fn crlf_shebang(path: &Path) -> bool {
@@ -131,7 +141,7 @@ pub fn program_problems(dir: &Path, m: &Mandate) -> Vec<ProgramProblem> {
         if !word.contains('/') || word.starts_with('/') {
             continue;
         }
-        let path = dir.join(word);
+        let path = program_path(dir, word);
         if !path.is_file() {
             out.push(ProgramProblem {
                 text: format!(
