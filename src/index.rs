@@ -1297,12 +1297,25 @@ impl Index {
         self.reports.get(venture)?.get(metric).copied()
     }
 
-    /// Is the latest trusted report of any of a venture's metrics flagged
-    /// implausible?
-    pub fn implausible_now(&self, venture: &str) -> bool {
-        self.flagged
+    /// The metrics of a venture whose latest trusted report is flagged
+    /// implausible, each with that report's number.
+    pub fn implausible_now(&self, venture: &str) -> Vec<(String, Seq)> {
+        let mut out: Vec<(String, Seq)> = self
+            .flagged
             .iter()
-            .any(|((v, _), (_, flag))| v == venture && *flag)
+            .filter(|((v, _), (_, flag))| v == venture && *flag)
+            .map(|((_, m), (seq, _))| (m.clone(), *seq))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Is the latest trusted report of this metric flagged implausible?
+    /// None when there is no trusted report of it.
+    pub fn flagged(&self, venture: &str, metric: &str) -> Option<bool> {
+        self.flagged
+            .get(&(venture.to_string(), metric.to_string()))
+            .map(|(_, flag)| *flag)
     }
 
     /// Does a venture have a suspended lever?

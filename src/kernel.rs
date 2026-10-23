@@ -1071,6 +1071,9 @@ impl Kernel {
                     None => "no report yet".to_string(),
                 },
             };
+            if *state == gate::State::Implausible {
+                detail.push_str(&held_implausible(&index, &adopted, &v.name));
+            }
             if let Some(note) = &v.note {
                 detail.push_str(&format!("  [{note}]"));
             }
@@ -5491,6 +5494,46 @@ pub fn load_config(home: &Path) -> Result<Config, Exit> {
         ));
     }
     Config::load(home).map_err(|e| Exit::new(exit::CONFIG, e))
+}
+
+/// What holds a venture implausible, for its status row: each reading
+/// its mandate reads whose latest trusted report is flagged, why, and
+/// what clears it.
+fn held_implausible(index: &Index, adopted: &[gate::Adopted], venture: &str) -> String {
+    let mut out = String::new();
+    for (metric, seq) in gate::implausible_held(index, adopted, venture) {
+        let why = index
+            .get(seq)
+            .and_then(|e| e.record.implausible().map(str::to_string))
+            .unwrap_or_default();
+        let clears = clears_when(&metric, &why);
+        let why = why.split(':').next().unwrap_or_default();
+        out.push_str(&format!(
+            "  (held by {metric} #{seq}, {why}; clears when {clears})"
+        ));
+    }
+    out
+}
+
+/// What clears a reading marked implausible for this why, by the rules
+/// that marked it.
+fn clears_when(metric: &str, why: &str) -> String {
+    if why == "missing" || why == "NaN" || why.ends_with("is not a number a report can mean") {
+        format!("{metric} reads a number again (see avsm tail for why it fails)")
+    } else if why.contains("out of range") {
+        format!("{metric} reads inside its range")
+    } else if why.starts_with("stuck") {
+        format!("{metric} reads a value that differs")
+    } else if why.starts_with("flapping") {
+        format!("{metric} stops swinging past its step")
+    } else if why.starts_with(guards::UNCONFIRMED) {
+        format!("the next {metric} reading agrees with it")
+    } else {
+        format!(
+            "{metric} reads within its step of the last trusted reading, or {} readings in a row agree",
+            guards::AGREE
+        )
+    }
 }
 
 /// The master caution line: which ventures need a human, or that none do.

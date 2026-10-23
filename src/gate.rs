@@ -1365,11 +1365,15 @@ impl Holds {
     }
 
     /// Fold in what a measured, open signal says. Signals that no unit
-    /// maps to a state of their own mean asking.
-    fn signal(&mut self, sig: &Signal) {
+    /// maps to a state of their own mean asking. An implausible ask holds
+    /// the venture implausible only while its metric is not trusted
+    /// again (`flagged`: its latest trusted report is marked, or there is
+    /// none); once it is, the ask is still open and asking.
+    fn signal(&mut self, sig: &Signal, flagged: &dyn Fn(&str) -> bool) {
         match sig {
             Signal::Guard { .. } => self.guarded = true,
-            Signal::Implausible { .. } => self.implausible = true,
+            Signal::Implausible { metric, .. } if flagged(metric) => self.implausible = true,
+            Signal::Implausible { .. } => self.asking = true,
             Signal::Ineffective { .. } => self.ineffective = true,
             Signal::Saturated { .. } => self.saturated = true,
             Signal::Pending { .. }
@@ -1389,6 +1393,33 @@ fn guard_out(mandates: &[Adopted], venture: &str, reading: &dyn Fn(&str) -> Opti
         .filter(|m| m.venture == venture)
         .flat_map(|m| m.mandate.guards.iter())
         .any(|g| reading(&g.metric()).is_some_and(|x| g.breached(x)))
+}
+
+/// The metrics the venture's adopted mandate reads now: its metric, its
+/// guards' and its audits'. None when no mandate of it is adopted.
+fn read_metrics(mandates: &[Adopted], venture: &str) -> Option<BTreeSet<String>> {
+    let mut found = None;
+    for m in mandates.iter().filter(|m| m.venture == venture) {
+        let set = found.get_or_insert_with(BTreeSet::new);
+        set.insert(m.mandate.metric_name().to_string());
+        set.extend(m.mandate.guards.iter().map(|g| g.metric()));
+        set.extend(m.mandate.audits.iter().map(|a| a.metric()));
+    }
+    found
+}
+
+/// The readings that hold a venture implausible: each metric its mandate
+/// reads now whose latest trusted report is flagged, with that report's
+/// number. A metric the mandate no longer reads is never read again, so
+/// its last flagged report could never be followed by a plausible one;
+/// it holds nothing.
+pub fn implausible_held(index: &Index, mandates: &[Adopted], venture: &str) -> Vec<(String, Seq)> {
+    let read = read_metrics(mandates, venture);
+    index
+        .implausible_now(venture)
+        .into_iter()
+        .filter(|(m, _)| read.as_ref().is_none_or(|r| r.contains(m)))
+        .collect()
 }
 
 /// The state of a venture: paused after a declared pause, a stop action
@@ -1417,13 +1448,14 @@ pub fn state_in(index: &Index, mandates: &[Adopted], venture: &str) -> State {
         guarded: guard_out(mandates, venture, &|metric| {
             index.series(venture, metric).last().map(|(_, x)| *x)
         }),
-        implausible: index.implausible_now(venture),
+        implausible: !implausible_held(index, mandates, venture).is_empty(),
         ineffective: index.any_suspended(venture),
         asking: index.open_of(venture).next().is_some(),
         saturated: false,
     };
+    let flagged = |m: &str| index.flagged(venture, m) != Some(false);
     for sig in index.signals_of(venture) {
-        h.signal(sig);
+        h.signal(sig, &flagged);
     }
     h.state()
 }
@@ -3122,10 +3154,13 @@ pub mod reference {
                     _ => None,
                 })
             }),
-            implausible: metrics(ledger, venture).iter().any(|m| {
-                latest_report(ledger, venture, m, false)
-                    .is_some_and(|e| e.record.implausible().is_some())
-            }),
+            implausible: metrics(ledger, venture)
+                .iter()
+                .filter(|m| read_metrics(mandates, venture).is_none_or(|r| r.contains(*m)))
+                .any(|m| {
+                    latest_report(ledger, venture, m, false)
+                        .is_some_and(|e| e.record.implausible().is_some())
+                }),
             ineffective: ledger.iter().any(|e| {
                 matches!(&e.record, Record::Ask {
                     claim: Claim::Measured,
@@ -3151,7 +3186,11 @@ pub mod reference {
                 ..
             }) = ledger.iter().find(|e| e.seq == *q)
             {
-                h.signal(sig);
+                let flagged = |m: &str| {
+                    latest_report(ledger, venture, m, false)
+                        .is_none_or(|e| e.record.implausible().is_some())
+                };
+                h.signal(sig, &flagged);
             }
         }
         h.state()

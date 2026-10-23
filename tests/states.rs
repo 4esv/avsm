@@ -211,6 +211,46 @@ fn the_latest_report_flagged_implausible_is_implausible_until_a_plausible_one() 
 }
 
 #[test]
+fn a_failing_guard_holds_a_venture_implausible_while_its_metric_reads_fine() {
+    let mut fx = Fx::new();
+    fx.report(Claim::Measured, "count", 4.0, false);
+    fx.report(Claim::Measured, "guard.spend", 1.0, true);
+    fx.report(Claim::Measured, "count", 5.0, false);
+    assert_eq!(fx.state(), State::Implausible);
+    let entries = fx.ledger.all().unwrap();
+    let held = gate::implausible_held(&Index::from_entries(&entries), &fx.adopted, V);
+    assert_eq!(
+        held.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(),
+        ["guard.spend"],
+        "the reading that holds it is named"
+    );
+}
+
+#[test]
+fn a_flagged_reading_of_a_metric_the_mandate_no_longer_reads_never_holds_it() {
+    // A guard removed by a re-adoption reads no more: its last flagged
+    // reading can never be followed by a plausible one.
+    let mut fx = Fx::new();
+    fx.report(Claim::Measured, "guard.gone", 1.0, true);
+    fx.report(Claim::Measured, "count", 5.0, false);
+    assert_eq!(fx.state(), State::Running);
+}
+
+#[test]
+fn an_open_implausible_ask_whose_metric_is_trusted_again_is_asking() {
+    let mut fx = Fx::new();
+    fx.report(Claim::Measured, "count", 4000.0, true);
+    fx.signal(Claim::Measured, "doubt", Some(implausible()));
+    assert_eq!(fx.state(), State::Implausible);
+    fx.report(Claim::Measured, "count", 5.0, false);
+    assert_eq!(
+        fx.state(),
+        State::Asking,
+        "the reading is trusted again; the ask is still open"
+    );
+}
+
+#[test]
 fn a_suspended_lever_is_ineffective() {
     let mut fx = Fx::new();
     let q = fx.signal(Claim::Measured, "no effect", Some(ineffective()));
@@ -424,6 +464,14 @@ fn ask(k: &mut Kernel, venture: &str, signal: Signal) {
 }
 
 fn kernel(tmp: &Path) -> Kernel {
+    let mut k = bare(tmp);
+    k.add(&venture(tmp, "tomato")).unwrap();
+    k.add(&venture(tmp, "trader")).unwrap();
+    k
+}
+
+/// A kernel with no venture, whose role says nothing.
+fn bare(tmp: &Path) -> Kernel {
     let home = home(tmp);
     let warden = LocalWarden::open(&home).unwrap();
     struct Quiet;
@@ -437,10 +485,40 @@ fn kernel(tmp: &Path) -> Kernel {
             Ok(vec![])
         }
     }
-    let mut k = Kernel::with(&home, Box::new(Quiet), Box::new(warden)).unwrap();
-    k.add(&venture(tmp, "tomato")).unwrap();
-    k.add(&venture(tmp, "trader")).unwrap();
-    k
+    Kernel::with(&home, Box::new(Quiet), Box::new(warden)).unwrap()
+}
+
+#[test]
+fn status_names_the_reading_that_holds_a_venture_implausible_and_what_clears_it() {
+    // Monkey round 3: a guard whose program is not executable fails every
+    // reading, so the venture stays implausible after its asks are denied
+    // while its metric reads fine. Status must say which reading holds it.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = bare(tmp.path());
+    let dir = tmp.path().join("job");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        "purpose: p\nmetric: shell echo 3\ncontroller: {kind: model}\ncadence: 1h\n\
+         permitted:\n  - {name: water, run: \"echo w\", cap: 3/day, reversible: true}\n\
+         guards:\n  - {name: g, run: ./g, above: 5}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("g"), "#!/bin/sh\necho 0\n").unwrap();
+    k.add(&dir).unwrap();
+    k.report("job", false);
+    for q in gate::open_asks(&k.entries().unwrap()) {
+        k.deny(q, "no").unwrap();
+    }
+    k.report("job", false);
+    let status = k.status().unwrap();
+    let row = status.lines().find(|l| l.starts_with("job ")).unwrap();
+    assert!(row.contains("implausible"), "{status}");
+    assert!(row.contains("held by guard.g #"), "{status}");
+    assert!(
+        row.contains("clears when guard.g reads a number again"),
+        "{status}"
+    );
 }
 
 #[test]
