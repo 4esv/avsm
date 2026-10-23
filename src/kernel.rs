@@ -1515,7 +1515,25 @@ impl Kernel {
             ));
             self.foreign.clear();
         }
-        Ok(entry.line() + "\n")
+        let mut out = entry.line() + "\n";
+        // Resuming is the human's, so it stands; but a guard still past
+        // its bound will pause it again at the next reading.
+        if let (Some(v), Ok(index)) = (self.ventures.get(name), self.index()) {
+            for g in &v.mandate.guards {
+                let Some(&(_, x)) = index.series(name, &g.metric()).last() else {
+                    continue;
+                };
+                if g.breached(x) {
+                    let (above, bound) = g.bound();
+                    out.push_str(&format!(
+                        "warning: guard {} is still past its bound ({x} {} {bound}); the guard will pause it again\n",
+                        g.name,
+                        if above { ">" } else { "<" }
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn entry(&self, seq: Seq) -> Result<Entry, String> {

@@ -614,6 +614,41 @@ fn an_ineffective_venture_with_nothing_to_answer_says_what_restores_it() {
 }
 
 #[test]
+fn resume_while_a_guard_is_past_its_bound_warns_and_still_resumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = bare(tmp.path());
+    let dir = tmp.path().join("disk");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        "purpose: p\nmetric: shell echo 3\ncontroller: {kind: model}\ncadence: 1h\n\
+         permitted:\n  - {name: water, run: \"echo w\", cap: 3/day, reversible: true}\n\
+         guards:\n  - {name: size, run: \"echo 2000000\", above: 1000000}\n",
+    )
+    .unwrap();
+    k.add(&dir).unwrap();
+    k.append(Record::report(
+        Claim::Measured,
+        "disk",
+        "guard.size",
+        Some(2_000_000.0),
+        "",
+    ))
+    .unwrap();
+    k.pause("disk").unwrap();
+    let said = k.resume("disk").unwrap();
+    assert!(said.contains("declared  decision  resumed"), "{said}");
+    assert!(
+        said.contains(
+            "warning: guard size is still past its bound (2000000 > 1000000); the guard will pause it again"
+        ),
+        "{said}"
+    );
+    let status = k.status().unwrap();
+    assert!(!status.contains("disk         paused"), "{status}");
+}
+
+#[test]
 fn a_cap_that_still_binds_shows_in_the_row_whatever_the_state() {
     // Monkey round 3: approving the saturation ask turned the row to
     // asking and hid the cap, which still bound.
