@@ -46,7 +46,7 @@ enum Process {
 }
 
 fn fail(e: exit::Exit) -> ExitCode {
-    eprintln!("avsmd: {}", e.text.trim_end());
+    eprintln!("avsmd: {}", avsmd::protocol::display(e.text.trim_end()));
     ExitCode::from(e.code)
 }
 
@@ -78,9 +78,9 @@ fn main() -> ExitCode {
         Some(Process::Roles) => avsmd::kernel::roles_main().map_err(exit::Exit::from),
         None if cli.test => {
             let found = avsmd::doctor::test(&home);
-            print!("{}", found.out);
+            print!("{}", avsmd::protocol::display(&found.out));
             for p in &found.problems {
-                eprintln!("avsmd: {p}");
+                eprintln!("avsmd: {}", avsmd::protocol::display(p));
             }
             return ExitCode::from(found.code);
         }

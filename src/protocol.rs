@@ -24,9 +24,56 @@ pub struct Response {
     pub text: String,
 }
 
+/// Text as a terminal may safely be shown it: every control character
+/// but the newline and the tab written out (`\x1b`, `\u{9b}`), so a
+/// reading or a note cannot move the cursor, clear the screen, set the
+/// title or type into the shell. The ledger keeps the bytes as they came;
+/// only what is shown is changed.
+pub fn display(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() && c != '\n' && c != '\t' {
+            let n = c as u32;
+            if n < 0x100 {
+                out.push_str(&format!("\\x{n:02x}"));
+            } else {
+                out.push_str(&format!("\\u{{{n:x}}}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The longest socket path this system takes, in bytes: `sun_path` less
+/// the terminating NUL (103 on macOS, 107 on Linux).
+pub fn socket_limit() -> usize {
+    // SAFETY: sockaddr_un is plain data; all zeroes is a valid value.
+    let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_path.len() - 1
+}
+
+/// Say so, with the way out, when a socket path is longer than the system
+/// takes; None when it fits.
+pub fn socket_too_long(sock: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = sock.as_os_str().as_bytes().len();
+    let limit = socket_limit();
+    (len > limit).then(|| {
+        format!(
+            "use a shorter --home or AVSMD_HOME (the socket path is {len} bytes, the limit is {limit}): {}",
+            sock.display()
+        )
+    })
+}
+
 /// Send a command to a running avsmd and wait for the answer. No daemon
 /// is EX_UNAVAILABLE, a socket this user may not open EX_NOPERM.
 pub fn request(sock: &Path, args: &[String]) -> Result<Response, Exit> {
+    if let Some(e) = socket_too_long(sock) {
+        return Err(Exit::new(exit::USAGE, e));
+    }
     let stream = UnixStream::connect(sock).map_err(|e| match e.kind() {
         ErrorKind::NotFound | ErrorKind::ConnectionRefused => Exit::new(
             exit::UNAVAILABLE,
@@ -86,6 +133,9 @@ pub fn alive(sock: &Path) -> bool {
 
 /// Bind the socket, owner-only, replacing a stale one.
 pub fn bind(sock: &Path) -> Result<UnixListener, String> {
+    if let Some(e) = socket_too_long(sock) {
+        return Err(e);
+    }
     if sock.exists() {
         if alive(sock) {
             return Err(format!("avsmd is already running at {}", sock.display()));

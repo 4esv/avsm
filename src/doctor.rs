@@ -267,6 +267,10 @@ fn on_disk(v: &Venture) -> Disk {
 /// is the text on disk. Prints each mandate's teachback. Writes nothing.
 pub fn test(home: &Path) -> Found {
     let mut found = Found::default();
+    if let Some(e) = crate::protocol::socket_too_long(&crate::kernel::socket_path(home)) {
+        found.problems.push(e);
+        found.code = exit::worst(found.code, exit::USAGE);
+    }
     let path = crate::config::path(home);
     match crate::kernel::load_config(home) {
         Ok(_) => found
@@ -305,6 +309,10 @@ pub fn test(home: &Path) -> Found {
             .out
             .push_str(&format!("{name} from {}\n", dir.display()));
         found.out.push_str(&crate::teach::render(&v.mandate));
+        for p in venture::missing_programs(&dir, &v.mandate) {
+            found.problems.push(format!("{name}: {p}"));
+            found.code = exit::worst(found.code, exit::CONFIG);
+        }
         match on_disk(&v) {
             Disk::Same => {}
             Disk::Changed => found.out.push_str(&format!(
@@ -481,7 +489,19 @@ pub fn doctor(
             continue;
         }
         match on_disk(v) {
-            Disk::Same => found.ok(format!("mandate {name} at {}", dir.display())),
+            Disk::Same => {
+                let missing = venture::missing_programs(&dir, &v.mandate);
+                if missing.is_empty() {
+                    found.ok(format!("mandate {name} at {}", dir.display()));
+                }
+                for p in missing {
+                    found.fail(
+                        exit::CONFIG,
+                        format!("{name}: {p}"),
+                        format!("create it in {d}, or fix the path in {d}/mandate.yaml and run: avsm add {d}"),
+                    );
+                }
+            }
             Disk::Changed => found.fail(
                 exit::CONFIG,
                 format!(
@@ -506,7 +526,13 @@ pub fn doctor(
     // The daemon.
     let sock = crate::kernel::socket_path(home);
     let holder = crate::lock::holder(home);
-    if crate::protocol::alive(&sock) {
+    if let Some(e) = crate::protocol::socket_too_long(&sock) {
+        found.fail(
+            exit::USAGE,
+            e,
+            format!("mv {h} ~/.avsmd && avsmd --home ~/.avsmd  # or any home with a short path"),
+        );
+    } else if crate::protocol::alive(&sock) {
         found.ok(format!("avsmd answering at {}", sock.display()));
         // What only the daemon can tell: its warden and roles processes
         // alive, and the ledger taking its writes. A daemon too old to

@@ -50,6 +50,58 @@ impl Venture {
     }
 }
 
+/// The relative programs a mandate runs that are not an executable file in
+/// its directory, one line each. Only a `run:` whose command starts with a
+/// relative path (`./reset`) is checked: a bare word or a shell line is
+/// the shell's to find. Also the venture's `report` file, when it exists
+/// and cannot be executed.
+pub fn missing_programs(dir: &Path, m: &Mandate) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |p: &Path| {
+        std::fs::metadata(p).is_ok_and(|md| md.is_file() && md.permissions().mode() & 0o111 != 0)
+    };
+    let mut runs: Vec<(String, &str)> = Vec::new();
+    for p in &m.permitted {
+        if let Some(r) = &p.run {
+            runs.push((format!("lever {}", p.name), r));
+        }
+    }
+    for g in &m.guards {
+        if let Some(r) = &g.run {
+            runs.push((format!("guard {}", g.name), r));
+        }
+    }
+    for a in &m.audits {
+        if let Some(r) = &a.run {
+            runs.push((format!("audit {}", a.name), r));
+        }
+    }
+    for r in &m.readings {
+        runs.push((format!("reading {}", r.name), &r.run));
+    }
+    let mut out = Vec::new();
+    for (what, run) in runs {
+        let Some(word) = run.split_whitespace().next() else {
+            continue;
+        };
+        if word.contains('/') && !word.starts_with('/') && !executable(&dir.join(word)) {
+            out.push(format!(
+                "{what} runs {word}, which is not an executable file in {}",
+                dir.display()
+            ));
+        }
+    }
+    let report = dir.join("report");
+    if report.is_file() && !executable(&report) {
+        out.push(format!(
+            "report is not executable in {}; chmod +x {}",
+            dir.display(),
+            report.display()
+        ));
+    }
+    out
+}
+
 /// Read and hash a venture directory's mandate: the mandate, the hash of
 /// its text and the text.
 pub fn read_mandate(dir: &Path) -> Result<(Mandate, String, String), String> {

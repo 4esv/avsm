@@ -152,7 +152,7 @@ fn done(result: Result<(), Exit>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("avsm: {}", e.text.trim_end());
+            eprintln!("avsm: {}", avsmd::protocol::display(e.text.trim_end()));
             ExitCode::from(e.code)
         }
     }
@@ -255,7 +255,7 @@ fn approve_edited(sock: &std::path::Path, remote: Option<&str>, number: &str) ->
         edited,
     ];
     let answer = send(&args)?;
-    print!("{}", answer.text);
+    print!("{}", avsmd::protocol::display(&answer.text));
     if answer.ok {
         Ok(())
     } else {
@@ -276,6 +276,21 @@ fn main() -> ExitCode {
     };
     let home = cli.home.unwrap_or_else(avsmd::kernel::default_home);
     let remote = cli.remote;
+    // A mistyped --home is not "avsmd is not running".
+    let needs_home = |remote: &Option<String>| {
+        if remote.is_none() && !home.is_dir() {
+            Err(Exit::new(
+                exit::NOINPUT,
+                format!(
+                    "no home at {}; check --home or AVSMD_HOME, or start avsmd there with: avsmd --home {}",
+                    home.display(),
+                    home.display()
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    };
     let args: Vec<String> = match cli.command {
         Command::Doctor { since, cut } => {
             if remote.is_some() {
@@ -294,7 +309,10 @@ fn main() -> ExitCode {
                         )))
                     }
                 };
-                return done(avsmd::doctor::cut(&home, seq).map(|text| print!("{text}")));
+                return done(
+                    avsmd::doctor::cut(&home, seq)
+                        .map(|text| print!("{}", avsmd::protocol::display(&text))),
+                );
             }
             let since = match since.as_deref().map(avsmd::doctor::parse_anchor) {
                 Some(Err(e)) => return done(Err(Exit::new(exit::USAGE, e))),
@@ -306,7 +324,7 @@ fn main() -> ExitCode {
                 avsmd::kernel::old_home(|v| std::env::var_os(v)).as_deref(),
                 since.as_ref(),
             );
-            print!("{}", found.out);
+            print!("{}", avsmd::protocol::display(&found.out));
             return ExitCode::from(found.code);
         }
         Command::Simulate {
@@ -364,6 +382,9 @@ fn main() -> ExitCode {
             edit: false,
         } => vec!["approve".to_string(), number],
         Command::Approve { number, edit: true } => {
+            if let Err(e) = needs_home(&remote) {
+                return done(Err(e));
+            }
             let sock = avsmd::kernel::socket_path(&home);
             return done(approve_edited(&sock, remote.as_deref(), &number));
         }
@@ -411,13 +432,16 @@ fn main() -> ExitCode {
             v
         }
     };
+    if let Err(e) = needs_home(&remote) {
+        return done(Err(e));
+    }
     let answer = match &remote {
         Some(at) => avsmd::protocol::request_remote(at, &args),
         None => avsmd::protocol::request(&avsmd::kernel::socket_path(&home), &args),
     };
     match answer {
         Ok(answer) if answer.ok => {
-            print!("{}", answer.text);
+            print!("{}", avsmd::protocol::display(&answer.text));
             ExitCode::SUCCESS
         }
         // A no is a diagnostic: it goes to standard error.
