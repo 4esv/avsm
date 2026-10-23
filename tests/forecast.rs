@@ -1477,6 +1477,40 @@ fn a_better_down_metric_rising_while_the_asks_quota_refuses_asks_naming_the_quot
 }
 
 #[test]
+fn runs_dated_in_the_future_do_not_spend_the_cap_a_held_back_ask_names() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("inbox", "unread", INBOX);
+    inbox_days(&mut f, 0..8, |_| {});
+    // A week of the lever's cap, dated after now: a clock that ran ahead.
+    // None of it has happened yet.
+    let ahead = f.now + 3 * DAY;
+    avsmd::clock::set(ahead);
+    for _ in 0..35 {
+        f.k.append(Record::Action {
+            claim: Claim::Measured,
+            venture: "inbox".to_string(),
+            action: "reply".to_string(),
+            proof: avsmd::gate::Proof {
+                venture: "inbox".to_string(),
+                action: "reply".to_string(),
+                steps: vec![],
+            },
+            ok: true,
+            detail: String::new(),
+            payload: None,
+        })
+        .unwrap();
+    }
+    avsmd::clock::set(f.now);
+    f.k.check_capacity("inbox");
+    let asks = capacity_asks(&f);
+    assert_eq!(asks.len(), 1, "{:#?}", f.entries());
+    let q = question(&asks[0]);
+    assert!(q.contains("reply ran 0 of 35: the controller"), "{q}");
+}
+
+#[test]
 fn a_rising_metric_whose_controller_proposes_nothing_names_the_controller_and_asks_once() {
     let _c = clock();
     let mut f = fixture("");

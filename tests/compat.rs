@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use avsmd::kernel::Kernel;
 use avsmd::ledger::Ledger;
-use avsmd::record::{Entry, Record, Verdict};
+use avsmd::record::{Entry, Kind, Record, Verdict};
 
 fn open_copy(tmp: &Path) -> PathBuf {
     let home = tmp.join("home");
@@ -310,4 +310,85 @@ fn doctor_tail_know_and_the_digest_say_a_record_is_dated_in_the_future() {
         .to_string();
     assert!(since.as_str() <= "2026-10-23T06", "{digest}");
     assert!(digest.contains("dated in the future"), "{digest}");
+}
+
+#[test]
+fn the_digest_counts_only_what_is_dated_up_to_now() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = open_copy(tmp.path());
+    let all = Ledger::open_read_only(&home.join("ledger.db"))
+        .unwrap()
+        .all()
+        .unwrap();
+    let mut ahead_asks = 0;
+    let mut ahead_runs = 0;
+    for now in [UPGRADED, UPGRADED - 2 * DAY, UPGRADED - 4 * DAY] {
+        let _clock = avsmd::clock::scoped(now);
+        let kind = |e: &&Entry, k: &[Kind]| k.contains(&e.record.kind());
+        // Since the last digest of the week, else the last day.
+        let digest_seq = all
+            .iter()
+            .rev()
+            .filter(|e| e.at <= now)
+            .find(|e| matches!(&e.record, Record::Report { venture, metric, .. } if venture == "self" && metric == "digest"))
+            .filter(|e| e.at > now - 7 * DAY)
+            .map(|e| e.seq);
+        let day: Vec<&Entry> = all
+            .iter()
+            .filter(|e| e.at <= now)
+            .filter(|e| match digest_seq {
+                Some(d) => e.seq > d,
+                None => e.at > now - DAY,
+            })
+            .collect();
+        let runs = day
+            .iter()
+            .filter(|e| kind(e, &[Kind::Action, Kind::Intent]))
+            .count();
+        let asks = day.iter().filter(|e| kind(e, &[Kind::Ask])).count();
+        let week = || all.iter().filter(|e| e.at > now - 7 * DAY && e.at <= now);
+        let weekly_asks = week().filter(|e| kind(e, &[Kind::Ask])).count();
+        let weekly_incidents = week()
+            .filter(|e| {
+                matches!(
+                    &e.record,
+                    Record::Action { ok: false, .. }
+                        | Record::Outcome { ok: false, .. }
+                        | Record::Escalation { .. }
+                )
+            })
+            .count();
+        ahead_asks += all
+            .iter()
+            .filter(|e| e.at > now && e.at <= now + 7 * DAY && kind(e, &[Kind::Ask]))
+            .count();
+        ahead_runs += all
+            .iter()
+            .filter(|e| e.at > now && e.at <= now + DAY && kind(e, &[Kind::Action, Kind::Intent]))
+            .count();
+        let k = Kernel::open(&home).unwrap();
+        let digest = k.digest().unwrap();
+        assert!(
+            digest.contains(&format!(" {runs} actions, {asks} asks,")),
+            "{runs} actions, {asks} asks at {now}: {digest}"
+        );
+        // Incidents of stops and a broken chain are counted too; those the
+        // plain counts above leave out are no more than what the week holds.
+        let row = digest
+            .lines()
+            .find(|l| l.contains("/week"))
+            .unwrap_or_else(|| panic!("{digest}"));
+        assert!(
+            row.contains(&format!("asks {weekly_asks}/week")),
+            "{weekly_asks} at {now}: {row}"
+        );
+        let incidents: usize = row
+            .split("incidents ")
+            .nth(1)
+            .and_then(|s| s.split('/').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("{row}"));
+        assert!(incidents >= weekly_incidents, "{row}");
+    }
+    assert!(ahead_asks > 0 && ahead_runs > 0, "the ledger reaches ahead");
 }

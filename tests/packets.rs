@@ -515,3 +515,39 @@ fn the_ratchet_discounts_approvals_from_an_approver_who_approved_a_canary() {
         proposal.line()
     );
 }
+
+#[test]
+fn what_a_cap_has_left_does_not_count_runs_dated_in_the_future() {
+    let _c = clock();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut k, _dir, ask) = shop_with_ask(tmp.path(), "");
+    let left = |e: &Entry| {
+        let text = format!("{:?}", packet(e));
+        text.split("cap ")
+            .nth(1)
+            .and_then(|s| s.split(" left after").next())
+            .unwrap_or_else(|| panic!("no cap left in {text}"))
+            .to_string()
+    };
+    assert_eq!(left(&ask), "8");
+    // The run happens two hours ahead of the clock the next ask is written
+    // by: it is not in that ask's window yet.
+    avsmd::clock::set(T0 + 7_200);
+    k.approve(ask.seq, None).unwrap();
+    k.tick();
+    avsmd::clock::set(T0);
+    let ahead = k
+        .entries()
+        .unwrap()
+        .iter()
+        .filter(|e| e.at > T0 && matches!(e.record.kind(), Kind::Action | Kind::Intent))
+        .count();
+    assert!(ahead > 0, "the approved run is dated ahead");
+    k.cycle("shop");
+    let next = asks(&k)
+        .into_iter()
+        .rev()
+        .find(|e| e.record.action() == Some("announce") && e.seq > ask.seq)
+        .expect("a second announce ask");
+    assert_eq!(left(&next), "8", "{:?}", packet(&next));
+}
