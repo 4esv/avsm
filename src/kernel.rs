@@ -97,6 +97,12 @@ pub struct Kernel {
     /// `forecast:` says. The daemon sets it; a simulation and a forecast's
     /// own branches never do, so a forecast never forecasts.
     pub forecasts: bool,
+    /// Forecasts running on threads of their own, each with what its
+    /// records cite and what it is of: written as each comes in.
+    forecasting: Vec<Forecasting>,
+    /// The forecast a command asked for, taken from the head: the socket
+    /// runs it with the kernel free, then writes it (`finish_forecast`).
+    asked: Option<crate::forecast::Prepared>,
     /// Ventures whose metric is in a capacity episode, it drifting from
     /// the target faster than the levers can bring it back, each with the
     /// clean checks in a row since. Asked once an episode.
@@ -176,6 +182,14 @@ impl Drop for Quiet {
     fn drop(&mut self) {
         QUIET.with(|q| q.set(self.0));
     }
+}
+
+/// A forecast running on a thread of its own: where its outcome will
+/// come, what its records will cite, and what it is of, for the log.
+struct Forecasting {
+    coming: std::sync::mpsc::Receiver<Result<crate::forecast::Outcome, String>>,
+    cites: Vec<Seq>,
+    of: String,
 }
 
 /// Where a reading still coming will come from.
@@ -340,6 +354,8 @@ impl Kernel {
             judged: BTreeMap::new(),
             sim: None,
             forecasts: false,
+            forecasting: Vec::new(),
+            asked: None,
             short: BTreeMap::new(),
             capacity_checked: BTreeMap::new(),
             packet_forecasts: RefCell::new(BTreeMap::new()),
@@ -530,12 +546,18 @@ impl Kernel {
             ("doctor", []) => Ok(self.doctor()),
             ("forecast", rest) => {
                 let opts = crate::forecast::Options::parse(rest, self.config.forecast_settings())?;
-                let (outcome, written) = self.forecast(&opts, &[])?;
-                let mut out = outcome.render();
-                for e in &written {
-                    out.push_str(&format!("  {}\n", e.line()));
+                // The daemon takes what the forecast needs and lets the
+                // socket run it with the kernel free (`take_forecast`).
+                if self.apart {
+                    let prepared = {
+                        let index = self.index()?;
+                        crate::forecast::prepare(&index, &self.ledger, &self.home, &opts)?
+                    };
+                    self.asked = Some(prepared);
+                    return Ok(String::new());
                 }
-                Ok(out)
+                let (outcome, written) = self.forecast(&opts, &[])?;
+                Ok(rendered(&outcome, &written))
             }
             ("propose", [venture, lever]) => self.propose(venture, lever, None),
             ("propose", [venture, lever, payload @ ..]) => {
@@ -654,8 +676,10 @@ impl Kernel {
     }
 
     /// When `report` is the venture's first trusted, plausible reading
-    /// since its adoption, forecast it, citing the adoption and the
-    /// report. From the ledger, so a restart neither repeats nor skips it.
+    /// since its mandate was adopted, forecast it, citing the adoption and
+    /// the report. A re-adoption of the same mandate is not a new one: it
+    /// forecasts nothing new. From the ledger, so a restart repeats none;
+    /// one still running on its thread when avsmd stops is not written.
     fn forecast_first_reading(&mut self, v: &Venture, metric: &str, report: Seq) {
         if v.name == SELF || !self.forecasts {
             return;
@@ -665,21 +689,90 @@ impl Kernel {
         };
         let first = {
             let Ok(index) = self.index() else { return };
-            let since: Vec<Seq> = index
-                .series(&v.name, metric)
-                .iter()
-                .map(|(s, _)| *s)
-                .filter(|s| *s > v.adopted)
-                .collect();
-            since == [report]
+            let series = index.series(&v.name, metric);
+            let first = |after: Seq| {
+                let i = series.partition_point(|(s, _)| *s <= after);
+                series.get(i).map(|(s, _)| *s)
+            };
+            // Cheap first: the first since this adoption at all.
+            first(v.adopted) == Some(report)
+                && first(index.unchanged_since(&v.name, v.adopted)) == Some(report)
         };
         if !first {
             return;
         }
         let opts = crate::forecast::Options::new(vec![v.name.clone()], settings);
-        if let Err(e) = self.forecast(&opts, &[v.adopted, report]) {
+        let cites = [v.adopted, report];
+        let done = if self.apart {
+            self.forecast_apart(&opts, &cites, &v.name)
+        } else {
+            self.forecast(&opts, &cites).map(|_| ())
+        };
+        if let Err(e) = done {
             log(&format!("{}: no forecast: {e}", v.name));
         }
+    }
+
+    /// Start a forecast on a thread of its own: what it needs is taken
+    /// from the head now, and its records are written by the tick it
+    /// comes in on (`forecasts_in`), each citing `cites`. The kernel, its
+    /// commands and its guards go on meanwhile.
+    fn forecast_apart(
+        &mut self,
+        opts: &crate::forecast::Options,
+        cites: &[Seq],
+        of: &str,
+    ) -> Result<(), String> {
+        let prepared = {
+            let index = self.index()?;
+            crate::forecast::prepare(&index, &self.ledger, &self.home, opts)?
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(prepared.run());
+        });
+        self.forecasting.push(Forecasting {
+            coming: rx,
+            cites: cites.to_vec(),
+            of: of.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Write each forecast that came in from its thread.
+    fn forecasts_in(&mut self) {
+        let mut still = Vec::new();
+        for f in std::mem::take(&mut self.forecasting) {
+            match f.coming.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => still.push(f),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    log(&format!("{}: no forecast: its thread ended", f.of));
+                }
+                Ok(Err(e)) => log(&format!("{}: no forecast: {e}", f.of)),
+                Ok(Ok(outcome)) => {
+                    if let Err(e) = self.write_forecast(&outcome, &f.cites) {
+                        log(&format!("{}: cannot write the forecast: {e}", f.of));
+                    }
+                }
+            }
+        }
+        self.forecasting.extend(still);
+    }
+
+    /// The forecast a command asked for, to be run with the kernel free.
+    pub fn take_forecast(&mut self) -> Option<crate::forecast::Prepared> {
+        self.asked.take()
+    }
+
+    /// Write the forecast a command asked for, run with the kernel free,
+    /// and say what it found.
+    pub fn finish_forecast(
+        &mut self,
+        ran: Result<crate::forecast::Outcome, String>,
+    ) -> Result<String, String> {
+        let outcome = ran?;
+        let written = self.write_forecast(&outcome, &[])?;
+        Ok(rendered(&outcome, &written))
     }
 
     /// Forecast as `opts` says, and write what it found into the ledger:
@@ -695,6 +788,17 @@ impl Kernel {
             let index = self.index()?;
             crate::forecast::run_in(&index, &self.ledger, &self.home, opts)?
         };
+        let written = self.write_forecast(&outcome, cites)?;
+        Ok((outcome, written))
+    }
+
+    /// Write a forecast's records, each citing `cites`, then the asks its
+    /// walls raise.
+    fn write_forecast(
+        &mut self,
+        outcome: &crate::forecast::Outcome,
+        cites: &[Seq],
+    ) -> Result<Vec<Entry>, String> {
         let mut written = Vec::new();
         let mut seqs: BTreeMap<String, Vec<Seq>> = BTreeMap::new();
         for record in outcome.records(cites) {
@@ -706,14 +810,14 @@ impl Kernel {
         }
         let asks = {
             let index = self.index()?;
-            crate::forecast::asks(&index, &outcome, &seqs)
+            crate::forecast::asks(&index, outcome, &seqs)
         };
         for record in asks {
             let e = self.append(record)?;
             log(&e.line());
             written.push(e);
         }
-        Ok((outcome, written))
+        Ok(written)
     }
 
     /// Check, in code, that the permitted levers can keep the venture's
@@ -1383,6 +1487,7 @@ impl Kernel {
         self.vet();
         self.watch();
         self.settle_inflight();
+        self.forecasts_in();
         // A dead warden cannot check an intent; it is checked once one is
         // back.
         if !self.dead.contains_key("warden") {
@@ -3818,6 +3923,15 @@ fn ripe(index: &Index, venture: &str, lever: &str, n: usize) -> Option<(String, 
 
 /// Was anything in this time-ordered list written on this local date?
 /// Only times within a few days of now can fall on today.
+/// What `avsm forecast` prints: the forecast, then the records written.
+fn rendered(outcome: &crate::forecast::Outcome, written: &[Entry]) -> String {
+    let mut out = outcome.render();
+    for e in written {
+        out.push_str(&format!("  {}\n", e.line()));
+    }
+    out
+}
+
 fn written_on(times: &[i64], today: NaiveDate) -> bool {
     let since = now() - 3 * Cap::DAY.as_secs() as i64;
     times[times.partition_point(|t| *t < since)..]

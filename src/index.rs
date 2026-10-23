@@ -1445,6 +1445,33 @@ impl Index {
         let seqs = self.versions.get(venture)?;
         seqs.binary_search(&adopted).ok().map(|i| i + 1)
     }
+
+    /// The first of the declared adoptions in a row, up to and including
+    /// `adopted`, of the same mandate: a re-adoption of an unchanged
+    /// mandate (a restore) continues the one before it. `adopted` itself
+    /// when the one before differs, or there is none.
+    pub fn unchanged_since(&self, venture: &str, adopted: Seq) -> Seq {
+        let hash = |s: Seq| match self.get(s).map(|e| &e.record) {
+            Some(Record::Decision {
+                verdict: crate::record::Verdict::Adopt { mandate, .. },
+                ..
+            }) => Some(mandate.as_str()),
+            _ => None,
+        };
+        let Some(seqs) = self.versions.get(venture) else {
+            return adopted;
+        };
+        let Ok(mut i) = seqs.binary_search(&adopted) else {
+            return adopted;
+        };
+        let Some(this) = hash(adopted) else {
+            return adopted;
+        };
+        while i > 0 && hash(seqs[i - 1]) == Some(this) {
+            i -= 1;
+        }
+        seqs[i]
+    }
 }
 
 /// The decisions a proof cites.

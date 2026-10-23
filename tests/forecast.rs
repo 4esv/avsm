@@ -1100,6 +1100,34 @@ fn forecasts_at_add_and_as_a_lever() {
 }
 
 #[test]
+fn re_adding_an_unchanged_mandate_forecasts_nothing_new() {
+    let _c = clock();
+    let mut f = fixture("forecast: {days: 1, seeds: 2}\n");
+    f.k.forecasts = true;
+    let dir = f.venture("blog", "posts", BLOG);
+    f.history("blog", &[1.0], HOUR);
+    let forecasts = |f: &Fixture| {
+        f.entries()
+            .iter()
+            .filter(|e| e.record.kind() == Kind::Forecast)
+            .count()
+    };
+    assert_eq!(forecasts(&f), 3);
+    // The same mandate again: a fresh adoption (it restores a suspended
+    // lever), and no fresh forecast on its first reading.
+    f.k.add(&dir).unwrap();
+    f.history("blog", &[2.0], HOUR);
+    assert_eq!(forecasts(&f), 3);
+    // A changed mandate is forecast on its first reading.
+    let text = std::fs::read_to_string(dir.join("mandate.yaml")).unwrap();
+    let text = text.replace("cap: 9/day", "cap: 8/day");
+    std::fs::write(dir.join("mandate.yaml"), text).unwrap();
+    f.k.add(&dir).unwrap();
+    f.history("blog", &[3.0], HOUR);
+    assert_eq!(forecasts(&f), 6);
+}
+
+#[test]
 fn a_ratchet_delegate_ask_cites_the_forecast_of_the_proposed_mandate() {
     let _c = clock();
     let tmp = tempfile::tempdir().unwrap();

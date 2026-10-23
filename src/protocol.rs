@@ -448,6 +448,7 @@ pub fn answer_from<S: Read + Write>(
                 Response { ok: false, text }
             }
             Ok(args) => {
+                let kernel_ref = kernel;
                 let mut kernel = kernel
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -460,9 +461,21 @@ pub fn answer_from<S: Read + Write>(
                     kernel.handle_as(&args, by)
                 };
                 let started = kernel.take_started();
+                let forecast = kernel.take_forecast();
                 let ledger = kernel.home.join("ledger.db");
-                // The kernel is free while the levers it started run.
+                // The kernel is free while the levers it started run, and
+                // while a forecast it was asked for runs.
                 drop(kernel);
+                let handled = match (handled, forecast) {
+                    (Ok(_), Some(prepared)) => {
+                        let ran = prepared.run();
+                        let mut kernel = kernel_ref
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        kernel.finish_forecast(ran)
+                    }
+                    (handled, _) => handled,
+                };
                 match handled {
                     Ok(mut text) => {
                         text.push_str(&outcomes(&ledger, &started));

@@ -643,3 +643,111 @@ fn avsmd_starts_beside_a_venture_it_cannot_read_and_says_so() {
         "{log}"
     );
 }
+
+/// How many readings of `metric` the ledger holds, and how many forecast
+/// records.
+fn counts(home: &Path, metric: &str) -> (usize, usize) {
+    let entries = Ledger::open_read_only(&home.join("ledger.db"))
+        .unwrap()
+        .all()
+        .unwrap();
+    let readings = entries
+        .iter()
+        .filter(|e| matches!(&e.record, Record::Report { metric: m, .. } if m == metric))
+        .count();
+    let forecasts = entries
+        .iter()
+        .filter(|e| matches!(&e.record, Record::Forecast { .. }))
+        .count();
+    (readings, forecasts)
+}
+
+/// While `busy` holds, status is answered within a second each time and
+/// the guard keeps being read. Returns how long `busy` held.
+fn answered_while(tmp: &Path, home: &Path, mut busy: impl FnMut() -> bool) -> Duration {
+    let h = home.to_str().unwrap();
+    let began = Instant::now();
+    let (guards, _) = counts(home, "guard.load");
+    while busy() {
+        assert!(began.elapsed() < Duration::from_secs(120), "never done");
+        let t = Instant::now();
+        let out = avsm(tmp, &["--home", h, "status"]);
+        let took = t.elapsed();
+        assert!(out.status.success(), "{:?}", text(&out));
+        assert!(
+            took < Duration::from_secs(1),
+            "status took {took:?} while a forecast ran"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let held = began.elapsed();
+    if held > Duration::from_secs(3) {
+        let (now, _) = counts(home, "guard.load");
+        assert!(
+            now >= guards + 2,
+            "the guard was read {} times in {held:?} of forecast",
+            now - guards
+        );
+    }
+    held
+}
+
+#[test]
+fn status_answers_and_guards_tick_while_a_forecast_runs() {
+    // Power 3 of #55: every forecast held the kernel for 9-15 s; status
+    // took 9 s and guards did not tick.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        "nightly: never\nforecast: {days: 90, seeds: 6}\n",
+    )
+    .unwrap();
+    let dir = tmp.path().join("watch");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        "purpose: Watch.\nmetric: count\ncontroller: {kind: threshold, above: 1000, action: reset}\n\
+         cadence: 1s\npermitted:\n- {name: reset, run: 'true', cap: 1/day, reversible: true}\n\
+         guards:\n- {name: load, run: ./load, above: 1000, then: ask}\n",
+    )
+    .unwrap();
+    for (name, body) in [("report", "echo 5"), ("load", "echo 1")] {
+        std::fs::write(dir.join(name), format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let sock = avsmd::kernel::socket_path(&home);
+    let h = home.to_str().unwrap();
+    let _d = start(tmp.path(), &["--home", h], &[], &sock);
+    // The forecast at add runs on the first reading, apart.
+    let out = avsm(tmp.path(), &["--home", h, "add", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "{:?}", text(&out));
+    let began = Instant::now();
+    while counts(&home, "guard.load").0 == 0 {
+        assert!(began.elapsed() < Duration::from_secs(30), "no guard read");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let held = answered_while(tmp.path(), &home, || counts(&home, "guard.load").1 < 3);
+    eprintln!("the forecast at add took {held:?}");
+    // And `avsm forecast`, whose client waits for it.
+    let mut client = Command::new(env!("CARGO_BIN_EXE_avsm"))
+        .args(["--home", h, "forecast", "--days", "90", "--seeds", "6"])
+        .env("HOME", tmp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let held = answered_while(tmp.path(), &home, || client.try_wait().unwrap().is_none());
+    eprintln!("avsm forecast took {held:?}");
+    let out = client.wait_with_output().unwrap();
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("forecast over 90 days x 6 seeds"),
+        "{stdout}"
+    );
+    assert_eq!(counts(&home, "guard.load").1, 6, "{stdout}");
+    assert!(held > Duration::from_secs(1), "too quick to show anything");
+}

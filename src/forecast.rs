@@ -587,6 +587,9 @@ struct Shared<'a> {
 /// What a branch came to, venture by venture, or why it failed.
 type Traced = Result<BTreeMap<String, Trace>, String>;
 
+/// Every branch of a forecast, and what each came to, in the same order.
+type Ran = (Vec<Branch>, Vec<BTreeMap<String, Trace>>);
+
 /// What one venture came to in one branch.
 #[derive(Clone, Debug, Default)]
 struct Trace {
@@ -623,6 +626,37 @@ pub fn run_in(
     home: &Path,
     opts: &Options,
 ) -> Result<Outcome, String> {
+    prepare(index, source, home, opts)?.run()
+}
+
+/// A forecast with all it needs taken from the head: a copy of the
+/// index, the ledger forked to a scratch directory, the config. It owns
+/// all of it, so it runs on a thread of its own while the kernel goes on
+/// (Power 3 of #55: a forecast held the kernel for 9-15 s).
+pub struct Prepared {
+    index: Index,
+    opts: Options,
+    names: Vec<String>,
+    variants: Vec<Variant>,
+    mandates: Vec<BTreeMap<String, Mandate>>,
+    step: i64,
+    start: i64,
+    end: i64,
+    scratch: Scratch,
+    head: PathBuf,
+    config: Option<String>,
+    fits: BTreeMap<String, BTreeMap<String, Fit>>,
+}
+
+/// Take from the head what a forecast needs, quickly, under whatever
+/// lock the caller holds: check the options, copy the index, fork the
+/// ledger. The branches run later, in `Prepared::run`.
+pub fn prepare(
+    index: &Index,
+    source: &Ledger,
+    home: &Path,
+    opts: &Options,
+) -> Result<Prepared, String> {
     // The depth guard: whatever path reaches here from inside a branch,
     // a branch never forecasts, so a forecast never recurses.
     if DEPTH.with(std::cell::Cell::get) > 0 {
@@ -738,19 +772,71 @@ pub fn run_in(
     source
         .copy_to(&head)
         .map_err(|e| format!("cannot fork the ledger: {e}"))?;
-    let shared = Shared {
-        head,
-        index,
-        config: std::fs::read_to_string(home.join(config::CONFIG_FILE)).ok(),
+    // What each venture's history says of each metric forecast: how much
+    // of it there is, its hull and its precision.
+    let fits = names
+        .iter()
+        .map(|n| (n.clone(), fits_of(index, n, &mandates[0][n])))
+        .collect();
+    Ok(Prepared {
+        index: index.clone(),
+        opts: opts.clone(),
+        names,
+        variants,
+        mandates,
+        step,
         start,
         end,
-        step,
-        names: &names,
-        variants: &variants,
-        mandates: &mandates,
-    };
+        scratch,
+        head,
+        config: std::fs::read_to_string(home.join(config::CONFIG_FILE)).ok(),
+        fits,
+    })
+}
+
+impl Prepared {
+    /// Run the branches and aggregate them: the slow part, which reads
+    /// nothing of the kernel's.
+    pub fn run(self) -> Result<Outcome, String> {
+        let Prepared {
+            index,
+            opts,
+            names,
+            variants,
+            mandates,
+            step,
+            start,
+            end,
+            scratch,
+            head,
+            config,
+            fits,
+        } = self;
+        let shared = Shared {
+            head,
+            index: &index,
+            config,
+            start,
+            end,
+            step,
+            names: &names,
+            variants: &variants,
+            mandates: &mandates,
+        };
+        let outcome = branches_of(&opts, &shared, &scratch).map(|(branches, paths)| {
+            aggregate(
+                &opts, step, &names, &variants, &mandates, &branches, &paths, &fits,
+            )
+        });
+        drop(scratch);
+        outcome
+    }
+}
+
+/// Run every branch of a forecast, on as many threads as there are cores.
+fn branches_of(opts: &Options, shared: &Shared, scratch: &Scratch) -> Result<Ran, String> {
     let mut branches = Vec::new();
-    for variant in 0..variants.len() {
+    for variant in 0..shared.variants.len() {
         for policy in opts.policies.iter().copied() {
             for i in 0..opts.seeds {
                 branches.push(Branch {
@@ -773,7 +859,7 @@ pub fn run_in(
                 let i = next.fetch_add(1, Ordering::SeqCst);
                 let Some(b) = branches.get(i) else { break };
                 let home = scratch.0.join(format!("branch-{i}"));
-                let r = run_branch(&home, b, &shared);
+                let r = run_branch(&home, b, shared);
                 let _ = std::fs::remove_dir_all(&home);
                 *results[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
             });
@@ -787,10 +873,7 @@ pub fn run_in(
             None => return Err("a forecast branch did not run".to_string()),
         }
     }
-    drop(scratch);
-    Ok(aggregate(
-        opts, step, &names, &variants, &mandates, &branches, &paths,
-    ))
+    Ok((branches, paths))
 }
 
 /// Run one branch in `home`: copy the head, run the kernel over the days,
@@ -979,6 +1062,15 @@ pub fn target(m: &Mandate) -> Option<Direction> {
     })
 }
 
+/// What a venture's history says of one metric a forecast shows.
+#[derive(Clone, Debug, Default)]
+struct Fit {}
+
+/// The fit of each metric of a venture a forecast shows.
+fn fits_of(_index: &Index, _venture: &str, _mandate: &Mandate) -> BTreeMap<String, Fit> {
+    BTreeMap::new()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn aggregate(
     opts: &Options,
@@ -988,6 +1080,7 @@ fn aggregate(
     mandates: &[BTreeMap<String, Mandate>],
     branches: &[Branch],
     paths: &[BTreeMap<String, Trace>],
+    _fits: &BTreeMap<String, BTreeMap<String, Fit>>,
 ) -> Outcome {
     let mut summaries = Vec::new();
     // (variant, venture, policy) -> the paths of its seeds, in seed order.
