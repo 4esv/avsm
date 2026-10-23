@@ -1109,13 +1109,25 @@ fn hang_both(tmp: &Path, home: &Path, d: &Daemon) -> (PathBuf, PathBuf, i32, i32
         hung.join("pid").exists() && slow.join("rpid").exists()
     });
     std::thread::sleep(Duration::from_millis(300));
-    let lever = pid_in(&hung);
-    let report: i32 = std::fs::read_to_string(slow.join("rpid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert!(group_alive(lever) && group_alive(report), "{}", d.log());
+    // Their groups: `$$` names the script, which under dash's `sh -c` is
+    // a child of the group's leader.
+    let group = |pid: i32| avsmd::procs::get(pid).map_or(pid, |p| p.pgid);
+    let lever = group(pid_in(&hung));
+    let report = group(
+        std::fs::read_to_string(slow.join("rpid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+    assert!(
+        group_alive(lever) && group_alive(report),
+        "lever {lever} alive {}, report {report} alive {}\n{}\n{}",
+        group_alive(lever),
+        group_alive(report),
+        left_under(tmp).join("\n"),
+        d.log()
+    );
     (hung, slow, lever, report)
 }
 

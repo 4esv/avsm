@@ -1899,13 +1899,20 @@ mod tests {
         assert!(out.starts_with("killed after 0s"), "{out}");
         let (ok, out) = run_command(tmp.path(), "env", "", Duration::from_secs(5));
         assert!(ok);
-        // Clean but for the time (AVSM_NOW, deliberate: the greenhouse reads it).
-        let avsm: Vec<&str> = out
+        // Clean but for the time (AVSM_NOW, deliberate: the greenhouse reads
+        // it) and the group's mark (AVSM_GROUP, how avsmd knows what a kill
+        // -9 left behind is its own).
+        let mut avsm: Vec<&str> = out
             .split_whitespace()
             .filter(|w| w.starts_with("AVSM"))
             .map(|w| w.split('=').next().unwrap())
             .collect();
-        assert_eq!(avsm, vec!["AVSM_NOW"], "clean environment: {out}");
+        avsm.sort_unstable();
+        assert_eq!(
+            avsm,
+            vec!["AVSM_GROUP", "AVSM_NOW"],
+            "clean environment: {out}"
+        );
     }
 
     #[test]
