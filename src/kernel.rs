@@ -78,8 +78,8 @@ pub struct Kernel {
     handled: BTreeSet<Seq>,
     /// The local date each venture last had its nightly cycle.
     cycled: BTreeMap<String, NaiveDate>,
-    /// The local date the digest was last written.
-    digested: Option<NaiveDate>,
+    /// When the digest was last written, Unix seconds.
+    digested: Option<i64>,
     /// Who is giving the command being handled, when the path it came in
     /// over knows: a Tailscale login. The socket knows nobody.
     by: Option<String>,
@@ -1695,24 +1695,33 @@ impl Kernel {
         self.capacity_checked.insert(name.to_string(), today) != Some(today)
     }
 
-    /// Is the nightly digest due: past the nightly time, with none written
-    /// today?
+    /// Is the nightly digest due: past tonight's nightly time, with none
+    /// written since it? A digest written earlier the same day (at first
+    /// start, or under another nightly time) is the night before's, and
+    /// does not stand for tonight's.
     fn digest_due(&self) -> bool {
         let Ok(Some(at)) = self.config.nightly_minutes() else {
             return false;
         };
         let local = crate::clock::local();
-        if local.hour() * 60 + local.minute() < at {
+        let minutes = local.hour() * 60 + local.minute();
+        if minutes < at {
             return false;
         }
-        let today = local.date_naive();
-        if self.digested == Some(today) {
+        // Tonight's nightly, by the wall clock.
+        let now = now();
+        let since = now - i64::from(minutes - at) * 60 - i64::from(local.second());
+        let after = |t: i64| t >= since && t <= now;
+        if self.digested.is_some_and(after) {
             return false;
         }
         let Ok(index) = self.index() else {
             return false;
         };
-        !written_on(index.digests_at(), today)
+        let times = index.digests_at();
+        !times[times.partition_point(|t| *t < since)..]
+            .iter()
+            .any(|t| after(*t))
     }
 
     /// What happened since the last digest, or over the last day: one
@@ -1733,7 +1742,7 @@ impl Kernel {
                 weekly(index.entries(), now),
             )
         };
-        self.digested = Some(crate::clock::local().date_naive());
+        self.digested = Some(now);
         let entry = self.append(Record::report(Claim::Measured, SELF, "digest", None, &text))?;
         self.append(Record::report(
             Claim::Measured,
