@@ -2153,6 +2153,27 @@ fn a_run_with_too_little_history_for_the_drift_is_not_judged_yet() {
 }
 
 #[test]
+fn a_run_not_judged_for_want_of_history_neither_breaks_nor_ends_a_streak() {
+    let _c = clock();
+    // Two failures bear revoke_after: 2 even with a run between them that
+    // had too little history to be judged: it is neither a hit that
+    // resets the count nor a wait that stops the judging.
+    let mut f = fixture(
+        "delegated: true, revoke_after: 2, expects: up 5 within 1",
+        "test -f ok",
+    );
+    f.report(3.0); // fails
+    std::fs::write(f.dir.join("ok"), "").unwrap();
+    f.report_tomorrow(3.0); // runs, ok
+    f.report(3.0); // its one reading: the same, on no history to judge by
+    assert!(!f.suspended());
+    std::fs::remove_file(f.dir.join("ok")).unwrap();
+    f.report_tomorrow(3.0); // fails
+    assert_eq!(f.intents(), 3);
+    assert!(f.suspended(), "{:#?}", f.entries());
+}
+
+#[test]
 fn a_metric_that_steps_to_a_new_value_and_holds_it_asks_again() {
     let _c = clock();
     // Behind the late sensor, whose readings repeat more often than they
@@ -2195,6 +2216,146 @@ fn an_exact_repeat_on_a_metric_that_seldom_repeats_is_still_no_new_evidence() {
     assert_eq!(f.ineffective().len(), 1, "{:#?}", f.ineffective());
     f.report(4.5);
     assert_eq!(f.ineffective().len(), 2, "two that differ are evidence");
+}
+
+/// A metric that sat at the bottom of its range for a long while and then
+/// climbed 10 an hour; a lever fires above 50, and the run is followed by
+/// readings that repeat the one it fired on.
+fn climbed_from_the_bound() -> Fixture {
+    let mut f = fixture_in(
+        "controller: {kind: threshold, above: 50, action: boost}\ncadence: 1h\nrange: [0, 100]\n",
+        "{name: boost, run: echo boost >> boosts, cap: 6/hour, reversible: true, \
+         delegated: true, expects: up 5 within 1}",
+    );
+    for _ in 0..9 {
+        f.report(0.0);
+    }
+    for x in [10.0, 20.0, 30.0, 40.0, 50.0] {
+        f.report(x);
+    }
+    assert_eq!(f.intents(), 0);
+    f.report(60.0); // crosses: boost runs
+    assert_eq!(f.intents(), 1);
+    f
+}
+
+#[test]
+fn repeats_at_a_bound_of_the_range_say_nothing_of_how_long_the_sensor_holds() {
+    let _c = clock();
+    let mut f = climbed_from_the_bound();
+    let waiting = |f: &Fixture| {
+        let range = Some([0.0, 100.0]);
+        let got =
+            f.k.index()
+                .unwrap()
+                .waiting("raiser", "boost", "count", 1, range);
+        let want =
+            avsmd::gate::reference::waiting(&f.entries(), "raiser", "boost", "count", 1, range);
+        assert_eq!(got, want, "the index and the reference agree");
+        got.is_some()
+    };
+    // Six steps of the climb, none a repeat: two repeats of the run's
+    // reading are likely, three are not. Nine readings at the bottom, eight
+    // of them exact repeats, would have made them likely: they are no
+    // steps of the sensor.
+    f.report(60.0);
+    assert!(waiting(&f), "one repeat: the sensor may still hold it");
+    f.report(60.0);
+    assert!(waiting(&f), "two repeats: it may still");
+    f.report(60.0);
+    assert!(!waiting(&f), "{:#?}", f.entries());
+    assert!(f.suspended(), "{:#?}", f.entries());
+}
+
+#[test]
+fn the_gate_holds_a_lever_on_a_span_of_repeats_by_the_mandates_range() {
+    let _c = clock();
+    let mut f = climbed_from_the_bound();
+    f.report(60.0);
+    f.report(60.0);
+    let held = |f: &Fixture| format!("{:?}", gate_now(f, vec![]));
+    assert!(held(&f).contains("Waiting"), "{}", held(&f));
+    f.report(60.0);
+    assert!(!held(&f).contains("Waiting"), "{}", held(&f));
+}
+
+#[test]
+fn a_repeat_after_an_ask_needs_the_history_of_a_few_steps_to_be_ordinary() {
+    let _c = clock();
+    // Two steps of history say nothing of how often a metric repeats: the
+    // readings after it must differ.
+    let mut f = fixture_in(
+        "controller: {kind: threshold, below: 5, action: boost}\ncadence: 1h\n",
+        "{name: boost, run: echo boost >> boosts, cap: 1/day, reversible: true, delegated: true}",
+    );
+    f.report(5.0);
+    f.report(5.0);
+    f.report(5.0);
+    let since = f.entries().last().unwrap().seq;
+    f.report(20.0);
+    f.report(20.0);
+    let found = |f: &Fixture| {
+        f.k.index()
+            .unwrap()
+            .fresh_evidence("raiser", "count", since, None)
+    };
+    assert_eq!(found(&f), None, "{:#?}", f.entries());
+    f.report(30.0);
+    assert!(found(&f).is_some());
+}
+
+#[test]
+fn a_repeat_at_a_bound_of_the_range_is_no_step_of_a_metric_that_seldom_repeats() {
+    let _c = clock();
+    // The metric sat at a bound of its range and then climbed: but for the
+    // bound it never repeats, so a repeat after an ask is a stuck
+    // sensor's signature and the two readings must differ.
+    for (start, climb) in [(0.0, [10.0, 20.0, 30.0]), (100.0, [90.0, 80.0, 70.0])] {
+        avsmd::clock::set(T0);
+        let mut f = fixture_in(
+            "controller: {kind: threshold, below: -1, action: boost}\ncadence: 1h\nrange: [0, 100]\n",
+            "{name: boost, run: echo boost >> boosts, cap: 1/day, reversible: true, delegated: true}",
+        );
+        for _ in 0..9 {
+            f.report(start);
+        }
+        for x in climb {
+            f.report(x);
+        }
+        let since = f.entries().last().unwrap().seq;
+        f.report(55.0);
+        f.report(55.0);
+        let range = Some([0.0, 100.0]);
+        let found = |f: &Fixture| {
+            f.k.index()
+                .unwrap()
+                .fresh_evidence("raiser", "count", since, range)
+        };
+        assert_eq!(found(&f), None, "{start}: {:#?}", f.entries());
+        f.report(60.0);
+        assert!(found(&f).is_some(), "{start}");
+    }
+}
+
+#[test]
+fn an_adoption_that_is_not_declared_answers_no_ineffective_ask() {
+    let _c = clock();
+    let (mut f, ask) = suspended();
+    f.k.append(Record::Decision {
+        claim: Claim::Measured,
+        venture: "raiser".to_string(),
+        verdict: Verdict::Adopt {
+            mandate: "abc".to_string(),
+            path: "/x".to_string(),
+            text: None,
+        },
+        by: None,
+    })
+    .unwrap();
+    // Only a human's adoption ends the suspension the ask is about, in the
+    // index and the reference alike.
+    assert!(f.k.index().unwrap().is_open(ask), "{:#?}", f.entries());
+    assert!(avsmd::gate::reference::open_asks(&f.entries()).contains(&ask));
 }
 
 #[test]
