@@ -430,6 +430,51 @@ fn why_on_a_record_the_alarm_named_says_avsmd_did_not_write_it() {
     assert!(text.contains(&format!("avsm why {alarm}")), "{text}");
 }
 
+/// Monkey round 3: the digest of a venture whose mandate cannot be read
+/// showed a blank metric and "no report". It names the metric of the
+/// last adopted mandate in the ledger, and its reading.
+#[test]
+fn the_digest_of_a_venture_whose_mandate_cannot_be_read_names_its_last_adopted_metric() {
+    use avsmd::record::Verdict;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let mandate = "purpose: p\nmetric: count\ncontroller: {kind: model}\ncadence: 1h\n\
+                   permitted:\n  - {name: water, run: ./water, cap: 3/day, reversible: true}\n";
+    {
+        let mut kernel = Kernel::open(&home).unwrap();
+        // Adopted text that does not match its hash: the venture cannot run.
+        kernel
+            .append(Record::Decision {
+                claim: Claim::Declared,
+                venture: "broken".to_string(),
+                verdict: Verdict::Adopt {
+                    mandate: "0000".to_string(),
+                    path: tmp.path().join("broken").to_string_lossy().into_owned(),
+                    text: Some(mandate.to_string()),
+                },
+                by: None,
+            })
+            .unwrap();
+        kernel
+            .append(Record::report(
+                Claim::Measured,
+                "broken",
+                "count",
+                Some(4.0),
+                "",
+            ))
+            .unwrap();
+    }
+    let kernel = Kernel::open(&home).unwrap();
+    let digest = kernel.digest().unwrap();
+    let line = digest
+        .lines()
+        .find(|l| l.starts_with("broken"))
+        .unwrap_or_else(|| panic!("{digest}"));
+    assert!(line.contains("count=4"), "{digest}");
+    assert!(!line.contains("no report"), "{digest}");
+}
+
 /// The README walkthrough: add examples/counter, watch the count cross the
 /// threshold, read the proof. The count is seeded at 10 so it crosses on
 /// the first report.

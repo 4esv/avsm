@@ -4041,6 +4041,24 @@ const PRECISION_SEEN: usize = 50;
 /// The most decimal places a digest delta shows.
 const PRECISION_MAX: usize = 6;
 
+/// The metric of the latest declared adoption of a venture whose text
+/// parses, whatever its hash: what to name when the mandate in force
+/// cannot be read.
+fn last_adopted_metric(index: &Index, venture: &str) -> Option<String> {
+    index.of(venture).rev().find_map(|e| match &e.record {
+        Record::Decision {
+            claim: Claim::Declared,
+            verdict: Verdict::Adopt {
+                text: Some(text), ..
+            },
+            ..
+        } => crate::mandate::Mandate::parse(text)
+            .ok()
+            .map(|m| m.metric_name().to_string()),
+        _ => None,
+    })
+}
+
 /// The digest text: since the last digest when there is one this week,
 /// else the last day.
 fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) -> String {
@@ -4101,11 +4119,21 @@ fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) ->
         ));
     }
     let mut names: Vec<&String> = ventures.keys().filter(|n| *n != SELF).collect();
-    names.push(&ventures[SELF].name);
+    if let Some(me) = ventures.get(SELF) {
+        names.push(&me.name);
+    }
     let (asks_week, incidents_week) = weekly(entries.iter().copied(), now);
     for name in names.into_iter().filter(|n| ventures.contains_key(*n)) {
         let v = &ventures[name];
-        let metric = v.mandate.metric_name();
+        // A mandate that cannot be read names no metric: the last adopted
+        // mandate in the ledger that parses does.
+        let last_adopted = v
+            .problem
+            .as_ref()
+            .and_then(|_| last_adopted_metric(index, name));
+        let metric = last_adopted
+            .as_deref()
+            .unwrap_or_else(|| v.mandate.metric_name());
         let reading = |e: &&Entry| -> Option<f64> {
             match &e.record {
                 Record::Report {
