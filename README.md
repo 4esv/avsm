@@ -29,7 +29,11 @@ Or from source:
 Two binaries: `avsmd`, the daemon, and `avsm`, which gives it commands. No
 public listener: avsmd answers over a Unix socket in its home,
 `~/Library/Application Support/avsmd` on macOS and `$XDG_STATE_HOME/avsmd`
-(`~/.local/state/avsmd`) on Linux, or `$AVSMD_HOME`, or `--home`.
+(`~/.local/state/avsmd`) on Linux, or `$AVSMD_HOME`, or `--home`. A Unix socket
+path is limited by the system, 103 bytes on macOS and 107 on Linux, and the
+socket is `sock` in the home, so keep the home short: a longer one fails with
+`use a shorter --home or AVSMD_HOME`, and `avsmd -t` and `avsm doctor` say so
+before then.
 
 ## Add a venture
 
@@ -90,7 +94,9 @@ A lever may take content: `takes: text`, `json`, `diff` or `file`. A model can
 then propose the text of an announcement or the diff of a change, and what it
 wrote waits for you. `avsm asks` shows it under the question, `avsm approve
 <number> --edit` opens it in your editor so what you save is what runs, and
-`avsm propose <venture> <lever> <content>` files a proposal of your own. Content
+`avsm propose <venture> <lever> <content>` files a proposal of your own. The
+editor is `$VISUAL` when it is set, else `$EDITOR`, else `vi`; it needs a
+terminal, so with a terminal editor and no terminal `--edit` waits for nothing. Content
 a model produced runs only after a human approves it, unless the mandate
 delegates the lever.
 
@@ -178,8 +184,33 @@ controller: {kind: band, low: 19, high: 24, below: heat, above: cool}
 
 Below `low` it runs `below`, above `high` it runs `above`, and in between it
 runs neither. Each side acts as a threshold does, with the band's `deadband`
-and `hold`; the deadband must be less than the band is wide. A lever below the
-band that expects anything expects up, one above it down.
+and `hold`; the deadband must be less than the band is wide. A lever for the
+low side may only declare `expects: up ... within ...` and one for the high side
+`expects: down ...` (see Expecting an effect, below); `expects` always carries
+`within`, so `expects: up` alone is refused.
+
+### Expecting an effect
+
+A lever may say what a run should do to the metric:
+
+```yaml
+permitted:
+  - {name: water, run: ./water, cap: 4/day, reversible: true, expects: up 5 within 3}
+  - {name: vent, run: ./vent, cap: 4/day, reversible: true, expects: down within 2}
+```
+
+The syntax is `up` or `down`, then optionally a size (a number above 0), then
+`within` and a count: `up 5 within 3`, `down within 2`. `within` counts
+reports: the trusted, plausible readings of the metric that follow the run's
+successful outcome, not minutes or runs. The count-th such report is compared
+with the last reading before the run, net of what the metric was doing anyway,
+and avsm writes whether the run did what was expected; until then the verdict
+is waiting. Without a size, any move the right way beyond the metric's own
+noise is enough; with one, a move far off it is the wrong size. With
+`revoke_after: n` on a delegated lever, n misses in a row suspend the
+delegation until you approve the ask it raises. A lever with `expects` also
+gives the forecast and the capacity check an effect to start from before it
+has run enough to be measured.
 
 ### World models
 
@@ -203,6 +234,9 @@ takes its reply as a proposal, a question for you, or nothing. Backends are
 named in `config.yaml` in the home; any API in the Anthropic or OpenAI style works,
 and so does a local command, so a classifier you trained yourself fits:
 
+`nightly:` is the local time of the machine avsmd runs on, as `HH:MM`, or
+`never`; a change of daylight saving time moves it with the clock.
+
 ```yaml
 nightly: "03:00"
 default: anthropic
@@ -223,6 +257,10 @@ tailnet port; `adapters:` says where `stripe` and `github` reach, each
 `{url: ...}`, and how `mail.send` sends, `mail: {command: "sendmail -t -i",
 from: you@example.com}`; an `anthropic` backend also takes `url` and `effort`
 (`low` to `max`), and a `command` backend `offbox`.
+A decision packet's forecast is 7 days by 8 seeds until `forecast:` says
+otherwise. avsmd reads `config.yaml` once, at start: after an edit, restart it,
+and `avsm add` says `config.yaml changed on disk; restart avsmd to apply it`
+while the file and the daemon differ.
 
 Keys go in `keys` in the home, one `name=value` per line, readable by you alone.
 Only the warden, the one process avsmd starts that may act, ever reads them; the
@@ -305,7 +343,11 @@ A ledger that cannot be written stops everything that would write to it:
 `avsm doctor` changes nothing. Each check it fails prints the command that
 fixes it, and it exits with the worst code it found. Both binaries exit as
 sysexits.h says: 64 for bad usage, 65 for input avsmd refused, 69 when no
-avsmd is running, 78 for a config or mandate that does not hold. `avsm doctor`
+avsmd is running, 78 for a config or mandate that does not hold. The 78 comes
+from `avsmd`, `avsmd -t` and `avsm doctor`, which read the files themselves; a
+mandate that `avsm add` is refused by the running avsmd is input it refused,
+so `avsm add` exits 65 for it, and so does `avsm propose` for a proposal the
+gate refuses and `avsm tail 0`. `avsm doctor`
 exits 0 when every check passes, and otherwise with the worst code it found, in
 this order: 65 a ledger that is not a database or whose chain is broken, 78 a
 config or mandate that does not hold, 77 a permission missing, 73 a home that
