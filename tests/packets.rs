@@ -94,8 +94,7 @@ fn kernel(tmp: &Path, config: &str, role: Box<dyn Role + Send>) -> Kernel {
 }
 
 const SHOP: &str = "purpose: Sell more.\nmetric: orders\ncontroller: {kind: model}\ncadence: 1h\n\
-permitted:\n- {name: announce, run: \"cat >> announced\", cap: 9/day, reversible: true, takes: text}\n\
-- {name: canary, run: \"touch canary-ran\", cap: 9/day, reversible: true}\n";
+permitted:\n- {name: announce, run: \"cat >> announced\", cap: 9/day, reversible: true, takes: text}\n";
 
 fn asks(k: &Kernel) -> Vec<Entry> {
     k.entries()
@@ -357,8 +356,9 @@ fn a_canary_ask_can_never_run_even_when_approved() {
                 && e.record.action() == Some("canary")),
         "an action or intent for the canary"
     );
-    // The gate says no on its own rule, even though the mandate permits
-    // the lever and a declared decision approved it.
+    // The gate says no on its own rule, though a declared decision
+    // approved it. (A mandate can no longer name the lever at all, so
+    // this holds for a ledger that still has one from before.)
     let decision = entries
         .iter()
         .find(|e| matches!(&e.record, Record::Decision { verdict: Verdict::Approve { ask, .. }, .. } if *ask == c.seq))

@@ -601,7 +601,9 @@ fn display_escapes_what_a_terminal_would_act_on_and_nothing_else() {
     assert_eq!(display("\u{1b}[2J"), "\\x1b[2J");
     assert_eq!(display("\u{7}\u{0}\r"), "\\x07\\x00\\x0d");
     assert_eq!(display("\u{9b}31m"), "\\x9b31m");
-    assert_eq!(display("\u{2028}"), "\u{2028}");
+    // Invisible formatting characters are written out, bidi controls too.
+    assert_eq!(display("\u{2028}"), "\\u{2028}");
+    assert_eq!(display("a\u{202e}b"), "a\\u{202e}b");
 }
 
 #[test]

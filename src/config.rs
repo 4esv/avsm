@@ -95,12 +95,15 @@ impl Config {
     /// the defaults of `forecast:` and `canary_asks:` written out where
     /// config.yaml leaves them out.
     pub fn show(&self) -> Result<String, String> {
-        let mut shown = self.clone();
-        let set = shown.forecast.is_some();
-        shown.forecast = Some(self.forecast_settings());
-        let mut text = serde_yaml::to_string(&shown).map_err(|e| e.to_string())?;
-        if !set {
-            text.push_str("# forecast: the default; a decision packet looks 7 days by 8 seeds until forecast: is set\n");
+        let mut text = serde_yaml::to_string(self).map_err(|e| e.to_string())?;
+        // NOTE: a comment, not a setting: written as one it would change
+        // what a decision packet forecasts (7 days by 8 seeds when unset).
+        if self.forecast.is_none() {
+            let f = self.forecast_settings();
+            text.push_str(&format!(
+                "# forecast: {{days: {}, seeds: {}}} is the default, for forecasts at add and before a ratchet ask; a decision packet looks 7 days by 8 seeds until forecast: is set\n",
+                f.days, f.seeds
+            ));
         }
         if self.canary_asks.is_none() {
             text.push_str(

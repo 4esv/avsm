@@ -266,7 +266,7 @@ backends:
 
 Other keys in `config.yaml`, each optional (`avsmd -T` prints them all as
 they stand): `ratchet: 5` is the approvals of one lever that make `self` propose
-delegating it, 0 for never; `forecast: {days: 30, seeds: 16}` (the default, which `avsmd -T` prints when you leave it out, as it prints `canary_asks: null` for off) is how far and how
+delegating it, 0 for never; `forecast: {days: 30, seeds: 16}` (the default, which `avsmd -T` prints as a comment when you leave it out, and `canary_asks: null` for off) is how far and how
 wide the forecasts at add, before a ratchet ask and in a decision packet look,
 and `seeds: 0` turns them off; `canary_asks: {every: 20}` writes a canary ask
 after that many asks, and is off when absent; `port: 2876` is the

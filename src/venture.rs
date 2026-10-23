@@ -250,11 +250,11 @@ pub fn dir_problem(path: &Path) -> Option<DirProblem> {
 /// its text and the text.
 pub fn read_mandate(dir: &Path) -> Result<(Mandate, String, String), String> {
     let path = dir.join(MANDATE_FILE);
-    let text = std::fs::read_to_string(&path).map_err(|e| {
-        dir_problem(dir).map_or_else(
-            || format!("cannot read {}: {}", path.display(), plain(&e)),
-            |p| p.text().to_string(),
-        )
+    let text = std::fs::read_to_string(&path).map_err(|e| match dir_problem(dir) {
+        Some(p @ DirProblem::Wrong(_)) if dir.is_file() || dir.join("mandate.yml").exists() => {
+            p.text().to_string()
+        }
+        _ => format!("cannot read {}: {}", path.display(), plain(&e)),
     })?;
     let mandate = Mandate::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let hash = Mandate::hash(&text);

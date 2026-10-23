@@ -486,8 +486,12 @@ fn avsmd_dash_capital_t_prints_the_forecast_and_canary_defaults() {
     };
     let out = show("nightly: never\n");
     assert!(
-        out.contains("forecast:\n  days: 30\n  seeds: 16\n"),
+        out.contains("# forecast: {days: 30, seeds: 16} is the default"),
         "{out}"
+    );
+    assert!(
+        !out.contains("\nforecast:"),
+        "a default is a comment: {out}"
     );
     assert!(out.contains("canary_asks: null"), "{out}");
     let out = show("forecast: {days: 3, seeds: 4}\ncanary_asks: {every: 7}\n");
