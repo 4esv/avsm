@@ -331,7 +331,18 @@ impl Ledger {
                 entry.record.canonical()
             ],
         )?;
+        // Told before it commits: a warden killed once it has committed
+        // has already told the daemon, which never takes the record for
+        // another writer's (#52). A note of a record that never commits
+        // matches no record.
+        if noted.is_some() {
+            crate::groups::note_record(entry.seq, &entry.hash);
+        }
         tx.commit()?;
+        #[cfg(debug_assertions)]
+        if crate::groups::noting() && entry.record.kind() == crate::record::Kind::Outcome {
+            hold_for_test();
+        }
         self.seen = Some((seq, entry.hash.clone()));
         if let Some(noted) = noted.as_mut() {
             noted.push((entry.seq, entry.hash.clone()));
@@ -572,6 +583,28 @@ fn in_wal_mode(path: &Path) -> bool {
 /// Unix seconds now. Before 1970 the clock reads negative, as it should.
 fn now() -> i64 {
     crate::clock::now()
+}
+
+/// A test hook, in debug builds only: with `AVSMD_TEST_HOLD_OUTCOME`
+/// naming a file that does not exist yet, the first outcome a tracking
+/// process commits creates it and the append holds there for good, its
+/// note to the process's own count not yet made, so a test can kill the
+/// warden at that moment.
+#[cfg(debug_assertions)]
+fn hold_for_test() {
+    let Some(path) = std::env::var_os("AVSMD_TEST_HOLD_OUTCOME") else {
+        return;
+    };
+    let fresh = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .is_ok();
+    if fresh {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
 }
 
 /// SQLite integers are signed; sequence numbers and counts are not.

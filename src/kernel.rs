@@ -176,8 +176,17 @@ impl Drop for Quiet {
     }
 }
 
-/// Where a reading from a `report` program running apart will come.
-type Coming = std::sync::mpsc::Receiver<(Option<f64>, String)>;
+/// Where a reading still coming will come from.
+enum Coming {
+    /// A `report` program running on a thread: where its reading will
+    /// come, and the flag that stops it.
+    Report(
+        std::sync::mpsc::Receiver<(Option<f64>, String)>,
+        Arc<AtomicBool>,
+    ),
+    /// An adapter the warden is still reading: asked again each tick.
+    Warden,
+}
 
 /// What the kernel knows about a venture beyond the ledger.
 #[derive(Default)]
@@ -195,6 +204,9 @@ struct Runtime {
     /// A `report` program running apart: since when, and where its
     /// reading will come.
     measuring: Option<(Instant, Coming)>,
+    /// A reading the pause stopped: none starts again until the venture
+    /// is resumed, or a hung one would start anew each cadence.
+    held: bool,
 }
 
 /// Unix seconds now.
@@ -1369,13 +1381,17 @@ impl Kernel {
             self.supervise(name, paused);
             if paused {
                 self.cancel_inflight(name);
+                self.stop_reading(name);
+            } else if let Some(rt) = self.runtime.get_mut(name) {
+                rt.held = false;
             }
             // A reading still coming, or a lever still running, holds this
             // venture's next report; it holds no other venture's.
             if self.reading_in(name, halted) || self.busy(name) {
                 continue;
             }
-            let due = self.runtime.entry(name.clone()).or_default().next_report <= now;
+            let rt = self.runtime.entry(name.clone()).or_default();
+            let due = rt.next_report <= now && !rt.held;
             if due && self.ventures[name].problem.is_none() {
                 self.report(name, halted);
             }
@@ -1699,6 +1715,12 @@ impl Kernel {
         if let Some(child) = rt.run.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    // What it started and left behind in its group goes
+                    // with it: a run started again starts afresh.
+                    // SAFETY: kill has no memory preconditions.
+                    unsafe {
+                        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                    }
                     rt.run = None;
                     let again = match v.mandate.restart {
                         Restart::Always => true,
@@ -1797,7 +1819,15 @@ impl Kernel {
             }
         }
         let (value, note) = match self.measure(&v) {
-            Some(m) => m,
+            Some(Err(e)) if self.apart && warden::pending(&e) => {
+                // The warden reads it apart: the reading comes in a later
+                // tick, and holds this venture's report till then.
+                self.runtime.entry(name.to_string()).or_default().measuring =
+                    Some((Instant::now(), Coming::Warden));
+                return;
+            }
+            Some(Err(e)) => (None, format!("cannot measure: {e}")),
+            Some(Ok(m)) => m,
             None => return,
         };
         self.reported(&v, halted, value, note);
@@ -1955,13 +1985,13 @@ impl Kernel {
     /// Read a venture's metric: through the warden when it names an
     /// adapter, else by running its `report` and taking the last line.
     /// The built-in self venture measures itself.
-    fn measure(&mut self, v: &Venture) -> Option<(Option<f64>, String)> {
+    fn measure(&mut self, v: &Venture) -> Option<Result<(Option<f64>, String), String>> {
         if v.name == SELF && v.path.is_none() {
-            return Some(crate::selfventure::measure(
+            return Some(Ok(crate::selfventure::measure(
                 &self.ledger,
                 &mut self.checked,
                 now(),
-            ));
+            )));
         }
         if let (Some(sim), Some(dir)) = (self.sim.clone(), v.path.as_deref()) {
             let simulated = {
@@ -1969,18 +1999,15 @@ impl Kernel {
                 sim.measure(&index, &v.name, &v.mandate, dir)
             };
             if simulated.is_some() {
-                return simulated;
+                return simulated.map(Ok);
             }
         }
         if v.mandate.metric_adapter().is_some() {
-            return Some(match self.warden.measure(&v.name) {
-                Ok(measured) => measured,
-                Err(e) => (None, format!("cannot measure: {e}")),
-            });
+            return Some(self.warden.measure(&v.name));
         }
         let dir = v.path.clone()?;
         let report = v.report()?;
-        Some(read_report(&dir, &report))
+        Some(Ok(read_report(&dir, &report)))
     }
 
     /// Start reading a venture's `report` program on a thread of its own,
@@ -1996,10 +2023,42 @@ impl Kernel {
         let dir = v.path.clone()?;
         let report = v.report()?;
         let (tx, rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let name = v.name.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(read_report(&dir, &report));
+            let read = crate::groups::within(&name, stopping, || read_report(&dir, &report));
+            let _ = tx.send(read);
         });
-        Some(rx)
+        Some(Coming::Report(rx, stop))
+    }
+
+    /// A paused venture's reading still coming is stopped: its `report`
+    /// program is signalled, then killed, and what the warden still reads
+    /// for it is cancelled there. Nothing of it is written.
+    fn stop_reading(&mut self, name: &str) {
+        if let Some(rt) = self.runtime.get_mut(name) {
+            if let Some((_, coming)) = rt.measuring.take() {
+                if let Coming::Report(_, stop) = coming {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                log(&format!("{name}: paused; stopping its report"));
+                rt.held = true;
+            }
+        }
+        let busy = self.warden.groups().iter().any(|(_, v)| v == name);
+        if busy {
+            // With no lever of its running, what the warden runs for it
+            // is a read.
+            if !self.busy(name) {
+                self.runtime.entry(name.to_string()).or_default().held = true;
+            }
+            if let Err(e) = self.warden.cancel(name) {
+                log(&format!(
+                    "{name}: paused, and cannot stop what the warden runs for it: {e}"
+                ));
+            }
+        }
     }
 
     /// Take a reading that came in from a `report` program running apart,
@@ -2010,7 +2069,15 @@ impl Kernel {
         };
         let got = match &rt.measuring {
             None => return false,
-            Some((_, coming)) => coming.try_recv(),
+            Some((_, Coming::Report(coming, _))) => coming.try_recv(),
+            Some((_, Coming::Warden)) => match self.warden.measure(name) {
+                Err(e) if warden::pending(&e) => return true,
+                Err(e) => Ok((None, format!("cannot measure: {e}"))),
+                Ok(m) => Ok(m),
+            },
+        };
+        let Some(rt) = self.runtime.get_mut(name) else {
+            return false;
         };
         match got {
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
@@ -2135,6 +2202,19 @@ impl Kernel {
                     },
                 );
                 if which == "warden" {
+                    // What it started outlives it, and their timers died
+                    // with it: each group it told of is ended here, SIGTERM
+                    // then SIGKILL after the grace, on a thread of its own.
+                    let groups: Vec<i32> =
+                        self.warden.groups().into_iter().map(|(g, _)| g).collect();
+                    if !groups.is_empty() {
+                        log(&format!(
+                            "ending {} process {} the dead warden started",
+                            groups.len(),
+                            if groups.len() == 1 { "group" } else { "groups" }
+                        ));
+                    }
+                    crate::groups::end_apart(groups, warden::DRAIN_GRACE);
                     // Its runs died with it: each intent is settled the
                     // way a restart settles one, never run again blindly.
                     for (s, f) in std::mem::take(&mut self.inflight) {
@@ -3440,6 +3520,10 @@ impl Drop for Kernel {
 
 fn kill(rt: &mut Runtime) {
     if let Some(mut child) = rt.run.take() {
+        // SAFETY: kill has no memory preconditions; the run leads a group.
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -3566,6 +3650,11 @@ fn spawn_run(home: &Path, name: &str, path: &Path, confine: bool) -> Result<Chil
             cmd.pre_exec(unshare_network);
         }
     }
+    // A group of its own, so a stop or a pause reaches what it started.
+    cmd.process_group(0);
+    let _spawning = crate::groups::SPAWNING
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
     cmd.spawn()
         .map_err(|e| format!("cannot run {}: {e}", path.display()))
 }
@@ -4122,6 +4211,10 @@ pub struct Process {
     home: PathBuf,
     what: String,
     drop: bool,
+    /// What the warden tells the daemon on a channel of its own: the
+    /// records it appends and the process groups it starts. Kept across
+    /// respawns.
+    notes: Option<crate::groups::Notes>,
 }
 
 impl Process {
@@ -4133,8 +4226,33 @@ impl Process {
         Process::spawn_exe(&exe, home, what, drop)
     }
 
-    /// Spawn a given avsmd binary; see `spawn`.
+    /// Spawn a given avsmd binary; see `spawn`. A warden gets a notes
+    /// channel at fd 3.
     pub fn spawn_exe(exe: &Path, home: &Path, what: &str, drop: bool) -> Result<Process, String> {
+        let notes = (what == "warden").then(crate::groups::Notes::default);
+        Process::spawn_with(exe, home, what, drop, notes)
+    }
+
+    fn spawn_with(
+        exe: &Path,
+        home: &Path,
+        what: &str,
+        drop: bool,
+        notes: Option<crate::groups::Notes>,
+    ) -> Result<Process, String> {
+        let _alone = notes.is_some().then(|| {
+            crate::groups::SPAWNING
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+        });
+        let channel = match &notes {
+            Some(n) => Some(
+                n.attach()
+                    .map_err(|e| format!("cannot open the {what}'s notes channel: {e}"))?,
+            ),
+            None => None,
+        };
+        let channel_fd = channel.as_ref().map(std::os::fd::AsRawFd::as_raw_fd);
         let build = |drop: bool| {
             let mut cmd = Command::new(exe);
             cmd.arg("--home").arg(home);
@@ -4158,6 +4276,17 @@ impl Process {
                     cmd.env(var, v);
                 }
             }
+            #[cfg(debug_assertions)]
+            if let Some(v) = std::env::var_os("AVSMD_TEST_HOLD_OUTCOME") {
+                cmd.env("AVSMD_TEST_HOLD_OUTCOME", v);
+            }
+            if let Some(fd) = channel_fd {
+                // SAFETY: the hook only calls dup2 and fcntl, which are
+                // async-signal-safe.
+                unsafe {
+                    cmd.pre_exec(move || notes_at_fd3(fd));
+                }
+            }
             if drop {
                 if let Some((uid, gid)) = unprivileged() {
                     cmd.uid(uid).gid(gid);
@@ -4177,6 +4306,8 @@ impl Process {
             }
             Err(e) => return Err(format!("cannot start the {what} process: {e}")),
         };
+        // The child has its end; ours goes, so the channel ends with it.
+        std::mem::drop(channel);
         let stdin = child.stdin.take().ok_or("no pipe to the child")?;
         let stdout = BufReader::new(child.stdout.take().ok_or("no pipe from the child")?);
         Ok(Process {
@@ -4187,6 +4318,7 @@ impl Process {
             home: home.to_path_buf(),
             what: what.to_string(),
             drop,
+            notes,
         })
     }
 
@@ -4202,7 +4334,13 @@ impl Process {
     /// Start the child again from the binary it was started from, in
     /// place of this one; the new pid.
     fn respawn(&mut self) -> Result<u32, String> {
-        let fresh = Process::spawn_exe(&self.exe, &self.home, &self.what, self.drop)?;
+        let fresh = Process::spawn_with(
+            &self.exe,
+            &self.home,
+            &self.what,
+            self.drop,
+            self.notes.clone(),
+        )?;
         *self = fresh;
         Ok(self.id())
     }
@@ -4238,6 +4376,24 @@ impl Drop for Process {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// In a warden about to start, after fork: its notes channel at fd 3,
+/// kept across exec.
+fn notes_at_fd3(fd: i32) -> std::io::Result<()> {
+    let target = crate::groups::NOTES_FD;
+    // SAFETY: dup2 and fcntl are async-signal-safe and touch only fds.
+    let r = unsafe {
+        if fd == target {
+            libc::fcntl(target, libc::F_SETFD, 0)
+        } else {
+            libc::dup2(fd, target)
+        }
+    };
+    if r == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The uid and gid to drop to when running as root: `nobody`, else 65534.
@@ -4289,13 +4445,23 @@ impl Warden for WardenProcess {
         }
     }
 
+    /// What the warden said it appended, on its notes channel: heard
+    /// whether or not it is still alive (#52).
     fn written(&mut self) -> Result<Vec<(Seq, String)>, String> {
-        self.0.send(&ToWarden::Written)?;
-        match self.0.recv::<FromWarden>()? {
-            FromWarden::Written(w) => Ok(w),
-            FromWarden::Err(e) => Err(e),
-            _ => Err("the warden answered the wrong question".to_string()),
-        }
+        Ok(self
+            .0
+            .notes
+            .as_ref()
+            .map(crate::groups::Notes::take_written)
+            .unwrap_or_default())
+    }
+
+    fn groups(&mut self) -> Vec<(i32, String)> {
+        self.0
+            .notes
+            .as_ref()
+            .map(crate::groups::Notes::groups)
+            .unwrap_or_default()
     }
 
     fn cancel(&mut self, venture: &str) -> Result<u32, String> {
@@ -4360,7 +4526,7 @@ impl Warden for WardenProcess {
         self.0.send(&ToWarden::Measure(venture.to_string()))?;
         match self.0.recv::<FromWarden>()? {
             FromWarden::Measured(value, note) => Ok((value, note)),
-            FromWarden::Err(e) => Err(e),
+            FromWarden::Pending(e) | FromWarden::Err(e) => Err(e),
             _ => Err("the warden answered the wrong question".to_string()),
         }
     }
@@ -4370,7 +4536,7 @@ impl Warden for WardenProcess {
             .send(&ToWarden::Read(venture.to_string(), metric.to_string()))?;
         match self.0.recv::<FromWarden>()? {
             FromWarden::Measured(value, note) => Ok((value, note)),
-            FromWarden::Err(e) => Err(e),
+            FromWarden::Pending(e) | FromWarden::Err(e) => Err(e),
             _ => Err("the warden answered the wrong question".to_string()),
         }
     }
@@ -4446,21 +4612,121 @@ impl Role for RolesProcess {
     }
 }
 
+/// How long the warden waits on a read or a measure before it answers
+/// that it is still going: the kernel waits on the answer, and holds the
+/// tick while it does (#45).
+pub const QUICK: Duration = Duration::from_millis(500);
+
+/// A read that ended this long before the kernel asked again is stale:
+/// it is dropped, and read afresh.
+pub const STALE: Duration = Duration::from_secs(60);
+
+/// What the warden answers while a read is still going.
+pub const PENDING: &str = "still running";
+
+/// Work of the warden's going on apart: a lever run, or a read or a
+/// measure that took longer than `QUICK`.
+struct Apart {
+    venture: String,
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// A read or a measure going on apart, and where its answer will come.
+struct Reading {
+    apart: Apart,
+    since: Instant,
+    done: std::sync::mpsc::Receiver<(Instant, FromWarden)>,
+}
+
+/// Answer a read or a measure: the answer of the one already going for
+/// `key` once it is in, else `work` started on a thread of its own and
+/// waited on up to `QUICK`. Past that, the answer is that it is still
+/// running, and the next ask for `key` takes it up.
+fn read_apart(
+    readings: &mut BTreeMap<String, Reading>,
+    key: String,
+    venture: &str,
+    work: Result<warden::Work<warden::Measured>, String>,
+) -> FromWarden {
+    if let Some(r) = readings.get(&key) {
+        match r.done.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                return FromWarden::Pending(format!(
+                    "{PENDING} after {}s",
+                    r.since.elapsed().as_secs()
+                ));
+            }
+            Ok((at, answer)) => {
+                readings.remove(&key);
+                if at.elapsed() < STALE {
+                    return answer;
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                readings.remove(&key);
+            }
+        }
+    }
+    let work = match work {
+        Ok(w) => w,
+        Err(e) => return FromWarden::Err(e),
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = {
+        let venture = venture.to_string();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let answer = match crate::groups::within(&venture, stop, work) {
+                Ok((value, note)) => FromWarden::Measured(value, note),
+                Err(e) => FromWarden::Err(e),
+            };
+            let _ = tx.send((Instant::now(), answer));
+        })
+    };
+    let since = Instant::now();
+    match rx.recv_timeout(QUICK) {
+        Ok((_, answer)) => {
+            let _ = handle.join();
+            answer
+        }
+        Err(_) => {
+            readings.insert(
+                key,
+                Reading {
+                    apart: Apart {
+                        venture: venture.to_string(),
+                        stop,
+                        handle,
+                    },
+                    since,
+                    done: rx,
+                },
+            );
+            FromWarden::Pending(format!("{PENDING} after {}s", QUICK.as_secs()))
+        }
+    }
+}
+
 /// The body of the warden process: answer the kernel until it hangs up.
 pub fn warden_main(home: &Path) -> Result<(), String> {
     // A stop drains: the run in flight is signalled and waited on, and its
     // outcome written; the warden then answers until the kernel hangs up.
     warden::drain_on_signals();
+    // The daemon's channel for what this warden appends and starts.
+    crate::groups::take_notes();
     let mut warden = LocalWarden::open(home)?;
     let ledger = home.join("ledger.db");
-    // Lever runs going on apart, each on a thread of its own: the venture,
-    // and the flag that stops it.
-    let mut runs: Vec<(String, Arc<AtomicBool>, std::thread::JoinHandle<()>)> = Vec::new();
+    // Lever runs going on apart, each on a thread of its own.
+    let mut runs: Vec<Apart> = Vec::new();
+    // Reads and measures going on apart, by what they read.
+    let mut readings: BTreeMap<String, Reading> = BTreeMap::new();
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
-        runs.retain(|(_, _, run)| !run.is_finished());
+        runs.retain(|a| !a.handle.is_finished());
         let reply = match serde_json::from_str::<ToWarden>(line.trim()) {
             Ok(ToWarden::Start(c)) => match warden.run_or_start(&c, true) {
                 Ok(Started::Done(e)) => FromWarden::Done(e),
@@ -4470,12 +4736,19 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
                     let ledger = ledger.clone();
                     let venture = job.venture.clone();
                     let notes = warden.notes();
-                    let run = std::thread::spawn(move || {
-                        let (ok, detail) = job.run(&|| stopped.load(Ordering::SeqCst));
+                    let handle = std::thread::spawn(move || {
+                        let flag = Arc::clone(&stopped);
+                        let (ok, detail, more) =
+                            crate::groups::within(&job.venture.clone(), flag, || {
+                                job.run(&|| stopped.load(Ordering::SeqCst))
+                            });
                         let wrote = Ledger::open(&ledger)
                             .and_then(|mut l| {
                                 l.track(notes);
-                                l.append(job.outcome(ok, detail))
+                                for record in std::iter::once(job.outcome(ok, detail)).chain(more) {
+                                    l.append(record)?;
+                                }
+                                Ok(())
                             })
                             .map_err(|e| e.to_string());
                         if let Err(e) = wrote {
@@ -4485,7 +4758,11 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
                             );
                         }
                     });
-                    runs.push((venture, stop, run));
+                    runs.push(Apart {
+                        venture,
+                        stop,
+                        handle,
+                    });
                     FromWarden::Done(e)
                 }
                 Err(Failure::Refused { reason_key, detail }) => {
@@ -4494,12 +4771,20 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
                 Err(Failure::Error(e)) => FromWarden::Err(e),
             },
             Ok(ToWarden::Cancel(v)) => {
+                // Its reads still going join its lever runs, to be waited
+                // on as runs are and asked for afresh; then each is
+                // signalled, and killed after the grace, as a drain does.
+                let (gone, kept) = std::mem::take(&mut readings)
+                    .into_iter()
+                    .partition(|(_, r)| r.apart.venture == v);
+                readings = kept;
+                runs.extend(gone.into_values().map(|r: Reading| r.apart));
                 let mut n = 0;
-                for (_, stop, _) in runs
+                for a in runs
                     .iter()
-                    .filter(|(of, _, run)| *of == v && !run.is_finished())
+                    .filter(|a| a.venture == v && !a.handle.is_finished())
                 {
-                    stop.store(true, Ordering::SeqCst);
+                    a.stop.store(true, Ordering::SeqCst);
                     n += 1;
                 }
                 FromWarden::Cancelled(n)
@@ -4522,22 +4807,20 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
                 Ok(t) => FromWarden::Text(t),
                 Err(e) => FromWarden::Err(e),
             },
-            Ok(ToWarden::Measure(v)) => match warden.measure(&v) {
-                Ok((value, note)) => FromWarden::Measured(value, note),
-                Err(e) => FromWarden::Err(e),
-            },
+            Ok(ToWarden::Measure(v)) => {
+                let work = warden.measure_work(&v);
+                read_apart(&mut readings, format!("measure {v}"), &v, work)
+            }
+            // No adapter can check a run yet, so confirming starts nothing
+            // and is answered here.
             Ok(ToWarden::Confirm(i)) => match warden.confirm(i) {
                 Ok(found) => FromWarden::Confirmed(found),
                 Err(e) => FromWarden::Err(e),
             },
-            Ok(ToWarden::Read(v, m)) => match warden.read(&v, &m) {
-                Ok((value, note)) => FromWarden::Measured(value, note),
-                Err(e) => FromWarden::Err(e),
-            },
-            Ok(ToWarden::Written) => match warden.written() {
-                Ok(w) => FromWarden::Written(w),
-                Err(e) => FromWarden::Err(e),
-            },
+            Ok(ToWarden::Read(v, m)) => {
+                let work = warden.read_work(&v, &m);
+                read_apart(&mut readings, format!("read {v} {m}"), &v, work)
+            }
             Err(e) => FromWarden::Err(format!("bad request: {e}")),
         };
         let mut text = serde_json::to_string(&reply).map_err(|e| e.to_string())?;
@@ -4546,13 +4829,17 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
             .and_then(|_| out.flush())
             .map_err(|e| e.to_string())?;
     }
-    // The kernel hung up with runs still going: they drain, as on a stop,
-    // and each outcome is written before the warden goes.
-    if !runs.is_empty() {
+    // The kernel hung up with work still going: it drains, as on a stop,
+    // and each lever's outcome is written before the warden goes.
+    let left: Vec<Apart> = runs
+        .into_iter()
+        .chain(readings.into_values().map(|r| r.apart))
+        .collect();
+    if !left.is_empty() {
         warden::drain_now();
     }
-    for (_, _, run) in runs {
-        let _ = run.join();
+    for a in left {
+        let _ = a.handle.join();
     }
     Ok(())
 }
@@ -4663,7 +4950,7 @@ impl Kernel {
                 log(&format!("{name}: stopping run"));
                 // SAFETY: kill has no memory preconditions.
                 unsafe {
-                    libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+                    libc::kill(-(child.id() as libc::pid_t), libc::SIGTERM);
                 }
             }
         }
@@ -4686,6 +4973,21 @@ impl Kernel {
             log(&format!(
                 "{}: {} (intent #{s}) has no outcome yet; the next start asks whether it happened",
                 f.venture, f.action
+            ));
+        }
+        // Nothing avsmd started outlives it: what this process and the
+        // warden started and is still going had its SIGTERM; at the
+        // deadline it has SIGKILL.
+        let left: Vec<i32> = crate::groups::live()
+            .into_iter()
+            .chain(self.warden.groups())
+            .map(|(g, _)| g)
+            .collect();
+        let killed = crate::groups::end(&left, deadline);
+        if killed > 0 {
+            log(&format!(
+                "killed {killed} process {} that ignored the stop",
+                if killed == 1 { "group" } else { "groups" }
             ));
         }
     }

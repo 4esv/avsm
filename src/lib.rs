@@ -12,6 +12,7 @@ pub mod expect;
 pub mod facts;
 pub mod forecast;
 pub mod gate;
+pub mod groups;
 pub mod index;
 pub mod kernel;
 pub mod ledger;

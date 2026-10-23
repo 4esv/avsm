@@ -99,6 +99,17 @@ pub trait Warden {
     fn written(&mut self) -> Result<Vec<(Seq, String)>, String> {
         Ok(Vec::new())
     }
+    /// The process groups this warden started that are still alive, each
+    /// with its venture: the daemon ends them when the warden dies, when
+    /// avsmd stops, and when their venture is paused.
+    fn groups(&mut self) -> Vec<(i32, String)> {
+        Vec::new()
+    }
+}
+
+/// Is this the error of a read or a measure still going in the warden?
+pub fn pending(error: &str) -> bool {
+    error.starts_with(crate::kernel::PENDING)
 }
 
 /// Why `execute` wrote nothing. A refusal is the warden's own typed
@@ -258,12 +269,10 @@ impl Warden for LocalWarden {
             // Only a start comes back running; should an execute ever, the
             // run happens here, recorded, then done, as ever.
             Started::Running(mut written, job) => {
-                let (ok, detail) = job.run(&|| false);
-                written.push(
-                    self.ledger
-                        .append(job.outcome(ok, detail))
-                        .map_err(|e| e.to_string())?,
-                );
+                let (ok, detail, more) = job.run(&|| false);
+                for record in std::iter::once(job.outcome(ok, detail)).chain(more) {
+                    written.push(self.ledger.append(record).map_err(|e| e.to_string())?);
+                }
                 Ok(written)
             }
         }
@@ -301,6 +310,14 @@ enum Pull {
         secret: Option<String>,
         adapters: config::Adapters,
     },
+    /// Ask the research backend a question.
+    Research {
+        config: Box<Config>,
+        home: PathBuf,
+        question: String,
+        /// A forecast branch asks no backend.
+        keyless: bool,
+    },
     Nothing(String),
 }
 
@@ -322,9 +339,39 @@ pub struct Job {
 
 impl Job {
     /// Pull the lever. `stop` says to stop it now: avsmd is stopping, or
-    /// the venture was paused. Returns whether it went well and one line
-    /// of what happened.
-    pub fn run(&self, stop: &dyn Fn() -> bool) -> (bool, String) {
+    /// the venture was paused. Returns whether it went well, one line of
+    /// what happened, and the records that go after its outcome.
+    pub fn run(&self, stop: &dyn Fn() -> bool) -> (bool, String, Vec<Record>) {
+        if let Pull::Research {
+            config,
+            home,
+            question,
+            keyless,
+        } = &self.pull
+        {
+            let asked = if *keyless {
+                Err("a forecast asks no backend".to_string())
+            } else {
+                research(config, home, question, &self.venture)
+            };
+            return match asked {
+                Ok(f) => (
+                    true,
+                    format!(
+                        "{} {}",
+                        f.len(),
+                        if f.len() == 1 { "finding" } else { "findings" }
+                    ),
+                    research::records(&self.venture, &f, self.intent),
+                ),
+                Err(e) => (false, e, vec![]),
+            };
+        }
+        let (ok, detail) = self.pull(stop);
+        (ok, detail, vec![])
+    }
+
+    fn pull(&self, stop: &dyn Fn() -> bool) -> (bool, String) {
         match (&self.pull, &self.payload) {
             (
                 Pull::Adapter {
@@ -356,6 +403,7 @@ impl Job {
                 stop,
             ),
             (Pull::Nothing(why), _) => (false, why.clone()),
+            (Pull::Research { .. }, _) => (false, "research runs apart".to_string()),
         }
     }
 
@@ -625,31 +673,34 @@ impl LocalWarden {
             return Ok(Started::Done(written));
         }
         if perm.is_research() {
+            // Recorded, then done, like a lever: the backend's command may
+            // take its time, so with `apart` it runs on a thread of its
+            // own and its outcome and findings are written when it ends.
             let question = payload.as_ref().map(Payload::text).unwrap_or_default();
-            let started = append(intent(proof, payload))?;
-            // A forecast branch asks no backend.
-            let asked = if self.keyless {
-                Err("a forecast asks no backend".to_string())
-            } else {
-                research(&self.config, &self.home, &question, &venture)
+            let proof_text = proof.to_string();
+            let started = append(intent(proof, payload.clone()))?;
+            let job = Job {
+                venture: venture.clone(),
+                action: action.clone(),
+                intent: started.seq,
+                dir: self.home.clone(),
+                pull: Pull::Research {
+                    config: Box::new(self.config.clone()),
+                    home: self.home.clone(),
+                    question,
+                    keyless: self.keyless,
+                },
+                payload,
+                key,
+                proof: proof_text,
+                timeout: ACTION_TIMEOUT,
             };
-            let (ok, detail, findings) = match asked {
-                Ok(f) => (
-                    true,
-                    format!(
-                        "{} {}",
-                        f.len(),
-                        if f.len() == 1 { "finding" } else { "findings" }
-                    ),
-                    f,
-                ),
-                Err(e) => (false, e, vec![]),
-            };
-            let done = append(outcome(&started, ok, detail))?;
-            let seq = started.seq;
             written.push(started);
-            written.push(done);
-            for record in research::records(&venture, &findings, seq) {
+            if apart {
+                return Ok(Started::Running(written, Box::new(job)));
+            }
+            let (ok, detail, more) = job.run(&|| false);
+            for record in std::iter::once(job.outcome(ok, detail)).chain(more) {
                 written.push(append(record)?);
             }
             return Ok(Started::Done(written));
@@ -714,7 +765,7 @@ impl LocalWarden {
                 written.push(started);
                 return Ok(Started::Running(written, Box::new(job)));
             }
-            job.run(&|| false)
+            job.pull(&|| false)
         };
         let done = append(outcome(&started, ok, detail))?;
         written.push(started);
@@ -828,6 +879,17 @@ impl LocalWarden {
     }
 
     fn measure_now(&mut self, venture: &str) -> Result<(Option<f64>, String), String> {
+        self.measure_work(venture).and_then(|work| work())
+    }
+
+    fn read_now(&mut self, venture: &str, metric: &str) -> Result<(Option<f64>, String), String> {
+        self.read_work(venture, metric).and_then(|work| work())
+    }
+
+    /// Measuring a venture's metric through its adapter, as work that
+    /// owns all it needs: the warden process runs it on a thread of its
+    /// own, so a slow adapter holds up nothing else (#45).
+    pub fn measure_work(&mut self, venture: &str) -> Result<Work<Measured>, String> {
         if self.keyless {
             return Err("a forecast reads no adapter".to_string());
         }
@@ -838,17 +900,20 @@ impl LocalWarden {
         self.measure_in(&ventures, venture)
     }
 
-    fn read_now(&mut self, venture: &str, metric: &str) -> Result<(Option<f64>, String), String> {
+    /// Reading one of a venture's guards, audits or readings, as work
+    /// that owns all it needs; see `measure_work`.
+    pub fn read_work(&mut self, venture: &str, metric: &str) -> Result<Work<Measured>, String> {
         if self.keyless {
             // A forecast reads a guard from the world model's step, never
             // from the guard's command or adapter.
             let name = metric.strip_prefix("guard.").unwrap_or(metric);
-            return match self.sim.as_ref().and_then(|s| s.guard(venture, name)) {
+            let read = match self.sim.as_ref().and_then(|s| s.guard(venture, name)) {
                 Some(x) => Ok((Some(x), "simulated: world".to_string())),
                 None => Err(format!(
                     "a forecast reads {metric} from the world model alone, and it gave none"
                 )),
             };
+            return Ok(Box::new(move || read));
         }
         self.index
             .refresh(&self.ledger)
@@ -889,6 +954,17 @@ impl LocalWarden {
     }
 }
 
+/// A value, or None with a note saying why.
+pub type Measured = (Option<f64>, String);
+
+/// Work the warden does apart from its loop, owning all it needs.
+pub type Work<T> = Box<dyn FnOnce() -> Result<T, String> + Send>;
+
+/// Work whose answer is already known.
+fn known<T: Send + 'static>(answer: T) -> Result<Work<T>, String> {
+    Ok(Box::new(move || Ok(answer)))
+}
+
 impl LocalWarden {
     /// Read a guard's or an audit's command or built-in metric.
     fn read_in(
@@ -896,7 +972,7 @@ impl LocalWarden {
         ventures: &BTreeMap<String, venture::Venture>,
         venture: &str,
         metric: &str,
-    ) -> Result<(Option<f64>, String), String> {
+    ) -> Result<Work<Measured>, String> {
         let v = ventures
             .get(venture)
             .ok_or_else(|| format!("no venture named {venture}"))?;
@@ -906,29 +982,32 @@ impl LocalWarden {
                 .readings
                 .iter()
                 .find(|r| r.name == name)
-                .ok_or_else(|| format!("{venture} has no reading {name}"))?;
+                .ok_or_else(|| format!("{venture} has no reading {name}"))?
+                .clone();
             let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
-            // The note is the fields the reading names and nothing else of
-            // what its command printed: not its other lines, and not why
-            // it failed, since a model sees it.
-            let ran = run_command_raw(&dir, &r.run, ACTION_TIMEOUT);
-            let n = match adapter::number_from(&ran.stdout) {
-                Ok(n) if ran.ok => n,
-                _ => return Ok((None, String::new())),
-            };
             // An audit names what may be kept: its latest trusted reading,
             // written by the kernel just before.
-            let named = r.audit.as_deref().map(|a| {
+            let named: Option<String> = r.audit.as_deref().map(|a| {
                 let at = self
                     .index
                     .latest_report(venture, &format!("{}{a}", crate::mandate::AUDIT_PREFIX));
                 match at.and_then(|s| self.index.get(s)).map(|e| &e.record) {
-                    Some(Record::Report { note, .. }) => note.as_str(),
-                    _ => "",
+                    Some(Record::Report { note, .. }) => note.clone(),
+                    _ => String::new(),
                 }
             });
-            // The number is no field, so `keep` drops it with the rest.
-            return Ok((Some(n), r.keep(&ran.stdout, named)));
+            return Ok(Box::new(move || {
+                // The note is the fields the reading names and nothing else
+                // of what its command printed: not its other lines, and not
+                // why it failed, since a model sees it.
+                let ran = run_command_raw(&dir, &r.run, ACTION_TIMEOUT);
+                let n = match adapter::number_from(&ran.stdout) {
+                    Ok(n) if ran.ok => n,
+                    _ => return Ok((None, String::new())),
+                };
+                // The number is no field, so `keep` drops it with the rest.
+                Ok((Some(n), r.keep(&ran.stdout, named.as_deref())))
+            }));
         }
         let audit = metric.starts_with(crate::mandate::AUDIT_PREFIX);
         let (run, spec) = if let Some(name) = metric.strip_prefix("guard.") {
@@ -946,35 +1025,38 @@ impl LocalWarden {
         };
         let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
         if let Some(cmd) = run {
-            let ran = run_command_raw(&dir, &cmd, ACTION_TIMEOUT);
-            if !ran.ok {
-                return Ok((
-                    None,
-                    format!("{metric} failed: {}", ran.detail(ACTION_TIMEOUT)),
-                ));
-            }
-            return Ok(match adapter::number_from(&ran.stdout) {
-                // An audit's lines above its number are its note, like the
-                // senders of the mail it counts: no model sees an audit,
-                // and a payload check may read them. A guard keeps only
-                // its number.
-                Ok(n) if audit => (Some(n), above_number(&ran.stdout)),
-                Ok(n) => (Some(n), String::new()),
-                Err(_) => (
-                    None,
-                    format!(
-                        "{metric} did not print a number: {}",
-                        ran.detail(ACTION_TIMEOUT)
+            let metric = metric.to_string();
+            return Ok(Box::new(move || {
+                let ran = run_command_raw(&dir, &cmd, ACTION_TIMEOUT);
+                if !ran.ok {
+                    return Ok((
+                        None,
+                        format!("{metric} failed: {}", ran.detail(ACTION_TIMEOUT)),
+                    ));
+                }
+                Ok(match adapter::number_from(&ran.stdout) {
+                    // An audit's lines above its number are its note, like
+                    // the senders of the mail it counts: no model sees an
+                    // audit, and a payload check may read them. A guard
+                    // keeps only its number.
+                    Ok(n) if audit => (Some(n), above_number(&ran.stdout)),
+                    Ok(n) => (Some(n), String::new()),
+                    Err(_) => (
+                        None,
+                        format!(
+                            "{metric} did not print a number: {}",
+                            ran.detail(ACTION_TIMEOUT)
+                        ),
                     ),
-                ),
-            });
+                })
+            }));
         }
         let spec = spec.ok_or_else(|| format!("{metric} reads nothing"))?;
         let reading = adapter::Metric::parse(&spec)?
             .ok_or_else(|| format!("{metric}: {spec:?} is not a built-in metric"))?;
         if let Some(host) = reading.host(&self.config.adapters) {
             if !m.allows_host(&host) {
-                return Ok((
+                return known((
                     None,
                     format!(
                         "{} would reach {host}, which is not in the venture's network list",
@@ -983,18 +1065,18 @@ impl LocalWarden {
                 ));
             }
         }
-        let key = reading
-            .key_name()
-            .and_then(|k| self.keys.get(k))
-            .map(String::as_str);
-        Ok(reading.measure(&dir, key, &self.config.adapters))
+        let key = reading.key_name().and_then(|k| self.keys.get(k)).cloned();
+        let adapters = self.config.adapters.clone();
+        Ok(Box::new(move || {
+            Ok(reading.measure(&dir, key.as_deref(), &adapters))
+        }))
     }
 
     fn measure_in(
         &self,
         ventures: &BTreeMap<String, venture::Venture>,
         venture: &str,
-    ) -> Result<(Option<f64>, String), String> {
+    ) -> Result<Work<Measured>, String> {
         let v = ventures
             .get(venture)
             .ok_or_else(|| format!("no venture named {venture}"))?;
@@ -1004,7 +1086,7 @@ impl LocalWarden {
             .ok_or_else(|| format!("{venture} watches {}, not an adapter", v.mandate.metric))?;
         if let Some(host) = metric.host(&self.config.adapters) {
             if !v.mandate.allows_host(&host) {
-                return Ok((
+                return known((
                     None,
                     format!(
                         "{} would reach {host}, which is not in the venture's network list",
@@ -1014,11 +1096,11 @@ impl LocalWarden {
             }
         }
         let dir = v.path.clone().unwrap_or_else(|| self.home.clone());
-        let key = metric
-            .key_name()
-            .and_then(|k| self.keys.get(k))
-            .map(String::as_str);
-        Ok(metric.measure(&dir, key, &self.config.adapters))
+        let key = metric.key_name().and_then(|k| self.keys.get(k)).cloned();
+        let adapters = self.config.adapters.clone();
+        Ok(Box::new(move || {
+            Ok(metric.measure(&dir, key.as_deref(), &adapters))
+        }))
     }
 }
 
@@ -1295,7 +1377,9 @@ pub fn run_bounded(
     timeout: Duration,
     cap: usize,
 ) -> Ran {
-    run_draining(dir, program, args, env, stdin, timeout, cap, &draining)
+    run_draining(dir, program, args, env, stdin, timeout, cap, &|| {
+        draining() || crate::groups::stopped()
+    })
 }
 
 /// `run_bounded`, told by `draining` when avsmd is stopping.
@@ -1310,7 +1394,16 @@ fn run_draining(
     cap: usize,
     draining: &dyn Fn() -> bool,
 ) -> Ran {
-    let mut child = match Command::new(program)
+    let mut command = Command::new(program);
+    // SAFETY: the hook only calls prctl and getppid, which are
+    // async-signal-safe.
+    unsafe {
+        command.pre_exec(crate::groups::die_with_parent);
+    }
+    let spawning = crate::groups::SPAWNING
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let spawned = command
         .args(args)
         .current_dir(dir)
         .env_clear()
@@ -1332,8 +1425,9 @@ fn run_draining(
         // A group of its own, so a stop or a timeout reaches what it
         // started too, and a ^C at the terminal reaches only avsmd.
         .process_group(0)
-        .spawn()
-    {
+        .spawn();
+    std::mem::drop(spawning);
+    let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
             return Ran {
@@ -1342,6 +1436,11 @@ fn run_draining(
             }
         }
     };
+    // Kept, and told to the daemon from the warden, until it is gone: a
+    // warden that dies takes the run's timer with it, and the daemon ends
+    // the group in its place.
+    let pgid = child.id() as i32;
+    crate::groups::started(pgid);
     if !stdin.is_empty() {
         if let Some(mut input) = child.stdin.take() {
             use std::io::Write;
@@ -1402,6 +1501,10 @@ fn run_draining(
     }
     let status = exited.filter(|_| !killed);
     let (stdout, stderr) = reader.join().unwrap_or_default();
+    // What the leader left behind in its group stays known until it goes.
+    if !crate::groups::alive(pgid) {
+        crate::groups::ended(pgid);
+    }
     Ran {
         ok: status.is_some_and(|s| s.success()),
         stdout,
@@ -1482,7 +1585,7 @@ pub fn run_lever_until(
         &stdin,
         timeout,
         usize::MAX,
-        &|| draining() || stop(),
+        &|| draining() || stop() || crate::groups::stopped(),
     );
     if !ran.ok && stop() && !draining() {
         let detail = Ran {
@@ -1545,8 +1648,6 @@ pub enum ToWarden {
     Read(String, String),
     /// A venture, a lever and a payload: run the lever's check.
     Check(String, String, Payload),
-    /// The records the warden appended since it was last asked.
-    Written,
 }
 
 /// What a warden process answers.
@@ -1566,8 +1667,8 @@ pub enum FromWarden {
     Checked,
     /// How many runs a cancel stopped.
     Cancelled(u32),
-    /// The records appended since the last ask: number and hash.
-    Written(Vec<(Seq, String)>),
+    /// A read or a measure still going, and for how long; ask again.
+    Pending(String),
     Err(String),
 }
 

@@ -329,6 +329,14 @@ finishes, a lever still running is sent SIGTERM and then SIGKILL if it lingers,
 and its outcome is written before avsmd exits 0. A warden or roles process
 that dies is started again, and a measured report of self's says so; a lever
 it was running is asked about (`did reset happen?`), never run again blindly.
+Every lever, `report`, guard, audit and reading command, and `run` leads a
+process group of its own, and none outlives avsmd: the warden tells avsmd of
+each group it starts, so when the warden dies avsmd ends what it left
+running, and a stop, or the pause of its venture, ends the rest. Ending is
+SIGTERM, then SIGKILL 7 seconds later. A guard, audit, reading or adapter
+metric that takes longer than half a second is read apart in the warden, so
+the tick goes on: the venture's report waits for its metric, and a guard,
+audit or reading still running is written as not read until it is done.
 A ledger that cannot be written stops everything that would write to it:
 `avsm status` and `avsm doctor` say so, and avsmd tries again every 30 seconds.
 
@@ -547,7 +555,17 @@ could pass for you:
 
 What it does not detect: a program that leaves avsmd's process tree (by
 daemonizing) before it connects, and anything written while avsmd is stopped.
-The anchor kept off the machine covers the second.
+The anchor kept off the machine covers the second. On Linux, making the
+warden a child subreaper (`PR_SET_CHILD_SUBREAPER`) would keep a daemonized
+lever in the tree; avsmd does not do that yet. A program that daemonizes
+into a session of its own also leaves the process group avsmd ends, so it
+outlives a stop or a pause. On Linux the first process of each group dies
+with the thread that started it (`PR_SET_PDEATHSIG`); macOS has no such
+call, so there avsmd ends a group only once the warden has told it of the
+group, which it does as soon as the group starts. If avsmd itself is killed
+with SIGKILL, the warden still ends its own runs, but a `report` program
+then running is not ended: on Linux only its first process dies with avsmd,
+and on macOS none does.
 
 Only the first answer to an ask counts; a later one is kept and authorizes
 nothing. An approval refused for any reason (a pause, a cap, a budget, a
