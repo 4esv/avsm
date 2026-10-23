@@ -523,9 +523,9 @@ out["checks"] = {
     "baseline_calibrated": check({k: v["n"] for k, v in calibration.items()}, any(k.endswith("/baseline") for k in calibration)),
     "branches_with_propensities": check(len(branches), None if not planned else any(alternatives(r) and all(x["propensity"] is not None for x in alternatives(r)) for s, a, r in branches)),
     "forecast_or_capacity_ask_before_day_20": check(early[:5], bool(early)),
-    # Passes on waterings against the evidence; the ones a human restored or that preceded the evidence are reported, not failed.
+    # The spec: 0 waterings of a dead plant. The split (human approved, before the evidence, restored) is reported, not a pass reason.
     "zero_waterings_of_a_dead_plant": check({"all": water_after_death, "autonomous": autonomous_after,
-                                              "human_approved": approved_after, **after_by}, after_by["against_evidence"] == 0),
+                                              "human_approved": approved_after, **after_by}, water_after_death == 0),
     "cap_and_budget_refusals_recorded": check({**{k: by_reason.get(k, 0) for k in ("OverCap", "OverBudget")},
                                                 "printed_without_record": unrecorded[:5]},
                                                None if printed is None else not unrecorded),
