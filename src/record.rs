@@ -503,7 +503,14 @@ impl Packet {
                     f.breach * 100.0,
                     f.spend
                 ),
-                None => "no forecast".to_string(),
+                // A lever's ask has a cost; an ask the kernel wrote about a
+                // reading has none, and no lever runs on its answer.
+                None if o.cost.is_some() => {
+                    "no forecast: forecasts are off or this one failed (the daemon's log says which)"
+                        .to_string()
+                }
+                None => "no forecast: answering runs no lever, so there is nothing to forecast"
+                    .to_string(),
             };
             out.push_str(&format!("    {}: {forecast}", o.name));
             if let Some(c) = &o.cost {

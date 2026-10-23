@@ -26,6 +26,34 @@ const ALREADY_ASKED: &str = "AlreadyAsked";
 pub(super) const SUSPENDED: &str = "Suspended";
 /// How a saturation question ends. Code never reads it; the signal field does.
 const SATURATED: &str = "; the limits cannot keep up";
+/// What a wait on an expectation is, when a limit is refusing too: not a
+/// limit running out, so it may pass by itself.
+const WAITING: &str = "; the run before it has not been judged yet, which holds it too, so this may pass without a change";
+/// What answering a saturation ask does.
+const APPROVING: &str = "; approving only records that you saw this and changes no limit: to give the lever room, raise the cap, budget or quota named above and run avsm add";
+
+/// The question of a saturation ask.
+fn saturation_question(
+    metric: &str,
+    bound: f64,
+    lever: &str,
+    detail: &str,
+    waiting: bool,
+    failed: Option<(usize, &str)>,
+) -> String {
+    match failed {
+        Some((n, why)) => format!(
+            "{metric} is past {bound} and {lever} is refused: {detail}; but its last {n} run{} in the window failed ({why}), so the cap is spent on failures: fix {lever}",
+            if n == 1 { "" } else { "s" },
+        ),
+        None if waiting => {
+            format!("{metric} is past {bound} and {lever} is refused: {detail}{WAITING}{APPROVING}")
+        }
+        None => {
+            format!("{metric} is past {bound} and {lever} is refused: {detail}{SATURATED}{APPROVING}")
+        }
+    }
+}
 
 /// One refusal record not yet closed, and what is known of it.
 struct Open {
@@ -51,6 +79,8 @@ struct Last {
     venture: String,
     lever: String,
     limit: bool,
+    /// An expectation that is not judged yet holds the lever too.
+    waiting: bool,
     detail: String,
 }
 
@@ -169,6 +199,7 @@ impl Kernel {
             venture: venture.to_string(),
             lever: lever.to_string(),
             limit,
+            waiting: key.contains("Waiting("),
             detail: detail.clone(),
         });
         let id = (venture.to_string(), lever.to_string());
@@ -343,17 +374,14 @@ impl Kernel {
         // A cap spent by runs that failed is not a limit that cannot keep
         // up: the lever is what is wrong.
         let failed = self.failed_runs(venture, lever, now - window);
-        let question = match &failed {
-            Some((n, detail)) => format!(
-                "{metric} is past {bound} and {lever} is refused: {}; but its last {n} run{} in the window failed ({detail}), so the cap is spent on failures: fix {lever}",
-                last.detail,
-                if *n == 1 { "" } else { "s" },
-            ),
-            None => format!(
-                "{metric} is past {bound} and {lever} is refused: {}{SATURATED}",
-                last.detail
-            ),
-        };
+        let question = saturation_question(
+            metric,
+            bound,
+            lever,
+            &last.detail,
+            last.waiting,
+            failed.as_ref().map(|(n, d)| (*n, d.as_str())),
+        );
         let id = (venture.to_string(), lever.to_string());
         // When the episode was last seen: in memory, or after a restart
         // the latest saturation ask the ledger holds for this lever.
@@ -410,5 +438,26 @@ impl Kernel {
             Ok(e) => log(&e.line()),
             Err(e) => log(&format!("{venture}: cannot write ask: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wait_is_not_blamed_on_the_limits_and_approving_is_explained() {
+        let said = |waiting: bool, failed: Option<(usize, &str)>| {
+            saturation_question("count", 10.0, "reset", "cap spent", waiting, failed)
+        };
+        let limits = said(false, None);
+        assert!(limits.contains("the limits cannot keep up"), "{limits}");
+        assert!(limits.contains("approving only records"), "{limits}");
+        let waited = said(true, None);
+        assert!(!waited.contains("cannot keep up"), "{waited}");
+        assert!(waited.contains("not been judged yet"), "{waited}");
+        assert!(waited.contains("approving only records"), "{waited}");
+        let failed = said(true, Some((2, "exit 1")));
+        assert!(failed.contains("fix reset") && !failed.contains("cannot keep up"));
     }
 }
