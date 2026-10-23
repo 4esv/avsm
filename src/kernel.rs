@@ -4256,7 +4256,7 @@ pub fn utc(t: i64) -> String {
 
 pub(crate) fn log(line: &str) {
     if !QUIET.with(std::cell::Cell::get) {
-        eprintln!("avsmd: {line}");
+        crate::protocol::elog(&format!("avsmd: {line}"));
     }
 }
 
@@ -4847,10 +4847,10 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
                             })
                             .map_err(|e| e.to_string());
                         if let Err(e) = wrote {
-                            eprintln!(
-                                "avsmd: warden: cannot write the outcome of intent #{}: {e}",
+                            log(&format!(
+                                "warden: cannot write the outcome of intent #{}: {e}",
                                 job.intent
-                            );
+                            ));
                         }
                     });
                     runs.push(Apart {

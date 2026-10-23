@@ -219,7 +219,7 @@ pub fn ledger_before_start(home: &Path) -> Result<(), exit::Exit> {
     if t.what.starts_with("does not read") {
         return Err(exit::Exit::new(exit::DATAERR, text));
     }
-    eprintln!("avsmd: {text}");
+    crate::protocol::elog(&format!("avsmd: {text}"));
     Ok(())
 }
 

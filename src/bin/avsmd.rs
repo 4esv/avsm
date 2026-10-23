@@ -46,7 +46,7 @@ enum Process {
 }
 
 fn fail(e: exit::Exit) -> ExitCode {
-    eprintln!("avsmd: {}", avsmd::protocol::display(e.text.trim_end()));
+    avsmd::protocol::elog(&format!("avsmd: {}", e.text.trim_end()));
     ExitCode::from(e.code)
 }
 
@@ -78,18 +78,20 @@ fn main() -> ExitCode {
         Some(Process::Roles) => avsmd::kernel::roles_main().map_err(exit::Exit::from),
         None if cli.test => {
             let found = avsmd::doctor::test(&home);
-            print!("{}", avsmd::protocol::display(&found.out));
+            avsmd::protocol::emit(&found.out);
             for p in &found.problems {
-                eprintln!("avsmd: {}", avsmd::protocol::display(p));
+                avsmd::protocol::elog(&format!("avsmd: {p}"));
             }
             return ExitCode::from(found.code);
         }
         None if cli.show => match avsmd::kernel::load_config(&home) {
             Ok(config) => match serde_yaml::to_string(&config) {
                 Ok(text) => {
-                    println!("# home {}", home.display());
-                    println!("# config {}", avsmd::config::path(&home).display());
-                    print!("{text}");
+                    avsmd::protocol::emit(&format!(
+                        "# home {}\n# config {}\n{text}",
+                        home.display(),
+                        avsmd::config::path(&home).display()
+                    ));
                     Ok(())
                 }
                 Err(e) => Err(exit::Exit::new(exit::SOFTWARE, e.to_string())),

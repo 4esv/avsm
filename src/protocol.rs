@@ -32,7 +32,7 @@ pub struct Response {
 pub fn display(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() && c != '\n' && c != '\t' {
+        if (c.is_control() && c != '\n' && c != '\t') || invisible(c) {
             let n = c as u32;
             if n < 0x100 {
                 out.push_str(&format!("\\x{n:02x}"));
@@ -44,6 +44,59 @@ pub fn display(text: &str) -> String {
         }
     }
     out
+}
+
+/// A formatting character that draws nothing or reorders what is around
+/// it: the bidi controls (U+202A-202E, U+2066-2069 and the marks), zero
+/// width characters, the soft hyphen, the invisible operators and the tag
+/// characters.
+fn invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x061C | 0x180E
+        | 0x200B..=0x200F
+        | 0x2028..=0x202E
+        | 0x2060..=0x206F
+        | 0xFEFF
+        | 0xFFF9..=0xFFFB
+        | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// Print text to standard output as `display` shows it. A reader that
+/// went away (`avsm tail | head -1`) ends the program quietly: it is not
+/// a failure of ours.
+pub fn emit(text: &str) {
+    let mut out = std::io::stdout().lock();
+    let shown = display(text);
+    if let Err(e) = out.write_all(shown.as_bytes()).and_then(|()| out.flush()) {
+        if e.kind() == ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+    }
+}
+
+/// A standard output that ends the program quietly when its reader has
+/// gone away.
+pub struct Stdout;
+
+impl Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match std::io::stdout().write(buf) {
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => std::process::exit(0),
+            other => other,
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match std::io::stdout().flush() {
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => std::process::exit(0),
+            other => other,
+        }
+    }
+}
+
+/// Write a diagnostic line to standard error as `display` shows it. A
+/// closed standard error loses the line; it never panics.
+pub fn elog(line: &str) {
+    let _ = writeln!(std::io::stderr(), "{}", display(line));
 }
 
 /// The longest socket path this system takes, in bytes: `sun_path` less

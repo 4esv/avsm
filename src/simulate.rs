@@ -224,6 +224,13 @@ impl Simulation {
     }
 }
 
+/// Write text to the simulation's output as `display` shows it: record
+/// text came from a model and must not move the cursor.
+fn say(out: &mut dyn Write, text: &str) {
+    let _ = out.write_all(crate::protocol::display(text).as_bytes());
+    let _ = out.flush();
+}
+
 /// Run the plan, writing what happens to `out`: every new record as a
 /// ledger line, the human's answers, and the digest each simulated day.
 pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> {
@@ -298,10 +305,6 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
     let end = start + i64::from(plan.days) * 86_400;
     let mut shown: Seq = kernel.entries()?.last().map_or(0, |e| e.seq);
     let mut day = clock::local().date_naive();
-    let say = |out: &mut dyn Write, text: &str| {
-        let _ = out.write_all(text.as_bytes());
-        let _ = out.flush();
-    };
     say(
         out,
         &format!(
@@ -414,6 +417,16 @@ use chrono::Timelike;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_a_simulation_shows_is_escaped() {
+        let mut out = Vec::new();
+        say(&mut out, "world: \u{1b}]0;x\u{7}\u{202e}ok\n");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "world: \\x1b]0;x\\x07\\u{202e}ok\n"
+        );
+    }
 
     /// A mandate the ratchet would put in a delegate ask, with a lever
     /// list a bare line would break.

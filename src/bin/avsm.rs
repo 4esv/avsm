@@ -152,7 +152,7 @@ fn done(result: Result<(), Exit>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("avsm: {}", avsmd::protocol::display(e.text.trim_end()));
+            avsmd::protocol::elog(&format!("avsm: {}", e.text.trim_end()));
             ExitCode::from(e.code)
         }
     }
@@ -255,7 +255,7 @@ fn approve_edited(sock: &std::path::Path, remote: Option<&str>, number: &str) ->
         edited,
     ];
     let answer = send(&args)?;
-    print!("{}", avsmd::protocol::display(&answer.text));
+    avsmd::protocol::emit(&answer.text);
     if answer.ok {
         Ok(())
     } else {
@@ -310,8 +310,7 @@ fn main() -> ExitCode {
                     }
                 };
                 return done(
-                    avsmd::doctor::cut(&home, seq)
-                        .map(|text| print!("{}", avsmd::protocol::display(&text))),
+                    avsmd::doctor::cut(&home, seq).map(|text| avsmd::protocol::emit(&text)),
                 );
             }
             let since = match since.as_deref().map(avsmd::doctor::parse_anchor) {
@@ -324,7 +323,7 @@ fn main() -> ExitCode {
                 avsmd::kernel::old_home(|v| std::env::var_os(v)).as_deref(),
                 since.as_ref(),
             );
-            print!("{}", avsmd::protocol::display(&found.out));
+            avsmd::protocol::emit(&found.out);
             return ExitCode::from(found.code);
         }
         Command::Simulate {
@@ -364,7 +363,8 @@ fn main() -> ExitCode {
                 world,
             };
             return done(
-                avsmd::simulate::run(&home, &plan, &mut std::io::stdout()).map_err(Exit::from),
+                avsmd::simulate::run(&home, &plan, &mut avsmd::protocol::Stdout)
+                    .map_err(Exit::from),
             );
         }
         Command::Add { dir } => {
@@ -441,7 +441,7 @@ fn main() -> ExitCode {
     };
     match answer {
         Ok(answer) if answer.ok => {
-            print!("{}", avsmd::protocol::display(&answer.text));
+            avsmd::protocol::emit(&answer.text);
             ExitCode::SUCCESS
         }
         // A no is a diagnostic: it goes to standard error.
