@@ -121,8 +121,9 @@ fn left_under(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Wait until nothing runs under `dir`, or fail naming what does.
-fn none_left(what: &str, dir: &Path, within: Duration) {
+/// Wait until nothing runs under `dir`, or fail naming what does, with
+/// the daemon's log.
+fn none_left(what: &str, dir: &Path, within: Duration, log: &dyn Fn() -> String) {
     let began = Instant::now();
     loop {
         let left = left_under(dir);
@@ -131,8 +132,9 @@ fn none_left(what: &str, dir: &Path, within: Duration) {
         }
         assert!(
             began.elapsed() < within,
-            "{what}: still running after {within:?}:\n{}",
-            left.join("\n")
+            "{what}: still running after {within:?}:\n{}\n{}",
+            left.join("\n"),
+            log()
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -665,7 +667,12 @@ fn a_warden_killed_with_a_lever_that_ignores_sigterm_leaves_no_process_behind() 
         libc::kill(warden, libc::SIGKILL);
     }
     // TERM, its grace, then KILL: nothing of the venture's is left.
-    none_left("the dead warden's lever", &hung, Duration::from_secs(20));
+    none_left(
+        "the dead warden's lever",
+        &hung,
+        Duration::from_secs(20),
+        &|| d.log(),
+    );
     // The intent in flight is asked about, never run again.
     wait_for("the did-it-happen ask", Duration::from_secs(15), || {
         text(&avsm(tmp.path(), &home, &["asks"])).contains("did reset happen")
@@ -687,12 +694,18 @@ fn a_daemon_stopped_with_a_report_that_ignores_sigterm_leaves_no_process_behind(
         slow.join("started").exists()
     });
     stop_daemon(&mut d, libc::SIGTERM, Duration::from_secs(15));
-    none_left("the stopped daemon's report", &slow, Duration::from_secs(3));
+    none_left(
+        "the stopped daemon's report",
+        &slow,
+        Duration::from_secs(3),
+        &|| d.log(),
+    );
     // Nor its warden or roles process.
     none_left(
         "the stopped daemon's children",
         &home,
         Duration::from_secs(3),
+        &|| d.log(),
     );
 }
 
@@ -718,6 +731,7 @@ fn pausing_a_venture_stops_its_hung_report() {
         "the paused venture's report",
         &slow,
         Duration::from_secs(15),
+        &|| d.log(),
     );
     let out = timed(tmp.path(), &home, &["status"], Duration::from_secs(2));
     assert!(out.status.success(), "{}\n{}", text(&out), d.log());
@@ -778,6 +792,7 @@ fn a_hung_guard_leaves_status_answering_and_another_venture_reporting() {
         "the paused venture's guard",
         &guarded,
         Duration::from_secs(15),
+        &|| d.log(),
     );
 }
 
@@ -830,7 +845,12 @@ fn a_hung_metric_adapter_leaves_status_answering_and_its_venture_held() {
         Duration::from_secs(2),
     );
     assert!(out.status.success(), "{}", text(&out));
-    none_left("the paused venture's metric", &dir, Duration::from_secs(15));
+    none_left(
+        "the paused venture's metric",
+        &dir,
+        Duration::from_secs(15),
+        &|| d.log(),
+    );
 }
 
 /// The pids of the avsmd daemons on `home`, as doctor finds them.

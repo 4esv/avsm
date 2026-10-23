@@ -1277,6 +1277,10 @@ impl Kernel {
     pub fn pause(&mut self, name: &str) -> Result<String, String> {
         self.known(name)?;
         let entry = self.append(self.decision(name, Verdict::Pause))?;
+        // What it runs is stopped now, not at the next tick: a tick can
+        // wait behind a forecast.
+        self.cancel_inflight(name);
+        self.stop_reading(name);
         Ok(entry.line() + "\n")
     }
 
