@@ -146,6 +146,22 @@ impl Kernel {
         detail: String,
         limit: bool,
     ) {
+        self.refuse_citing(venture, lever, key, detail, limit, vec![]);
+    }
+
+    /// `refuse`, answering the declared approvals in `cites`: the warden
+    /// refused a run the gate allowed on them. Such a refusal spends them,
+    /// so it is always written, never only counted: a repeat for the same
+    /// reason closes the open one and opens its own.
+    pub(super) fn refuse_citing(
+        &mut self,
+        venture: &str,
+        lever: &str,
+        key: String,
+        detail: String,
+        limit: bool,
+        cites: Vec<Seq>,
+    ) {
         self.refusals.last = Some(Last {
             venture: venture.to_string(),
             lever: lever.to_string(),
@@ -155,11 +171,16 @@ impl Kernel {
         let id = (venture.to_string(), lever.to_string());
         let day = today();
         if let Some(open) = self.refusals.open.get_mut(&id) {
-            if open.key == key && open.day == day {
+            if open.key == key && open.day == day && cites.is_empty() {
                 open.count = open.count.saturating_add(1);
                 return;
             }
-            self.close_refusal(&id, "reason changed");
+            let why = if open.key == key {
+                "an approval was refused"
+            } else {
+                "reason changed"
+            };
+            self.close_refusal(&id, why);
         }
         let record = Record::Refusal {
             claim: Claim::Measured,
@@ -169,6 +190,7 @@ impl Kernel {
             detail,
             count: 1,
             closes: None,
+            cites,
         };
         match self.append(record) {
             Ok(e) => {
@@ -199,6 +221,7 @@ impl Kernel {
             detail: format!("{why}; refused {} times", open.count),
             count: open.count,
             closes: Some(open.seq),
+            cites: vec![],
         };
         if let Err(e) = self.append(record) {
             log(&format!("{}: cannot write refusal: {e}", id.0));
@@ -250,6 +273,7 @@ impl Kernel {
                 detail: format!("avsmd restarted; refused at least {count} times"),
                 count,
                 closes: Some(seq),
+                cites: vec![],
             };
             if let Err(e) = self.append(record) {
                 log(&format!("{venture}: cannot write refusal: {e}"));

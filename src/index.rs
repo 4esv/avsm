@@ -469,14 +469,33 @@ impl Index {
             } => {
                 self.predictions.entry(venture).or_default().insert(seq);
             }
-            Record::Refusal { closes, .. } => match closes {
-                None => {
-                    self.refusals_open.insert(seq);
+            Record::Refusal {
+                claim,
+                action,
+                closes,
+                cites,
+                ..
+            } => {
+                match closes {
+                    None => {
+                        self.refusals_open.insert(seq);
+                    }
+                    Some(open) => {
+                        self.refusals_open.remove(open);
+                    }
                 }
-                Some(open) => {
-                    self.refusals_open.remove(open);
+                // The warden refused a run the gate allowed on an approval:
+                // the refusal is its outcome and spends it, as an intent
+                // would.
+                if *claim == Claim::Measured {
+                    let spent: Vec<Seq> = cites
+                        .iter()
+                        .copied()
+                        .filter(|d| self.approves(*d, &venture, action))
+                        .collect();
+                    self.cite(spent);
                 }
-            },
+            }
             Record::Outcome {
                 claim, intent, ok, ..
             } => {

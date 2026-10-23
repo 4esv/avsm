@@ -168,6 +168,7 @@ mod tests {
             detail: "cap".into(),
             count,
             closes: None,
+            cites: vec![],
         };
         let ask = || Record::Ask {
             packet: None,

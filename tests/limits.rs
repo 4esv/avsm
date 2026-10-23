@@ -2,11 +2,14 @@
 //! amended may only turn `delegated` from false to true.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
+use avsmd::gate::Candidate;
 use avsmd::kernel::Kernel;
-use avsmd::record::{Claim, Entry, Kind, Payload, Record};
+use avsmd::record::{Claim, Entry, Kind, Payload, Record, Seq};
 use avsmd::role::{Context, InferRequest, Role};
-use avsmd::warden::LocalWarden;
+use avsmd::warden::{Failure, LocalWarden, Warden};
 
 struct Scripted {
     replies: VecDeque<Vec<Record>>,
@@ -238,5 +241,83 @@ fn an_edit_on_disk_nobody_adopted_never_rides_along() {
         payload,
         delegated(SHOP),
         "the proposal is the adopted mandate, delegated"
+    );
+}
+
+/// The real warden, counting the runs of `delegate` it is asked for.
+struct Counting {
+    inner: LocalWarden,
+    tries: Arc<AtomicUsize>,
+}
+
+impl Warden for Counting {
+    fn execute(&mut self, c: &Candidate) -> Result<Vec<Entry>, Failure> {
+        if c.action == "delegate" {
+            self.tries.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.execute(c)
+    }
+    fn confirm(&mut self, i: Seq) -> Result<Option<(bool, String)>, String> {
+        self.inner.confirm(i)
+    }
+    fn check(&mut self, v: &str, a: &str, p: &Payload) -> Result<(), Failure> {
+        self.inner.check(v, a, p)
+    }
+    fn infer(&mut self, r: &InferRequest) -> Result<String, String> {
+        self.inner.infer(r)
+    }
+    fn measure(&mut self, v: &str) -> Result<(Option<f64>, String), String> {
+        self.inner.measure(v)
+    }
+}
+
+#[test]
+fn a_refused_delegation_spends_its_approval_and_is_not_tried_again_after_a_restart() {
+    let raised = SHOP.replace("cap: 9/day", "cap: 90/day");
+    let (mut s, _) = ratcheted(SHOP);
+    let ask = forged(&mut s, &raised);
+    s.k.approve(ask, None).unwrap();
+    let decision = s.k.entries().unwrap().last().unwrap().seq;
+    s.k.tick();
+    let opened = |k: &Kernel| {
+        k.entries()
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                matches!(&e.record, Record::Refusal { reason, closes: None, .. }
+                    if reason == "EditsLimits")
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = opened(&s.k);
+    assert_eq!(first.len(), 1, "{}", lines(&first));
+    assert!(
+        matches!(&first[0].record, Record::Refusal { cites, .. } if cites == &vec![decision]),
+        "the refusal cites the approval it spends: {}",
+        lines(&first)
+    );
+    let home = s._tmp.path().join("home");
+    let tries = Arc::new(AtomicUsize::new(0));
+    for _ in 0..2 {
+        let warden = Counting {
+            inner: LocalWarden::open(&home).unwrap(),
+            tries: tries.clone(),
+        };
+        s.k = Kernel::with(
+            &home,
+            Box::new(Scripted {
+                replies: VecDeque::new(),
+            }),
+            Box::new(warden),
+        )
+        .unwrap();
+        s.k.tick();
+        s.k.tick();
+    }
+    assert_eq!(opened(&s.k).len(), 1, "{}", lines(&opened(&s.k)));
+    assert_eq!(tries.load(Ordering::SeqCst), 0, "never re-gated");
+    assert_eq!(
+        std::fs::read_to_string(s.dir.join("mandate.yaml")).unwrap(),
+        SHOP
     );
 }

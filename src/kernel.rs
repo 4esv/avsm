@@ -1861,10 +1861,19 @@ impl Kernel {
                 }
                 Err(Failure::Refused { reason_key, detail }) => {
                     // The check said no after the gate said yes: a refusal
-                    // record, no intent, nothing run.
+                    // record, no intent, nothing run. It cites what
+                    // authorized the run, which it spends: an approval is
+                    // used once, and a changed situation needs a fresh one.
                     lines.push(format!("{name}: {action} refused: {detail}"));
                     log(lines.last().map_or("", String::as_str));
-                    self.refuse(name, action, reason_key, detail, false);
+                    self.refuse_citing(
+                        name,
+                        action,
+                        reason_key,
+                        detail,
+                        false,
+                        candidate.cites.clone(),
+                    );
                 }
                 Err(Failure::Error(e)) => {
                     lines.push(format!("{name}: {action} did not run: {e}"));

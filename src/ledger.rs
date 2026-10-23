@@ -559,19 +559,23 @@ mod tests {
                 text(),
                 text(),
                 any::<u32>(),
-                prop::option::of(any::<Seq>())
+                prop::option::of(any::<Seq>()),
+                prop::collection::vec(any::<Seq>(), 0..3)
             )
-                .prop_map(|(claim, venture, action, reason, detail, count, closes)| {
-                    Record::Refusal {
-                        claim,
-                        venture,
-                        action,
-                        reason,
-                        detail,
-                        count,
-                        closes,
+                .prop_map(
+                    |(claim, venture, action, reason, detail, count, closes, cites)| {
+                        Record::Refusal {
+                            claim,
+                            venture,
+                            action,
+                            reason,
+                            detail,
+                            count,
+                            closes,
+                            cites,
+                        }
                     }
-                }),
+                ),
             (
                 claim(),
                 text(),

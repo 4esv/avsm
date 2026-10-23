@@ -1377,6 +1377,7 @@ fn quota_refusal(f: &mut Fixture, count: u32) {
         detail: "the asks quota is used up, so no ask was written".to_string(),
         count,
         closes,
+        cites: vec![],
     };
     let open = f.k.append(refusal(1, None)).unwrap().seq;
     f.k.append(refusal(count, Some(open))).unwrap();

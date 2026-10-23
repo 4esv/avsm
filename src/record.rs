@@ -658,6 +658,10 @@ pub enum Record {
         count: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         closes: Option<Seq>,
+        /// The declared approval this refusal answers, when the warden
+        /// refused a run the gate allowed: the approval is spent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cites: Vec<Seq>,
     },
     /// The first backend could not answer, so a second was asked (or, with
     /// `refused`, was not: the reason). Written by code before the call and
