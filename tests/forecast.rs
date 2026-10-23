@@ -725,6 +725,22 @@ fn simulate_garden(config: &str) -> Vec<Entry> {
     )
     .unwrap();
     script(&dir, "report", "echo 80");
+    // Readings from before: a simulation starts from the ledger's last,
+    // and never runs the report program to get one.
+    avsmd::clock::set(T0 - 4 * HOUR);
+    let mut k = Kernel::open(&home).unwrap();
+    for _ in 0..3 {
+        avsmd::clock::advance(HOUR);
+        k.append(Record::report(
+            Claim::Measured,
+            "garden",
+            "level",
+            Some(80.0),
+            "",
+        ))
+        .unwrap();
+    }
+    drop(k);
     let plan = avsmd::simulate::Plan {
         days: 1,
         step: 6 * HOUR,
@@ -749,6 +765,7 @@ fn a_simulation_forecasts_at_add_as_its_config_says() {
         .seq;
     let first = entries
         .iter()
+        .filter(|e| e.seq > adopt)
         .find(|e| matches!(&e.record, Record::Report { venture, metric, .. } if venture == "garden" && metric == "level"))
         .unwrap()
         .seq;

@@ -6,9 +6,40 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 
-use avsmd::record::{Record, Signal};
+use avsmd::record::{Claim, Record, Signal};
 use avsmd::simulate::{run, Human, Plan};
+
+/// The virtual clock belongs to the whole process: one test at a time.
+static CLOCK: Mutex<()> = Mutex::new(());
+
+const START: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
+
+fn clock() -> MutexGuard<'static, ()> {
+    std::env::set_var("TZ", "UTC");
+    CLOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Take the janitor on before START with a few readings of 89: a
+/// simulation starts from the ledger's last reading, and never runs the
+/// report program to get one.
+fn history(home: &Path, dir: &Path) {
+    avsmd::clock::set(START - 5 * 3600);
+    let mut k = avsmd::kernel::Kernel::open(home).unwrap();
+    k.add(dir).unwrap();
+    for _ in 0..4 {
+        avsmd::clock::advance(3600);
+        k.append(Record::report(
+            Claim::Measured,
+            "janitor",
+            "usage",
+            Some(89.0),
+            "",
+        ))
+        .unwrap();
+    }
+}
 
 /// A cleanup venture whose usage reads 89 and stays there unless
 /// something moves it, with one delegated lever under `lever`.
@@ -41,7 +72,7 @@ fn home_in(tmp: &Path) -> std::path::PathBuf {
 
 #[test]
 fn a_frozen_baseline_never_finds_a_lever_ineffective() {
-    std::env::set_var("TZ", "UTC");
+    let _c = clock();
     let tmp = tempfile::tempdir().unwrap();
     let home = home_in(tmp.path());
     let dir = tmp.path().join("janitor");
@@ -50,11 +81,12 @@ fn a_frozen_baseline_never_finds_a_lever_ineffective() {
         "{name: clean, run: 'true', cap: 6/hour, reversible: true, delegated: true, \
          expects: down within 2}",
     );
+    history(&home, &dir);
     let plan = Plan {
         days: 1,
         step: 3600,
         human: Human::Away,
-        start: Some(1_767_225_600), // 2026-01-01T00:00:00Z
+        start: Some(START),
         add: vec![dir],
         world: None,
     };
@@ -86,6 +118,7 @@ fn a_frozen_baseline_never_finds_a_lever_ineffective() {
 
 #[test]
 fn stderr_says_a_refusal_once_an_episode() {
+    let _c = clock();
     let tmp = tempfile::tempdir().unwrap();
     let home = home_in(tmp.path());
     let dir = tmp.path().join("janitor");
@@ -94,6 +127,7 @@ fn stderr_says_a_refusal_once_an_episode() {
         &dir,
         "{name: clean, run: 'true', cap: 1/day, reversible: true, delegated: true}",
     );
+    history(&home, &dir);
     let out = Command::new(env!("CARGO_BIN_EXE_avsm"))
         .args([
             "--home",

@@ -95,6 +95,7 @@ fn a_script_lever_goes_to_the_world_and_never_runs() {
 fn without_a_world_the_lever_steps_the_world_model_and_reports_follow_it() {
     let _c = clock();
     let (_tmp, home, dir) = setup("");
+    history(&home, &dir, &[3.0, 3.0, 3.0]);
     let mut out = Vec::new();
     run(&home, &plan(&dir, None), &mut out).unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -111,21 +112,132 @@ fn without_a_world_the_lever_steps_the_world_model_and_reports_follow_it() {
                 if *i == intent.seq && detail.starts_with("simulated: baseline"))),
         "{text}"
     );
-    // The first reading is real and seeds the baseline; the rest come
-    // from the model's state.
+    // The baseline starts from the ledger's last reading; every reading
+    // comes from the model's state, none from the report program.
     let notes: Vec<&str> = entries
         .iter()
+        .filter(|e| e.at >= START)
         .filter_map(|e| match &e.record {
             Record::Report { metric, note, .. } if metric == "count" => Some(note.as_str()),
             _ => None,
         })
         .collect();
-    assert_eq!(notes[0], "", "{text}");
     assert!(notes.len() > 20, "{text}");
-    assert!(
-        notes[1..].iter().all(|n| *n == "simulated: baseline"),
-        "{text}"
+    assert!(notes.iter().all(|n| *n == "simulated: baseline"), "{text}");
+}
+
+/// Take the venture on before the simulation starts, with these readings
+/// of its metric in the ledger, an hour apart, ending an hour before
+/// START.
+fn history(home: &Path, dir: &Path, values: &[f64]) {
+    avsmd::clock::set(START - (values.len() as i64 + 1) * 3600);
+    let mut k = Kernel::open(home).unwrap();
+    k.add(dir).unwrap();
+    for v in values {
+        avsmd::clock::advance(3600);
+        k.append(Record::report(
+            Claim::Measured,
+            "low",
+            "count",
+            Some(*v),
+            "",
+        ))
+        .unwrap();
+    }
+}
+
+/// A venture whose every program, were it to run, leaves a trace: the
+/// report counts its runs in `count`, as examples/counter's does, and the
+/// guard, the audit and the reading each touch a file.
+fn tracing() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (tmp, home, dir) = setup(
+        "guards:\n- {name: spend, run: ./spend, above: 50, then: ask}\n\
+         audits:\n- {name: refunds, run: ./refunds, worse: up}\n\
+         readings:\n- {name: waiting, run: ./waiting, lines: address}\n",
     );
+    std::fs::write(dir.join("count"), "500\n").unwrap();
+    script(
+        &dir,
+        "report",
+        "n=$(cat count); echo $((n + 1)) > count; echo 3",
+    );
+    for name in ["spend", "refunds", "waiting"] {
+        let mark = name.to_uppercase();
+        script(&dir, name, &format!("touch {mark}_RAN; echo 1"));
+    }
+    (tmp, home, dir)
+}
+
+/// Every program the venture holds is as it was: none of it ran.
+fn untouched(dir: &Path, text: &str) {
+    assert_eq!(
+        std::fs::read_to_string(dir.join("count")).unwrap(),
+        "500\n",
+        "the report ran: {text}"
+    );
+    for name in ["LEVER_RAN", "SPEND_RAN", "REFUNDS_RAN", "WAITING_RAN"] {
+        assert!(!dir.join(name).exists(), "{name}: {text}");
+    }
+}
+
+#[test]
+fn a_simulation_runs_none_of_the_ventures_programs() {
+    let _c = clock();
+    let (_tmp, home, dir) = tracing();
+    let mut out = Vec::new();
+    run(&home, &plan(&dir, None), &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    untouched(&dir, &text);
+    // With nothing in the ledger to start from, the baseline says so on
+    // every reading, tagged as the simulation's.
+    let entries = Kernel::open(&home).unwrap().entries().unwrap();
+    let reports: Vec<&Record> = entries
+        .iter()
+        .map(|e| &e.record)
+        .filter(|r| r.venture() == "low" && r.kind() == Kind::Report)
+        .collect();
+    assert!(reports.len() > 20, "{text}");
+    for r in reports {
+        let Record::Report {
+            note,
+            value,
+            metric,
+            ..
+        } = r
+        else {
+            unreachable!()
+        };
+        assert!(note.starts_with("simulated:"), "{metric} {note}: {text}");
+        assert_eq!(*value, None, "{metric}: {text}");
+    }
+}
+
+#[test]
+fn a_simulation_starts_from_the_ledgers_last_reading() {
+    let _c = clock();
+    let (_tmp, home, dir) = tracing();
+    history(&home, &dir, &[7.0, 6.0, 7.0, 6.0]);
+    let mut out = Vec::new();
+    run(&home, &plan(&dir, None), &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    untouched(&dir, &text);
+    let entries = Kernel::open(&home).unwrap().entries().unwrap();
+    let first = entries
+        .iter()
+        .filter(|e| e.at >= START)
+        .find_map(|e| match &e.record {
+            Record::Report {
+                metric,
+                value,
+                note,
+                ..
+            } if metric == "count" => Some((*value, note.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{text}"));
+    assert_eq!(first.1, "simulated: baseline", "{text}");
+    let x = first.0.unwrap_or_else(|| panic!("{text}"));
+    assert!((5.0..=8.0).contains(&x), "{x}: {text}");
 }
 
 #[test]

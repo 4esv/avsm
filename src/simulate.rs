@@ -40,6 +40,10 @@ pub const EDIT: &str = "Edited by simulation.";
 /// The name declared records carry when the policy decided.
 pub const BY: &str = "simulation";
 
+/// The note of a simulated reading when the baseline has no reading in
+/// the ledger to start from.
+pub const NO_START: &str = "simulated: no reading yet to start from";
+
 /// How long to simulate and how.
 #[derive(Clone, Debug)]
 pub struct Plan {
@@ -187,8 +191,10 @@ impl Simulation {
 
     /// Read a venture's metric from its world model's state, when there
     /// is no `--world` to move the real files. None means read it for
-    /// real: there is a `--world`, or the baseline has nothing yet to
-    /// start from, so the first reading seeds it.
+    /// real: there is a `--world`. The baseline starts from the ledger's
+    /// last trusted, plausible reading; with none it says so, and never
+    /// runs the report program to get one: that program is the venture's,
+    /// and may change what it reads (a counter counts its runs).
     pub(crate) fn measure(
         &self,
         index: &Index,
@@ -213,12 +219,9 @@ impl Simulation {
                 states.insert(venture.to_string(), (next.state, now));
                 Some((Some(next.metric), format!("simulated: {}", model.name())))
             }
-            // A forecast branch never reads for real: a report program is
-            // the venture's, and may change what it reads.
-            Err(_) if model.name() == world::BASELINE && state.is_null() && self.seed.is_some() => {
-                Some((None, "simulated: no reading yet to start from".to_string()))
+            Err(_) if model.name() == world::BASELINE && state.is_null() => {
+                Some((None, NO_START.to_string()))
             }
-            Err(_) if model.name() == world::BASELINE && state.is_null() => None,
             Err(e) => Some((None, format!("simulated: {}  {e}", model.name()))),
         }
     }

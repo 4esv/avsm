@@ -448,7 +448,10 @@ the payload on standard input; a world that fails stops the simulation. Without
 `--world`, a lever steps the venture's world model and the reports come from its
 state; unless the mandate names a `world:`, that is a baseline learned from the
 ledger, which replays the steps the venture's own readings have shown, so a
-venture with little history gives a flat one. A simulation exits 70 when it
+venture with little history gives a flat one. It starts from the ledger's last
+reading, and a venture with none in the simulation's home reads nothing and
+says so: without `--world`, no `report`, guard, audit or reading program of a
+venture runs, since a program may change what it reads. A simulation exits 70 when it
 cannot run or its world fails. The world is not avsm's and leaves no record; the
 text it prints is escaped before it reaches your terminal.
 
