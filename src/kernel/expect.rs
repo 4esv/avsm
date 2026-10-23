@@ -382,8 +382,19 @@ impl Kernel {
         why: String,
         cites: Vec<Seq>,
     ) {
+        // A lever that never ran on its own is let run again, not delegated.
+        let delegated = self
+            .ventures
+            .get(venture)
+            .and_then(|v| v.mandate.permitted(lever))
+            .is_some_and(|p| p.delegated);
+        let again = if delegated {
+            "delegate it again"
+        } else {
+            "let it run again"
+        };
         let question = format!(
-            "{lever} is ineffective, so it is refused and asks no more: {why}; approve to delegate it again"
+            "{lever} is ineffective, so it is refused and asks no more: {why}; approve to {again}"
         );
         let signal = Signal::Ineffective {
             action: lever.to_string(),

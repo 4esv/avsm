@@ -311,6 +311,8 @@ fn missed(f: &mut Fixture) {
         }
         other => panic!("{other:?}"),
     }
+    let asked = f.ineffective()[0].record.summary();
+    assert!(asked.contains("approve to delegate it again"), "{asked}");
     // The delegation is suspended: tomorrow's crossing is refused, and
     // asks nothing.
     let runs = f.intents();
@@ -409,6 +411,11 @@ fn a_reversible_lever_that_does_nothing_is_suspended_after_one_miss() {
     assert_eq!(f.intents(), 1, "50 more crossings, no more runs");
     assert!(f.lever_asks().is_empty(), "no ask a run, not fifty");
     assert_eq!(f.ineffective().len(), 1, "the one ask of the episode");
+    let asked = f.ineffective()[0].record.summary();
+    assert!(
+        asked.contains("approve to let it run again") && !asked.contains("delegate"),
+        "boost was never delegated: {asked}"
+    );
     let refused = f
         .entries()
         .into_iter()
