@@ -2204,6 +2204,10 @@ fn a_new_adoption_answers_the_open_ineffective_ask_and_the_state_moves_on() {
     let state =
         |f: &Fixture| avsmd::gate::state_in(&f.k.index().unwrap(), &f.k.adopted(), "raiser");
     assert_eq!(state(&f), avsmd::gate::State::Ineffective);
+    // Open until then, in the index and the reference alike: the adoption
+    // before it answers nothing.
+    assert!(f.k.index().unwrap().is_open(ask));
+    assert!(avsmd::gate::reference::open_asks(&f.entries()).contains(&ask));
     let dir = f.dir.clone();
     f.k.add(&dir).unwrap();
     // The adoption ended the suspension the ask was about: it is answered,
