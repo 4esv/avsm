@@ -1,3 +1,5 @@
 /target
 /.claude/
 __pycache__/
+# state a venture writes when its example runs in place
+/examples/*/count

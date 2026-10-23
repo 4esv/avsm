@@ -393,7 +393,7 @@ fn examples_counter_end_to_end() {
     assert!(why.contains("counter: reset is allowed"), "{why}");
     assert!(why.contains("measured  count=11"), "{why}");
     assert!(why.contains("threshold  count above 10"), "{why}");
-    assert!(why.contains("cap        0 of 6/hour used"), "{why}");
+    assert!(why.contains("cap        0 of 60/hour used"), "{why}");
     assert_eq!(
         std::fs::read_to_string(dir.join("count")).unwrap().trim(),
         "0"

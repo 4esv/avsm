@@ -1,14 +1,17 @@
 # The smallest venture: a number that climbs, and one lever that puts it back.
+# The count rises by one every 10s, so it passes ten and is reset about every
+# two minutes: roughly 33 resets an hour against a cap of 60, so a first run
+# stays well inside its limit for hours.
 purpose: Keep the counter below ten.
 metric: count
 controller:
   kind: threshold
   above: 10
   action: reset
-cadence: 5s
+cadence: 10s
 permitted:
   - name: reset
     run: ./reset
-    cap: 6/hour
+    cap: 60/hour
     reversible: true
 forbidden: [rm]

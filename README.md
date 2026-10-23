@@ -57,11 +57,11 @@ controller:
   kind: threshold
   above: 10
   action: reset
-cadence: 5s
+cadence: 10s
 permitted:
   - name: reset
     run: ./reset
-    cap: 6/hour
+    cap: 60/hour
     reversible: true
 forbidden: [rm]
 ```
@@ -71,7 +71,9 @@ Watch it work:
     avsm status
     avsm tail
 
-Within a minute the count climbs past ten, avsm runs `reset`, and the ledger
+The count rises by one every 10 seconds. Within two minutes it climbs past ten,
+avsm runs `reset`, and then does so again about every two minutes: some 33 resets
+an hour against a cap of 60, so the example stays inside its limit. The ledger
 holds the reports, the action, and the proof that allowed it. Every line is one
 record: its number, its time, its venture, who made it (measured, declared,
 inferred), what it is, and a summary.
@@ -521,10 +523,10 @@ prints the derivation behind record 9, one premise per line:
     #9     2026-10-15T22:04:11Z  counter      measured  action    reset: done  count is 0 again
     counter: reset is allowed
       mandate    #2  declared  adopted mandate e3f2c02fc1c2
-      permitted  reset  6/hour  reversible
+      permitted  reset  60/hour  reversible
       report     #8  measured  count=11
       threshold  count above 10
-      cap        0 of 6/hour used
+      cap        0 of 60/hour used
       running    counter is not paused
 
 Everything in a proof is measured or declared. A model's proposal appears only
