@@ -272,7 +272,8 @@ impl Kernel {
                         .filter(|q| *q > adopted);
                     ask = Some(match last {
                         None => (why, None),
-                        Some(q) => match index.fresh_evidence(venture, &metric, q) {
+                        Some(q) => match index.fresh_evidence(venture, &metric, q, v.mandate.range)
+                        {
                             Some((was, now, readings)) => {
                                 cites.extend(readings);
                                 (
@@ -421,7 +422,7 @@ impl Kernel {
                 return;
             }
             index
-                .fresh_evidence(venture, &metric, last)
+                .fresh_evidence(venture, &metric, last, v.mandate.range)
                 .map(|(was, now, readings)| {
                     (
                         format!(

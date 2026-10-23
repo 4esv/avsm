@@ -2151,3 +2151,48 @@ fn a_run_with_too_little_history_for_the_drift_is_not_judged_yet() {
         f.ineffective()
     );
 }
+
+#[test]
+fn a_metric_that_steps_to_a_new_value_and_holds_it_asks_again() {
+    let _c = clock();
+    // Behind the late sensor, whose readings repeat more often than they
+    // change: a run read the wrong way, the lever is found ineffective,
+    // and the human says no.
+    let mut f = late_sensor();
+    f.report(2.0);
+    f.report(2.0);
+    assert!(f.suspended(), "{:#?}", f.entries());
+    let ask = f.ineffective()[0].seq;
+    f.k.deny(ask, "no").unwrap();
+    // Then the metric steps to 4 and holds it, as this sensor does: two
+    // readings away from 2, the same, and each one a repeat as ordinary
+    // as a change on this metric. That is new evidence: one ask again.
+    f.report(4.0);
+    assert_eq!(f.ineffective().len(), 1, "one reading is not yet evidence");
+    f.report(4.0);
+    assert_eq!(f.ineffective().len(), 2, "{:#?}", f.ineffective());
+    assert!(f.suspended(), "an open ask is no answer");
+    f.report(4.0);
+    assert_eq!(f.ineffective().len(), 2, "one open at a time");
+}
+
+#[test]
+fn an_exact_repeat_on_a_metric_that_seldom_repeats_is_still_no_new_evidence() {
+    let _c = clock();
+    // The same, on a metric that changes at every reading: a repeat there
+    // is what a stuck sensor reads first, and two of them ask nothing.
+    let mut f = fixture(TEST_DELEGATED, "echo boost >> boosts");
+    f.history(7.0);
+    f.report(3.0);
+    f.report(2.0);
+    f.report(1.0);
+    f.report_tomorrow(1.0);
+    assert!(f.suspended(), "{:#?}", f.entries());
+    let ask = f.ineffective()[0].seq;
+    f.k.deny(ask, "no").unwrap();
+    f.report(4.0);
+    f.report(4.0);
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.ineffective());
+    f.report(4.5);
+    assert_eq!(f.ineffective().len(), 2, "two that differ are evidence");
+}

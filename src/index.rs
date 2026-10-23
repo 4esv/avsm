@@ -1093,11 +1093,20 @@ impl Index {
     /// repeats stuck, or flags a flap right after it (`impugned`).
     /// Returns the two values and the two readings. Only asks rest on
     /// it; it never voids, so the gate's `voided` keeps `evidence`.
+    ///
+    /// The two may be an exact repeat on a metric whose own history, before
+    /// the record, makes a repeat at least as likely as a change (the
+    /// posterior predictive of one repeat, `expect::hold_chance`, at least
+    /// 1/2; repeats at a bound of `range` are no steps): a sensor read more
+    /// often than it refreshes holds a new value, and that is no stuck
+    /// sensor's signature there. On a metric that seldom repeats, a repeat
+    /// is what a stuck sensor reads first, and the two must differ.
     pub fn fresh_evidence(
         &self,
         venture: &str,
         metric: &str,
         since: Seq,
+        range: Option<[f64; 2]>,
     ) -> Option<(f64, f64, [Seq; 2])> {
         let series = self.series(venture, metric);
         let i = series.partition_point(|(s, _)| *s <= since);
@@ -1110,12 +1119,16 @@ impl Index {
         let values: Vec<f64> = series[..i].iter().map(|(_, x)| *x).collect();
         let noise = crate::expect::noise(&values);
         let away = |x: f64| (x - frozen).abs() > noise;
+        let bound = |x: f64| range.is_some_and(|[lo, hi]| x == lo || x == hi);
+        let (steps, zero) = crate::expect::repeats(&values, &[], bound);
+        let ordinary = steps >= crate::expect::MIN_SAMPLES
+            && crate::expect::hold_chance(steps, zero, 1) >= 0.5;
         (i..series.len().saturating_sub(1)).find_map(|j| {
             let ((s0, x0), (s1, x1)) = (series[j], series[j + 1]);
             let from = j.checked_sub(1).map_or(0, |k| series[k].0);
             (away(x0)
                 && away(x1)
-                && x0 != x1
+                && (x0 != x1 || ordinary)
                 && !self.doubted_between(venture, metric, from, s1)
                 && self.impugned(venture, metric, s0).is_none()
                 && self.impugned(venture, metric, s1).is_none())
