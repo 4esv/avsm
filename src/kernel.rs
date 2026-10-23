@@ -557,9 +557,12 @@ impl Kernel {
 
     /// Take on the venture in a directory: adopt its mandate.
     pub fn add(&mut self, dir: &Path) -> Result<String, String> {
+        if let Some(problem) = venture::dir_problem(dir) {
+            return Err(problem.text().to_string());
+        }
         let dir = dir
             .canonicalize()
-            .map_err(|e| format!("cannot find {}: {e}", dir.display()))?;
+            .map_err(|e| format!("cannot find {}: {}", dir.display(), venture::plain(&e)))?;
         let name = venture::name_of(&dir)?;
         let (mandate, hash, text) = venture::read_mandate(&dir)?;
         self.check_family(&name, &mandate)?;

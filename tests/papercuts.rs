@@ -357,3 +357,46 @@ fn a_missing_record_number_hints_at_zsh_comments() {
     let (_, _, err) = avsm_out(tmp.path(), &["pause"]);
     assert!(!err.contains("zsh"), "{err}");
 }
+
+#[test]
+fn add_says_what_is_wrong_with_the_path_without_os_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let _daemon = start(&home);
+    let h = home.as_path();
+
+    let (code, _, err) = avsm_out(h, &["add", tmp.path().join("nope").to_str().unwrap()]);
+    assert_eq!(code, Some(66), "{err}");
+    assert!(
+        err.contains("cannot find") && !err.contains("os error"),
+        "{err}"
+    );
+
+    let yml = tmp.path().join("yml");
+    std::fs::create_dir_all(&yml).unwrap();
+    std::fs::write(yml.join("mandate.yml"), "purpose: x\n").unwrap();
+    let (code, _, err) = avsm_out(h, &["add", yml.to_str().unwrap()]);
+    assert_eq!(code, Some(65), "{err}");
+    assert!(err.contains("rename mandate.yml to mandate.yaml"), "{err}");
+    assert!(!err.contains("os error"), "{err}");
+
+    let dir = counter_venture(tmp.path());
+    let (code, _, err) = avsm_out(h, &["add", dir.join("mandate.yaml").to_str().unwrap()]);
+    assert_eq!(code, Some(65), "{err}");
+    assert!(err.contains("pass the directory"), "{err}");
+    assert!(!err.contains("os error"), "{err}");
+
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let (code, _, err) = avsm_out(h, &["add", empty.to_str().unwrap()]);
+    assert_eq!(code, Some(65), "{err}");
+    assert!(
+        err.contains("holds no mandate.yaml") && !err.contains("os error"),
+        "{err}"
+    );
+
+    // The daemon says the same to a caller that did not check first.
+    let mut k = avsmd::kernel::Kernel::open(&tmp.path().join("other")).unwrap();
+    let err = k.add(&yml).unwrap_err();
+    assert!(err.contains("rename mandate.yml to mandate.yaml"), "{err}");
+}

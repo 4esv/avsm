@@ -377,6 +377,19 @@ fn main() -> ExitCode {
             );
         }
         Command::Add { dir } => {
+            // A path on this machine is checked here, so a missing one
+            // exits 66 as doctor does; a remote avsmd checks its own.
+            if remote.is_none() {
+                match avsmd::venture::dir_problem(&dir) {
+                    Some(avsmd::venture::DirProblem::Missing(t)) => {
+                        return done(Err(Exit::new(exit::NOINPUT, t)))
+                    }
+                    Some(avsmd::venture::DirProblem::Wrong(t)) => {
+                        return done(Err(Exit::new(exit::DATAERR, t)))
+                    }
+                    None => {}
+                }
+            }
             let dir = dir.canonicalize().unwrap_or(dir);
             vec!["add".to_string(), dir.to_string_lossy().into_owned()]
         }

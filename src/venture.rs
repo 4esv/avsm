@@ -188,12 +188,74 @@ pub fn program_problems(dir: &Path, m: &Mandate) -> Vec<ProgramProblem> {
     out
 }
 
+/// An io error's words without the number the system adds.
+pub fn plain(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    text.split(" (os error").next().unwrap_or(&text).to_string()
+}
+
+/// What is wrong with a path given as a venture directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirProblem {
+    /// There is nothing there.
+    Missing(String),
+    /// There is something, and it is not a venture directory.
+    Wrong(String),
+}
+
+impl DirProblem {
+    pub fn text(&self) -> &str {
+        match self {
+            DirProblem::Missing(t) | DirProblem::Wrong(t) => t,
+        }
+    }
+}
+
+/// Is this path a directory with a mandate in it? None when it is; else
+/// what is wrong, in words that say what to do.
+pub fn dir_problem(path: &Path) -> Option<DirProblem> {
+    let d = crate::doctor::sh(path);
+    if !path.exists() {
+        return Some(DirProblem::Missing(format!(
+            "cannot find {}: there is nothing there",
+            path.display()
+        )));
+    }
+    if path.is_file() {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        return Some(DirProblem::Wrong(format!(
+            "{} is a file; pass the directory that holds it: avsm add {}",
+            path.display(),
+            crate::doctor::sh(parent)
+        )));
+    }
+    let yaml = path.join(MANDATE_FILE);
+    let yml = path.join("mandate.yml");
+    if !yaml.exists() && yml.exists() {
+        return Some(DirProblem::Wrong(format!(
+            "{} holds mandate.yml; rename mandate.yml to mandate.yaml: mv {d}/mandate.yml {d}/mandate.yaml",
+            path.display()
+        )));
+    }
+    if !yaml.exists() {
+        return Some(DirProblem::Wrong(format!(
+            "{} holds no {MANDATE_FILE}; a venture directory holds {MANDATE_FILE} and, unless the metric is built in, a report program",
+            path.display()
+        )));
+    }
+    None
+}
+
 /// Read and hash a venture directory's mandate: the mandate, the hash of
 /// its text and the text.
 pub fn read_mandate(dir: &Path) -> Result<(Mandate, String, String), String> {
     let path = dir.join(MANDATE_FILE);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        dir_problem(dir).map_or_else(
+            || format!("cannot read {}: {}", path.display(), plain(&e)),
+            |p| p.text().to_string(),
+        )
+    })?;
     let mandate = Mandate::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let hash = Mandate::hash(&text);
     Ok((mandate, hash, text))
