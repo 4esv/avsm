@@ -356,6 +356,28 @@ fn account_name() -> String {
     format!("uid {uid}")
 }
 
+/// Is the venture paused: is its latest declared pause or resume a pause?
+fn is_paused(entries: &[Entry], name: &str) -> bool {
+    use crate::record::{Claim, Record, Verdict};
+    entries
+        .iter()
+        .rev()
+        .find_map(|e| match &e.record {
+            Record::Decision {
+                claim: Claim::Declared,
+                venture,
+                verdict,
+                ..
+            } if venture == name => match verdict {
+                Verdict::Pause => Some(true),
+                Verdict::Resume => Some(false),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 /// The ventures a human adopted, self left out.
 fn adopted(entries: &[Entry]) -> BTreeMap<String, Venture> {
     let mut ventures = venture::load_all(entries);
@@ -446,6 +468,10 @@ pub fn test(home: &Path) -> Found {
                 found.problems.push(format!("{name}: {e}"));
                 found.code = exit::worst(found.code, exit::CONFIG);
             }
+            Disk::Gone if is_paused(&entries, &name) => found.out.push_str(&format!(
+                "  {name} is paused and {} is not a directory; nothing needs it until avsm resume {name}\n",
+                dir.display()
+            )),
             Disk::Gone => {
                 found
                     .problems
@@ -661,10 +687,16 @@ pub fn doctor(
                 format!("{name}: {e}"),
                 format!("${{EDITOR:-vi}} {d}/mandate.yaml && avsm add {d}"),
             ),
+            // A pause is the way to stop a venture whose directory moved:
+            // nothing runs there, so nothing is wrong until it resumes.
+            Disk::Gone if is_paused(&entries, name) => found.note(format!(
+                "{name} is paused and {} is not a directory; put it back at {d} before: avsm resume {name}",
+                dir.display()
+            )),
             Disk::Gone => found.fail(
                 exit::NOINPUT,
                 format!("{name}: {} is not a directory", dir.display()),
-                format!("avsm pause {name}  # or put the directory back at {d}"),
+                format!("avsm pause {name}  # stops it, and doctor then only notes it; or put the directory back at {d}"),
             ),
         }
     }

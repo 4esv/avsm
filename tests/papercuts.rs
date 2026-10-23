@@ -319,3 +319,26 @@ fn a_lever_that_exists_without_the_execute_bit_gets_chmod_not_create() {
     assert!(out.contains("fix: chmod +x "), "{out}");
     assert!(!out.contains("fix: create it"), "{out}");
 }
+
+#[test]
+fn doctor_stops_failing_a_moved_directory_once_its_venture_is_paused() {
+    use avsmd::kernel::Kernel;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let mut k = Kernel::open(&home).unwrap();
+    let dir = venture_with(tmp.path(), "moved", b"#!/bin/sh\necho 3\n", 0o755);
+    k.add(&dir).unwrap();
+    std::fs::rename(&dir, tmp.path().join("elsewhere")).unwrap();
+    let (_, out, _) = avsm_out(&home, &["doctor"]);
+    assert!(
+        out.contains("FAIL  moved: ") && out.contains("fix: avsm pause moved"),
+        "{out}"
+    );
+    k.pause("moved").unwrap();
+    let (_, out, _) = avsm_out(&home, &["doctor"]);
+    assert!(!out.contains("FAIL  moved"), "{out}");
+    assert!(out.contains("note  moved is paused"), "{out}");
+    k.resume("moved").unwrap();
+    let (_, out, _) = avsm_out(&home, &["doctor"]);
+    assert!(out.contains("FAIL  moved: "), "{out}");
+}
