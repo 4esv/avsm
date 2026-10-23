@@ -1194,6 +1194,19 @@ impl Kernel {
     /// they did. The next tick acts on it.
     pub fn approve(&mut self, seq: Seq, amended: Option<&str>) -> Result<String, String> {
         let ask = self.open_ask(seq)?;
+        // The gate spends an approval its paused venture cannot run on, so
+        // one given now would be gone by the resume. Saying whether a run
+        // happened runs nothing, and is answered whatever the state.
+        let venture = ask.record.venture().to_string();
+        if pending_asked(&ask).is_none() {
+            let index = self.index()?;
+            if gate::state_in(&index, &self.adopted(), &venture) == gate::State::Paused {
+                return Err(format!(
+                    "{venture} is paused; resume it first (avsm resume {venture}), then approve: \
+                     an approval given while paused is spent without running"
+                ));
+            }
+        }
         let lever_takes = ask.record.action().and_then(|a| {
             self.ventures
                 .get(ask.record.venture())

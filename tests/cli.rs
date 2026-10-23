@@ -346,6 +346,62 @@ fn approve_and_deny_answer_open_asks() {
     assert_eq!(kernel.ledger.verify().unwrap(), 4);
 }
 
+/// Monkey round 3: an approval given while its venture is paused is spent
+/// by the gate without running, so a lever that pauses its venture could
+/// burn a human's approvals. Approve is refused until a resume; deny is
+/// not.
+#[test]
+fn approve_is_refused_while_the_ventures_paused_and_deny_is_not() {
+    use avsmd::record::Verdict;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut kernel = Kernel::open(&tmp.path().join("home")).unwrap();
+    let ask = |action: &str| Record::Ask {
+        packet: None,
+        cites: vec![],
+        claim: Claim::Inferred,
+        venture: "counter".to_string(),
+        action: Some(action.to_string()),
+        question: format!("may I {action}?"),
+        refusal: None,
+        signal: None,
+        payload: None,
+    };
+    let first = kernel.append(ask("deploy")).unwrap().seq;
+    let second = kernel.append(ask("rollback")).unwrap().seq;
+    let decide = |k: &mut Kernel, verdict: Verdict| {
+        k.append(Record::Decision {
+            claim: Claim::Declared,
+            venture: "counter".to_string(),
+            verdict,
+            by: None,
+        })
+        .unwrap();
+    };
+    decide(&mut kernel, Verdict::Pause);
+    let handle = |k: &mut Kernel, args: &[&str]| {
+        k.handle(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    };
+    let err = handle(&mut kernel, &["approve", &first.to_string()]).unwrap_err();
+    assert!(
+        err.contains(
+            "counter is paused; resume it first (avsm resume counter), then approve: \
+             an approval given while paused is spent without running"
+        ),
+        "{err}"
+    );
+    assert!(
+        handle(&mut kernel, &["asks"])
+            .unwrap()
+            .contains("may I deploy?"),
+        "the ask stays open"
+    );
+    let text = handle(&mut kernel, &["deny", &second.to_string(), "no"]).unwrap();
+    assert!(text.contains(&format!("denied #{second}")), "{text}");
+    decide(&mut kernel, Verdict::Resume);
+    let text = handle(&mut kernel, &["approve", &first.to_string()]).unwrap();
+    assert!(text.contains(&format!("approved #{first}")), "{text}");
+}
+
 /// The README walkthrough: add examples/counter, watch the count cross the
 /// threshold, read the proof. The count is seeded at 10 so it crosses on
 /// the first report.
