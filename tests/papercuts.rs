@@ -400,3 +400,24 @@ fn add_says_what_is_wrong_with_the_path_without_os_errors() {
     let err = k.add(&yml).unwrap_err();
     assert!(err.contains("rename mandate.yml to mandate.yaml"), "{err}");
 }
+
+#[test]
+fn doctor_since_takes_the_digests_head_line_as_printed() {
+    let line = "head 42:0123456789abcdef; keep it off this machine and check it with: avsm doctor --since 42:0123456789abcdef";
+    let want = (Some(42), "0123456789abcdef".to_string());
+    for text in [
+        line,
+        "  head 42:0123456789abcdef  ",
+        "42:0123456789abcdef",
+        "head 42:0123456789abcdef;",
+    ] {
+        assert_eq!(avsmd::doctor::parse_anchor(text).unwrap(), want, "{text}");
+    }
+    assert_eq!(
+        avsmd::doctor::parse_anchor("head 0123456789ABCDEF").unwrap(),
+        (None, "0123456789abcdef".to_string())
+    );
+    for bad in ["head", "head 12", "x:y", "head 3:abc"] {
+        assert!(avsmd::doctor::parse_anchor(bad).is_err(), "{bad}");
+    }
+}

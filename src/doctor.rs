@@ -126,6 +126,14 @@ fn cut_fix(home: &Path, bad: Option<Seq>) -> String {
 /// A head kept off the machine, as the digest prints it: `seq:hash`, or
 /// a bare hash, with at least the 16 hex digits the digest shows.
 pub fn parse_anchor(text: &str) -> Result<(Option<Seq>, String), String> {
+    // The digest's whole head line pastes as it is printed:
+    // `head 42:0123456789abcdef; keep it off this machine and ...`.
+    let text = text.trim();
+    let text = text.strip_prefix("head ").unwrap_or(text).trim_start();
+    let text = text
+        .split(|c: char| c == ';' || c.is_whitespace())
+        .next()
+        .unwrap_or(text);
     let (seq, hash) = match text.split_once(':') {
         Some((seq, hash)) => (
             Some(
