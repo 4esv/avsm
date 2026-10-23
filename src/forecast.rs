@@ -1595,7 +1595,7 @@ fn cap_spent_past(
     } else {
         format!(
             "{SPENT_WINDOWS} windows of {}",
-            humantime::format_duration(p.cap.per)
+            crate::mandate::spoken(p.cap.per)
         )
     };
     Some(Gap {

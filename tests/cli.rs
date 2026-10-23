@@ -429,9 +429,7 @@ fn propose_asks_and_approve_edit_over_the_socket() {
         "{text}"
     );
     assert!(
-        text.contains(
-            "may mail  3/day  irreversible, will ask first, takes text and will ask first"
-        ),
+        text.contains("may mail  3/day  irreversible, takes text and will ask first"),
         "{text}"
     );
 

@@ -276,9 +276,7 @@ fn stripe_store_reads_revenue_researches_freely_and_asks_before_mailing() {
         "{out}"
     );
     assert!(
-        out.contains(
-            "may nudge  1/day  irreversible, will ask first, takes text and will ask first"
-        ),
+        out.contains("may nudge  1/day  irreversible, takes text and will ask first"),
         "{out}"
     );
     assert!(out.contains("child of portfolio"), "{out}");

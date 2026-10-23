@@ -472,6 +472,15 @@ pub struct OptionForecast {
     pub assumes: Option<String>,
 }
 
+/// How many times, as a person says it: once, 2 times.
+pub fn times(n: u32) -> String {
+    if n == 1 {
+        "once".to_string()
+    } else {
+        format!("{n} times")
+    }
+}
+
 /// The line every packet ends with.
 pub const UNANSWERED: &str = "Unanswered means no.";
 
@@ -1124,7 +1133,7 @@ impl Record {
                 count,
                 closes: Some(open),
                 ..
-            } => format!("#{open} {action} refused {count} times: {detail}"),
+            } => format!("#{open} {action} refused {}: {detail}", times(*count)),
             Record::Escalation {
                 from,
                 to,

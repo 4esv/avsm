@@ -1352,6 +1352,26 @@ const ACTION_FIELDS: &[&str] = &[
     "timeout",
 ];
 
+/// A duration as a person says it: humantime writes `1day` and `2weeks`;
+/// the long units get a space, `1 day` and `2 weeks`, the short ones
+/// (`1h 30m`) stay as they are.
+pub fn spoken(d: Duration) -> String {
+    humantime::format_duration(d)
+        .to_string()
+        .split(' ')
+        .map(|part| {
+            let at = part.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
+            let (n, unit) = part.split_at(at);
+            if at > 0 && unit.len() > 2 {
+                format!("{n} {unit}")
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Names no permitted action may take: they are built in.
 pub const BUILT_IN: &[&str] = &[STOP, "delegate", "canary"];
 

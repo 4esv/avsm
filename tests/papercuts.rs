@@ -421,3 +421,49 @@ fn doctor_since_takes_the_digests_head_line_as_printed() {
         assert!(avsmd::doctor::parse_anchor(bad).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn wording_counts_and_durations_read_as_a_person_says_them() {
+    use std::time::Duration;
+    let d = |s| avsmd::mandate::spoken(Duration::from_secs(s));
+    assert_eq!(d(86_400), "1 day");
+    assert_eq!(d(2 * 86_400), "2 days");
+    assert_eq!(d(90 * 60), "1h 30m");
+    assert_eq!(d(14 * 86_400), "14 days");
+    assert_eq!(d(86_400 + 3_600), "1 day 1h");
+    assert_eq!(avsmd::record::times(1), "once");
+    assert_eq!(avsmd::record::times(2), "2 times");
+    assert_eq!(avsmd::record::times(21), "21 times");
+}
+
+#[test]
+fn a_levers_teachback_says_it_will_ask_first_once() {
+    let m = avsmd::mandate::Mandate::parse(
+        "purpose: p\nmetric: m\ncontroller: {kind: model}\ncadence: 1h\npermitted:\n\
+         - {name: mail, run: ./mail, cap: 3/day, reversible: false, takes: text}\n\
+         - {name: wipe, run: ./wipe, cap: 3/day, reversible: false}\n\
+         - {name: post, run: ./post, cap: 3/day, reversible: true, takes: text}\n\
+         - {name: sent, run: ./sent, cap: 3/day, reversible: false, delegated: true, takes: text}\n",
+    )
+    .unwrap();
+    let text = avsmd::teach::render(&m);
+    for line in text.lines().filter(|l| l.contains("may ")) {
+        assert!(line.matches("will ask first").count() <= 1, "{line}");
+    }
+    assert!(
+        text.contains("may mail  3/day  irreversible, takes text and will ask first"),
+        "{text}"
+    );
+    assert!(
+        text.contains("may wipe  3/day  irreversible, will ask first"),
+        "{text}"
+    );
+    assert!(
+        text.contains("may post  3/day  reversible, takes text and will ask first"),
+        "{text}"
+    );
+    assert!(
+        text.contains("may sent  3/day  irreversible, delegated, takes text"),
+        "{text}"
+    );
+}

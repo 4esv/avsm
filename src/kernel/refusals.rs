@@ -256,7 +256,7 @@ impl Kernel {
             venture: id.0.clone(),
             action: id.1.clone(),
             reason: open.key,
-            detail: format!("{why}; refused {} times", open.count),
+            detail: format!("{why}; refused {}", crate::record::times(open.count)),
             count: open.count,
             closes: Some(open.seq),
             cites: vec![],
@@ -308,7 +308,10 @@ impl Kernel {
                 venture: venture.clone(),
                 action,
                 reason,
-                detail: format!("avsmd restarted; refused at least {count} times"),
+                detail: format!(
+                    "avsmd restarted; refused at least {}",
+                    crate::record::times(count)
+                ),
                 count,
                 closes: Some(seq),
                 cites: vec![],

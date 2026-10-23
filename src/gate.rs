@@ -2270,7 +2270,7 @@ impl fmt::Display for Reason {
             Reason::Reversal { child, last, hold } => write!(
                 f,
                 "{child}'s budget moved the other way in #{last}, and the hold is {}",
-                humantime::format_duration(*hold)
+                crate::mandate::spoken(*hold)
             ),
             Reason::Guarded {
                 guard,

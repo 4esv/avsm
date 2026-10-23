@@ -296,7 +296,7 @@ fn lever_adapters_pull_through_the_warden() {
         "{out}"
     );
     assert!(
-        out.contains("may pr  3/day  irreversible, will ask first, takes diff and will ask first"),
+        out.contains("may pr  3/day  irreversible, takes diff and will ask first"),
         "{out}"
     );
 

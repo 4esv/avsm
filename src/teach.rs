@@ -154,7 +154,7 @@ pub fn unenforced(m: &Mandate) -> Vec<Figure> {
 }
 
 fn every(d: Duration) -> String {
-    humantime::format_duration(d).to_string()
+    crate::mandate::spoken(d)
 }
 
 fn way(w: Worse) -> &'static str {
@@ -271,12 +271,15 @@ pub fn render(m: &Mandate) -> String {
             } else if p.delegated {
                 "irreversible, delegated"
             } else {
-                "irreversible, will ask first"
+                "irreversible"
             }
         );
+        // Said once: an irreversible lever asks, and so does one that
+        // takes content, but it does not ask twice.
         match p.takes() {
             Some(t) if p.delegated => s.push_str(&format!(", takes {t}")),
             Some(t) => s.push_str(&format!(", takes {t} and will ask first")),
+            None if !p.reversible && !p.delegated => s.push_str(", will ask first"),
             None => {}
         }
         if p.cost > 0 {
@@ -294,7 +297,7 @@ pub fn render(m: &Mandate) -> String {
         if let Some(t) = p.timeout {
             s.push_str(&format!(
                 ", killed after {} a run",
-                humantime::format_duration(t)
+                crate::mandate::spoken(t)
             ));
         }
         line(s);
