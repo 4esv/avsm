@@ -85,7 +85,7 @@ fn main() -> ExitCode {
             return ExitCode::from(found.code);
         }
         None if cli.show => match avsmd::kernel::load_config(&home) {
-            Ok(config) => match serde_yaml::to_string(&config) {
+            Ok(config) => match config.show() {
                 Ok(text) => {
                     avsmd::protocol::emit(&format!(
                         "# home {}\n# config {}\n{text}",
@@ -94,7 +94,7 @@ fn main() -> ExitCode {
                     ));
                     Ok(())
                 }
-                Err(e) => Err(exit::Exit::new(exit::SOFTWARE, e.to_string())),
+                Err(e) => Err(exit::Exit::new(exit::SOFTWARE, e)),
             },
             Err(e) => Err(e),
         },

@@ -467,3 +467,31 @@ fn a_levers_teachback_says_it_will_ask_first_once() {
         "{text}"
     );
 }
+
+#[test]
+fn avsmd_dash_capital_t_prints_the_forecast_and_canary_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let show = |config: &str| {
+        let home = tmp.path().join("h");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.yaml"), config).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_avsmd"))
+            .arg("--home")
+            .arg(&home)
+            .arg("-T")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let out = show("nightly: never\n");
+    assert!(
+        out.contains("forecast:\n  days: 30\n  seeds: 16\n"),
+        "{out}"
+    );
+    assert!(out.contains("canary_asks: null"), "{out}");
+    let out = show("forecast: {days: 3, seeds: 4}\ncanary_asks: {every: 7}\n");
+    assert!(out.contains("forecast:\n  days: 3\n  seeds: 4\n"), "{out}");
+    assert!(out.contains("canary_asks:\n  every: 7\n"), "{out}");
+    assert!(!out.contains("canary_asks: null"), "{out}");
+}

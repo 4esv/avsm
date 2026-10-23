@@ -91,6 +91,25 @@ pub struct Config {
 }
 
 impl Config {
+    /// The config in force as `avsmd -T` prints it: every setting, with
+    /// the defaults of `forecast:` and `canary_asks:` written out where
+    /// config.yaml leaves them out.
+    pub fn show(&self) -> Result<String, String> {
+        let mut shown = self.clone();
+        let set = shown.forecast.is_some();
+        shown.forecast = Some(self.forecast_settings());
+        let mut text = serde_yaml::to_string(&shown).map_err(|e| e.to_string())?;
+        if !set {
+            text.push_str("# forecast: the default; a decision packet looks 7 days by 8 seeds until forecast: is set\n");
+        }
+        if self.canary_asks.is_none() {
+            text.push_str(
+                "canary_asks: null  # off; {every: N} sends a canary ask after every N asks\n",
+            );
+        }
+        Ok(text)
+    }
+
     /// How far and how wide a forecast asked for looks.
     pub fn forecast_settings(&self) -> Forecast {
         self.forecast.unwrap_or_default()
