@@ -343,16 +343,17 @@ impl Kernel {
                             } else if already {
                                 log(&format!("{name}: the plan's ask is already open"));
                             } else if !may_ask {
-                                log(&format!(
-                                    "{name}: the plan's backend would ask, but the asks quota is used up; not asking"
-                                ));
-                                self.refuse(
+                                if self.refuse(
                                     name,
                                     action.as_deref().unwrap_or("ask"),
                                     "AsksQuotaSpent".to_string(),
                                     "the asks quota is used up".to_string(),
                                     false,
-                                );
+                                ) {
+                                    log(&format!(
+                                        "{name}: the plan's backend would ask, but the asks quota is used up; not asking"
+                                    ));
+                                }
                             } else {
                                 let packet = self.packet(
                                     name,

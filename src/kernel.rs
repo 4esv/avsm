@@ -2164,8 +2164,9 @@ impl Kernel {
             lines.push(format!(
                 "{name}: {action} refused before the gate: {detail}"
             ));
-            log(&lines[0]);
-            self.refuse(name, action, key, detail, limit);
+            if self.refuse(name, action, key, detail, limit) {
+                log(&lines[0]);
+            }
             return lines;
         }
         // What the gate says, and what an ask would carry, as the ledger
@@ -2213,6 +2214,10 @@ impl Kernel {
             log(lines.last().map_or("", String::as_str));
             return lines;
         }
+        // A refusal that only counts toward one already open: stderr said
+        // it when it opened, as the ledger did, and says it again only when
+        // its reason changes.
+        let mut repeat = false;
         match judged {
             Ok(_) => match if self.apart {
                 self.warden.start(&candidate)
@@ -2249,8 +2254,7 @@ impl Kernel {
                     // authorized the run, which it spends: an approval is
                     // used once, and a changed situation needs a fresh one.
                     lines.push(format!("{name}: {action} refused: {detail}"));
-                    log(lines.last().map_or("", String::as_str));
-                    self.refuse_citing(
+                    repeat = !self.refuse_citing(
                         name,
                         action,
                         reason_key,
@@ -2324,17 +2328,19 @@ impl Kernel {
                     let (key, detail, limit) =
                         refusals::describe(&refusal.reasons, &[refusals::SUSPENDED]);
                     lines.push(format!("{name}: {action} refused: {detail}"));
-                    self.refuse(name, action, key, detail, limit);
+                    repeat = !self.refuse(name, action, key, detail, limit);
                     self.reask_ineffective(name, action);
                 } else if let Some(line) = checked {
+                    // The check logged it, when it opened.
                     lines.push(line);
+                    repeat = true;
                 } else if needs_human && !already && !may_ask {
                     lines.push(format!(
                         "{name}: {action} needs a decision, but the asks quota is used up; not asking"
                     ));
                     let (key, detail, limit) =
                         refusals::describe_gate(&refusal.reasons, false, true);
-                    self.refuse(name, action, key, detail, limit);
+                    repeat = !self.refuse(name, action, key, detail, limit);
                 } else if needs_human && !already {
                     let question = match &payload {
                         Some(_) => format!("may I {action} with this?{reason}"),
@@ -2383,15 +2389,15 @@ impl Kernel {
                     lines.push(format!("{name}: {action} is already asked; see: avsm asks"));
                     let (key, detail, limit) =
                         refusals::describe_gate(&refusal.reasons, true, false);
-                    self.refuse(name, action, key, detail, limit);
+                    repeat = !self.refuse(name, action, key, detail, limit);
                 } else {
                     let (key, detail, limit) = refusals::describe(&refusal.reasons, &[]);
                     lines.push(format!("{name}: {action} refused: {detail}"));
-                    self.refuse(name, action, key, detail, limit);
+                    repeat = !self.refuse(name, action, key, detail, limit);
                 }
             }
         }
-        for line in &lines {
+        for line in lines.iter().filter(|_| !repeat) {
             log(line);
         }
         lines
@@ -2584,8 +2590,9 @@ impl Kernel {
         match self.warden.check(name, action, payload) {
             Err(Failure::Refused { reason_key, detail }) => {
                 let line = format!("{name}: {action} refused: {detail}; not asking");
-                log(&line);
-                self.refuse(name, action, reason_key, detail, false);
+                if self.refuse(name, action, reason_key, detail, false) {
+                    log(&line);
+                }
                 Some(line)
             }
             Err(Failure::Error(e)) => {
@@ -2639,8 +2646,9 @@ impl Kernel {
         };
         let (key, detail, limit) = refusals::describe(&refusal, extra);
         let line = format!("{name}: {action} refused: {detail}; not asking");
-        log(&line);
-        self.refuse(name, action, key, detail, limit);
+        if self.refuse(name, action, key, detail, limit) {
+            log(&line);
+        }
         if suspended {
             self.reask_ineffective(name, action);
         }
@@ -2693,10 +2701,12 @@ impl Kernel {
                     }],
                     &[refusals::SUSPENDED],
                 );
-                log(&format!(
+                let line = format!(
                     "{venture}: {action} refused: approved #{seq} predates the suspension; {detail}"
-                ));
-                self.refuse(&venture, &action, key, detail, limit);
+                );
+                if self.refuse(&venture, &action, key, detail, limit) {
+                    log(&line);
+                }
                 continue;
             }
             self.act(&venture, &action, vec![seq], Claim::Declared);
@@ -3133,16 +3143,17 @@ impl Kernel {
             return;
         }
         if !may_ask {
-            log(&format!(
-                "{name}: the asks quota is used up; not asking: {question}"
-            ));
-            self.refuse(
+            if self.refuse(
                 name,
                 "ask",
                 "AsksQuotaSpent".to_string(),
                 format!("the asks quota is used up; not asking: {question}"),
                 false,
-            );
+            ) {
+                log(&format!(
+                    "{name}: the asks quota is used up; not asking: {question}"
+                ));
+            }
             return;
         }
         let packet = self.packet(name, None, &[], None, false);

@@ -137,7 +137,9 @@ impl Kernel {
     /// Record that `lever` of `venture` was refused. The first refusal for
     /// this reason writes an opening record; a repeat only counts; a new
     /// reason closes the one before. Also remembers the refusal for
-    /// `saturate`.
+    /// `saturate`. True when it opened a refusal record: the refusal is
+    /// new, or its reason changed. Only then is it worth a line on stderr;
+    /// a repeat is a count, as in the ledger.
     pub(super) fn refuse(
         &mut self,
         venture: &str,
@@ -145,8 +147,8 @@ impl Kernel {
         key: String,
         detail: String,
         limit: bool,
-    ) {
-        self.refuse_citing(venture, lever, key, detail, limit, vec![]);
+    ) -> bool {
+        self.refuse_citing(venture, lever, key, detail, limit, vec![])
     }
 
     /// `refuse`, answering the declared approvals in `cites`: the warden
@@ -161,7 +163,7 @@ impl Kernel {
         detail: String,
         limit: bool,
         cites: Vec<Seq>,
-    ) {
+    ) -> bool {
         self.refusals.last = Some(Last {
             venture: venture.to_string(),
             lever: lever.to_string(),
@@ -173,7 +175,7 @@ impl Kernel {
         if let Some(open) = self.refusals.open.get_mut(&id) {
             if open.key == key && open.day == day && cites.is_empty() {
                 open.count = open.count.saturating_add(1);
-                return;
+                return false;
             }
             let why = if open.key == key {
                 "an approval was refused"
@@ -203,8 +205,12 @@ impl Kernel {
                         day,
                     },
                 );
+                true
             }
-            Err(e) => log(&format!("{venture}: cannot write refusal: {e}")),
+            Err(e) => {
+                log(&format!("{venture}: cannot write refusal: {e}"));
+                true
+            }
         }
     }
 
