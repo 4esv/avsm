@@ -1720,3 +1720,165 @@ fn a_rising_metric_whose_lever_ran_its_cap_names_the_cap() {
     let q = question(&asks[0]);
     assert!(q.contains("archive ran 7 of 7: the cap"), "{q}");
 }
+
+// ----- forecast sanity (Power 3 of #55) -----
+
+/// A venture with nothing but a metric, read hourly.
+const WATCH: &str = "controller: {kind: model}\ncadence: 1h\n";
+
+/// Readings that wander about `mid` by up to `by`, hour after hour.
+fn wander(mid: f64, by: f64, n: usize) -> Vec<f64> {
+    let steps = [0.0, 1.0, -1.0, 0.5, -0.5, 1.0, 0.0, -1.0];
+    (0..n).map(|i| mid + by * steps[i % steps.len()]).collect()
+}
+
+/// The quantiles of the venture's metric in its forecast under `all`,
+/// and the record's line.
+fn forecast_of(f: &mut Fixture, venture: &str) -> (avsmd::record::Envelope, String, String) {
+    let opts = f.opts(&[venture], 3, 4);
+    let (outcome, written) = f.k.forecast(&opts, &[]).unwrap();
+    let e = written
+        .iter()
+        .find(|e| matches!(&e.record, Record::Forecast { policy, .. } if policy == "all"))
+        .unwrap();
+    let Record::Forecast { metrics, .. } = &e.record else {
+        unreachable!()
+    };
+    (metrics[0].clone(), e.line(), outcome.render())
+}
+
+#[test]
+fn a_reading_a_later_flag_impugns_stays_out_of_the_forecast() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("age", "age", WATCH);
+    f.history("age", &wander(100.0, 1.0, 30), HOUR);
+    // An epoch-sized reading, plausible when it came; the next is
+    // flagged a flap, which impugns it. Then the metric goes on.
+    for (x, flag) in [
+        (1_700_000_000.0, None),
+        (
+            100.0,
+            Some("flapping: reversed by more than 2 twice in a row"),
+        ),
+    ] {
+        f.now += HOUR;
+        avsmd::clock::set(f.now);
+        f.k.append(Record::Report {
+            claim: Claim::Measured,
+            venture: "age".into(),
+            metric: "age".into(),
+            value: Some(x),
+            note: String::new(),
+            source: None,
+            confidence: None,
+            cites: vec![],
+            implausible: flag.map(str::to_string),
+            facts: None,
+        })
+        .unwrap();
+    }
+    f.history("age", &wander(100.0, 1.0, 10), HOUR);
+    let (m, line, _) = forecast_of(&mut f, "age");
+    // A wander of 1 a step over 3 days: nowhere near the epoch.
+    assert!(!m.thin, "{line}");
+    let q = m.quantiles;
+    assert!(q.p5 >= 50.0 && q.p95 <= 150.0, "{line}");
+}
+
+#[test]
+fn a_forecast_is_clamped_to_the_declared_range() {
+    let _c = clock();
+    let mut f = fixture("");
+    // A world model that says 50 of a metric that ranges 0 to 16.
+    let dir = f.venture(
+        "queue",
+        "queue",
+        "controller: {kind: model}\ncadence: 1h\nrange: [0, 16]\nworld: ./world\n",
+    );
+    script(
+        &dir,
+        "world",
+        "cat > /dev/null; echo '{\"state\": {}, \"metric\": 50}'",
+    );
+    f.history("queue", &wander(8.0, 4.0, 12), HOUR);
+    let (m, line, _) = forecast_of(&mut f, "queue");
+    assert!(m.quantiles.values().iter().all(|x| *x <= 16.0), "{line}");
+}
+
+#[test]
+fn forecast_values_have_the_precision_of_the_metric() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("count", "count", WATCH);
+    f.history("count", &wander(40.0, 2.0, 40), HOUR);
+    let (m, line, render) = forecast_of(&mut f, "count");
+    assert!(!m.thin, "{line}");
+    assert!(
+        m.quantiles.values().iter().all(|x| x.fract() == 0.0),
+        "whole readings, whole forecasts: {line}"
+    );
+    let shown = render
+        .lines()
+        .find_map(|l| l.split_once(" count p5 "))
+        .map(|(_, rest)| rest.split(';').next().unwrap_or_default().to_string())
+        .unwrap_or_else(|| panic!("{render}"));
+    assert!(!shown.contains('.'), "{render}");
+    // Readings to three places show at most two.
+    f.venture("ph", "ph", WATCH);
+    let fine: Vec<f64> = wander(7.0, 0.137, 40).iter().map(|x| x + 0.001).collect();
+    f.history("ph", &fine, HOUR);
+    let (m, line, _) = forecast_of(&mut f, "ph");
+    for x in m.quantiles.values() {
+        assert_eq!((x * 100.0).round() / 100.0, x, "{line}");
+    }
+}
+
+#[test]
+fn a_forecast_on_too_little_history_says_so() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("new", "count", WATCH);
+    f.history("new", &[3.0, 4.0], HOUR);
+    let (m, line, render) = forecast_of(&mut f, "new");
+    assert!(m.thin, "{line}");
+    assert!(
+        line.contains("count: too little history to forecast"),
+        "{line}"
+    );
+    assert!(!line.contains("p50"), "{line}");
+    assert!(
+        render.contains("count: too little history to forecast"),
+        "{render}"
+    );
+    assert!(!render.contains("count p5"), "{render}");
+    // With enough, numbers.
+    f.history("new", &wander(4.0, 1.0, 12), HOUR);
+    let (m, line, _) = forecast_of(&mut f, "new");
+    assert!(!m.thin, "{line}");
+}
+
+#[test]
+fn a_stationary_metric_whose_forecast_spreads_wildly_says_so() {
+    let _c = clock();
+    let mut f = fixture("");
+    // A world model that scatters a 0 to 16 queue over thousands.
+    let dir = f.venture(
+        "queue",
+        "queue",
+        "controller: {kind: model}\ncadence: 1h\nworld: ./world\n",
+    );
+    script(
+        &dir,
+        "world",
+        "seed=$(cat | tr -cd '0-9' | cut -c1-6); \
+         echo \"{\\\"state\\\": {}, \\\"metric\\\": $(( seed % 16000 - 8000 ))}\"",
+    );
+    f.history("queue", &wander(8.0, 8.0, 24), HOUR);
+    let (m, line, _) = forecast_of(&mut f, "queue");
+    assert!(m.thin, "{line}");
+    assert!(
+        line.contains("queue: too little history to forecast"),
+        "{line}"
+    );
+}

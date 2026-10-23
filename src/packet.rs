@@ -132,7 +132,8 @@ pub fn policy_forecasts(
                 .summaries
                 .iter()
                 .find(|s| s.venture == venture && s.policy == *policy && s.variant.is_none())?;
-            let q = &s.metrics.iter().find(|m| m.name == metric)?.quantiles;
+            let target = s.metrics.iter().find(|m| m.name == metric)?;
+            let q = &target.quantiles;
             let found: Vec<String> = bounds
                 .iter()
                 .map(|&(b, above)| {
@@ -148,7 +149,8 @@ pub fn policy_forecasts(
                     }
                 })
                 .collect();
-            let threshold = (!found.is_empty()).then(|| found.join("; "));
+            // Numbers it does not stand behind say nothing of a bound.
+            let threshold = (!found.is_empty() && !target.thin).then(|| found.join("; "));
             Some(PolicyForecast {
                 policy: policy.name().to_string(),
                 metric: metric.to_string(),
@@ -158,6 +160,7 @@ pub fn policy_forecasts(
                 p50: crate::record::round(q.p50),
                 p95: crate::record::round(q.p95),
                 threshold,
+                thin: target.thin,
             })
         })
         .collect()
@@ -306,6 +309,7 @@ pub fn option_forecast(outcome: &Outcome, venture: &str, policy: Policy) -> Opti
         breach: s.guards.iter().map(|g| g.p).fold(0.0, f64::max),
         spend: crate::record::round(s.reached.spend.p50),
         assumes: None,
+        thin: target.thin,
     })
 }
 
@@ -335,6 +339,7 @@ mod tests {
             metrics: vec![Envelope {
                 name: "temperature".to_string(),
                 quantiles: quantiles(p5, p50, p95),
+                thin: false,
             }],
             guards: vec![],
             reached: Reached {
@@ -410,5 +415,34 @@ mod tests {
     #[test]
     fn a_controller_without_a_bound_shows_none() {
         assert_eq!(bound("{kind: model}", &forecast(1.0, 2.0, 3.0)), None);
+    }
+
+    #[test]
+    fn a_forecast_on_too_little_history_shows_no_numbers_beside_the_button() {
+        let mut outcome = forecast(-8473.0, 4.0, 6999.0);
+        outcome.summaries[0].metrics[0].thin = true;
+        let t = "{kind: threshold, above: 24, action: cool}";
+        assert_eq!(bound(t, &outcome), None, "a bound read off no numbers");
+        let option = option_forecast(&outcome, "bay", Policy::EVERY[0]).unwrap();
+        let packet = Packet {
+            premises: vec![],
+            options: vec![PacketOption {
+                name: APPROVE.to_string(),
+                forecast: Some(option),
+                cost: Some("runs heat".to_string()),
+            }],
+            reason: None,
+            policies: policy_forecasts(&outcome, "bay", &mandate(t)),
+        };
+        let text = packet.render();
+        assert!(
+            text.contains("approve: temperature: too little history to forecast over 30d"),
+            "{text}"
+        );
+        assert!(
+            text.contains("all: temperature: too little history to forecast at 30d"),
+            "{text}"
+        );
+        assert!(!text.contains("8473"), "{text}");
     }
 }

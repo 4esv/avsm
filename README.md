@@ -275,7 +275,13 @@ tailnet port; `adapters:` says where `stripe` and `github` reach, each
 from: you@example.com}`; an `anthropic` backend also takes `url` and `effort`
 (`low` to `max`), and a `command` backend `offbox`.
 A decision packet's forecast is 7 days by 8 seeds until `forecast:` says
-otherwise. avsmd reads `config.yaml` once, at start: after an edit, restart it,
+otherwise. A forecast runs apart from the kernel: commands are answered and
+guards read while it runs, and the forecast at add is written when it is done.
+It is fit to the readings no plausibility check doubts, held to the metric's
+`range:`, and shown to the precision of its readings, at most two decimals; on
+fewer than three lever-free steps of history, or with a spread the history
+cannot account for, it says `too little history to forecast` instead of
+numbers. A re-add of an unchanged mandate is not forecast again. avsmd reads `config.yaml` once, at start: after an edit, restart it,
 and `avsm add` says `config.yaml changed on disk; restart avsmd to apply it`
 while the file and the daemon differ.
 

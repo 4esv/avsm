@@ -801,6 +801,32 @@ impl Index {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// The readings of a metric a forecast or a world model is fit to:
+    /// its trusted, plausible series less every reading a check doubts
+    /// (`trusted`): one beside a reading flagged implausible, or one a
+    /// later flag impugns, as a stuck run's first reading or the reading
+    /// before a flap is. The series itself when nothing is flagged.
+    pub fn fit_series(&self, venture: &str, metric: &str) -> std::borrow::Cow<'_, [(Seq, f64)]> {
+        let series = self.series(venture, metric);
+        if self.doubts(venture, metric) == 0 {
+            return std::borrow::Cow::Borrowed(series);
+        }
+        std::borrow::Cow::Owned(
+            (0..series.len())
+                .filter(|j| self.trusted(venture, metric, series, *j))
+                .map(|j| series[j])
+                .collect(),
+        )
+    }
+
+    /// How many trusted reports of a metric code marked implausible.
+    pub fn doubts(&self, venture: &str, metric: &str) -> usize {
+        self.doubted
+            .get(venture)
+            .and_then(|m| m.get(metric))
+            .map_or(0, Vec::len)
+    }
+
     /// The trusted reports of a venture's metric with a value, as
     /// stretches of exactly equal readings, oldest first: the plausible
     /// ones and those a stuck ask's approval vouched for.

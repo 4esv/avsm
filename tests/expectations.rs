@@ -1905,6 +1905,7 @@ fn a_run_ask_of_a_restored_lever_cites_the_misses_and_says_its_forecast_assumes_
         breach: 0.0,
         spend: 27.0,
         assumes: None,
+        thin: false,
     };
     let index = f.k.index().unwrap();
     let packet = avsmd::packet::build(

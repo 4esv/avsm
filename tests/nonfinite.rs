@@ -37,6 +37,7 @@ fn ask(signal: Signal) -> Record {
                     breach: f64::NAN,
                     spend: f64::INFINITY,
                     assumes: None,
+                    thin: false,
                 }),
                 cost: None,
             }],
@@ -179,6 +180,7 @@ fn records(x: f64) -> Vec<Record> {
             metrics: vec![Envelope {
                 name: "m".into(),
                 quantiles: q(x),
+                thin: false,
             }],
             guards: vec![Event {
                 name: "g".into(),

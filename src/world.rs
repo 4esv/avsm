@@ -105,9 +105,10 @@ pub trait WorldModel {
     ) -> Result<Next, String>;
 }
 
-/// The last `HISTORY` trusted, plausible reports of a venture's metric.
+/// The last `HISTORY` trusted, plausible reports of a venture's metric
+/// that no check doubts (`Index::fit_series`).
 pub fn history(index: &Index, venture: &str, metric: &str) -> Vec<Point> {
-    let series = index.series(venture, metric);
+    let series = index.fit_series(venture, metric);
     let from = series.len().saturating_sub(HISTORY);
     series[from..]
         .iter()
@@ -239,14 +240,23 @@ pub fn drift_steps(
     upto: Option<Seq>,
 ) -> Vec<Drift> {
     let metric = mandate.metric_name();
-    let series = index.series(venture, metric);
+    let fit = index.fit_series(venture, metric);
+    let series: &[(Seq, f64)] = &fit;
     let end = upto.map_or(series.len(), |u| series.partition_point(|(s, _)| *s < u));
     let levers = horizons(mandate);
     let names: Vec<String> = levers.iter().map(|(l, w)| format!("{l} {w}")).collect();
     let key = (venture.to_string(), metric.to_string(), names.join("\n"));
     let mut memos = index.drift_memo().lock().unwrap_or_else(|e| e.into_inner());
-    // The memo lives with the index, whose series only ever grow.
+    // The memo lives with the index, whose series only ever grow; a new
+    // flag may take readings out of the fit, and then it starts again.
     let memo = memos.entry(key).or_default();
+    let doubts = index.doubts(venture, metric);
+    if memo.doubts != doubts {
+        *memo = Memo {
+            doubts,
+            ..Memo::default()
+        };
+    }
     let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
     let want = end.saturating_sub(1);
     for i in memo.windows..want {
@@ -305,6 +315,8 @@ fn judged_over(series: &[(Seq, f64)], i: usize, runs: &[Seq], within: usize) -> 
 pub struct Memo {
     windows: usize,
     steps: Vec<(usize, Drift)>,
+    /// The metric's flagged reports when the windows were looked at.
+    doubts: usize,
 }
 
 /// Every venture's drift steps worked out so far, kept with an index.
@@ -334,12 +346,12 @@ pub fn drift_steps_whole(
     mandate: &Mandate,
     upto: Option<Seq>,
 ) -> Vec<Drift> {
-    let series = index.series(venture, mandate.metric_name());
-    let end = upto.map_or(series.len(), |u| series.partition_point(|(s, _)| *s < u));
-    let series = &series[..end];
+    let fit = index.fit_series(venture, mandate.metric_name());
+    let whole: &[(Seq, f64)] = &fit;
+    let end = upto.map_or(whole.len(), |u| whole.partition_point(|(s, _)| *s < u));
+    let series = &whole[..end];
     let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
     let levers = horizons(mandate);
-    let whole = index.series(venture, mandate.metric_name());
     series
         .windows(2)
         .enumerate()
@@ -500,10 +512,12 @@ impl Baseline {
         median * (dt as f64).sqrt()
     }
 
-    /// Learn the drift and the effects from the ledger.
+    /// Learn the drift and the effects from the ledger: from the readings
+    /// no check doubts (`Index::fit_series`).
     pub fn from_index(index: &Index, venture: &str, mandate: &Mandate) -> Baseline {
         let metric = mandate.metric_name();
-        let series = index.series(venture, metric);
+        let fit = index.fit_series(venture, metric);
+        let series: &[(Seq, f64)] = &fit;
         let at = |s: Seq| index.get(s).map_or(0, |e| e.at);
         let steps = drift_steps(index, venture, mandate, None);
         let mut gaps: Vec<i64> = series
@@ -519,7 +533,14 @@ impl Baseline {
             .max(1);
         let mut b = Baseline {
             last: series.last().map(|(_, v)| *v),
-            peak: index.peak(venture, metric),
+            peak: match index.doubts(venture, metric) {
+                0 => index.peak(venture, metric),
+                _ => series
+                    .iter()
+                    .map(|(_, v)| *v)
+                    .filter(|v| v.is_finite())
+                    .reduce(f64::max),
+            },
             drawdowns: mandate
                 .guards
                 .iter()

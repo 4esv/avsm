@@ -286,6 +286,7 @@ impl Outcome {
                     .map(|m| Envelope {
                         name: clip(&m.name, MAX_EVENT_NAME),
                         quantiles: m.quantiles,
+                        thin: m.thin,
                     })
                     .collect(),
                 guards: s
@@ -337,6 +338,10 @@ impl Outcome {
                 line.push_str(&format!(" [{v}]"));
             }
             for m in s.metrics.iter().take(1) {
+                if m.thin {
+                    line.push_str(&format!(" {}: {}", m.name, record::THIN));
+                    continue;
+                }
                 line.push_str(&format!(
                     " {} p5 {} p50 {} p95 {}",
                     m.name,
@@ -1062,13 +1067,137 @@ pub fn target(m: &Mandate) -> Option<Direction> {
     })
 }
 
-/// What a venture's history says of one metric a forecast shows.
-#[derive(Clone, Debug, Default)]
-struct Fit {}
+/// The most decimal places a forecast value shows.
+pub const MAX_PLACES: u32 = 2;
 
-/// The fit of each metric of a venture a forecast shows.
-fn fits_of(_index: &Index, _venture: &str, _mandate: &Mandate) -> BTreeMap<String, Fit> {
-    BTreeMap::new()
+/// What a venture's history says of one metric a forecast shows: how
+/// much of it there is, what it spans, how it drifts, its precision and
+/// its declared range. From the readings no check doubts.
+#[derive(Clone, Debug, Default)]
+struct Fit {
+    /// The readings, and the lever-free steps between them the baseline
+    /// learns its drift from.
+    readings: usize,
+    steps: usize,
+    /// Rest on readings, not steps: a `world:` command, or a guard.
+    by_readings: bool,
+    /// The lowest and the highest reading.
+    hull: Option<[f64; 2]>,
+    /// The baseline's drift a day, and its spread over one second (the
+    /// median residual), for the target.
+    drift_per_day: f64,
+    spread: f64,
+    /// Check the forecast's band against the history: the target's
+    /// alone, since a guard heading for a wall it never reached is what
+    /// a forecast is for.
+    banded: bool,
+    places: u32,
+    range: Option<[f64; 2]>,
+}
+
+impl Fit {
+    fn of(values: &[f64], range: Option<[f64; 2]>) -> Fit {
+        let finite = values.iter().copied().filter(|x| x.is_finite());
+        let hull = finite.clone().fold(None, |h: Option<[f64; 2]>, x| {
+            Some(h.map_or([x, x], |[lo, hi]| [lo.min(x), hi.max(x)]))
+        });
+        Fit {
+            readings: values.len(),
+            steps: values.len().saturating_sub(1),
+            by_readings: true,
+            hull,
+            drift_per_day: 0.0,
+            spread: 0.0,
+            banded: false,
+            places: finite.map(places).max().unwrap_or(MAX_PLACES),
+            range,
+        }
+    }
+
+    /// Too little to forecast from: fewer than `MIN_SAMPLES` lever-free
+    /// steps for the baseline's drift and spread (with fewer, it is
+    /// persistence), or readings for a world model or a guard; or a
+    /// forecast whose 5-95 band leaves the readings' hull by more than
+    /// the history can account for. That room is the metric's own: the
+    /// hull's width, the drift over the horizon, and its spread over the
+    /// horizon times 1/sqrt(ALPHA), past which Chebyshev's bound gives
+    /// any distribution a chance under ALPHA. A queue that has read 0 to
+    /// 16 and moves a few a step is never forecast at -8473.
+    fn thin(&self, q: &Quantiles, days: u32) -> bool {
+        let enough = if self.by_readings {
+            self.readings > MIN_SAMPLES
+        } else {
+            self.steps >= MIN_SAMPLES
+        };
+        if !enough {
+            return true;
+        }
+        let Some([lo, hi]) = self.hull else {
+            return true;
+        };
+        if !self.banded {
+            return false;
+        }
+        let horizon = f64::from(days) * DAY_SECS as f64;
+        let room = (hi - lo)
+            + (self.drift_per_day * f64::from(days)).abs()
+            + self.spread * horizon.sqrt() / crate::kernel::ALPHA.sqrt();
+        q.p5 < lo - room || q.p95 > hi + room
+    }
+
+    /// The envelope of `metric` from the branches' quantiles: clamped to
+    /// the declared range, marked thin when the history cannot carry it,
+    /// and rounded to the precision of the metric's readings.
+    fn envelope(&self, metric: &str, quantiles: Quantiles, days: u32) -> Envelope {
+        let clamp = |x: f64| match self.range {
+            Some([lo, hi]) => x.clamp(lo, hi),
+            None => x,
+        };
+        let q = Quantiles::from_values(quantiles.values().map(clamp));
+        let thin = self.thin(&q, days);
+        let scale = 10f64.powi(self.places as i32);
+        Envelope {
+            name: metric.to_string(),
+            quantiles: Quantiles::from_values(q.values().map(|x| (x * scale).round() / scale)),
+            thin,
+        }
+    }
+}
+
+/// How many decimal places a reading has, at most `MAX_PLACES`.
+fn places(x: f64) -> u32 {
+    (0..MAX_PLACES)
+        .find(|p| {
+            let scale = 10f64.powi(*p as i32);
+            ((x * scale).round() / scale - x).abs() <= 1e-9 * x.abs().max(1.0)
+        })
+        .unwrap_or(MAX_PLACES)
+}
+
+/// The fit of each metric of a venture a forecast shows: the target,
+/// then each guard. The last `HISTORY` readings say the hull and the
+/// precision; the baseline, from the whole history, the steps and drift.
+fn fits_of(index: &Index, venture: &str, mandate: &Mandate) -> BTreeMap<String, Fit> {
+    let recent = |metric: &str| -> Vec<f64> {
+        let fit = index.fit_series(venture, metric);
+        let from = fit.len().saturating_sub(world::HISTORY);
+        fit[from..].iter().map(|(_, x)| *x).collect()
+    };
+    let metric = mandate.metric_name();
+    let base = Baseline::from_index(index, venture, mandate);
+    let mut target = Fit::of(&recent(metric), mandate.range);
+    target.by_readings = mandate.world.is_some();
+    target.steps = base.drift.len();
+    target.drift_per_day = base.drift_per_day();
+    target.spread = base.spread(1);
+    target.banded = true;
+    let mut fits = BTreeMap::from([(metric.to_string(), target)]);
+    for g in &mandate.guards {
+        let m = g.metric();
+        let fit = Fit::of(&recent(&m), g.range);
+        fits.insert(m, fit);
+    }
+    fits
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1080,7 +1209,7 @@ fn aggregate(
     mandates: &[BTreeMap<String, Mandate>],
     branches: &[Branch],
     paths: &[BTreeMap<String, Trace>],
-    _fits: &BTreeMap<String, BTreeMap<String, Fit>>,
+    fits: &BTreeMap<String, BTreeMap<String, Fit>>,
 ) -> Outcome {
     let mut summaries = Vec::new();
     // (variant, venture, policy) -> the paths of its seeds, in seed order.
@@ -1104,17 +1233,32 @@ fn aggregate(
                 let seeds = of(vi, name, policy);
                 let mut metric_names = vec![m.metric_name().to_string()];
                 metric_names.extend(m.guards.iter().map(|g| g.metric()));
+                let fit = fits.get(name);
                 let metrics = metric_names
                     .iter()
-                    .filter_map(|metric| {
+                    .enumerate()
+                    .filter_map(|(i, metric)| {
                         let values: Vec<f64> = seeds
                             .iter()
                             .filter_map(|p| p.last.get(metric).copied())
                             .collect();
-                        world::quantiles(&values).map(|quantiles| Envelope {
-                            name: metric.clone(),
-                            quantiles,
-                        })
+                        let fit = fit.and_then(|f| f.get(metric));
+                        match (world::quantiles(&values), fit) {
+                            (Some(q), Some(fit)) => Some(fit.envelope(metric, q, opts.days)),
+                            (Some(quantiles), None) => Some(Envelope {
+                                name: metric.clone(),
+                                quantiles,
+                                thin: false,
+                            }),
+                            // The target always comes first: with no value
+                            // at the horizon, it says so.
+                            (None, _) if i == 0 => Some(Envelope {
+                                name: metric.clone(),
+                                quantiles: Quantiles::from_values([0.0; 7]),
+                                thin: true,
+                            }),
+                            (None, _) => None,
+                        }
                     })
                     .collect();
                 let n = seeds.len().max(1) as f64;
@@ -1191,7 +1335,7 @@ fn aggregate(
                     })?;
                     s.metrics
                         .iter()
-                        .find(|m| m.name == metric)
+                        .find(|m| m.name == metric && !m.thin)
                         .map(|m| m.quantiles)
                 });
                 walls.push(Wall {
@@ -1253,7 +1397,8 @@ fn aggregate(
                             ));
                         }
                     }
-                    if let (Some(ma), Some(mb)) = (a.metrics.first(), b.metrics.first()) {
+                    let shown = |s: &Summary| s.metrics.first().filter(|m| !m.thin).cloned();
+                    if let (Some(ma), Some(mb)) = (shown(a), shown(b)) {
                         let spread = ma.quantiles.p75 - ma.quantiles.p25;
                         let moved = mb.quantiles.p50 - ma.quantiles.p50;
                         if moved.abs() > spread {
@@ -1316,15 +1461,19 @@ pub fn asks(index: &Index, outcome: &Outcome, seqs: &BTreeMap<String, Vec<Seq>>)
         let first = walls[0];
         let envelope = first.envelope.unwrap_or(Quantiles::from_values([0.0; 7]));
         let v = envelope.values().map(record::round);
+        let shown = match first.envelope {
+            Some(_) => format!(
+                "{} at day {}: p5 {} p10 {} p25 {} p50 {} p75 {} p90 {} p95 {}",
+                first.metric, outcome.days, v[0], v[1], v[2], v[3], v[4], v[5], v[6]
+            ),
+            None => format!("{}: {}", first.metric, record::THIN),
+        };
         let mut question = format!(
-            "a forecast over {} days x {} seeds reaches a wall: {} on {}\n  envelope   {} at day {}: p5 {} p10 {} p25 {} p50 {} p75 {} p90 {} p95 {}\n  first hit  {}\n",
+            "a forecast over {} days x {} seeds reaches a wall: {} on {}\n  envelope   {shown}\n  first hit  {}\n",
             outcome.days,
             outcome.seeds,
             first.kind,
             first.metric,
-            first.metric,
-            outcome.days,
-            v[0], v[1], v[2], v[3], v[4], v[5], v[6],
             first_days(&first.days)
         );
         for w in walls.iter().skip(1).take(7) {
@@ -2021,6 +2170,51 @@ mod tests {
         assert!(run(&ledger, tmp.path(), &opts)
             .unwrap_err()
             .contains("nothing to forecast"));
+    }
+
+    #[test]
+    fn an_envelope_is_clamped_to_the_range_and_rounded_to_the_readings() {
+        let fit = Fit::of(&[1.0, 2.0, 3.0, 4.0, 5.0], Some([0.0, 16.0]));
+        let q = Quantiles::from_values([-3.0, 1.26, 2.0, 5.55, 9.0, 15.0, 40.0]);
+        let e = fit.envelope("queue", q, 1);
+        assert!(!e.thin, "{e:?}");
+        assert_eq!(e.quantiles.values(), [0.0, 1.0, 2.0, 6.0, 9.0, 15.0, 16.0]);
+        assert_eq!(places(3.0), 0);
+        assert_eq!(places(20.5), 1);
+        assert_eq!(places(7.137), 2);
+        assert_eq!(places(-0.25), 2);
+        // Four readings are enough; three are not.
+        assert!(Fit::of(&[1.0, 2.0, 3.0], None).thin(&q, 1));
+        // The baseline needs MIN_SAMPLES lever-free steps.
+        let mid = Quantiles::from_values([2.0; 7]);
+        let mut target = Fit::of(&[1.0, 2.0, 3.0, 4.0], None);
+        target.by_readings = false;
+        target.steps = MIN_SAMPLES;
+        assert!(!target.thin(&mid, 1));
+        target.steps = MIN_SAMPLES - 1;
+        assert!(target.thin(&mid, 1));
+    }
+
+    #[test]
+    fn a_band_past_what_the_history_accounts_for_is_thin() {
+        // A 0-16 queue that moves 2 a step (per hour): 2/60 a second's
+        // root.
+        let mut fit = Fit::of(&[0.0, 16.0, 4.0, 12.0, 8.0], None);
+        fit.banded = true;
+        fit.spread = 2.0 / 60.0;
+        let band = |lo: f64, hi: f64| Quantiles::from_values([lo, lo, lo, 8.0, hi, hi, hi]);
+        // One day: the room is 16 + 2/60 * sqrt(86400) * 10 = 114.
+        assert!(!fit.thin(&band(-90.0, 110.0), 1));
+        assert!(fit.thin(&band(-8473.0, 6999.0), 1));
+        assert!(fit.thin(&band(0.0, 140.0), 1));
+        // A drift of 50 a day makes room for 50 more a day.
+        fit.drift_per_day = 50.0;
+        assert!(!fit.thin(&band(0.0, 140.0), 1));
+        // With no spread to speak of, the hull and its width alone.
+        fit.drift_per_day = 0.0;
+        fit.spread = 0.0;
+        assert!(!fit.thin(&band(-16.0, 32.0), 1));
+        assert!(fit.thin(&band(-17.0, 32.0), 1));
     }
 
     #[test]

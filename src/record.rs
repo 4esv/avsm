@@ -426,6 +426,9 @@ pub struct PolicyForecast {
     pub p95: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<String>,
+    /// Too little history to forecast from: the numbers are not shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thin: bool,
 }
 
 /// A measured or declared record an ask rests on.
@@ -470,6 +473,10 @@ pub struct OptionForecast {
     /// effect its earlier runs showed, and this says so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assumes: Option<String>,
+    /// Too little history to forecast the metric from: its numbers are
+    /// not shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thin: bool,
 }
 
 /// How many times, as a person says it: once, 2 times.
@@ -498,6 +505,17 @@ impl Packet {
         out.push_str("  options:\n");
         for o in &self.options {
             let forecast = match &o.forecast {
+                Some(f) if f.thin => format!(
+                    "{}{}: {THIN} over {}d x {} seeds, guard breach {:.0}%, spend {}",
+                    f.assumes
+                        .as_deref()
+                        .map_or_else(String::new, |a| format!("{a}: ")),
+                    f.metric,
+                    f.days,
+                    f.seeds,
+                    f.breach * 100.0,
+                    f.spend
+                ),
                 Some(f) => format!(
                     "{}{} p5 {} p50 {} p95 {} over {}d x {} seeds, guard breach {:.0}%, spend {}",
                     f.assumes
@@ -531,6 +549,13 @@ impl Packet {
             out.push_str("  forecast by policy (inferred):\n");
         }
         for f in &self.policies {
+            if f.thin {
+                out.push_str(&format!(
+                    "    {}: {}: {THIN} at {}d x {} seeds\n",
+                    f.policy, f.metric, f.days, f.seeds
+                ));
+                continue;
+            }
             out.push_str(&format!(
                 "    {}: {} p5 {} p50 {} p95 {} at {}d x {} seeds",
                 f.policy, f.metric, f.p5, f.p50, f.p95, f.days, f.seeds
@@ -801,7 +826,16 @@ pub const MAX_ACTION_NAME: usize = 64;
 pub struct Envelope {
     pub name: String,
     pub quantiles: Quantiles,
+    /// Set when the history is too little to forecast the metric from:
+    /// fewer readings than the forecast needs, or a stationary metric
+    /// whose forecast spreads far past anything it has read. The
+    /// quantiles are then not shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thin: bool,
 }
+
+/// What a forecast says in place of numbers it does not stand behind.
+pub const THIN: &str = "too little history to forecast";
 
 /// What a forecast's branches reached by the horizon, as quantiles over
 /// the seeds: spend (cost of the runs), asks, refusals, halts (stops) and
@@ -1205,6 +1239,7 @@ impl Record {
             } => {
                 let mut text = format!("{policy} over {horizon}d x {seeds} seeds:");
                 match metrics.first() {
+                    Some(m) if m.thin => text.push_str(&format!(" {}: {THIN}", m.name)),
                     Some(m) => text.push_str(&format!(
                         " {} p50 {} (p5 {} to p95 {})",
                         m.name,
