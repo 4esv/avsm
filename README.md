@@ -47,7 +47,8 @@ In another terminal, take on the example venture:
     avsm add examples/counter
 
 `examples/counter` holds three files. `report` prints a number, one higher each
-time it runs. `reset` puts the number back to zero. `mandate.yaml` says what to
+time it runs; the program that reads a venture's metric is always named
+`report`, beside the mandate, unless the metric names a built-in one. `reset` puts the number back to zero. `mandate.yaml` says what to
 do about it:
 
 ```yaml
@@ -70,6 +71,9 @@ Watch it work:
 
     avsm status
     avsm tail
+
+A duration (`cadence`, `timeout`, a cap's period) is a number and its unit:
+`10s`, `5m`, `2h`, `1d`. `1h30` is not one; write `90m`.
 
 The count rises by one every 10 seconds. Within two minutes it climbs past ten,
 avsm runs `reset`, and then does so again about every two minutes: some 33 resets
@@ -103,7 +107,10 @@ a model produced runs only after a human approves it, unless the mandate
 delegates the lever.
 
 `avsm pause <venture>` stops a venture and nothing but `avsm resume <venture>`
-starts it again. There is no other steering. To change what a venture may do,
+starts it again. `avsm approve` of a paused venture's ask is refused: the gate
+would spend the approval without running it, so resume first; `avsm deny` is
+answered whatever the state. A resume while a guard still reads past its bound
+goes through, and says the guard will pause it again. There is no other steering. To change what a venture may do,
 edit its mandate and run `avsm add` again; the old permissions end with the old
 mandate.
 
@@ -145,7 +152,9 @@ set) while the audit gets worse by more than its tolerance. The metric improves
 going up unless the audit says `better: down`, as for unread mail. No model ever sees
 an audit reading. A report outside `range`, a step past `max_step`, a flap, a
 NaN or a failed report is kept, marked implausible, never acted on, and asks
-once until a plausible report comes. With `max_step`, the report right after an
+once until a plausible report comes. A guard's or audit's failed reading holds
+the venture implausible just as the metric's does; `avsm status` names the
+reading that holds it, and what clears it. With `max_step`, the report right after an
 implausible one is unconfirmed: kept and shown, never acted on, until the next
 agrees with it within `max_step`; `confirm: false` on the mandate, a guard or an
 audit acts on it at once, where waiting costs more than a misreading. Where a
@@ -199,6 +208,31 @@ low side may only declare `expects: up ... within ...` and one for the high side
 `expects: down ...` (see Expecting an effect, below); `expects` always carries
 `within`, so `expects: up` alone is refused.
 
+### Doing something every hour
+
+There is no schedule: a venture watches a number. To run `backup` every hour,
+watch how long ago it last ran. `report` prints the age of a stamp the lever
+touches, making the stamp first so a missing file is not a reading of 56 years:
+
+```sh
+#!/bin/sh
+[ -e stamp ] || touch stamp
+echo $(( $(date +%s) - $(date -r stamp +%s) ))
+```
+
+```yaml
+purpose: Back up every hour.
+metric: age
+controller: {kind: threshold, above: 3600, action: backup}
+cadence: 1m
+permitted:
+  - {name: backup, run: ./backup && touch stamp, cap: 2/hour, reversible: true}
+max_rise: 120
+```
+
+Bound the rise only: the age falls to 0 after every run, and a `max_step`
+would call that fall implausible.
+
 ### Expecting an effect
 
 A lever may say what a run should do to the metric:
@@ -213,9 +247,10 @@ The syntax is `up` or `down`, then optionally a size (a number above 0), then
 `within` and a count: `up 5 within 3`, `down within 2`. `within` counts
 reports: the trusted, plausible readings of the metric that follow the run's
 successful outcome, not minutes or runs. The count-th such report is compared
-with the last reading before the run, net of what the metric was doing anyway,
-and avsm writes whether the run did what was expected; until then the verdict
-is waiting. Without a size, any move the right way beyond the metric's own
+with the last reading before the run, net of what the metric was doing anyway.
+avsm writes a record when the run missed, or showed its effect later than
+`within`; a run that did what was expected writes nothing. Until the count-th
+report the verdict is waiting. Without a size, any move the right way beyond the metric's own
 noise is enough; with one, a move far off it is the wrong size. Absence of
 evidence is not a miss. With fewer than 3 steps of history the metric's drift
 is not known, and the run is not judged. A span of exact repeats of the reading
@@ -388,7 +423,10 @@ exits 0 when every check passes, and otherwise with the worst code it found, in
 this order: 65 a ledger that is not a database or whose chain is broken, 78 a
 config or mandate that does not hold, 77 a permission missing, 73 a home that
 is not a directory, 66 a home or mandate directory that is not there, 69 no
-avsmd answering. A sound ledger and no daemon running is 69. avsmd itself
+avsmd answering. A sound ledger and no daemon running is 69. `avsm doctor --cut`
+exits 75 while avsmd runs on the home (stop it first), and doctor exits 64 for
+bad usage: a `--cut` that is not a record number, a `--since` that is not an
+anchor, or `--remote`. avsmd itself
 exits 75 when another is already running on the same home, and names its pid:
 each daemon holds a lock on `avsmd.lock` in the home for its life, so even with
 its socket deleted a second one does not start, and `avsm doctor` says the
@@ -431,7 +469,10 @@ machine catches all three. The digest ends with the head of the chain as
 `head <number>:<hash>`, the hash cut to its first 16 hex digits (64 bits); copy
 it somewhere the owner of this machine cannot edit (mail it, paste it into a
 ticket), and later `avsm doctor --since <number>:<hash>` fails with 65 unless
-the ledger still holds exactly that hash at that number. `--since` takes the
+the ledger still holds exactly that hash at that number. An anchor covers the
+chain up to its own number only: records after it are covered by the next
+anchor you keep, so keep the latest digest's, and know that a cut or delete of
+records after the last anchor you kept is not caught. `--since` takes the
 digest's head line exactly as printed (`head 42:0123456789abcdef; keep it off
 this machine...`) as well as the bare `<number>:<hash>`. A bare hash of 16 to
 64 hex digits is looked for anywhere in the ledger.
