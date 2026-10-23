@@ -524,6 +524,31 @@ warden, which hands them their one key and holds them to the mandate's network
 list. `network: none` cuts `run` off from the network where Linux allows it,
 and `avsm status` says so when it cannot.
 
+A `run` lever, a script lever and a `report` program run with your authority,
+as your user: anything you can do, they can do, the ledger and the socket
+included. avsmd cannot prevent that; it detects the two ways such a program
+could pass for you:
+
+- **A record avsmd did not write.** While it runs, avsmd is the ledger's only
+  writer, and it knows every record it and its warden appended. Any other
+  record, however well chained, is never acted on: self writes a measured
+  `foreign` alarm citing it (an approval among them is spent for good), pauses
+  everything, and says so on stderr, in `avsm status` and in `avsm doctor`
+  (exit 65). Read the records it names with `avsm why`, then `avsm resume self`.
+- **A command from a process avsmd started.** `approve`, `deny`, `resume`,
+  `add` and `propose` from a lever, a report or a role (anything whose parent
+  chain leads back to avsmd) are refused and logged. Reading commands and
+  `pause` stay open to them. Where the system cannot say who the peer is, the
+  command is allowed.
+
+What it does not detect: a program that leaves avsmd's process tree (by
+daemonizing) before it connects, and anything written while avsmd is stopped.
+The anchor kept off the machine covers the second.
+
+Only the first answer to an ask counts; a later one is kept and authorizes
+nothing. An approval refused for any reason (a pause, a cap, a budget, a
+quota) is spent, and the next ask comes when the situation allows.
+
 ## Where this comes from
 
 avsm is built on Stafford Beer's Viable System Model, the cybernetics of

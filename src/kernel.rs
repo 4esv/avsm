@@ -123,6 +123,16 @@ pub struct Kernel {
     /// The intents the command being handled started apart, for the
     /// socket to wait on the outcomes of once the kernel is free.
     started: Vec<Seq>,
+    /// Set by the daemon alone: every record after this one must be one
+    /// this kernel or its warden wrote. None: nobody keeps count.
+    vetted: Option<Seq>,
+    /// What this kernel and its warden appended past `vetted`, by number,
+    /// with each record's hash.
+    ours: BTreeMap<Seq, String>,
+    /// Records found in the ledger that this daemon did not write while it
+    /// ran. While any is unanswered nothing runs; a human's `resume self`
+    /// answers them.
+    foreign: Vec<Seq>,
 }
 
 /// A lever run going on apart.
@@ -327,6 +337,9 @@ impl Kernel {
             fault: None,
             dead: BTreeMap::new(),
             started: Vec::new(),
+            vetted: None,
+            ours: BTreeMap::new(),
+            foreign: Vec::new(),
         };
         kernel.reload()?;
         kernel.recover();
@@ -423,6 +436,9 @@ impl Kernel {
     pub fn append(&mut self, record: Record) -> Result<Entry, String> {
         match self.ledger.append(record) {
             Ok(e) => {
+                if self.vetted.is_some() {
+                    self.ours.insert(e.seq, e.hash.clone());
+                }
                 if let Some(f) = self.fault.take() {
                     log(&format!(
                         "the ledger takes writes again after {}",
@@ -468,6 +484,7 @@ impl Kernel {
     pub fn handle_as(&mut self, args: &[String], by: Option<&str>) -> Result<String, String> {
         self.by = by.map(str::to_string);
         self.started.clear();
+        self.vet();
         let result = self.dispatch(args);
         self.by = None;
         result
@@ -1255,6 +1272,16 @@ impl Kernel {
     pub fn resume(&mut self, name: &str) -> Result<String, String> {
         self.known(name)?;
         let entry = self.append(self.decision(name, Verdict::Resume))?;
+        // A human resuming self has seen the alarm: what it named stays
+        // spent, and the kernel acts again.
+        if name == SELF && !self.foreign.is_empty() {
+            log(&format!(
+                "foreign records {} answered by a human's resume of self (#{})",
+                seqs(&self.foreign),
+                entry.seq
+            ));
+            self.foreign.clear();
+        }
         Ok(entry.line() + "\n")
     }
 
@@ -1295,6 +1322,7 @@ impl Kernel {
         {
             return;
         }
+        self.vet();
         self.watch();
         self.settle_inflight();
         // A dead warden cannot check an intent; it is checked once one is
@@ -2015,6 +2043,11 @@ impl Kernel {
     /// apart.
     fn track(&mut self, written: &[Entry]) {
         for e in written {
+            // The warden's own word on what it wrote, kept at once: a
+            // warden killed before it is next asked takes its notes with it.
+            if self.vetted.is_some() {
+                self.ours.insert(e.seq, e.hash.clone());
+            }
             if let Record::Intent {
                 venture, action, ..
             } = &e.record
@@ -2158,6 +2191,14 @@ impl Kernel {
     /// warden or roles process dead. Empty when all is well.
     fn alarms(&self) -> String {
         let mut out = String::new();
+        if !self.foreign.is_empty() {
+            out.push_str(&format!(
+                "caution: records {} were not written by this avsmd while it ran; nothing runs \
+                 and every venture is paused. read them (avsm why {}), then: avsm resume self\n",
+                seqs(&self.foreign),
+                self.foreign[0]
+            ));
+        }
         if let Some(f) = &self.fault {
             out.push_str(&format!(
                 "caution: the ledger cannot be written ({}): {}; nothing runs until it can\n",
@@ -2192,7 +2233,108 @@ impl Kernel {
         if let Some(f) = &self.fault {
             out.push_str(&format!("fail the ledger cannot be written: {}\n", f.error));
         }
+        if let Some(first) = self.foreign.first() {
+            out.push_str(&format!(
+                "alarm {first} records {} were not written by this avsmd while it ran\n",
+                seqs(&self.foreign)
+            ));
+        }
         out
+    }
+
+    /// Count from here on what this kernel and its warden write: every
+    /// later record must be one of theirs. The daemon alone does this; a
+    /// home is written by one avsmd at a time, so any other writer while
+    /// it runs is foreign.
+    pub fn guard_foreign(&mut self) -> Result<(), String> {
+        let head = self.ledger_last();
+        self.warden.written()?;
+        self.vetted = Some(head);
+        self.ours.clear();
+        Ok(())
+    }
+
+    /// Check every record appended since the last check against what this
+    /// kernel and its warden wrote. One neither wrote is foreign: it is
+    /// never acted on, self writes a measured alarm citing it (which
+    /// spends any approval among them) and pauses everything, and stderr
+    /// and status say so until a human resumes self. True when nothing
+    /// foreign is unanswered.
+    fn vet(&mut self) -> bool {
+        let Some(from) = self.vetted else {
+            return true;
+        };
+        let after = match self.ledger.after(from) {
+            Ok(after) => after,
+            Err(e) => {
+                log(&format!("cannot read the ledger to vet it: {e}"));
+                return false;
+            }
+        };
+        let Some(last) = after.last().map(|e| e.seq) else {
+            return self.foreign.is_empty();
+        };
+        let unknown = |ours: &BTreeMap<Seq, String>| -> Vec<Seq> {
+            after
+                .iter()
+                .filter(|e| ours.get(&e.seq) != Some(&e.hash))
+                .map(|e| e.seq)
+                .collect()
+        };
+        if !unknown(&self.ours).is_empty() {
+            match self.warden.written() {
+                Ok(theirs) => self.ours.extend(theirs),
+                Err(e) => {
+                    // Asked again at the next look; nothing runs till then.
+                    log(&format!("cannot ask the warden what it wrote: {e}"));
+                    return false;
+                }
+            }
+        }
+        let foreign = unknown(&self.ours);
+        self.vetted = Some(last);
+        self.ours.retain(|s, _| *s > last);
+        if !foreign.is_empty() {
+            self.alarm_foreign(foreign);
+        }
+        self.foreign.is_empty()
+    }
+
+    /// Records this daemon did not write are in its ledger: say so loudly,
+    /// write self's alarm citing them, and pause everything.
+    fn alarm_foreign(&mut self, foreign: Vec<Seq>) {
+        let list = seqs(&foreign);
+        log(&format!(
+            "ALARM: records {list} were not written by this avsmd: another process wrote the \
+             ledger while it runs. nothing they say is acted on and every venture is paused; \
+             read them (avsm why {}), then: avsm resume self",
+            foreign[0]
+        ));
+        self.foreign.extend(&foreign);
+        let alarm = Record::Report {
+            claim: Claim::Measured,
+            venture: SELF.to_string(),
+            metric: crate::index::FOREIGN.to_string(),
+            value: Some(foreign.len() as f64),
+            note: format!("records {list} were not written by this avsmd while it ran"),
+            source: None,
+            confidence: None,
+            cites: foreign,
+            implausible: None,
+            facts: None,
+        };
+        let pause = Record::Decision {
+            claim: Claim::Measured,
+            venture: SELF.to_string(),
+            verdict: Verdict::Pause,
+            by: None,
+        };
+        for record in [alarm, pause] {
+            match self.append(record) {
+                Ok(e) => log(&e.line()),
+                Err(e) => log(&format!("cannot write the alarm: {e}")),
+            }
+        }
     }
 
     /// Try to take an action: gate it, and if allowed have the warden do
@@ -2213,6 +2355,16 @@ impl Kernel {
         ask_cites: Vec<Seq>,
     ) -> Vec<String> {
         let mut lines = Vec::new();
+        if !self.vet() {
+            // Fail closed: a record another process wrote may be among
+            // what this run would rest on.
+            lines.push(format!(
+                "{name}: {action} not run: records {} were not written by this avsmd; \
+                 see: avsm status",
+                seqs(&self.foreign)
+            ));
+            return lines;
+        }
         if let Some(f) = &self.fault {
             // Fail closed: what cannot be recorded does not run.
             lines.push(format!(
@@ -3890,6 +4042,14 @@ fn indent(text: &str, max: usize) -> String {
     out
 }
 
+/// Record numbers as a list: `#4, #9`.
+fn seqs(list: &[Seq]) -> String {
+    list.iter()
+        .map(|s| format!("#{s}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn parse_seq(s: &str) -> Result<Seq, String> {
     s.trim_start_matches('#')
         .parse()
@@ -3910,7 +4070,7 @@ pub fn ago(secs: i64) -> String {
     }
 }
 
-fn log(line: &str) {
+pub(crate) fn log(line: &str) {
     if !QUIET.with(std::cell::Cell::get) {
         eprintln!("avsmd: {line}");
     }
@@ -4129,6 +4289,15 @@ impl Warden for WardenProcess {
         }
     }
 
+    fn written(&mut self) -> Result<Vec<(Seq, String)>, String> {
+        self.0.send(&ToWarden::Written)?;
+        match self.0.recv::<FromWarden>()? {
+            FromWarden::Written(w) => Ok(w),
+            FromWarden::Err(e) => Err(e),
+            _ => Err("the warden answered the wrong question".to_string()),
+        }
+    }
+
     fn cancel(&mut self, venture: &str) -> Result<u32, String> {
         self.0.send(&ToWarden::Cancel(venture.to_string()))?;
         match self.0.recv::<FromWarden>()? {
@@ -4300,10 +4469,14 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
                     let stopped = Arc::clone(&stop);
                     let ledger = ledger.clone();
                     let venture = job.venture.clone();
+                    let notes = warden.notes();
                     let run = std::thread::spawn(move || {
                         let (ok, detail) = job.run(&|| stopped.load(Ordering::SeqCst));
                         let wrote = Ledger::open(&ledger)
-                            .and_then(|mut l| l.append(job.outcome(ok, detail)))
+                            .and_then(|mut l| {
+                                l.track(notes);
+                                l.append(job.outcome(ok, detail))
+                            })
                             .map_err(|e| e.to_string());
                         if let Err(e) = wrote {
                             eprintln!(
@@ -4359,6 +4532,10 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
             },
             Ok(ToWarden::Read(v, m)) => match warden.read(&v, &m) {
                 Ok((value, note)) => FromWarden::Measured(value, note),
+                Err(e) => FromWarden::Err(e),
+            },
+            Ok(ToWarden::Written) => match warden.written() {
+                Ok(w) => FromWarden::Written(w),
                 Err(e) => FromWarden::Err(e),
             },
             Err(e) => FromWarden::Err(format!("bad request: {e}")),
@@ -4550,6 +4727,7 @@ pub fn start(home: &Path) -> Result<(), Exit> {
     kernel.forecasts = true;
     kernel.apart = true;
     kernel.adopt_self()?;
+    kernel.guard_foreign()?;
     let kernel = Arc::new(Mutex::new(kernel));
     log(&format!("listening at {}", sock.display()));
     let server = Arc::clone(&kernel);

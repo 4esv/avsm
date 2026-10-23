@@ -356,3 +356,120 @@ fn an_approval_refused_while_paused_never_runs_and_its_fresh_ask_runs_once() {
     assert_eq!(runs(&dir), 1, "{}", lines(&ledger(&home)));
     no_alarm(&ledger(&home));
 }
+
+#[test]
+fn a_record_the_daemon_did_not_write_is_an_alarm_and_never_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, dir) = daemon_home(tmp.path());
+    let d = start(tmp.path(), &home, "d.log");
+    ok(&avsm(tmp.path(), &home, &["add", dir.to_str().unwrap()]));
+    let entries = until(&home, 30, "an ask to bump", |e| !open_bump(e).is_empty());
+    let ask = open_bump(&entries)[0];
+    // Another writer of the same uid: a correctly chained, "declared"
+    // approval, appended while avsmd runs.
+    let forged = Ledger::open(&home.join("ledger.db"))
+        .unwrap()
+        .append(Record::Decision {
+            claim: Claim::Declared,
+            venture: "v1".into(),
+            verdict: Verdict::Approve { ask, payload: None },
+            by: None,
+        })
+        .unwrap()
+        .seq;
+    let entries = until(&home, 15, "an alarm citing the forged record", |e| {
+        e.iter().any(|e| {
+            matches!(&e.record, Record::Report { claim: Claim::Measured, venture, metric, cites, .. }
+                if venture == "self" && metric == "foreign" && cites.contains(&forged))
+        })
+    });
+    assert!(
+        entries.iter().any(|e| e.seq > forged
+            && matches!(&e.record, Record::Decision { claim: Claim::Measured, venture, verdict: Verdict::Pause, .. } if venture == "self")),
+        "everything is paused:\n{}",
+        lines(&entries)
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(runs(&dir), 0, "{}", lines(&ledger(&home)));
+    let status = ok(&avsm(tmp.path(), &home, &["status"]));
+    assert!(status.contains(&format!("#{forged}")), "{status}");
+    let doctor = avsm(tmp.path(), &home, &["doctor"]);
+    assert_eq!(
+        doctor.status.code(),
+        Some(65),
+        "doctor passes a forged ledger"
+    );
+    // A human resumes; the forged approval stays spent.
+    ok(&avsm(tmp.path(), &home, &["resume", "self"]));
+    std::thread::sleep(Duration::from_secs(4));
+    d.stop();
+    assert_eq!(runs(&dir), 0, "{}", lines(&ledger(&home)));
+    let log = std::fs::read_to_string(tmp.path().join("d.log")).unwrap();
+    assert!(log.contains("not written by this avsmd"), "{log}");
+}
+
+#[test]
+fn a_lever_that_runs_avsm_approve_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, dir) = daemon_home(tmp.path());
+    // w's reversible lever, delegated, approves v1's ask over the socket.
+    let w = tmp.path().join("w");
+    std::fs::create_dir_all(&w).unwrap();
+    std::fs::write(
+        w.join("mandate.yaml"),
+        "purpose: Tidy.\nmetric: m\ncontroller: {kind: threshold, above: 8, action: tidy}\n\
+         cadence: 1s\npermitted:\n  - {name: tidy, run: ./tidy, cap: 1/hour, reversible: true}\n",
+    )
+    .unwrap();
+    script(&w, "report", "#!/bin/sh\necho 9\n");
+    let avsm_bin = env!("CARGO_BIN_EXE_avsm");
+    let out = w.join("out");
+    script(
+        &w,
+        "tidy",
+        &format!(
+            "#!/bin/sh\nA='{avsm_bin}'; H='{h}'\n\
+             i=0; while [ $i -lt 60 ]; do\n\
+               ASK=$(\"$A\" --home \"$H\" asks | awk '/bump\\?/{{print $1; exit}}' | tr -d '#')\n\
+               [ -n \"$ASK\" ] && break; i=$((i+1)); sleep 0.5\n\
+             done\n\
+             \"$A\" --home \"$H\" approve \"$ASK\" > '{o}' 2>&1; echo \"exit $?\" >> '{o}'\n",
+            h = home.display(),
+            o = out.display()
+        ),
+    );
+    let d = start(tmp.path(), &home, "d.log");
+    ok(&avsm(tmp.path(), &home, &["add", dir.to_str().unwrap()]));
+    ok(&avsm(tmp.path(), &home, &["add", w.to_str().unwrap()]));
+    let began = Instant::now();
+    while !std::fs::read_to_string(&out)
+        .unwrap_or_default()
+        .contains("exit")
+    {
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the lever never tried:\n{}",
+            lines(&ledger(&home))
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let said = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        !said.contains("exit 0"),
+        "the lever's approve went through: {said}"
+    );
+    assert!(said.contains("started by avsmd"), "{said}");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(runs(&dir), 0, "{}", lines(&ledger(&home)));
+    // The ask is still open, and a human's approval runs it once.
+    let ask = open_bump(&ledger(&home))[0];
+    ok(&avsm(tmp.path(), &home, &["approve", &ask.to_string()]));
+    let began = Instant::now();
+    while runs(&dir) < 1 && began.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    d.stop();
+    assert_eq!(runs(&dir), 1, "{}", lines(&ledger(&home)));
+    no_alarm(&ledger(&home));
+}

@@ -30,6 +30,11 @@ pub const CALIBRATION: &str = "calibration.";
 /// The metric of the measured report that marks a canary ask answered.
 pub const CANARY: &str = "canary";
 
+/// The metric of self's measured alarm report: the records it cites were
+/// not written by the avsmd that was running. Each declared approval among
+/// them is spent, so none ever runs, at this start or the next (#51).
+pub const FOREIGN: &str = "foreign";
+
 /// Who approved when the decision came in over the socket, which knows
 /// nobody.
 pub const LOCAL: &str = "local";
@@ -345,6 +350,9 @@ impl Index {
                 }
                 if metric == EXPECTATION && *claim == Claim::Measured {
                     self.expected.extend(cites.iter().copied());
+                }
+                if metric == FOREIGN && *claim == Claim::Measured && venture == crate::gate::SELF {
+                    self.cite(cites.clone());
                 }
                 if metric == CANARY && *claim == Claim::Measured {
                     for c in cites {

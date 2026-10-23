@@ -41,7 +41,16 @@ pub struct Ledger {
     /// The last record this connection appended or found at the head,
     /// which must still be there at the next append.
     seen: Option<(i64, String)>,
+    /// Where each append is noted, number and hash, when someone keeps
+    /// count of what this process wrote.
+    track: Option<Written>,
 }
+
+/// The records a process appended, by number and hash, noted as each
+/// commits: the daemon tells its own writes from another writer's by
+/// them (#51). Held across the append, so whoever reads it after seeing a
+/// row has that row's note too.
+pub type Written = std::sync::Arc<std::sync::Mutex<Vec<(Seq, String)>>>;
 
 /// A ledger file as opened: its path, device and inode.
 struct Opened {
@@ -168,7 +177,13 @@ impl Ledger {
             conn,
             file: None,
             seen: None,
+            track: None,
         }
+    }
+
+    /// Note every append from now on in `written`.
+    pub fn track(&mut self, written: Written) {
+        self.track = Some(written);
     }
 
     /// A ledger that lives only in memory, for tests.
@@ -266,6 +281,12 @@ impl Ledger {
         // A ledger must never store a record it cannot read.
         readable(&record)?;
         self.same_file()?;
+        // Held from before the write until it is noted: a reader of the
+        // notes waits for an append it may already see in the file.
+        let track = self.track.clone();
+        let mut noted = track
+            .as_ref()
+            .map(|t| t.lock().unwrap_or_else(|p| p.into_inner()));
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -312,6 +333,9 @@ impl Ledger {
         )?;
         tx.commit()?;
         self.seen = Some((seq, entry.hash.clone()));
+        if let Some(noted) = noted.as_mut() {
+            noted.push((entry.seq, entry.hash.clone()));
+        }
         Ok(entry)
     }
 

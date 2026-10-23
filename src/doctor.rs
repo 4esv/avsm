@@ -554,6 +554,14 @@ pub fn doctor(
                         what,
                         format!("kill {pid} && avsmd --home {h}  # avsmd stops cleanly and starts afresh"),
                     );
+                } else if let Some((first, what)) =
+                    line.strip_prefix("alarm ").and_then(|l| l.split_once(' '))
+                {
+                    found.fail(
+                        exit::DATAERR,
+                        what,
+                        format!("avsm --home {h} why {first}  # then, when you know who wrote it: avsm --home {h} resume self"),
+                    );
                 }
             }
         }

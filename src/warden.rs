@@ -16,7 +16,7 @@ use crate::adapter::{self, Occasion};
 use crate::config::{self, Backend, Config};
 use crate::gate::{self, Candidate, DELEGATE, RESUME, STOP};
 use crate::index::Index;
-use crate::ledger::Ledger;
+use crate::ledger::{Ledger, Written};
 use crate::mandate::{FieldType, Mandate, ParentCall};
 use crate::record::Verdict;
 use crate::record::{self, Claim, Entry, Payload, Record, Seq};
@@ -94,6 +94,11 @@ pub trait Warden {
     fn respawn(&mut self) -> Result<u32, String> {
         Err("this warden has no process to start".to_string())
     }
+    /// The records this warden appended since it was last asked, number
+    /// and hash: with the kernel's own, every record the daemon wrote.
+    fn written(&mut self) -> Result<Vec<(Seq, String)>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// Why `execute` wrote nothing. A refusal is the warden's own typed
@@ -142,12 +147,17 @@ pub struct LocalWarden {
     /// A forecast branch's warden: it holds no keys, calls no backend,
     /// reads no adapter, runs no payload check and writes no mandate file.
     keyless: bool,
+    /// Every record this warden appended, on any of its ledger
+    /// connections, not yet handed to the kernel.
+    written: Written,
 }
 
 impl LocalWarden {
     /// Open the ledger and read config and keys.
     pub fn open(home: &Path) -> Result<LocalWarden, String> {
-        let ledger = Ledger::open(&home.join("ledger.db")).map_err(|e| e.to_string())?;
+        let mut ledger = Ledger::open(&home.join("ledger.db")).map_err(|e| e.to_string())?;
+        let written = Written::default();
+        ledger.track(written.clone());
         Ok(LocalWarden {
             home: home.to_path_buf(),
             ledger,
@@ -156,6 +166,7 @@ impl LocalWarden {
             keys: config::load_keys(home)?,
             sim: None,
             keyless: false,
+            written,
         })
     }
 
@@ -168,7 +179,9 @@ impl LocalWarden {
         sim: Arc<Simulation>,
         head: &Index,
     ) -> Result<LocalWarden, String> {
-        let ledger = Ledger::open(&home.join("ledger.db")).map_err(|e| e.to_string())?;
+        let mut ledger = Ledger::open(&home.join("ledger.db")).map_err(|e| e.to_string())?;
+        let written = Written::default();
+        ledger.track(written.clone());
         ledger.throwaway().map_err(|e| e.to_string())?;
         let index = head.seed_for(&ledger).map_err(|e| e.to_string())?;
         Ok(LocalWarden {
@@ -179,7 +192,14 @@ impl LocalWarden {
             keys: BTreeMap::new(),
             sim: Some(sim),
             keyless: true,
+            written,
         })
+    }
+
+    /// Where this warden notes what it appends; a ledger opened on
+    /// another thread of the warden notes there too.
+    pub fn notes(&self) -> Written {
+        self.written.clone()
     }
 
     /// How many keys this warden holds.
@@ -197,6 +217,11 @@ impl LocalWarden {
 }
 
 impl Warden for LocalWarden {
+    fn written(&mut self) -> Result<Vec<(Seq, String)>, String> {
+        let mut noted = self.written.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(std::mem::take(&mut *noted))
+    }
+
     fn check(&mut self, venture: &str, action: &str, payload: &Payload) -> Result<(), Failure> {
         if self.keyless {
             return Ok(());
@@ -1520,6 +1545,8 @@ pub enum ToWarden {
     Read(String, String),
     /// A venture, a lever and a payload: run the lever's check.
     Check(String, String, Payload),
+    /// The records the warden appended since it was last asked.
+    Written,
 }
 
 /// What a warden process answers.
@@ -1539,6 +1566,8 @@ pub enum FromWarden {
     Checked,
     /// How many runs a cancel stopped.
     Cancelled(u32),
+    /// The records appended since the last ask: number and hash.
+    Written(Vec<(Seq, String)>),
     Err(String),
 }
 
