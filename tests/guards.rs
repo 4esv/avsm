@@ -128,9 +128,11 @@ fn a_guard_that_pauses_pauses_and_no_approval_gets_a_lever_past_it() {
     report(&mut k, &dir, "shop", "5");
     assert_eq!(count(&k, Kind::Action, "stop"), 1);
 
-    // The human approves and resumes: the guard still holds the lever.
-    k.approve(ask, None).unwrap();
+    // The human resumes and approves (approve is refused while paused):
+    // the guard still holds the lever.
+    assert!(k.approve(ask, None).unwrap_err().contains("shop is paused"));
     k.resume("shop").unwrap();
+    k.approve(ask, None).unwrap();
     k.tick();
     assert!(!dir.join("wiped").exists(), "no approval passes a guard");
     assert_eq!(count(&k, Kind::Intent, "wipe"), 0);

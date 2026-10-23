@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Quotas;
 use crate::index::{Index, Pulled};
 use crate::mandate::{Cap, Mandate, ParentCall, Permitted};
-use crate::record::{Claim, Entry, Kind, Packet, Payload, Record, Seq, Signal, Takes, Verdict};
+use crate::record::{Claim, Entry, Kind, Payload, Record, Seq, Signal, Takes, Verdict};
 
 /// The action that always passes.
 pub const STOP: &str = crate::mandate::STOP;
