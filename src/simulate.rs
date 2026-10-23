@@ -109,6 +109,11 @@ impl Simulation {
         }
     }
 
+    /// Does a `--world` command take the lever runs?
+    pub(crate) fn has_world(&self) -> bool {
+        self.world.is_some()
+    }
+
     /// A guard reading the venture's world model gave at its last step.
     pub(crate) fn guard(&self, venture: &str, name: &str) -> Option<f64> {
         let guards = self.guards.lock().unwrap_or_else(|e| e.into_inner());

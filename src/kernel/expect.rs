@@ -75,6 +75,14 @@ impl Kernel {
             return;
         };
         let metric = v.mandate.metric_name().to_string();
+        // Simulated with neither a `--world` nor a `world:` of its own,
+        // the venture reads the baseline, whose lever effects are only
+        // what the ledger has measured before: a fresh home has none, and
+        // the metric sits frozen. What it reads after a run is the model
+        // agreeing with itself, no evidence of what the lever does, so the
+        // run's expectation is not judged: neither a hit nor a miss.
+        let baseline =
+            self.sim.as_ref().is_some_and(|s| !s.has_world()) && v.mandate.world.is_none();
         for perm in &v.mandate.permitted {
             if perm.expects.is_none() && perm.revoke_after.is_none() {
                 continue;
@@ -139,7 +147,7 @@ impl Kernel {
                     );
                     let result = if !ok {
                         Run::Failed
-                    } else if past_stuck {
+                    } else if past_stuck || (baseline && perm.expects.is_some()) {
                         Run::Unjudged
                     } else if let Some((seen, x)) = stuck {
                         Run::Frozen(
