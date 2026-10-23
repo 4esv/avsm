@@ -550,6 +550,24 @@ fn a_report_that_double_forks_avsm_approve_is_refused_and_the_lever_never_runs()
     no_alarm(&ledger(&home));
 }
 
+/// With job control on, the shell puts the approver in a process group of
+/// its own: only the session avsmd made still says whose it is.
+#[test]
+fn a_report_that_moves_its_approver_to_a_group_of_its_own_is_still_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, dir) = daemon_home(tmp.path());
+    let (w, out) = escaping_reporter(tmp.path(), &home, "sh -c 'set -m; \"$0\" & exit'");
+    let d = start(tmp.path(), &home, "d.log");
+    ok(&avsm(tmp.path(), &home, &["add", dir.to_str().unwrap()]));
+    ok(&avsm(tmp.path(), &home, &["add", w.to_str().unwrap()]));
+    let said = told(&out, &home);
+    assert!(!said.contains("exit 0"), "the approve went through: {said}");
+    assert!(said.contains("refused"), "{said}");
+    std::thread::sleep(Duration::from_secs(3));
+    d.stop();
+    assert_eq!(runs(&dir), 0, "{}", lines(&ledger(&home)));
+}
+
 /// A program that calls setsid itself leaves avsmd's session. On Linux
 /// avsmd is its subreaper, so it is still found in avsmd's tree and
 /// refused; on macOS nothing ties it to avsmd, and its approve goes
