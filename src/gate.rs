@@ -1937,7 +1937,15 @@ fn allocation_reasons<'a>(
     let Some(&(last, last_at, current)) = history.last() else {
         return reasons;
     };
-    if amount < current {
+    // Under a total a lower child cannot be raised past it, so a raise the
+    // parent cannot take back would turn the order of cuts into a ratchet:
+    // a cut no lower than where the last raise found the child undoes it.
+    let undo = total.is_some()
+        && history
+            .len()
+            .checked_sub(2)
+            .is_some_and(|i| history[i].2 <= amount);
+    if amount < current && !undo {
         // A cut: not while a lower-priority child sits above its floor.
         for other in &parent.mandate.children {
             if other.name == child
@@ -4384,6 +4392,47 @@ mod tests {
         // With the farm at its floor, the shop may be cut.
         set_budget(&mut fx, "farm", 1);
         assert!(parent_gate(&mut fx, "budget", "shop 8").is_ok());
+    }
+
+    #[test]
+    fn under_a_total_a_cut_that_undoes_a_raise_is_not_held_by_priority() {
+        // heldout3: the pen was raised from 4 to 5 for a low-oxygen night
+        // with the total full. Cutting it back was refused while the lice
+        // sat above their floor, and raising the lice was past the total:
+        // the budgets could only move toward the pen, for fifty days.
+        let priority = |r: &Refusal| has(r, |r| matches!(r, Reason::Priority { .. }));
+        let mut fx = Fx::new();
+        siblings(
+            &mut fx,
+            term("shop", 1, 2),
+            term("farm", 0, 1),
+            total(7, Duration::ZERO),
+        );
+        set_budget(&mut fx, "shop", 4);
+        set_budget(&mut fx, "farm", 2);
+        set_budget(&mut fx, "shop", 5);
+        // Back to where the raise found it, or anywhere in between: an undo.
+        assert!(parent_gate(&mut fx, "budget", "shop 4").is_ok());
+        // Below that it is a cut, and the farm is above its floor.
+        let refusal = parent_gate(&mut fx, "budget", "shop 3").unwrap_err();
+        assert!(priority(&refusal), "{refusal}");
+        // After a cut, a further cut undoes nothing.
+        set_budget(&mut fx, "shop", 4);
+        let refusal = parent_gate(&mut fx, "budget", "shop 3").unwrap_err();
+        assert!(priority(&refusal), "{refusal}");
+        // Without a total the farm can be raised instead: the undo is held.
+        let mut fx = Fx::new();
+        siblings(
+            &mut fx,
+            term("shop", 1, 2),
+            term("farm", 0, 1),
+            allocation(1, Duration::ZERO),
+        );
+        set_budget(&mut fx, "shop", 4);
+        set_budget(&mut fx, "farm", 2);
+        set_budget(&mut fx, "shop", 5);
+        let refusal = parent_gate(&mut fx, "budget", "shop 4").unwrap_err();
+        assert!(priority(&refusal), "{refusal}");
     }
 
     fn allocation(deadband: u32, hold: Duration) -> Option<Allocation> {
