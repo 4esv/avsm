@@ -234,11 +234,7 @@ fn every_command_against_a_temp_ledger() {
     );
     let (ok, text) = run(&["status"]);
     assert!(ok);
-    assert_eq!(
-        text.lines().next(),
-        Some("caution: 1 venture needs you: counter paused"),
-        "{text}"
-    );
+    assert_eq!(text.lines().next(), Some("paused: counter"), "{text}");
     assert!(
         text.lines()
             .nth(1)
@@ -400,6 +396,38 @@ fn approve_is_refused_while_the_ventures_paused_and_deny_is_not() {
     decide(&mut kernel, Verdict::Resume);
     let text = handle(&mut kernel, &["approve", &first.to_string()]).unwrap();
     assert!(text.contains(&format!("approved #{first}")), "{text}");
+}
+
+/// Monkey round 3: `why` on a record the foreign-record alarm named said
+/// "declared by a human". It says avsmd did not write it, citing the alarm.
+#[test]
+fn why_on_a_record_the_alarm_named_says_avsmd_did_not_write_it() {
+    use avsmd::record::Verdict;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut kernel = Kernel::open(&tmp.path().join("home")).unwrap();
+    let forged = kernel
+        .append(Record::Decision {
+            claim: Claim::Declared,
+            venture: "v1".to_string(),
+            verdict: Verdict::Pause,
+            by: None,
+        })
+        .unwrap()
+        .seq;
+    let mut alarm = Record::report(Claim::Measured, "self", "foreign", Some(1.0), "not ours");
+    if let Record::Report { cites, .. } = &mut alarm {
+        cites.push(forged);
+    }
+    let alarm = kernel.append(alarm).unwrap().seq;
+    let text = kernel.why(forged).unwrap();
+    assert!(
+        text.contains(&format!(
+            "not written by avsmd: the foreign-record alarm #{alarm} named it"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("by a human"), "{text}");
+    assert!(text.contains(&format!("avsm why {alarm}")), "{text}");
 }
 
 /// The README walkthrough: add examples/counter, watch the count cross the

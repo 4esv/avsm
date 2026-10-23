@@ -158,6 +158,8 @@ pub struct Index {
     canaries: BTreeMap<String, (u32, u32)>,
     /// Decisions already counted.
     canaried: HashSet<Seq>,
+    /// Records the foreign-record alarm named, each with the alarm.
+    foreign: HashMap<Seq, Seq>,
     /// The baseline's drift steps worked out so far (`world::drift_steps`).
     drift: crate::world::DriftMemo,
 }
@@ -352,6 +354,9 @@ impl Index {
                     self.expected.extend(cites.iter().copied());
                 }
                 if metric == FOREIGN && *claim == Claim::Measured && venture == crate::gate::SELF {
+                    for c in cites {
+                        self.foreign.entry(*c).or_insert(seq);
+                    }
                     self.cite(cites.clone());
                 }
                 if metric == CANARY && *claim == Claim::Measured {
@@ -1285,6 +1290,12 @@ impl Index {
             self.acted.insert(d);
             self.unacted.remove(&d);
         }
+    }
+
+    /// The foreign-record alarm that named this record, if one did: avsmd
+    /// did not write it, whatever its claim says.
+    pub fn alarm_naming(&self, seq: Seq) -> Option<Seq> {
+        self.foreign.get(&seq).copied()
     }
 
     /// The highest trusted, plausible value a venture's metric has had.

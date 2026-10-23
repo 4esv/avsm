@@ -4186,6 +4186,17 @@ fn why_in(
     seq: Seq,
 ) -> Result<String, String> {
     let entry = index.get(seq).ok_or_else(|| format!("no record #{seq}"))?;
+    // Its claim is what another writer put there: say who did not write it.
+    if let Some(alarm) = index.alarm_naming(seq) {
+        return Ok(format!(
+            "{}\n  not written by avsmd: the foreign-record alarm #{alarm} named it. \
+             another process wrote it into the ledger while avsmd ran; its claim ({}) is that \
+             process's word, not a human's or avsmd's, and nothing acts on it\n  \
+             read the alarm: avsm why {alarm}\n",
+            entry.line(),
+            entry.record.claim()
+        ));
+    }
     if let Record::Proposal {
         venture, action, ..
     } = &entry.record
