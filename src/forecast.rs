@@ -1409,7 +1409,7 @@ pub fn capacity_with(
         let mut runs_a_day = cap.min(turns);
         let mut limit = if turns < cap { why } else { "the cap" };
         // Each run of a lever that asks each time is an ask.
-        let asks_each_time = !p.reversible || (p.takes().is_some() && !p.delegated);
+        let asks_each_time = !p.delegated && (!p.reversible || p.takes().is_some());
         if let (true, Some(quota)) = (asks_each_time, asks_a_day) {
             if quota < runs_a_day {
                 runs_a_day = quota;

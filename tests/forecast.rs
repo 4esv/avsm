@@ -989,6 +989,26 @@ fn a_lever_that_asks_each_time_runs_no_more_than_the_asks_quota() {
 }
 
 #[test]
+fn a_delegated_irreversible_lever_is_not_bound_by_the_asks_quota() {
+    let _c = clock();
+    let mut f = fixture("");
+    // Delegated, so it never asks, though it is irreversible: its cap
+    // binds, and the gap must not blame the asks quota.
+    f.venture(
+        "logs",
+        "unread",
+        "controller: {kind: model}\ncadence: 1d\nbetter: down\n\
+         permitted:\n- {name: prune, run: echo ran >> invoked, cap: 3/day, reversible: false, delegated: true, expects: down 1 within 1}\n",
+    );
+    f.history("logs", &[3.0, 10.0, 17.0, 24.0], DAY);
+    let m = &f.k.ventures["logs"].mandate;
+    let index = f.k.index().unwrap();
+    let gap = forecast::capacity_with(&index, "logs", m, Some(1.0)).unwrap();
+    assert!(!gap.describe().contains("asks quota"), "{}", gap.describe());
+    assert_eq!(gap.most, 3.0, "{}", gap.describe());
+}
+
+#[test]
 fn forecasts_at_add_and_as_a_lever() {
     let _c = clock();
     let mut f = fixture("forecast: {days: 1, seeds: 2}\n");
