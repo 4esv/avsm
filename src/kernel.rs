@@ -4630,7 +4630,16 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static WARDEN_PID: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn on_signal(_: libc::c_int) {
+    stop_now();
+}
+
+/// Stop as SIGTERM does: drain, and pass the stop on to the warden. Only
+/// atomics and kill, so a signal handler may call it.
+fn stop_now() {
     STOP.store(true, Ordering::SeqCst);
+    // The `report` programs this process runs drain as the warden's runs
+    // do: SIGTERM now, SIGKILL after the grace.
+    warden::drain_now();
     let pid = WARDEN_PID.load(Ordering::SeqCst);
     if pid > 0 {
         // SAFETY: kill is async-signal-safe.
@@ -4699,7 +4708,7 @@ pub fn start(home: &Path) -> Result<(), Exit> {
     let sock = socket_path(home);
     // One daemon per home, and a ledger it can read, before anything
     // else: a second daemon must write nothing (#44).
-    let _lock = crate::doctor::hold_home(home)?;
+    let mut lock = crate::doctor::hold_home(home)?;
     crate::doctor::ledger_before_start(home)?;
     let listener = crate::protocol::bind(&sock).map_err(|e| {
         let code = if crate::protocol::alive(&sock) {
@@ -4709,7 +4718,7 @@ pub fn start(home: &Path) -> Result<(), Exit> {
         };
         Exit::new(code, e)
     })?;
-    let ours = crate::lock::identity(&sock);
+    let mut ours = crate::lock::identity(&sock);
     let warden = WardenProcess::spawn(home)?;
     let roles = RolesProcess::spawn(home)?;
     log(&format!(
@@ -4732,6 +4741,8 @@ pub fn start(home: &Path) -> Result<(), Exit> {
     log(&format!("listening at {}", sock.display()));
     let server = Arc::clone(&kernel);
     std::thread::spawn(move || crate::protocol::serve(listener, server));
+    // Why this daemon stops on its own: another took its home.
+    let mut lost: Option<String> = None;
     match crate::tailscale::start(&config, Arc::clone(&kernel)) {
         Ok(Some(at)) => log(&format!(
             "listening on the tailnet at {at} for {}",
@@ -4743,6 +4754,12 @@ pub fn start(home: &Path) -> Result<(), Exit> {
     // When the stop came: the tick in flight finishes first.
     let stopped = loop {
         if stopping() {
+            break Instant::now();
+        }
+        if let Err(e) = keep_home(home, &mut lock, &sock, &mut ours, &kernel) {
+            log(&format!("ALARM: {e}; stopping"));
+            lost = Some(e);
+            stop_now();
             break Instant::now();
         }
         {
@@ -4771,6 +4788,69 @@ pub fn start(home: &Path) -> Result<(), Exit> {
         .unwrap_or_else(|p| p.into_inner())
         .drain(stopped + DRAIN - Duration::from_secs(1));
     log("stopped");
+    match lost {
+        Some(e) => Err(Exit::new(exit::TEMPFAIL, e)),
+        None => Ok(()),
+    }
+}
+
+/// Once a tick: the home's lock file and socket must still be this
+/// daemon's (#52). Deleted, they would let a second avsmd start on the
+/// same ledger, and doctor see nothing. A lock file deleted or replaced
+/// is taken again: whichever daemon gets the new file's lock first keeps
+/// the home, since flock on one file is one daemon's, and this one stops
+/// if it lost. A socket deleted or replaced is bound again, once the lock
+/// is surely this daemon's.
+fn keep_home(
+    home: &Path,
+    lock: &mut crate::lock::Held,
+    sock: &Path,
+    ours: &mut Option<(u64, u64)>,
+    kernel: &Arc<Mutex<Kernel>>,
+) -> Result<(), String> {
+    let path = home.join(crate::lock::LOCK_FILE);
+    if !lock.still_at(&path) {
+        match crate::lock::acquire(home) {
+            Ok(held) => {
+                *lock = held;
+                log(&format!(
+                    "the lock file {} was deleted or replaced; this avsmd holds it again",
+                    path.display()
+                ));
+            }
+            Err(crate::lock::Refused::Running(pid)) => {
+                let who = pid.map_or("another avsmd".to_string(), |p| format!("avsmd (pid {p})"));
+                return Err(format!(
+                    "{who} took this home's lock after its lock file {} was deleted or replaced                      under this one; two daemons must never write one ledger",
+                    path.display()
+                ));
+            }
+            Err(crate::lock::Refused::Io(e)) => {
+                log(&format!(
+                    "the lock file {} is gone and cannot be made again: {e}",
+                    path.display()
+                ));
+                return Ok(());
+            }
+        }
+    }
+    if crate::lock::identity(sock) != *ours {
+        // The lock is this daemon's, so whatever is at the socket's path
+        // is no daemon's of this home: it is put back.
+        let _ = std::fs::remove_file(sock);
+        match crate::protocol::bind(sock) {
+            Ok(listener) => {
+                *ours = crate::lock::identity(sock);
+                log(&format!(
+                    "the socket {} was deleted or replaced; listening there again",
+                    sock.display()
+                ));
+                let server = Arc::clone(kernel);
+                std::thread::spawn(move || crate::protocol::serve(listener, server));
+            }
+            Err(e) => log(&format!("the socket was deleted or replaced, and: {e}")),
+        }
+    }
     Ok(())
 }
 

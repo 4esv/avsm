@@ -356,7 +356,11 @@ avsmd answering. A sound ledger and no daemon running is 69. avsmd itself
 exits 75 when another is already running on the same home, and names its pid:
 each daemon holds a lock on `avsmd.lock` in the home for its life, so even with
 its socket deleted a second one does not start, and `avsm doctor` says the
-first is running but its socket is missing. Records go to
+first is running but its socket is missing. Each second avsmd checks that the
+lock file and the socket are still its own; one deleted or replaced is made
+again. Should a second avsmd take the lock first, the first stops with exit
+75 and says why. `avsm doctor` fails when it finds more than one avsmd on the
+home, and names the pids. Records go to
 standard output, diagnostics to standard error, and nothing is in color.
 `avsm tail --since <number>` prints every record after that one, for a script
 that follows the ledger.

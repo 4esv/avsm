@@ -20,7 +20,16 @@ pub const LOCK_FILE: &str = "avsmd.lock";
 const PATIENCE: Duration = Duration::from_secs(1);
 
 /// The lock, held until dropped.
-pub struct Held(#[allow(dead_code)] File);
+pub struct Held(File);
+
+impl Held {
+    /// Is the file at `path` still the one this lock is on? Not when it
+    /// was deleted or another put in its place.
+    pub fn still_at(&self, path: &Path) -> bool {
+        let held = self.0.metadata().ok().map(|m| (m.dev(), m.ino()));
+        held.is_some() && identity(path) == held
+    }
+}
 
 /// Why the lock was not taken.
 pub enum Refused {
@@ -53,11 +62,33 @@ pub fn acquire(home: &Path) -> Result<Held, Refused> {
         .open(&path)
         .map_err(|e| Refused::Io(format!("cannot open {}: {e}", path.display())))?;
     let began = Instant::now();
-    while !flock(&file, libc::LOCK_EX) {
-        if began.elapsed() >= PATIENCE {
-            return Err(Refused::Running(pid_in(&mut file)));
+    loop {
+        while !flock(&file, libc::LOCK_EX) {
+            if began.elapsed() >= PATIENCE {
+                return Err(Refused::Running(pid_in(&mut file)));
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        // The file locked must still be the one at the path: deleted or
+        // replaced between the open and the lock, it locks out nobody.
+        let held = Held(file);
+        if held.still_at(&path) {
+            file = held.0;
+            break;
+        }
+        if began.elapsed() >= PATIENCE {
+            return Err(Refused::Io(format!(
+                "{} keeps being replaced",
+                path.display()
+            )));
+        }
+        file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| Refused::Io(format!("cannot open {}: {e}", path.display())))?;
     }
     let wrote = file
         .set_len(0)

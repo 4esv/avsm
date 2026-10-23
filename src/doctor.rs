@@ -623,6 +623,36 @@ pub fn doctor(
         );
     }
 
+    // One daemon per home: a second, started while the lock file and the
+    // socket were gone, writes the same ledger unseen (#52).
+    let daemons = daemons_on(home, &crate::procs::all());
+    if daemons.len() > 1 {
+        let pids: Vec<String> = daemons.iter().map(i32::to_string).collect();
+        let keep = holder.filter(|p| daemons.contains(p));
+        let others: Vec<String> = daemons
+            .iter()
+            .filter(|p| Some(**p) != keep)
+            .map(i32::to_string)
+            .collect();
+        let fix = match keep {
+            Some(k) => format!(
+                "kill {}  # pid {k} holds the lock and stays",
+                others.join(" ")
+            ),
+            None => format!("kill {}  # then: avsmd --home {h}", others.join(" ")),
+        };
+        found.fail(
+            exit::UNAVAILABLE,
+            format!(
+                "{} avsmd processes on {}: pids {}",
+                daemons.len(),
+                home.display(),
+                pids.join(", ")
+            ),
+            fix,
+        );
+    }
+
     // The warden and roles: both are avsmd, started by itself.
     match find_daemon() {
         Some(p) => {

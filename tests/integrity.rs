@@ -381,7 +381,7 @@ fn bounded(tmp: &Path, h: &str) -> (Option<i32>, String) {
 }
 
 #[test]
-fn a_second_daemon_exits_75_naming_the_first_and_keeps_its_hands_off_the_socket() {
+fn a_second_daemon_exits_75_naming_the_first_which_takes_its_socket_back() {
     let tmp = tempfile::tempdir().unwrap();
     let home = adopted_home(tmp.path());
     let h = home.to_str().unwrap();
@@ -398,7 +398,10 @@ fn a_second_daemon_exits_75_naming_the_first_and_keeps_its_hands_off_the_socket(
     let (code, stderr) = bounded(tmp.path(), h);
     assert_eq!(code, Some(75), "{stderr}");
     assert!(stderr.contains(&format!("pid {pid}")), "{stderr}");
-    assert!(!sock.exists(), "the second daemon made a socket");
+    assert!(
+        !stderr.contains("listening"),
+        "the second daemon made a socket"
+    );
     // It wrote nothing: no false "did act happen?" ask.
     let entries = Ledger::open(&home.join("ledger.db"))
         .unwrap()
@@ -415,33 +418,30 @@ fn a_second_daemon_exits_75_naming_the_first_and_keeps_its_hands_off_the_socket(
             .collect::<Vec<_>>()
     );
 
+    // The first, which holds the lock, listens there again (#52).
+    let began = Instant::now();
+    while !avsmd::protocol::alive(&sock) {
+        assert!(began.elapsed() < Duration::from_secs(5), "no socket again");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let out = avsm(tmp.path(), &["--home", h, "doctor"]);
     let (stdout, _) = text(&out);
-    assert_eq!(out.status.code(), Some(69), "{stdout}");
-    assert!(
-        stdout.contains(&format!(
-            "avsmd is running (pid {pid}) but its socket is missing; restart it"
-        )),
-        "{stdout}"
-    );
-    assert!(
-        !stdout.contains(&format!("fix: avsmd --home {h}\n")),
-        "{stdout}"
-    );
+    assert!(stdout.contains("ok    avsmd answering at"), "{stdout}");
+    assert!(stdout.contains("ok    warden pid"), "{stdout}");
+    assert!(!stdout.contains("socket is missing"), "{stdout}");
 
-    // Someone else's socket at the path survives the first daemon's exit.
-    let other = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-    sigterm(&mut first);
-    assert!(
-        sock.exists(),
-        "the first daemon removed a socket not its own"
-    );
-    drop(other);
+    // A socket put in its place while it holds the lock is no daemon's of
+    // this home: it is replaced, and the daemon's own goes with it.
     std::fs::remove_file(&sock).unwrap();
-
-    // Its own socket goes with it.
-    let mut again = start(tmp.path(), &home, "again.log");
-    sigterm(&mut again);
+    let other = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let theirs = avsmd::lock::identity(&sock);
+    let began = Instant::now();
+    while avsmd::lock::identity(&sock) == theirs {
+        assert!(began.elapsed() < Duration::from_secs(5), "never taken back");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(other);
+    sigterm(&mut first);
     assert!(!sock.exists());
 }
 
