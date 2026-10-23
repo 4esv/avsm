@@ -20,6 +20,7 @@ pub mod mandate;
 pub mod packet;
 pub mod pbo;
 pub mod plan;
+pub mod procs;
 pub mod protocol;
 pub mod record;
 pub mod research;

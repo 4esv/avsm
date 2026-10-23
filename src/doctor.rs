@@ -128,6 +128,43 @@ pub fn parse_anchor(text: &str) -> Result<(Option<Seq>, String), String> {
     Ok((seq, hash.to_ascii_lowercase()))
 }
 
+/// The avsmd daemons on a home, by pid, from a process table: each
+/// process run as avsmd with `--home <home>` that is no warden or roles
+/// process, and the parent of each warden or roles process on it. A
+/// daemon started without `--home` is found by its warden, which always
+/// has one.
+pub fn daemons_on(home: &Path, table: &[crate::procs::Proc]) -> Vec<i32> {
+    let wanted: Vec<String> = [Some(home.to_path_buf()), std::fs::canonicalize(home).ok()]
+        .into_iter()
+        .flatten()
+        .map(|h| h.to_string_lossy().trim_end_matches('/').to_string())
+        .collect();
+    let mut found = std::collections::BTreeSet::new();
+    for p in table {
+        let a = &p.args;
+        let avsmd = a
+            .iter()
+            .take(2)
+            .any(|x| Path::new(x).file_name().is_some_and(|n| n == "avsmd"));
+        let on_home = a
+            .windows(2)
+            .any(|w| w[0] == "--home" && wanted.iter().any(|h| h == w[1].trim_end_matches('/')));
+        if !avsmd || !on_home {
+            continue;
+        }
+        match a.last().map(String::as_str) {
+            Some("warden" | "roles") if p.ppid > 1 => {
+                found.insert(p.ppid);
+            }
+            Some("warden" | "roles") => {}
+            _ => {
+                found.insert(p.pid);
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
 /// Take the home's lock for the daemon's life, or say who holds it.
 pub fn hold_home(home: &Path) -> Result<crate::lock::Held, exit::Exit> {
     crate::lock::acquire(home).map_err(|r| match r {
