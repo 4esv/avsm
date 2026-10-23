@@ -151,8 +151,9 @@ impl Kernel {
         self.refuse_citing(venture, lever, key, detail, limit, vec![])
     }
 
-    /// `refuse`, answering the declared approvals in `cites`: the warden
-    /// refused a run the gate allowed on them. Such a refusal spends them,
+    /// `refuse`, answering the declared approvals in `cites`: a run on
+    /// them was refused, by the quotas, the gate or the warden. Such a
+    /// refusal spends them,
     /// so it is always written, never only counted: a repeat for the same
     /// reason closes the open one and opens its own.
     pub(super) fn refuse_citing(

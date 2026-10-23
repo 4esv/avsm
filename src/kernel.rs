@@ -2227,9 +2227,15 @@ impl Kernel {
             cites,
         };
         let adopted = self.adopted();
+        // The declared approvals this run rests on. Refused for any reason,
+        // they are spent: the refusal cites them, and a changed situation
+        // needs a fresh ask, never a rerun of an old approval at the next
+        // start (#51).
+        let spends: Vec<Seq>;
         // The shared quotas come first: past one, the gate is not asked.
         let over = match self.index() {
             Ok(index) => {
+                spends = index.approvals_among(&candidate.cites, name, action);
                 gate::quota_check_in(&index, &adopted, &self.config.quotas, name, action, now()).1
             }
             Err(e) => {
@@ -2243,7 +2249,7 @@ impl Kernel {
             lines.push(format!(
                 "{name}: {action} refused before the gate: {detail}"
             ));
-            if self.refuse(name, action, key, detail, limit) {
+            if self.refuse_citing(name, action, key, detail, limit, spends) {
                 log(&lines[0]);
             }
             return lines;
@@ -2363,6 +2369,14 @@ impl Kernel {
                     }
                 }
             },
+            Err((refusal, ..)) if !spends.is_empty() => {
+                // An approval the gate refuses is spent, whatever the
+                // reason: no ask here, and the next cycle asks afresh when
+                // the situation allows.
+                let (key, detail, limit) = refusals::describe(&refusal.reasons, &[]);
+                lines.push(format!("{name}: {action} refused: {detail}"));
+                repeat = !self.refuse_citing(name, action, key, detail, limit, spends);
+            }
             Err((refusal, already, may_ask, payload, reason)) => {
                 // No ask is written for a lever the gate refuses for a
                 // reason an approval of this run does not cure: a pause, a
@@ -2777,7 +2791,8 @@ impl Kernel {
                 let line = format!(
                     "{venture}: {action} refused: approved #{seq} predates the suspension; {detail}"
                 );
-                if self.refuse(&venture, &action, key, detail, limit) {
+                // Refused, and so spent: the refusal cites it.
+                if self.refuse_citing(&venture, &action, key, detail, limit, vec![seq]) {
                     log(&line);
                 }
                 continue;

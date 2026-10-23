@@ -382,10 +382,15 @@ impl Index {
                         latest(self.resumed.entry(venture).or_insert(seq), seq)
                     }
                     Verdict::Approve { ask, .. } | Verdict::Deny { ask, .. } => {
+                        // Only the first trusted answer to an ask is its
+                        // answer: a later one is kept in the ledger and
+                        // authorizes nothing, so two approvals of one ask
+                        // never run its lever twice (#51).
+                        let first = trusted && !self.decided.contains(ask);
                         if trusted {
                             self.decide(*ask);
                         }
-                        if *claim == Claim::Declared {
+                        if *claim == Claim::Declared && first {
                             if let Verdict::Approve { ask, .. } = verdict {
                                 self.approved_by
                                     .entry(*ask)
@@ -1044,6 +1049,16 @@ impl Index {
                 }
             }
         }
+    }
+
+    /// The declared approvals among `cites` of `venture`'s ask to run
+    /// `action`: what a run on these cites would spend.
+    pub fn approvals_among(&self, cites: &[Seq], venture: &str, action: &str) -> Vec<Seq> {
+        cites
+            .iter()
+            .copied()
+            .filter(|d| self.approves(*d, venture, action))
+            .collect()
     }
 
     /// Is `decision` a declared approval of `venture`'s ask to run `action`?

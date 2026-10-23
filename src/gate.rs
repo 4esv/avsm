@@ -2981,20 +2981,26 @@ pub mod reference {
         }
     }
 
-    /// The first declared approval of an ask by this venture.
+    /// The ask's first trusted answer, when it is a declared approval by
+    /// this venture: a later answer authorizes nothing.
     fn approval_of(ledger: &[Entry], venture: &str, ask: Seq) -> Option<Seq> {
-        ledger
+        let first = ledger
             .iter()
             .filter(|d| {
                 matches!(&d.record, Record::Decision {
-                    claim: Claim::Declared,
-                    venture: dv,
-                    verdict: Verdict::Approve { ask: q, .. },
+                    claim,
+                    verdict: Verdict::Approve { ask: q, .. } | Verdict::Deny { ask: q, .. },
                     ..
-                } if dv == venture && *q == ask)
+                } if claim.authorizes() && *q == ask)
             })
-            .map(|d| d.seq)
-            .min()
+            .min_by_key(|d| d.seq)?;
+        matches!(&first.record, Record::Decision {
+            claim: Claim::Declared,
+            venture: dv,
+            verdict: Verdict::Approve { .. },
+            ..
+        } if dv == venture)
+        .then_some(first.seq)
     }
 
     /// The latest non-void ineffective ask after the last adoption, and

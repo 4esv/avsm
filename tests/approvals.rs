@@ -1,0 +1,358 @@
+//! An approval is a human's word, used once (#51): one refused for any
+//! reason is spent, only the first answer to an ask counts, a record the
+//! running daemon did not write is an alarm and never a premise, and a
+//! process the daemon started cannot approve over the socket.
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use avsmd::kernel::Kernel;
+use avsmd::ledger::Ledger;
+use avsmd::record::{Claim, Entry, Record, Seq, Verdict};
+use avsmd::warden::LocalWarden;
+
+// ----- in process -----
+
+/// A venture whose report always reads 5, above its threshold of 3, and
+/// whose one lever, irreversible, appends a line to `ran` when it runs.
+fn venture(parent: &Path, name: &str, cap: &str) -> PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        format!(
+            "purpose: Keep n down.\nmetric: n\n\
+             controller: {{kind: threshold, above: 3, action: bump}}\ncadence: 1s\n\
+             permitted:\n  - {{name: bump, run: ./bump, cap: {cap}, reversible: false}}\n"
+        ),
+    )
+    .unwrap();
+    script(&dir, "report", "#!/bin/sh\necho 5\n");
+    script(
+        &dir,
+        "bump",
+        &format!("#!/bin/sh\necho ran >> {}\n", dir.join("ran").display()),
+    );
+    dir
+}
+
+fn script(dir: &Path, name: &str, body: &str) {
+    std::fs::write(dir.join(name), body).unwrap();
+    std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn runs(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("ran"))
+        .map(|t| t.lines().count())
+        .unwrap_or(0)
+}
+
+fn home(tmp: &Path) -> PathBuf {
+    let home = tmp.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        "nightly: never\nforecast: {days: 2, seeds: 2}\n",
+    )
+    .unwrap();
+    home
+}
+
+fn kernel(home: &Path) -> Kernel {
+    Kernel::with(
+        home,
+        Box::new(avsmd::role::ModelRole),
+        Box::new(LocalWarden::open(home).unwrap()),
+    )
+    .unwrap()
+}
+
+fn lines(entries: &[Entry]) -> String {
+    entries.iter().map(|e| e.line() + "\n").collect()
+}
+
+/// The open asks to bump, oldest first.
+fn bump_asks(k: &Kernel) -> Vec<Seq> {
+    let open = k.open_asks().unwrap();
+    k.entries()
+        .unwrap()
+        .into_iter()
+        .filter(|e| open.contains(&e.seq) && e.record.action() == Some("bump"))
+        .map(|e| e.seq)
+        .collect()
+}
+
+#[test]
+fn an_approval_refused_at_its_cap_is_spent_and_never_runs_after_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path());
+    let dir = venture(tmp.path(), "v1", "1/hour");
+    let t0 = avsmd::clock::now();
+    let mut k = kernel(&home);
+    k.add(&dir).unwrap();
+    k.tick();
+    let first = *bump_asks(&k).first().expect("an ask to bump");
+    // A second ask for the same run, as a human may find two open: both
+    // approved, the cap lets one run, and the other is refused at it.
+    let ask = k
+        .entries()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.seq == first)
+        .unwrap();
+    let second = k.append(ask.record.clone()).unwrap().seq;
+    k.approve(first, None).unwrap();
+    k.approve(second, None).unwrap();
+    let approvals: Vec<Seq> = k
+        .entries()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.record,
+                Record::Decision {
+                    verdict: Verdict::Approve { .. },
+                    ..
+                }
+            )
+        })
+        .map(|e| e.seq)
+        .collect();
+    k.tick();
+    assert_eq!(runs(&dir), 1, "{}", lines(&k.entries().unwrap()));
+    let refused = k.entries().unwrap().into_iter().find(|e| {
+        matches!(&e.record, Record::Refusal { action, cites, .. }
+            if action == "bump" && cites.iter().any(|c| approvals.contains(c)))
+    });
+    assert!(
+        refused.is_some(),
+        "the refusal at the cap cites the approval it spends:\n{}",
+        lines(&k.entries().unwrap())
+    );
+    assert_eq!(
+        k.index().unwrap().unacted().count(),
+        0,
+        "nothing left to act on"
+    );
+    drop(k);
+
+    // Two hours on, the cap is free again: a restart runs nothing.
+    let _later = avsmd::clock::scoped(t0 + 7200);
+    let mut k = kernel(&home);
+    k.tick();
+    k.tick();
+    assert_eq!(runs(&dir), 1, "{}", lines(&k.entries().unwrap()));
+}
+
+#[test]
+fn a_second_approval_of_one_ask_runs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path());
+    let dir = venture(tmp.path(), "v1", "9/hour");
+    let mut k = kernel(&home);
+    k.add(&dir).unwrap();
+    k.tick();
+    let ask = *bump_asks(&k).first().expect("an ask to bump");
+    k.approve(ask, None).unwrap();
+    // The CLI refuses a second answer; the ledger can still hold one.
+    let again = k
+        .append(Record::Decision {
+            claim: Claim::Declared,
+            venture: "v1".into(),
+            verdict: Verdict::Approve { ask, payload: None },
+            by: None,
+        })
+        .unwrap()
+        .seq;
+    k.tick();
+    k.tick();
+    assert_eq!(runs(&dir), 1, "{}", lines(&k.entries().unwrap()));
+    assert!(
+        !k.index().unwrap().unacted().any(|d| d == again),
+        "a later answer authorizes nothing"
+    );
+    drop(k);
+    let mut k = kernel(&home);
+    k.tick();
+    assert_eq!(runs(&dir), 1, "{}", lines(&k.entries().unwrap()));
+}
+
+// ----- through the real binaries -----
+
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Daemon {
+    /// SIGTERM, and wait for it to drain.
+    fn stop(mut self) {
+        // SAFETY: kill has no memory preconditions.
+        unsafe {
+            libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let _ = self.0.wait();
+    }
+}
+
+fn start(tmp: &Path, home: &Path, log: &str) -> Daemon {
+    let sock = avsmd::kernel::socket_path(home);
+    let child = Command::new(env!("CARGO_BIN_EXE_avsmd"))
+        .arg("--home")
+        .arg(home)
+        .env("HOME", tmp)
+        .env_remove("AVSMD_HOME")
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(tmp.join(log)).unwrap())
+        .spawn()
+        .expect("spawn avsmd");
+    let began = Instant::now();
+    while !avsmd::protocol::alive(&sock) {
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "avsmd did not start: {}",
+            std::fs::read_to_string(tmp.join(log)).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Daemon(child)
+}
+
+fn avsm(tmp: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_avsm"))
+        .arg("--home")
+        .arg(home)
+        .args(args)
+        .env("HOME", tmp)
+        .env_remove("AVSMD_HOME")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run avsm")
+}
+
+fn ok(out: &Output) -> String {
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn ledger(home: &Path) -> Vec<Entry> {
+    Ledger::open_read_only(&home.join("ledger.db"))
+        .unwrap()
+        .all()
+        .unwrap()
+}
+
+/// Wait up to `secs` for `f` to hold; the last value of the ledger.
+fn until(home: &Path, secs: u64, what: &str, f: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
+    let began = Instant::now();
+    loop {
+        let entries = ledger(home);
+        if f(&entries) {
+            return entries;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(secs),
+            "{what}, within {secs}s:\n{}",
+            lines(&entries)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// No alarm: every record was the daemon's own, the warden's outcomes
+/// written on its threads among them.
+fn no_alarm(entries: &[Entry]) {
+    assert!(
+        !entries
+            .iter()
+            .any(|e| matches!(&e.record, Record::Report { metric, .. } if metric == "foreign")),
+        "a false alarm:\n{}",
+        lines(entries)
+    );
+}
+
+/// The open asks to bump of v1, oldest first, as the ledger says.
+fn open_bump(entries: &[Entry]) -> Vec<Seq> {
+    let answered: Vec<Seq> = entries
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::Decision {
+                verdict: Verdict::Approve { ask, .. } | Verdict::Deny { ask, .. },
+                ..
+            } => Some(*ask),
+            _ => None,
+        })
+        .collect();
+    entries
+        .iter()
+        .filter(|e| {
+            matches!(&e.record, Record::Ask { venture, action: Some(a), .. }
+                if venture == "v1" && a == "bump")
+                && !answered.contains(&e.seq)
+        })
+        .map(|e| e.seq)
+        .collect()
+}
+
+/// A home with v1 (cap 20/hour, cadence 1s) and a config that keeps
+/// forecasts small.
+fn daemon_home(tmp: &Path) -> (PathBuf, PathBuf) {
+    let home = home(tmp);
+    let dir = venture(tmp, "v1", "20/hour");
+    (home, dir)
+}
+
+#[test]
+fn an_approval_refused_while_paused_never_runs_and_its_fresh_ask_runs_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, dir) = daemon_home(tmp.path());
+    let d = start(tmp.path(), &home, "d1.log");
+    ok(&avsm(tmp.path(), &home, &["add", dir.to_str().unwrap()]));
+    let entries = until(&home, 30, "an ask to bump", |e| !open_bump(e).is_empty());
+    let ask = open_bump(&entries)[0];
+    ok(&avsm(tmp.path(), &home, &["pause", "v1"]));
+    ok(&avsm(tmp.path(), &home, &["approve", &ask.to_string()]));
+    let decision = ledger(&home).last().unwrap().seq;
+    // The pause refuses it; the refusal spends it.
+    until(&home, 15, "a refusal of bump after the approval", |e| {
+        e.iter().any(|e| {
+            e.seq > decision
+                && matches!(&e.record, Record::Refusal { action, .. } if action == "bump")
+        })
+    });
+    ok(&avsm(tmp.path(), &home, &["resume", "v1"]));
+    let entries = until(&home, 30, "a fresh ask to bump", |e| {
+        open_bump(e).iter().any(|s| *s > decision)
+    });
+    let fresh = *open_bump(&entries).last().unwrap();
+    d.stop();
+
+    let d = start(tmp.path(), &home, "d2.log");
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        runs(&dir),
+        0,
+        "the refused approval ran at the next start:\n{}",
+        lines(&ledger(&home))
+    );
+    ok(&avsm(tmp.path(), &home, &["approve", &fresh.to_string()]));
+    let began = Instant::now();
+    while runs(&dir) < 1 && began.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(4));
+    d.stop();
+    assert_eq!(runs(&dir), 1, "{}", lines(&ledger(&home)));
+    no_alarm(&ledger(&home));
+}
