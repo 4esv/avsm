@@ -107,6 +107,14 @@ starts it again. There is no other steering. To change what a venture may do,
 edit its mandate and run `avsm add` again; the old permissions end with the old
 mandate.
 
+A venture's name is the name of its directory, one word of letters, digits, `_`,
+`-` and `.`; `examples/counter` is `counter`, and moving or renaming the
+directory makes a new venture. Every program of a venture (`report`, `run`, the
+levers) runs in that directory, so `./reset` means the `reset` beside the
+mandate. There is no remove: a venture is never deleted from the ledger, and
+`avsm pause <venture>` is how you stop one. `avsm doctor` only notes a paused
+venture whose directory has gone.
+
 ### Guards, audits and plausibility
 
 A guard is a reading of its own that the warden takes beside the metric, with
@@ -258,7 +266,7 @@ backends:
 
 Other keys in `config.yaml`, each optional (`avsmd -T` prints them all as
 they stand): `ratchet: 5` is the approvals of one lever that make `self` propose
-delegating it, 0 for never; `forecast: {days: 30, seeds: 16}` is how far and how
+delegating it, 0 for never; `forecast: {days: 30, seeds: 16}` (the default, which `avsmd -T` prints when you leave it out, as it prints `canary_asks: null` for off) is how far and how
 wide the forecasts at add, before a ratchet ask and in a decision packet look,
 and `seeds: 0` turns them off; `canary_asks: {every: 20}` writes a canary ask
 after that many asks, and is off when absent; `port: 2876` is the
@@ -367,7 +375,9 @@ cannot read, since the others may be fine: it runs nothing of that venture,
 names it on standard error, and `avsm status` cautions that it cannot run. A
 mandate that `avsm add` is refused by the running avsmd is input it refused,
 so `avsm add` exits 65 for it, and so does `avsm propose` for a proposal the
-gate refuses and `avsm tail 0`. `avsm doctor`
+gate refuses and `avsm tail 0`. `avsm add` of a directory that is not there
+exits 66, as `avsm doctor` does; a file given for its directory, or a directory
+with `mandate.yml` for `mandate.yaml`, is 65 and says what to pass or rename. `avsm doctor`
 exits 0 when every check passes, and otherwise with the worst code it found, in
 this order: 65 a ledger that is not a database or whose chain is broken, 78 a
 config or mandate that does not hold, 77 a permission missing, 73 a home that
@@ -411,8 +421,36 @@ machine catches all three. The digest ends with the head of the chain as
 `head <number>:<hash>`, the hash cut to its first 16 hex digits (64 bits); copy
 it somewhere the owner of this machine cannot edit (mail it, paste it into a
 ticket), and later `avsm doctor --since <number>:<hash>` fails with 65 unless
-the ledger still holds exactly that hash at that number. A bare hash of 16 to
+the ledger still holds exactly that hash at that number. `--since` takes the
+digest's head line exactly as printed (`head 42:0123456789abcdef; keep it off
+this machine...`) as well as the bare `<number>:<hash>`. A bare hash of 16 to
 64 hex digits is looked for anywhere in the ledger.
+
+`ledger.db` and its journal are made readable by their owner alone (0600), and a
+home avsmd creates is 0700. A home or ledger that already exists is left as it
+is; `avsm doctor` warns, with the `chmod`, when the ledger is readable by others.
+
+## Simulating days
+
+`avsm simulate [--days 7] [--step 1h] [--approve all|none|mixed] [--start <unix seconds>] [--world <command>] [<venture directory>...]`
+runs ventures over simulated days in a home of their own, so pass `--home <an
+empty directory>`; it refuses your real home. The clock jumps one step at a
+time, the nights pass, a scripted human answers asks (`all` approves every ask,
+`none` answers none, `mixed` denies every third, edits text payloads and approves
+the rest), and each record and each day's digest is printed as it is written.
+No lever runs for real.
+
+`--world` names a command that stands for the world. It runs before every step
+with the simulated time in `AVSM_NOW` and the day in `AVSM_DAY`, and what it
+prints is shown. Every lever run goes to it instead of the lever, with
+`AVSM_LEVER` set to `venture/lever` (for example `blog/post`), `AVSM_KEY`, and
+the payload on standard input; a world that fails stops the simulation. Without
+`--world`, a lever steps the venture's world model and the reports come from its
+state; unless the mandate names a `world:`, that is a baseline learned from the
+ledger, which replays the steps the venture's own readings have shown, so a
+venture with little history gives a flat one. A simulation exits 70 when it
+cannot run or its world fails. The world is not avsm's and leaves no record; the
+text it prints is escaped before it reaches your terminal.
 
 ## Ventures from one file
 
