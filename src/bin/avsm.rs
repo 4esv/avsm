@@ -271,6 +271,12 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(e) => {
             let _ = e.print();
+            // `avsm approve #30` in zsh is `avsm approve`: # starts a comment.
+            let numbered =
+                std::env::args().any(|a| matches!(a.as_str(), "approve" | "deny" | "why"));
+            if e.kind() == ErrorKind::MissingRequiredArgument && numbered {
+                avsmd::protocol::elog("hint: zsh treats # as a comment; write 12 or '#12'");
+            }
             return match e.kind() {
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => ExitCode::SUCCESS,
                 _ => ExitCode::from(exit::USAGE),

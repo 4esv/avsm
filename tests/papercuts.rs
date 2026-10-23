@@ -342,3 +342,18 @@ fn doctor_stops_failing_a_moved_directory_once_its_venture_is_paused() {
     let (_, out, _) = avsm_out(&home, &["doctor"]);
     assert!(out.contains("FAIL  moved: "), "{out}");
 }
+
+#[test]
+fn a_missing_record_number_hints_at_zsh_comments() {
+    let tmp = tempfile::tempdir().unwrap();
+    for cmd in ["approve", "deny", "why"] {
+        let (code, _, err) = avsm_out(tmp.path(), &[cmd]);
+        assert_eq!(code, Some(64), "{cmd}: {err}");
+        assert!(
+            err.contains("hint: zsh treats # as a comment; write 12 or '#12'"),
+            "{cmd}: {err}"
+        );
+    }
+    let (_, _, err) = avsm_out(tmp.path(), &["pause"]);
+    assert!(!err.contains("zsh"), "{err}");
+}
