@@ -268,7 +268,7 @@ fn saturation_asks_once_even_with_the_asks_quota_used() {
     );
     assert!(question.contains("the cap is 1/day"), "{question}");
     // Only the two asks: refusals are not asks.
-    assert_eq!(k.index().unwrap().asks_after(0), 2);
+    assert_eq!(k.index().unwrap().asks_after(0, i64::MAX), 2);
 }
 
 #[test]

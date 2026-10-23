@@ -271,7 +271,7 @@ fn cost(index: &Index, adopted: &[Adopted], now: i64, venture: &str, action: &st
     else {
         return "cost unknown".to_string();
     };
-    let used = index.used(venture, action, now - perm.cap.per.as_secs() as i64);
+    let used = index.used(venture, action, now - perm.cap.per.as_secs() as i64, now);
     let mut text = format!(
         "cost {}; cap {} left after, of {}",
         perm.cost,

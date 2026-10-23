@@ -171,3 +171,135 @@ fn a_1_0_approval_that_already_did_not_run_is_not_run_again_on_start() {
         }
     }
 }
+
+// ----- issue #53: records dated in the future -----
+
+/// When Power 2 upgraded the 1.0 ledger: 2026-10-23T06:12Z. Its records
+/// run to 2026-10-29: 22 of tomato's waterings are dated after this.
+const UPGRADED: i64 = 1_792_735_920;
+const DAY: i64 = 86_400;
+
+/// The waterings of tomato the ledger dates in (from, to].
+fn waterings(home: &Path, from: i64, to: i64) -> usize {
+    Ledger::open_read_only(&home.join("ledger.db"))
+        .unwrap()
+        .all()
+        .unwrap()
+        .iter()
+        .filter(|e| e.at > from && e.at <= to)
+        .filter(|e| matches!(&e.record, Record::Action { venture, action, .. } if venture == "tomato" && action == "water"))
+        .count()
+}
+
+#[test]
+fn records_dated_in_the_future_never_fill_a_cap_window() {
+    let _clock = avsmd::clock::scoped(UPGRADED);
+    let tmp = tempfile::tempdir().unwrap();
+    let home = open_copy(tmp.path());
+    assert_eq!(waterings(&home, UPGRADED - DAY, UPGRADED), 3);
+    assert_eq!(waterings(&home, UPGRADED, i64::MAX), 22);
+    let mut k = Kernel::with(
+        &home,
+        Box::new(avsmd::role::ModelRole),
+        Box::new(avsmd::warden::LocalWarden::open(&home).unwrap()),
+    )
+    .unwrap();
+    let index = k.index().unwrap();
+    assert_eq!(index.used("tomato", "water", UPGRADED - DAY, UPGRADED), 3);
+    drop(index);
+    // The tomato adopted again, dry: it waters, on a cap of 4 a day with
+    // 3 used today.
+    let dir = tmp.path().join("tomato");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        "purpose: Keep the tomato alive.\nmetric: moisture\n\
+         controller: {kind: threshold, below: 35, action: water}\ncadence: 2h\n\
+         permitted:\n  - {name: water, run: echo watered, cap: 4/day, reversible: true}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("report"), "#!/bin/sh\necho 20\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("report"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    k.add(&dir).unwrap();
+    k.report("tomato", false);
+    let entries = k.entries().unwrap();
+    let ran = entries.iter().rev().find_map(|e| match &e.record {
+        Record::Intent {
+            venture,
+            action,
+            proof,
+            ..
+        } if venture == "tomato" && action == "water" && e.at == UPGRADED => Some(proof.clone()),
+        _ => None,
+    });
+    let refused: Vec<String> = entries
+        .iter()
+        .filter(|e| e.at == UPGRADED)
+        .filter_map(|e| match &e.record {
+            Record::Refusal { detail, .. } => Some(detail.clone()),
+            _ => None,
+        })
+        .collect();
+    let proof = ran.unwrap_or_else(|| panic!("tomato was refused: {refused:?}"));
+    assert!(
+        proof
+            .steps
+            .iter()
+            .any(|s| matches!(s, avsmd::gate::Step::Cap { used: 3, .. })),
+        "{proof:?}"
+    );
+}
+
+#[test]
+fn doctor_tail_know_and_the_digest_say_a_record_is_dated_in_the_future() {
+    let _clock = avsmd::clock::scoped(UPGRADED);
+    let tmp = tempfile::tempdir().unwrap();
+    let home = open_copy(tmp.path());
+    let found = avsmd::doctor::doctor(&home, None, None);
+    let note = found
+        .out
+        .lines()
+        .find(|l| l.contains("dated in the future"))
+        .unwrap_or_else(|| panic!("{}", found.out));
+    let future: Vec<Entry> = Ledger::open_read_only(&home.join("ledger.db"))
+        .unwrap()
+        .all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.at > UPGRADED)
+        .collect();
+    assert!(
+        note.contains(&format!("{} records", future.len())),
+        "{note}"
+    );
+    assert!(note.contains(&format!("#{}", future[0].seq)), "{note}");
+    assert!(note.contains("2026-10-29"), "{note}");
+    assert!(
+        !found.problems.iter().any(|p| p.contains("future")),
+        "a note, not a failure: {:?}",
+        found.problems
+    );
+
+    let k = Kernel::open(&home).unwrap();
+    // The last record is dated ahead: tail marks it.
+    let tail = k.tail(3).unwrap();
+    assert!(
+        tail.lines()
+            .all(|l| l.ends_with("d ahead]") && l.contains("[dated ")),
+        "{tail}"
+    );
+    let know = k.know("tomato").unwrap();
+    assert!(!know.contains("0s ago"), "{know}");
+    assert!(know.contains("ahead"), "{know}");
+    // The digest's window ends now, and starts in the past.
+    let digest = k.digest().unwrap();
+    let since = digest
+        .split("digest since ")
+        .nth(1)
+        .and_then(|s| s.split(':').next())
+        .unwrap_or_default()
+        .to_string();
+    assert!(since.as_str() <= "2026-10-23T06", "{digest}");
+    assert!(digest.contains("dated in the future"), "{digest}");
+}

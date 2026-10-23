@@ -1550,9 +1550,7 @@ fn cap_spent_past(
     let mut latest = None;
     // The runs in the cap window before `t`, not counting one at `t`, the
     // answer to the reading itself.
-    let spent = |t: i64| {
-        index.used(venture, action, t - per) - index.used(venture, action, t - 1) >= p.cap.count
-    };
+    let spent = |t: i64| index.used(venture, action, t - per, t - 1) >= p.cap.count;
     for k in 0..SPENT_WINDOWS {
         let (from, to) = (now - (k + 1) * per, now - k * per);
         let lo = series.partition_point(|(s, _)| at(*s) <= from);
@@ -1734,7 +1732,7 @@ pub fn held_back(index: &Index, venture: &str, mandate: &Mandate, now: i64) -> O
         let h = held.get(p.name.as_str()).unwrap_or(&none);
         let per = p.cap.per.as_secs().max(1) as i64;
         let room = (f64::from(p.cap.count) * span as f64 / per as f64).floor() as u32;
-        let ran = index.used(venture, &p.name, start);
+        let ran = index.used(venture, &p.name, start, now);
         most += effect_of(&base, p).map_or(0.0, f64::abs) * f64::from(p.cap.count) * 86_400.0
             / per as f64;
         let mut why = Vec::new();

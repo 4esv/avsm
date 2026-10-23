@@ -32,6 +32,13 @@ impl Found {
         self.out.push('\n');
     }
 
+    /// A note: nothing to fix, and it does not change the exit code.
+    fn note(&mut self, line: impl AsRef<str>) {
+        self.out.push_str("note  ");
+        self.out.push_str(line.as_ref());
+        self.out.push('\n');
+    }
+
     /// A failure, with the exact command that fixes it.
     fn fail(&mut self, code: u8, line: impl AsRef<str>, fix: impl AsRef<str>) {
         self.out.push_str("FAIL  ");
@@ -484,6 +491,18 @@ pub fn doctor(
             Vec::new()
         }
     };
+
+    // Records dated after now: a clock that ran ahead, or a ledger written
+    // under a virtual one. Windows leave them out until their time comes;
+    // the chain holds them, so there is nothing to fix.
+    if let Some((n, first, last, latest)) =
+        crate::kernel::dated_ahead(entries.iter(), crate::clock::now())
+    {
+        found.note(format!(
+            "{n} records are dated in the future, #{first} to #{last}, up to {}; caps, quotas and the digest count them only once their time comes",
+            crate::kernel::utc(latest)
+        ));
+    }
 
     // The head kept off the machine: is it still in the ledger?
     if let Some((seq, hash)) = since {

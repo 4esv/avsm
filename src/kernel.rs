@@ -971,13 +971,13 @@ impl Kernel {
         if entries.is_empty() {
             return Ok("the ledger is empty\n".to_string());
         }
-        Ok(entries.iter().map(|e| e.line() + "\n").collect())
+        Ok(entries.iter().map(tail_line).collect())
     }
 
     /// Every record after `seq`, one line each, oldest first.
     pub fn tail_since(&self, seq: Seq) -> Result<String, String> {
         let entries = self.ledger.after(seq).map_err(|e| e.to_string())?;
-        Ok(entries.iter().map(|e| e.line() + "\n").collect())
+        Ok(entries.iter().map(tail_line).collect())
     }
 
     /// The questions waiting for a human, one line each, with the payload
@@ -3779,7 +3779,7 @@ fn written_on(times: &[i64], today: NaiveDate) -> bool {
 /// a broken chain or canary, and stops.
 fn weekly<'a>(entries: impl Iterator<Item = &'a Entry>, now: i64) -> (u32, u32) {
     let since = now - 7 * Cap::DAY.as_secs() as i64;
-    let week = entries.filter(|e| e.at > since);
+    let week = entries.filter(|e| e.at > since && e.at <= now);
     let mut asks = 0;
     let mut incidents = 0;
     for e in week {
@@ -3833,12 +3833,15 @@ fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) ->
         .iter()
         .copied()
         .rev()
+        .filter(|e| e.at <= now)
         .find(|e| matches!(&e.record, Record::Report { venture, metric, .. } if venture == SELF && metric == "digest"))
         .filter(|e| e.at > now - 7 * day);
     let since = last_digest.map_or(now - day, |e| e.at);
+    // The window ends now: a record dated after it is not in it yet.
     let window: Vec<&Entry> = entries
         .iter()
         .copied()
+        .filter(|e| e.at <= now)
         .filter(|e| match last_digest {
             Some(d) => e.seq > d.seq,
             None => e.at > since,
@@ -3872,6 +3875,12 @@ fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) ->
         count(&[Kind::Action, Kind::Intent], None),
         count(&[Kind::Ask], None),
     );
+    if let Some((n, first, last, latest)) = dated_ahead(entries.iter().copied(), now) {
+        out.push_str(&format!(
+            "{n} records dated in the future, #{first} to #{last}, up to {}, are not counted\n",
+            utc(latest)
+        ));
+    }
     let mut names: Vec<&String> = ventures.keys().filter(|n| *n != SELF).collect();
     names.push(&ventures[SELF].name);
     let (asks_week, incidents_week) = weekly(entries.iter().copied(), now);
@@ -4153,16 +4162,55 @@ fn parse_seq(s: &str) -> Result<Seq, String> {
 
 /// A duration in seconds as "3s ago", "5m ago", "2h ago", "3d ago".
 pub fn ago(secs: i64) -> String {
-    let s = secs.max(0);
-    if s < 60 {
-        format!("{s}s ago")
-    } else if s < 3600 {
-        format!("{}m ago", s / 60)
-    } else if s < 86_400 {
-        format!("{}h ago", s / 3600)
-    } else {
-        format!("{}d ago", s / 86_400)
+    // A record dated after now says so; it never reads as just now.
+    if secs < 0 {
+        return format!("{} ahead", span(-secs));
     }
+    format!("{} ago", span(secs))
+}
+
+/// A span of seconds in its largest whole unit: 40s, 3m, 5h, 2d.
+fn span(s: i64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86_400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86_400)
+    }
+}
+
+/// One line of `tail`: a record dated after now is marked, so the future
+/// a clock that ran ahead wrote is never read as the past.
+fn tail_line(e: &Entry) -> String {
+    let ahead = e.at - now();
+    if ahead > 0 {
+        format!("{}  [dated {}]\n", e.line(), ago(-ahead))
+    } else {
+        e.line() + "\n"
+    }
+}
+
+/// The records dated after `now`: how many, the first and last of them by
+/// number, and the latest date. None when there are none.
+pub fn dated_ahead<'a>(
+    entries: impl Iterator<Item = &'a Entry>,
+    now: i64,
+) -> Option<(usize, Seq, Seq, i64)> {
+    entries
+        .filter(|e| e.at > now)
+        .fold(None, |acc, e| match acc {
+            None => Some((1, e.seq, e.seq, e.at)),
+            Some((n, a, b, t)) => Some((n + 1, a.min(e.seq), b.max(e.seq), t.max(e.at))),
+        })
+}
+
+/// A unix time as `2026-10-29T20:00Z`.
+pub fn utc(t: i64) -> String {
+    chrono::DateTime::from_timestamp(t, 0)
+        .map_or(t.to_string(), |d| d.format("%Y-%m-%dT%H:%MZ").to_string())
 }
 
 pub(crate) fn log(line: &str) {

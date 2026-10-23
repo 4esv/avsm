@@ -1357,35 +1357,39 @@ impl Index {
         self.open.contains(&seq)
     }
 
-    /// Asks written after `since`.
-    pub fn asks_after(&self, since: i64) -> u32 {
-        after(&self.asks_at, since, |t| *t).len() as u32
+    /// Asks written after `since`, up to `until`.
+    pub fn asks_after(&self, since: i64, until: i64) -> u32 {
+        between(&self.asks_at, since, until, |t| *t).len() as u32
     }
 
-    /// Asks the asks quota counts written after `since`: signal asks sit
-    /// outside it.
-    pub fn quota_asks_after(&self, since: i64) -> u32 {
-        after(&self.quota_asks_at, since, |t| *t).len() as u32
+    /// Asks the asks quota counts written after `since`, up to `until`:
+    /// signal asks sit outside it.
+    pub fn quota_asks_after(&self, since: i64, until: i64) -> u32 {
+        between(&self.quota_asks_at, since, until, |t| *t).len() as u32
     }
 
-    /// Actions and intents after `since`, as (at, venture, action).
-    pub fn runs_after(&self, since: i64) -> &[(i64, String, String)] {
-        after(&self.runs, since, |r| r.0)
+    /// Actions and intents after `since`, up to `until`, as (at, venture,
+    /// action).
+    pub fn runs_after(&self, since: i64, until: i64) -> &[(i64, String, String)] {
+        between(&self.runs, since, until, |r| r.0)
     }
 
-    /// A venture's actions and intents after `since`, as (at, action).
-    pub fn runs_of_after(&self, venture: &str, since: i64) -> &[(i64, String)] {
+    /// A venture's actions and intents after `since`, up to `until`, as
+    /// (at, action).
+    pub fn runs_of_after(&self, venture: &str, since: i64, until: i64) -> &[(i64, String)] {
         self.runs_of
             .get(venture)
-            .map_or(&[], |r| after(r, since, |r| r.0))
+            .map_or(&[], |r| between(r, since, until, |r| r.0))
     }
 
-    /// How many times a venture ran an action after `since`.
-    pub fn used(&self, venture: &str, action: &str, since: i64) -> u32 {
+    /// How many times a venture ran an action after `since`, up to
+    /// `until`. A record dated after `until` (a clock that ran ahead, a
+    /// ledger written under a virtual one) is not in the window yet.
+    pub fn used(&self, venture: &str, action: &str, since: i64, until: i64) -> u32 {
         self.runs_by
             .get(venture)
             .and_then(|m| m.get(action))
-            .map_or(0, |t| after(t, since, |t| *t).len() as u32)
+            .map_or(0, |t| between(t, since, until, |t| *t).len() as u32)
     }
 
     /// Declared approvals no action or intent cites yet, oldest first.
@@ -1461,9 +1465,12 @@ fn by_time<T>(list: &mut Vec<T>, item: T, at: impl Fn(&T) -> i64) {
     list.insert(i, item);
 }
 
-/// The part of a time-ordered list after `since`.
-fn after<T>(list: &[T], since: i64, at: impl Fn(&T) -> i64) -> &[T] {
-    &list[list.partition_point(|x| at(x) <= since)..]
+/// The part of a time-ordered list after `since`, up to `until`: a
+/// window never holds what is dated after its end.
+fn between<T>(list: &[T], since: i64, until: i64, at: impl Fn(&T) -> i64) -> &[T] {
+    let from = list.partition_point(|x| at(x) <= since);
+    let to = list.partition_point(|x| at(x) <= until).max(from);
+    &list[from..to]
 }
 
 /// Add a reading to stretches of exactly equal readings.

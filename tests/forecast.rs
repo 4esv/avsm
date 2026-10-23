@@ -1336,7 +1336,10 @@ fn a_cap_spent_while_the_metric_is_on_the_right_side_gets_no_capacity_ask() {
         f.k.check_capacity("tomato");
     }
     let m = f.k.ventures["tomato"].mandate.clone();
-    let used = f.k.index().unwrap().used("tomato", "water", f.now - DAY);
+    let used =
+        f.k.index()
+            .unwrap()
+            .used("tomato", "water", f.now - DAY, f.now);
     assert_eq!(used, 4, "the cap is spent");
     assert!(forecast::cap_spent(&f.k.index().unwrap(), "tomato", &m, f.now).is_none());
     assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
@@ -1360,7 +1363,10 @@ fn a_cap_with_margin_left_gets_no_capacity_ask() {
             .map(|i| if i % 3 == 0 { 30.0 } else { 50.0 })
             .collect()
     });
-    let used = f.k.index().unwrap().used("tomato", "water", f.now - DAY);
+    let used =
+        f.k.index()
+            .unwrap()
+            .used("tomato", "water", f.now - DAY, f.now);
     assert_eq!(used, 4, "the cap is used up");
     assert!(capacity_asks(&f).is_empty(), "{:#?}", f.entries());
 }

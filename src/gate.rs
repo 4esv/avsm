@@ -793,7 +793,7 @@ pub fn spent_today(ledger: &[Entry], mandates: &[&Adopted], venture: &str, now: 
 /// What a venture spent today, from the index.
 pub fn spent_today_in(index: &Index, mandates: &[&Adopted], venture: &str, now: i64) -> u32 {
     index
-        .runs_of_after(venture, now - Cap::DAY.as_secs() as i64)
+        .runs_of_after(venture, now - Cap::DAY.as_secs() as i64, now)
         .iter()
         .map(|(_, a)| cost_of(mandates, venture, a))
         .sum()
@@ -832,7 +832,7 @@ pub fn quota_check_in(
     let refs: Vec<&Adopted> = mandates.iter().collect();
     let runs = |per: Duration| {
         index
-            .runs_after(now - per.as_secs() as i64)
+            .runs_after(now - per.as_secs() as i64, now)
             .iter()
             .map(|(_, v, a)| (v.as_str(), a.as_str()))
     };
@@ -907,7 +907,7 @@ pub fn asks_used(ledger: &[Entry], cap: Cap, now: i64) -> u32 {
 /// How many asks were written inside the asks quota's window, from the
 /// index.
 pub fn asks_used_in(index: &Index, cap: Cap, now: i64) -> u32 {
-    index.quota_asks_after(now - cap.per.as_secs() as i64)
+    index.quota_asks_after(now - cap.per.as_secs() as i64, now)
 }
 
 /// Decide whether an action may happen, given the ledger so far and the
@@ -1004,7 +1004,7 @@ pub fn gate_in(
         &mut p,
         &adopted,
         now,
-        |venture, action, since| index.used(venture, action, since),
+        |venture, action, since| index.used(venture, action, since, now),
         |venture| effective_thresholds_in(index, mandates, venture),
         |venture, action| {
             index
@@ -2769,10 +2769,11 @@ pub mod reference {
         ledger: &'a [Entry],
         venture: Option<&str>,
         since: i64,
+        now: i64,
     ) -> Vec<(&'a str, &'a str)> {
         ledger
             .iter()
-            .filter(|e| e.at > since)
+            .filter(|e| e.at > since && e.at <= now)
             .filter(|e| matches!(e.record.kind(), Kind::Action | Kind::Intent))
             .filter(|e| venture.is_none_or(|v| e.record.venture() == v))
             .filter_map(|e| e.record.action().map(|a| (e.record.venture(), a)))
@@ -2781,7 +2782,7 @@ pub mod reference {
 
     /// What a venture spent today.
     pub fn spent_today(ledger: &[Entry], mandates: &[&Adopted], venture: &str, now: i64) -> u32 {
-        runs_since(ledger, Some(venture), now - Cap::DAY.as_secs() as i64)
+        runs_since(ledger, Some(venture), now - Cap::DAY.as_secs() as i64, now)
             .into_iter()
             .map(|(v, a)| cost_of(mandates, v, a))
             .sum()
@@ -2797,7 +2798,8 @@ pub mod reference {
         now: i64,
     ) -> (Vec<Step>, Vec<Reason>) {
         let refs: Vec<&Adopted> = mandates.iter().collect();
-        let runs = |per: Duration| runs_since(ledger, None, now - per.as_secs() as i64).into_iter();
+        let runs =
+            |per: Duration| runs_since(ledger, None, now - per.as_secs() as i64, now).into_iter();
         quota_steps(&refs, quotas, venture, action, runs)
     }
 
@@ -2805,7 +2807,7 @@ pub mod reference {
     pub fn asks_used(ledger: &[Entry], cap: Cap, now: i64) -> u32 {
         ledger
             .iter()
-            .filter(|e| e.at > now - cap.per.as_secs() as i64)
+            .filter(|e| e.at > now - cap.per.as_secs() as i64 && e.at <= now)
             .filter(|e| match &e.record {
                 Record::Ask { claim, signal, .. } => {
                     crate::index::counts_toward_quota(*claim, signal.as_ref())
@@ -2857,6 +2859,7 @@ pub mod reference {
                             && e.record.action() == Some(action)
                             && matches!(e.record.kind(), Kind::Action | Kind::Intent)
                             && e.at > since
+                            && e.at <= now
                     })
                     .count() as u32
             },
