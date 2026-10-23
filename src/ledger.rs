@@ -2,21 +2,31 @@
 //!
 //! One SQLite file holds one table, `records`. Each row is an [`Entry`]:
 //! numbered from 1, timed, chained to the hash of the row before it, and
-//! hashed itself. Two triggers refuse every `UPDATE` and `DELETE`, so the
-//! only way to change the table is to append to it.
+//! hashed itself. Two triggers refuse every `UPDATE` and `DELETE`, and a
+//! third refuses an `INSERT` of anything but the next row chained to the
+//! last, so the only way to change the table is to append to it.
 //!
-//! Two processes, the kernel and the warden, append to the same file. The
-//! file is in WAL mode so one can read while the other writes; every append
-//! is one `BEGIN IMMEDIATE` transaction so two appends can never chain to
-//! the same previous record; and a connection waits up to five seconds for
-//! the other process to finish before giving up.
+//! Two processes, the kernel and the warden, append to the same file.
+//! Every append is one `BEGIN IMMEDIATE` transaction so two appends can
+//! never chain to the same previous record, and a connection waits up to
+//! five seconds for the other process to finish before giving up. The
+//! file keeps a rollback journal, not a write-ahead log, with
+//! `synchronous=FULL`: a commit is in the main file before the append
+//! returns, so deleting the journal beside it can lose no record that was
+//! written (#44). Each append also checks that the file at the path is
+//! still the one it opened and still holds the last record it saw, and
+//! fails closed when either is not so.
 //!
 //! [`Ledger::verify`] reads every row back and recomputes the chain, so a
 //! change to any stored byte, or a row missing from the middle, is found.
-//! Rows cut off the end are not: the ledger alone cannot know how long it
-//! should be.
+//! Rows cut off the end are not, and neither is a rewrite by the file's
+//! owner, who can lift the triggers and rehash: the ledger alone cannot
+//! know how long it should be or which chain is the true one. The head an
+//! anchor names (`seq:hash`, printed by the digest), kept off the machine,
+//! catches both; [`Ledger::holds`] checks one.
 
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, Params, TransactionBehavior};
@@ -26,6 +36,18 @@ use crate::record::{verify_chain, verify_chain_from, Entry, Record, Seq, Tamper,
 /// An open ledger.
 pub struct Ledger {
     conn: Connection,
+    /// The file opened, by path and identity: None in memory.
+    file: Option<Opened>,
+    /// The last record this connection appended or found at the head,
+    /// which must still be there at the next append.
+    seen: Option<(i64, String)>,
+}
+
+/// A ledger file as opened: its path, device and inode.
+struct Opened {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
 }
 
 /// Anything that can go wrong reading or appending.
@@ -37,6 +59,10 @@ pub enum LedgerError {
     Encoding(#[from] serde_json::Error),
     #[error("ledger: {0}")]
     Tamper(#[from] Tamper),
+    /// The file under the open ledger was replaced, removed or rewound:
+    /// nothing more is written to it.
+    #[error("ledger: {0}")]
+    Gone(String),
 }
 
 /// Does the text a record is stored as read back as a record? Checked
@@ -65,7 +91,18 @@ CREATE TRIGGER IF NOT EXISTS records_no_delete BEFORE DELETE ON records
 BEGIN
     SELECT RAISE(ABORT, 'the ledger is append-only');
 END;
+CREATE TRIGGER IF NOT EXISTS records_chain BEFORE INSERT ON records
+WHEN NEW.seq IS NOT (SELECT IFNULL(MAX(seq), 0) + 1 FROM records)
+  OR NEW.prev IS NOT IFNULL((SELECT hash FROM records ORDER BY seq DESC LIMIT 1),
+     '0000000000000000000000000000000000000000000000000000000000000000')
+BEGIN
+    SELECT RAISE(ABORT, 'the ledger takes only the next record, chained to the last');
+END;
 ";
+
+/// The journal every ledger file keeps: the rollback journal, emptied at
+/// each commit, so a commit is in the main file when it returns.
+const JOURNAL: &str = "truncate";
 
 /// The columns of a row, in the order [`read_row`] expects them.
 const COLUMNS: &str = "seq, at, prev, hash, weight, record";
@@ -76,7 +113,15 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 impl Ledger {
     /// Open or create a ledger file. The directory must already exist.
     pub fn open(path: &Path) -> Result<Ledger, LedgerError> {
-        Ledger::prepare(Connection::open(path)?)
+        let mut ledger = Ledger::prepare(Connection::open(path)?)?;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| LedgerError::Gone(format!("cannot stat {}: {e}", path.display())))?;
+        ledger.file = Some(Opened {
+            path: path.to_path_buf(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        });
+        Ok(ledger)
     }
 
     /// Open an existing ledger file to read, writing nothing: no schema,
@@ -89,6 +134,14 @@ impl Ledger {
         let mut wal = path.as_os_str().to_owned();
         wal.push("-wal");
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        // A file that keeps a rollback journal is read under SQLite's
+        // shared lock, as any reader would; only a file still in WAL mode
+        // (one no daemon has opened since #44) needs the log's files.
+        if !in_wal_mode(path) {
+            let conn = Connection::open_with_flags(path, flags)?;
+            conn.busy_timeout(BUSY_TIMEOUT)?;
+            return Ok(Ledger::bare(conn));
+        }
         let conn = if Path::new(&wal).exists() {
             Connection::open_with_flags(path, flags)?
         } else {
@@ -106,7 +159,16 @@ impl Ledger {
             Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI)?
         };
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        Ok(Ledger { conn })
+        Ok(Ledger::bare(conn))
+    }
+
+    /// A ledger on a connection, with no file identity and nothing seen.
+    fn bare(conn: Connection) -> Ledger {
+        Ledger {
+            conn,
+            file: None,
+            seen: None,
+        }
     }
 
     /// A ledger that lives only in memory, for tests.
@@ -121,13 +183,27 @@ impl Ledger {
         // SQLite answers busy at once there instead of calling the busy
         // handler. avsmd's kernel and warden open a new ledger at the same
         // moment, so the loser waits here, as long as an append would.
+        // Leaving WAL mode (a ledger written before #44) also needs the
+        // file to itself: SQLite then answers with the mode it kept, and
+        // that is waited out the same way.
         let began = std::time::Instant::now();
         loop {
             // An in-memory database has no file to journal; it stays in
             // "memory" mode, and SQLite reports that instead of failing.
             let set = conn
-                .pragma_update(None, "journal_mode", "WAL")
-                .and_then(|_| conn.execute_batch(SCHEMA));
+                .pragma_update_and_check(None, "journal_mode", JOURNAL, |row| {
+                    row.get::<_, String>(0)
+                })
+                .and_then(|mode| {
+                    if mode != JOURNAL && mode != "memory" {
+                        return Err(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                            Some(format!("the ledger stays in {mode} mode")),
+                        ));
+                    }
+                    conn.pragma_update(None, "synchronous", "FULL")?;
+                    conn.execute_batch(SCHEMA)
+                });
             match set {
                 Err(rusqlite::Error::SqliteFailure(e, _))
                     if e.code == rusqlite::ErrorCode::DatabaseBusy
@@ -138,7 +214,41 @@ impl Ledger {
                 set => break set?,
             }
         }
-        Ok(Ledger { conn })
+        let mut ledger = Ledger::bare(conn);
+        ledger.seen = ledger.head()?;
+        Ok(ledger)
+    }
+
+    /// The last row's seq and hash, if there is one.
+    fn head(&self) -> Result<Option<(i64, String)>, LedgerError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT seq, hash FROM records ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Is the file at the path still the one this ledger opened? A file
+    /// moved over it or put back from a copy is another inode, and every
+    /// append to the old one would be lost.
+    fn same_file(&self) -> Result<(), LedgerError> {
+        let Some(opened) = &self.file else {
+            return Ok(());
+        };
+        match std::fs::metadata(&opened.path) {
+            Ok(m) if m.dev() == opened.dev && m.ino() == opened.ino => Ok(()),
+            Ok(_) => Err(LedgerError::Gone(format!(
+                "{} was replaced under this process; nothing more is written to it",
+                opened.path.display()
+            ))),
+            Err(e) => Err(LedgerError::Gone(format!(
+                "{} is gone under this process ({e}); nothing more is written to it",
+                opened.path.display()
+            ))),
+        }
     }
 
     /// Append a record now.
@@ -155,6 +265,7 @@ impl Ledger {
     pub fn append_at(&mut self, record: Record, at: i64) -> Result<Entry, LedgerError> {
         // A ledger must never store a record it cannot read.
         readable(&record)?;
+        self.same_file()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -165,6 +276,23 @@ impl Ledger {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        // The last record this connection saw must still be there: a
+        // ledger cut short or put back from an older copy under a running
+        // process is refused, not appended to with reused numbers.
+        if let Some((seen, hash)) = &self.seen {
+            let there: Option<String> = tx
+                .query_row("SELECT hash FROM records WHERE seq = ?1", [seen], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if there.as_ref() != Some(hash) {
+                return Err(LedgerError::Gone(format!(
+                    "record #{seen} ({}) is no longer in the ledger: it was cut short or \
+                     rewound under this process; nothing more is written to it",
+                    &hash[..hash.len().min(16)]
+                )));
+            }
+        }
         let (seq, prev) = match last {
             Some((seq, hash)) => (seq + 1, hash),
             None => (1, GENESIS.to_string()),
@@ -183,6 +311,7 @@ impl Ledger {
             ],
         )?;
         tx.commit()?;
+        self.seen = Some((seq, entry.hash.clone()));
         Ok(entry)
     }
 
@@ -292,12 +421,128 @@ impl Ledger {
         })
     }
 
+    /// The first row that does not read or does not chain, oldest first:
+    /// where the ledger stops being sound, and so where a cut keeps the
+    /// most history. None when every row reads and the chain verifies.
+    pub fn first_bad(&self) -> Result<Option<Tamper>, LedgerError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {COLUMNS} FROM records ORDER BY seq"))?;
+        let mut rows = stmt.query([])?;
+        let (mut seq, mut prev): (Seq, String) = (0, GENESIS.to_string());
+        while let Some(row) = rows.next()? {
+            let at = row
+                .get::<_, i64>(0)
+                .ok()
+                .and_then(|s| u64::try_from(s).ok())
+                .unwrap_or(seq + 1);
+            let entry = match read_row(row) {
+                Err(e) => {
+                    return Ok(Some(Tamper {
+                        seq: at,
+                        what: format!("does not read: {e}"),
+                    }))
+                }
+                Ok(stored) => match to_entry(stored) {
+                    Ok(entry) => entry,
+                    Err(LedgerError::Tamper(t)) => return Ok(Some(t)),
+                    Err(e) => return Err(e),
+                },
+            };
+            if let Err(t) = verify_chain_from(seq, &prev, std::slice::from_ref(&entry)) {
+                return Ok(Some(t));
+            }
+            seq = entry.seq;
+            prev = entry.hash;
+        }
+        Ok(None)
+    }
+
+    /// Does the ledger still hold `hash` (or a hash it begins) at `seq`,
+    /// or anywhere when `seq` is None? An anchor kept off the machine is
+    /// checked this way: a rewrite or a rewind past it is a no. Ok carries
+    /// the seq it was found at.
+    pub fn holds(&self, seq: Option<Seq>, hash: &str) -> Result<Option<Seq>, LedgerError> {
+        let prefix = hash.to_ascii_lowercase();
+        if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let found: Vec<(i64, String)> = match seq {
+            Some(seq) => {
+                let Ok(seq) = i64::try_from(seq) else {
+                    return Ok(None);
+                };
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT seq, hash FROM records WHERE seq = ?1")?;
+                let rows = stmt.query_map([seq], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<_, _>>()?
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT seq, hash FROM records WHERE substr(hash, 1, ?1) = ?2")?;
+                let rows = stmt.query_map(params![prefix.len() as i64, prefix], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+                rows.collect::<Result<_, _>>()?
+            }
+        };
+        Ok(found
+            .into_iter()
+            .find(|(_, h)| h.starts_with(&prefix))
+            .and_then(|(s, _)| u64::try_from(s).ok()))
+    }
+
+    /// Cut the ledger just before `seq`, keeping every record before it,
+    /// after a copy of the whole file is written to `backup` (which must
+    /// not exist). The triggers that forbid a delete are lifted and put
+    /// back in the one transaction that deletes, so no other writer ever
+    /// sees the table without them. Ok carries how many rows were cut.
+    /// The caller records the cut, declared, as the next record.
+    pub fn cut(&mut self, seq: Seq, backup: &Path) -> Result<u64, LedgerError> {
+        let last = self.head()?.map_or(0, |(s, _)| s);
+        let at = i64::try_from(seq).unwrap_or(i64::MAX);
+        if seq == 0 || at > last {
+            return Err(LedgerError::Gone(format!(
+                "there is no record #{seq} to cut before; the last is #{last}"
+            )));
+        }
+        if let Some(bad) = self.first_bad()?.filter(|t| t.seq < seq) {
+            return Err(LedgerError::Gone(format!(
+                "record #{} before it is bad too ({}); cut there instead",
+                bad.seq, bad.what
+            )));
+        }
+        self.conn
+            .execute("VACUUM INTO ?1", params![backup.to_string_lossy()])?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch("DROP TRIGGER IF EXISTS records_no_delete")?;
+        let cut = tx.execute("DELETE FROM records WHERE seq >= ?1", [at])?;
+        tx.execute_batch(SCHEMA)?;
+        tx.commit()?;
+        self.seen = self.head()?;
+        Ok(cut as u64)
+    }
+
     /// Run a query that selects [`COLUMNS`] and decode every row it returns.
     fn select<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Entry>, LedgerError> {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params, read_row)?;
         rows.map(|row| to_entry(row?)).collect()
     }
+}
+
+/// Is the SQLite file at `path` in WAL mode? Bytes 18 and 19 of its
+/// header are 2 then; 1 for a rollback journal.
+fn in_wal_mode(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut header))
+        .is_ok_and(|()| header[18] == 2)
 }
 
 /// Unix seconds now. Before 1970 the clock reads negative, as it should.
@@ -331,7 +576,11 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Stored> {
 /// leaves the text readable as the same record (a renamed key the record
 /// does not need, `1E3` for `1e3`) would otherwise go unnoticed.
 fn to_entry((seq, at, prev, hash, weight, text): Stored) -> Result<Entry, LedgerError> {
-    let record: Record = serde_json::from_str(&text)?;
+    // A row that does not read is named, so the cut before it can be.
+    let record: Record = serde_json::from_str(&text).map_err(|e| Tamper {
+        seq,
+        what: format!("does not read: {e}"),
+    })?;
     if record.canonical() != text {
         return Err(Tamper {
             seq,
@@ -852,7 +1101,9 @@ mod tests {
             .conn
             .execute("UPDATE records SET record = 'not json'", [])
             .unwrap();
-        assert!(matches!(ledger.verify(), Err(LedgerError::Encoding(_))));
+        assert!(
+            matches!(ledger.verify(), Err(LedgerError::Tamper(t)) if t.seq == 1 && t.what.starts_with("does not read"))
+        );
     }
 
     #[test]
@@ -979,5 +1230,268 @@ mod tests {
         // `append` stamps the current time, which is well after 2023.
         assert!(before[0].at > 1_700_000_000);
         assert!(before[0].at <= before[1].at);
+    }
+
+    /// A file-backed ledger with `n` reports in it.
+    fn on_disk(dir: &Path, n: usize) -> (PathBuf, Ledger) {
+        let path = dir.join("ledger.db");
+        let mut ledger = Ledger::open(&path).unwrap();
+        for i in 0..n {
+            ledger.append(report(i as f64)).unwrap();
+        }
+        (path, ledger)
+    }
+
+    /// A journal that dies with the process: its files deleted while the
+    /// ledger is open, then the process gone without closing (kill -9).
+    /// Every append that returned is still in the file (#44).
+    #[test]
+    fn deleting_the_journal_files_and_dying_loses_no_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ledger) = on_disk(dir.path(), 5);
+        let journals = || {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut p = path.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(p));
+            }
+        };
+        journals();
+        for i in 0..5 {
+            ledger.append(report(f64::from(i))).unwrap();
+        }
+        journals();
+        std::mem::forget(ledger);
+        let ledger = Ledger::open(&path).unwrap();
+        assert_eq!(ledger.verify().unwrap(), 10);
+    }
+
+    #[test]
+    fn a_ledger_file_keeps_a_rollback_journal_synced_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, ledger) = on_disk(dir.path(), 1);
+        let mode: String = ledger
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, JOURNAL);
+        let sync: i64 = ledger
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 2, "FULL");
+    }
+
+    #[test]
+    fn an_append_fails_closed_when_the_file_is_replaced_or_rewound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ledger) = on_disk(dir.path(), 3);
+        let copy = dir.path().join("copy.db");
+        ledger.copy_to(&copy).unwrap();
+        ledger.append(report(9.0)).unwrap();
+
+        // Rewound in place: the older copy's rows written over the file.
+        {
+            let other = Connection::open(&path).unwrap();
+            other
+                .execute_batch("DROP TRIGGER records_no_delete")
+                .unwrap();
+            other
+                .execute("DELETE FROM records WHERE seq = 4", [])
+                .unwrap();
+            other.execute_batch(SCHEMA).unwrap();
+            let e = Entry::new(4, 1, &ledger.get(3).unwrap().unwrap().hash, report(7.0));
+            other
+                .execute(
+                    "INSERT INTO records VALUES (4, ?1, ?2, ?3, 1, ?4)",
+                    params![e.at, e.prev, e.hash, e.record.canonical()],
+                )
+                .unwrap();
+        }
+        let e = ledger.append(report(1.0)).unwrap_err().to_string();
+        assert!(e.contains("record #4") && e.contains("rewound"), "{e}");
+        assert_eq!(Ledger::open(&path).unwrap().len().unwrap(), 4);
+
+        // Replaced: another file moved over the path.
+        let (path2, mut ledger2) = on_disk(&dir.path().join("b").tap_mkdir(), 2);
+        std::fs::copy(&copy, dir.path().join("swap.db")).unwrap();
+        std::fs::rename(dir.path().join("swap.db"), &path2).unwrap();
+        let e = ledger2.append(report(1.0)).unwrap_err().to_string();
+        assert!(e.contains("replaced"), "{e}");
+        // Removed.
+        std::fs::remove_file(&path2).unwrap();
+        let e = ledger2.append(report(1.0)).unwrap_err().to_string();
+        assert!(e.contains("gone"), "{e}");
+    }
+
+    trait TapMkdir {
+        fn tap_mkdir(self) -> PathBuf;
+    }
+
+    impl TapMkdir for PathBuf {
+        fn tap_mkdir(self) -> PathBuf {
+            std::fs::create_dir_all(&self).unwrap();
+            self
+        }
+    }
+
+    #[test]
+    fn the_insert_trigger_takes_only_the_next_chained_row() {
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let insert = |l: &Ledger, seq: i64, prev: &str| {
+            l.conn.execute(
+                "INSERT INTO records (seq, at, prev, hash, weight, record) \
+                 VALUES (?1, 0, ?2, ?3, 1, '{}')",
+                params![seq, prev, format!("h{seq}{prev}")],
+            )
+        };
+        // Empty: only #1 on the genesis hash.
+        assert!(insert(&ledger, 2, GENESIS).is_err());
+        assert!(insert(&ledger, 1, "beef").is_err());
+        let first = ledger.append(report(1.0)).unwrap();
+        for (seq, prev) in [
+            (1, first.hash.as_str()),
+            (3, first.hash.as_str()),
+            (2, GENESIS),
+        ] {
+            let e = insert(&ledger, seq, prev).unwrap_err().to_string();
+            assert!(e.contains("chained to the last"), "{seq}: {e}");
+        }
+        insert(&ledger, 2, &first.hash).unwrap();
+        assert_eq!(ledger.first_bad().unwrap().unwrap().seq, 2);
+    }
+
+    /// The schema before #44: the two triggers, no INSERT trigger, WAL.
+    const OLD_SCHEMA: &str = "
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE records (
+            seq INTEGER PRIMARY KEY, at INTEGER NOT NULL, prev TEXT NOT NULL,
+            hash TEXT NOT NULL UNIQUE, weight REAL NOT NULL, record TEXT NOT NULL);
+        CREATE TRIGGER records_no_update BEFORE UPDATE ON records
+        BEGIN SELECT RAISE(ABORT, 'the ledger is append-only'); END;
+        CREATE TRIGGER records_no_delete BEFORE DELETE ON records
+        BEGIN SELECT RAISE(ABORT, 'the ledger is append-only'); END;";
+
+    #[test]
+    fn an_older_ledger_gains_the_insert_trigger_and_keeps_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let rows = |conn: &Connection| -> Vec<Stored> {
+            let mut stmt = conn
+                .prepare(&format!("SELECT {COLUMNS} FROM records ORDER BY seq"))
+                .unwrap();
+            let rows = stmt.query_map([], read_row).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        let before = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(OLD_SCHEMA).unwrap();
+            let mut prev = GENESIS.to_string();
+            for i in 1..=4u64 {
+                let e = Entry::new(i, 100, &prev, report(i as f64));
+                conn.execute(
+                    "INSERT INTO records VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        i as i64,
+                        e.at,
+                        e.prev,
+                        e.hash,
+                        e.weight,
+                        e.record.canonical()
+                    ],
+                )
+                .unwrap();
+                prev = e.hash;
+            }
+            rows(&conn)
+        };
+        let ledger = Ledger::open(&path).unwrap();
+        assert_eq!(rows(&ledger.conn), before, "no row rewritten");
+        assert_eq!(ledger.verify().unwrap(), 4);
+        let e = ledger
+            .conn
+            .execute("INSERT INTO records VALUES (9, 0, 'x', 'y', 1, '{}')", [])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("chained"), "{e}");
+    }
+
+    #[test]
+    fn first_bad_names_the_first_row_that_does_not_read_or_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, ledger) = on_disk(dir.path(), 6);
+        assert_eq!(ledger.first_bad().unwrap(), None);
+        ledger
+            .conn
+            .execute_batch(
+                "DROP TRIGGER records_no_update;
+                 UPDATE records SET record = '{\"kind\":\"action\"}' WHERE seq = 5;
+                 UPDATE records SET at = at + 1 WHERE seq = 3;",
+            )
+            .unwrap();
+        let bad = ledger.first_bad().unwrap().unwrap();
+        assert_eq!(bad.seq, 3, "{bad}");
+        ledger
+            .conn
+            .execute("UPDATE records SET at = at - 1 WHERE seq = 3", [])
+            .unwrap();
+        let bad = ledger.first_bad().unwrap().unwrap();
+        assert_eq!(bad.seq, 5, "{bad}");
+        assert!(bad.what.starts_with("does not read"), "{bad}");
+        // A plain read names it too.
+        let e = ledger.all().unwrap_err().to_string();
+        assert!(e.contains("record #5"), "{e}");
+    }
+
+    #[test]
+    fn holds_finds_an_anchor_by_seq_and_hash_or_hash_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, ledger) = on_disk(dir.path(), 4);
+        let e = ledger.get(3).unwrap().unwrap();
+        assert_eq!(ledger.holds(Some(3), &e.hash[..16]).unwrap(), Some(3));
+        assert_eq!(ledger.holds(None, &e.hash).unwrap(), Some(3));
+        assert_eq!(
+            ledger.holds(None, &e.hash[..16].to_uppercase()).unwrap(),
+            Some(3)
+        );
+        assert_eq!(ledger.holds(Some(2), &e.hash[..16]).unwrap(), None);
+        assert_eq!(ledger.holds(Some(9), &e.hash[..16]).unwrap(), None);
+        assert_eq!(ledger.holds(None, "0123456789abcdef").unwrap(), None);
+        assert_eq!(ledger.holds(None, "'; --").unwrap(), None);
+    }
+
+    #[test]
+    fn a_cut_keeps_what_is_before_backs_up_the_rest_and_restores_the_triggers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ledger) = on_disk(dir.path(), 6);
+        let kept = ledger.tail(6).unwrap()[..3].to_vec();
+        let backup = dir.path().join("backup.db");
+        assert!(ledger.cut(0, &backup).is_err());
+        assert!(ledger.cut(7, &backup).is_err());
+        assert!(!backup.exists());
+        assert_eq!(ledger.cut(4, &backup).unwrap(), 3);
+        assert_eq!(ledger.all().unwrap(), kept);
+        assert_eq!(Ledger::open(&backup).unwrap().verify().unwrap(), 6);
+        // The triggers are back, and the ledger appends on as before.
+        assert!(ledger.conn.execute("DELETE FROM records", []).is_err());
+        assert!(ledger
+            .conn
+            .execute("UPDATE records SET at = 0", [])
+            .is_err());
+        let e = ledger.append(report(1.0)).unwrap();
+        assert_eq!(e.seq, 4);
+        assert_eq!(Ledger::open(&path).unwrap().verify().unwrap(), 4);
+        // A bad row before the cut point refuses the cut.
+        ledger
+            .conn
+            .execute_batch(
+                "DROP TRIGGER records_no_update; UPDATE records SET at = 1 WHERE seq = 2;",
+            )
+            .unwrap();
+        let e = ledger
+            .cut(3, &dir.path().join("b2.db"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("record #2"), "{e}");
     }
 }

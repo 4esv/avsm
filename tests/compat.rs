@@ -42,6 +42,49 @@ fn the_1_0_chain_still_verifies() {
     assert!(adopts.iter().all(Option::is_none), "1.0 stored no text");
 }
 
+/// Every row of a ledger file as stored, read with plain SQLite.
+fn raw_rows(db: &Path) -> Vec<(i64, i64, String, String, f64, String)> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT seq, at, prev, hash, weight, record FROM records ORDER BY seq")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+#[test]
+fn the_1_0_ledger_gains_the_chain_trigger_on_open_and_keeps_every_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = open_copy(tmp.path());
+    let db = home.join("ledger.db");
+    let before = raw_rows(&db);
+    let ledger = Ledger::open(&db).unwrap();
+    assert!(ledger.verify().unwrap() >= 645);
+    drop(ledger);
+    assert_eq!(raw_rows(&db), before, "no row rewritten");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let e = conn
+        .execute(
+            "INSERT INTO records (seq, at, prev, hash, weight, record) \
+             VALUES (99999, 0, 'x', 'y', 1, '{}')",
+            [],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("chained to the last"), "{e}");
+}
+
 #[test]
 fn the_commands_answer_on_a_1_0_ledger() {
     let tmp = tempfile::tempdir().unwrap();
