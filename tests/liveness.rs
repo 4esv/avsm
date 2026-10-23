@@ -182,17 +182,31 @@ fn reports(home: &Path, venture: &str) -> usize {
 }
 
 /// Run a client command, and fail when it takes longer than `limit`.
+/// The client is killed at the limit, so a daemon that never answers
+/// fails the test at once instead of hanging it.
 fn timed(tmp: &Path, home: &Path, args: &[&str], limit: Duration) -> Output {
+    let mut all = vec!["--home", home.to_str().unwrap()];
+    all.extend_from_slice(args);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_avsm"))
+        .args(&all)
+        .env("HOME", tmp)
+        .env_remove("AVSMD_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run avsm");
     let began = Instant::now();
-    let out = avsm(tmp, home, args);
-    let took = began.elapsed();
-    assert!(
-        took <= limit,
-        "avsm {} took {took:?}, over {limit:?}: {}",
-        args.join(" "),
-        text(&out)
-    );
-    out
+    while child.try_wait().unwrap().is_none() {
+        if began.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("avsm {} took over {limit:?}", args.join(" "));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
 }
 
 fn alive(pid: i32) -> bool {
