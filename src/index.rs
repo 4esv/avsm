@@ -837,6 +837,40 @@ impl Index {
             .max()
     }
 
+    /// The measured records that say this lever missed, since the last
+    /// declared adoption of the venture's mandate and since a measured
+    /// report last said a run of it moved the metric the right way: its
+    /// ineffective asks and its relapses, oldest first. A run that met
+    /// its expectation exactly leaves no record, so that is the nearest
+    /// the ledger says of its last success.
+    pub fn misses(&self, venture: &str, action: &str) -> Vec<Seq> {
+        let key = (venture.to_string(), action.to_string());
+        let adopted = self.adoptions.get(venture).map_or(0, |a| a.seq);
+        let intents = self.intents_of(venture, action);
+        let worked = self
+            .series(venture, EXPECTATION)
+            .iter()
+            .rev()
+            .find(|(s, _)| {
+                self.get(*s).is_some_and(|e| {
+                    e.record.claim() == Claim::Measured
+                        && e.record.cites().iter().any(|c| intents.contains(c))
+                })
+            })
+            .map_or(0, |(s, _)| *s);
+        let floor = adopted.max(worked);
+        let mut found: Vec<Seq> = [self.ineffective.get(&key), self.relapses.get(&key)]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .copied()
+            .filter(|s| *s > floor)
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
     /// The latest measured record that suspended this lever: its latest
     /// ineffective ask or its latest relapse. Runs are judged after it.
     pub fn last_suspension(&self, venture: &str, action: &str) -> Option<Seq> {

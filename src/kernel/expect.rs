@@ -374,7 +374,7 @@ impl Kernel {
             action: lever.to_string(),
             why,
         };
-        let packet = self.signal_packet(venture, &signal);
+        let packet = self.signal_packet_citing(venture, &signal, &cites);
         match self.append(Record::Ask {
             cites,
             claim: Claim::Measured,

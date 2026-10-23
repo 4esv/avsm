@@ -36,6 +36,7 @@ fn ask(signal: Signal) -> Record {
                     p95: f64::NEG_INFINITY,
                     breach: f64::NAN,
                     spend: f64::INFINITY,
+                    assumes: None,
                 }),
                 cost: None,
             }],

@@ -465,6 +465,11 @@ pub struct OptionForecast {
     pub breach: f64,
     #[serde(with = "finite")]
     pub spend: f64,
+    /// What the forecast assumes that the ledger has not seen, said by
+    /// code: approving a lever measured ineffective is forecast with the
+    /// effect its earlier runs showed, and this says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assumes: Option<String>,
 }
 
 /// The line every packet ends with.
@@ -485,7 +490,10 @@ impl Packet {
         for o in &self.options {
             let forecast = match &o.forecast {
                 Some(f) => format!(
-                    "{} p5 {} p50 {} p95 {} over {}d x {} seeds, guard breach {:.0}%, spend {}",
+                    "{}{} p5 {} p50 {} p95 {} over {}d x {} seeds, guard breach {:.0}%, spend {}",
+                    f.assumes
+                        .as_deref()
+                        .map_or_else(String::new, |a| format!("{a}: ")),
                     f.metric,
                     f.p5,
                     f.p50,

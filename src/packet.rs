@@ -5,7 +5,7 @@
 
 use crate::forecast::{Outcome, Policy};
 use crate::gate::{self, Adopted};
-use crate::index::{Index, EXPECTATION};
+use crate::index::Index;
 use crate::mandate::{Controller, Mandate};
 use crate::record::{
     OptionForecast, Packet, PacketOption, PolicyForecast, Premise, Record, Seq, Signal,
@@ -44,6 +44,19 @@ pub struct Basis<'a> {
 /// Build the packet. Premises come first, then options, then the reason.
 pub fn build(index: &Index, adopted: &[Adopted], now: i64, b: &Basis) -> Packet {
     let mut seqs = b.cites.clone();
+    // An ask to run a lever a human restored after it was measured
+    // ineffective rests on its misses as the ask that restored it did,
+    // and its forecast of approving says what it assumes.
+    let restored = b
+        .action
+        .and_then(|a| Some((a, assumes(index, b.venture, a)?)));
+    if let (Some((a, _)), Some(m)) = (&restored, b.metric) {
+        seqs.extend(misses(index, b.venture, a, m));
+    }
+    let approve = b.approve.clone().map(|mut f| {
+        f.assumes = restored.as_ref().map(|(_, why)| why.clone());
+        f
+    });
     let measured = |s: &Seq| index.get(*s).is_some_and(|e| e.record.claim().authorizes());
     if !seqs.iter().any(measured) {
         seqs.extend(
@@ -68,7 +81,7 @@ pub fn build(index: &Index, adopted: &[Adopted], now: i64, b: &Basis) -> Packet 
     let mut options = vec![
         PacketOption {
             name: APPROVE.to_string(),
-            forecast: b.approve.clone(),
+            forecast: approve.clone(),
             cost: cost.clone(),
         },
         PacketOption {
@@ -82,7 +95,7 @@ pub fn build(index: &Index, adopted: &[Adopted], now: i64, b: &Basis) -> Packet 
             1,
             PacketOption {
                 name: EDIT.to_string(),
-                forecast: b.approve.clone(),
+                forecast: approve,
                 cost,
             },
         );
@@ -202,12 +215,39 @@ fn last_readings(index: &Index, venture: &str, metric: &str, n: usize) -> Vec<Se
     found
 }
 
+/// How many misses a packet cites, the newest.
+pub const MAX_MISSES: usize = 8;
+
+/// What a lever found ineffective rests on: its misses since it last
+/// worked (`Index::misses`: the ineffective asks and the relapses, the
+/// newest `MAX_MISSES`), then the latest plausible reading of the metric,
+/// the one that has not moved. Never the runs that worked before.
+pub fn misses(index: &Index, venture: &str, action: &str, metric: &str) -> Vec<Seq> {
+    let all = index.misses(venture, action);
+    let mut found = all[all.len().saturating_sub(MAX_MISSES)..].to_vec();
+    found.extend(index.series(venture, metric).last().map(|(s, _)| *s));
+    found
+}
+
+/// What approving a lever measured ineffective assumes, when it is
+/// restored: the world model forecasts it with the effect its runs showed
+/// before, which the ledger has not seen since. None for a lever never
+/// found ineffective since the last adoption.
+fn assumes(index: &Index, venture: &str, action: &str) -> Option<String> {
+    let (ask, decision) = index.restored(venture, action)?;
+    let n = index.misses(venture, action).len();
+    Some(format!(
+        "assumes {action} has the effect its runs showed before ask #{ask} found it ineffective; \
+         the ledger has {n} misses of it since it last worked, and #{decision} restored it"
+    ))
+}
+
 /// The readings a signal was raised from.
 pub fn readings(index: &Index, venture: &str, signal: &Signal, metric: &str) -> Vec<Seq> {
     match signal {
         Signal::Saturated { .. } => last_readings(index, venture, metric, 1),
         Signal::Pending { intent, .. } => vec![*intent],
-        Signal::Ineffective { .. } => last_readings(index, venture, EXPECTATION, 3),
+        Signal::Ineffective { action, .. } => misses(index, venture, action, metric),
         Signal::Guard { guard, .. } => last_readings(index, venture, &format!("guard.{guard}"), 1),
         Signal::Audit { audit, .. } => {
             let mut s = last_readings(index, venture, &format!("audit.{audit}"), 1);
@@ -265,6 +305,7 @@ pub fn option_forecast(outcome: &Outcome, venture: &str, policy: Policy) -> Opti
         p95: crate::record::round(target.quantiles.p95),
         breach: s.guards.iter().map(|g| g.p).fold(0.0, f64::max),
         spend: crate::record::round(s.reached.spend.p50),
+        assumes: None,
     })
 }
 
