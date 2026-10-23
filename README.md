@@ -359,7 +359,10 @@ A ledger that cannot be written stops everything that would write to it:
 fixes it, and it exits with the worst code it found. Both binaries exit as
 sysexits.h says: 64 for bad usage, 65 for input avsmd refused, 69 when no
 avsmd is running, 78 for a config or mandate that does not hold. The 78 comes
-from `avsmd`, `avsmd -t` and `avsm doctor`, which read the files themselves; a
+from `avsmd -t` and `avsm doctor`, which read the files themselves, and from
+`avsmd` for its config. `avsmd` starts beside a venture whose adopted mandate it
+cannot read, since the others may be fine: it runs nothing of that venture,
+names it on standard error, and `avsm status` cautions that it cannot run. A
 mandate that `avsm add` is refused by the running avsmd is input it refused,
 so `avsm add` exits 65 for it, and so does `avsm propose` for a proposal the
 gate refuses and `avsm tail 0`. `avsm doctor`

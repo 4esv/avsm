@@ -730,9 +730,19 @@ impl Kernel {
                 .asks
                 .map(|c| f64::from(c.count) * 86_400.0 / c.per.as_secs().max(1) as f64);
             let now = now();
-            crate::forecast::capacity_with(&index, name, &v.mandate, asks)
-                .or_else(|| crate::forecast::cap_spent(&index, name, &v.mandate, now))
-                .or_else(|| crate::forecast::held_back(&index, name, &v.mandate, now))
+            let adopted = self.adopted();
+            let refs: Vec<&Adopted> = adopted.iter().collect();
+            let budget = gate::budget_of_in(&index, &refs, name).map(|(_, b)| b);
+            let parent = v.mandate.parent.as_deref().unwrap_or("the parent");
+            crate::forecast::capacity_with(
+                &index,
+                name,
+                &v.mandate,
+                asks,
+                budget.map(|b| (parent, b)),
+            )
+            .or_else(|| crate::forecast::cap_spent(&index, name, &v.mandate, now))
+            .or_else(|| crate::forecast::held_back(&index, name, &v.mandate, now))
         };
         let Some(gap) = gap else {
             if let Some(clean) = self.short.get_mut(name) {
@@ -912,7 +922,31 @@ impl Kernel {
             .map(|v| (v.name.as_str(), gate::state_in(&index, &adopted, &v.name)))
             .collect();
         let mut out = alarms;
-        let master = caution(&states);
+        let mut master = caution(&states);
+        // A venture whose adopted mandate cannot be read runs nothing,
+        // whatever its records say: it is never "running".
+        let broken: Vec<&str> = self
+            .ventures
+            .values()
+            .filter(|v| v.problem.is_some())
+            .map(|v| v.name.as_str())
+            .collect();
+        if !broken.is_empty() {
+            let line = format!(
+                "caution: {} cannot run: {}\n",
+                if broken.len() == 1 {
+                    "1 venture"
+                } else {
+                    "ventures"
+                },
+                broken.join(", ")
+            );
+            master = if master == "all running\n" {
+                line
+            } else {
+                master + &line
+            };
+        }
         if out.is_empty() || master != "all running\n" {
             out.push_str(&master);
         }
@@ -957,6 +991,10 @@ impl Kernel {
                     ));
                 }
             }
+            let state = match &v.problem {
+                Some(_) => "cannot run".to_string(),
+                None => state.to_string(),
+            };
             out.push_str(&format!("{:<12} {:<11} {detail}\n", v.name, state));
         }
         Ok(out)
@@ -3168,10 +3206,13 @@ impl Kernel {
                     .of(c)
                     .filter(|e| e.record.claim().authorizes() && !role::hidden(e))
                     .collect();
+                // The child's metric, as status shows it: not a guard's
+                // reading, an expectation, or any other report of it.
+                let own = child.mandate.metric_name();
                 let metric = theirs
                     .iter()
                     .rev()
-                    .find(|e| e.record.kind() == crate::record::Kind::Report)
+                    .find(|e| matches!(&e.record, Record::Report { metric: m, .. } if m == own))
                     .map_or("no report yet".to_string(), |e| {
                         format!("{}  reported {}", e.record.summary(), ago(now() - e.at))
                     });
@@ -5093,6 +5134,14 @@ pub fn start(home: &Path) -> Result<(), Exit> {
     kernel.apart = true;
     kernel.adopt_self()?;
     kernel.guard_foreign()?;
+    // A venture whose adopted mandate cannot be read does not stop the
+    // others: avsmd starts, runs nothing of it, and says so here and in
+    // status.
+    for v in kernel.ventures.values() {
+        if let Some(problem) = &v.problem {
+            log(&format!("{}: cannot run: {problem}", v.name));
+        }
+    }
     let kernel = Arc::new(Mutex::new(kernel));
     log(&format!("listening at {}", sock.display()));
     let server = Arc::clone(&kernel);

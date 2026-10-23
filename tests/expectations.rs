@@ -2196,3 +2196,22 @@ fn an_exact_repeat_on_a_metric_that_seldom_repeats_is_still_no_new_evidence() {
     f.report(4.5);
     assert_eq!(f.ineffective().len(), 2, "two that differ are evidence");
 }
+
+#[test]
+fn a_new_adoption_answers_the_open_ineffective_ask_and_the_state_moves_on() {
+    let _c = clock();
+    let (mut f, ask) = suspended();
+    let state =
+        |f: &Fixture| avsmd::gate::state_in(&f.k.index().unwrap(), &f.k.adopted(), "raiser");
+    assert_eq!(state(&f), avsmd::gate::State::Ineffective);
+    let dir = f.dir.clone();
+    f.k.add(&dir).unwrap();
+    // The adoption ended the suspension the ask was about: it is answered,
+    // in the index and the reference alike, and no longer holds the state.
+    assert!(!f.suspended());
+    assert!(!f.k.index().unwrap().is_open(ask), "{:#?}", f.ineffective());
+    assert!(!avsmd::gate::reference::open_asks(&f.entries()).contains(&ask));
+    assert_ne!(state(&f), avsmd::gate::State::Ineffective);
+    f.report_tomorrow(3.0);
+    assert_ne!(state(&f), avsmd::gate::State::Ineffective);
+}

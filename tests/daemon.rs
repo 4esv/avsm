@@ -614,3 +614,32 @@ fn avsmd_home_picks_the_home_and_home_flag_beats_it() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn avsmd_starts_beside_a_venture_it_cannot_read_and_says_so() {
+    // Issue #53: a 1.0 adoption whose directory is gone. The other
+    // ventures may be fine, so avsmd starts; it names the one it cannot
+    // run on standard error, and status cautions.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.yaml"), NEVER).unwrap();
+    let mut ledger = Ledger::open(&home.join("ledger.db")).unwrap();
+    let old = r#"{"kind":"decision","claim":"declared","venture":"vanished","verdict":{"verdict":"adopt","mandate":"abc","path":"/nowhere/vanished"}}"#;
+    ledger.append(serde_json::from_str(old).unwrap()).unwrap();
+    drop(ledger);
+    let sock = avsmd::kernel::socket_path(&home);
+    let h = home.to_str().unwrap();
+    let _d = start(tmp.path(), &["--home", h], &[], &sock);
+    // Status is answered once the kernel serves, after it said so.
+    let (out, _) = text(&avsm(tmp.path(), &["--home", h, "status"]));
+    assert!(
+        out.starts_with("caution: 1 venture cannot run: vanished"),
+        "{out}"
+    );
+    let log = std::fs::read_to_string(tmp.path().join("daemon.log")).unwrap();
+    assert!(
+        log.contains("vanished: cannot run: cannot read /nowhere/vanished"),
+        "{log}"
+    );
+}

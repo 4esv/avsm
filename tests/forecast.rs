@@ -976,7 +976,7 @@ fn a_lever_that_asks_each_time_runs_no_more_than_the_asks_quota() {
     f.history("inbox", &[3.0, 10.0, 17.0, 24.0], DAY);
     let m = &f.k.ventures["inbox"].mandate;
     let index = f.k.index().unwrap();
-    let gap = forecast::capacity_with(&index, "inbox", m, Some(2.0)).unwrap();
+    let gap = forecast::capacity_with(&index, "inbox", m, Some(2.0), None).unwrap();
     assert_eq!((gap.drift, gap.most), (7.0, 2.0));
     assert!(
         gap.describe()
@@ -1003,7 +1003,7 @@ fn a_delegated_irreversible_lever_is_not_bound_by_the_asks_quota() {
     f.history("logs", &[3.0, 10.0, 17.0, 24.0], DAY);
     let m = &f.k.ventures["logs"].mandate;
     let index = f.k.index().unwrap();
-    let gap = forecast::capacity_with(&index, "logs", m, Some(1.0)).unwrap();
+    let gap = forecast::capacity_with(&index, "logs", m, Some(1.0), None).unwrap();
     assert!(!gap.describe().contains("asks quota"), "{}", gap.describe());
     assert_eq!(gap.most, 3.0, "{}", gap.describe());
 }

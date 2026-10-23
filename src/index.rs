@@ -420,6 +420,19 @@ impl Index {
                         path,
                         text,
                     } if *claim == Claim::Declared => {
+                        // A new adoption answers every ineffective ask of
+                        // the venture still open: the suspension it asked
+                        // about ended with it.
+                        let stale: Vec<Seq> = self
+                            .ineffective
+                            .iter()
+                            .filter(|((v, _), _)| *v == venture)
+                            .flat_map(|(_, asks)| asks.iter().copied())
+                            .filter(|q| self.open.contains(q))
+                            .collect();
+                        for q in stale {
+                            self.decide(q);
+                        }
                         self.versions.entry(venture.clone()).or_default().push(seq);
                         self.adoptions.insert(
                             venture,

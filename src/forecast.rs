@@ -1366,18 +1366,22 @@ fn turns(mandate: &Mandate, lever: &str) -> (f64, &'static str) {
 /// by `expects`. Some when the drift is away from the target and
 /// the levers cannot keep up; None when they can, or nothing says.
 pub fn capacity(index: &Index, venture: &str, mandate: &Mandate) -> Option<Gap> {
-    capacity_with(index, venture, mandate, None)
+    capacity_with(index, venture, mandate, None, None)
 }
 
 /// `capacity`, with the asks quota a day when there is one: a lever that
 /// needs a decision each time runs at most as often as it can be asked.
 /// The quota is shared by every venture, so the whole of it is an upper
-/// bound, never what one venture gets.
+/// bound, never what one venture gets. And with the budget a day its
+/// parent set (`budget`, the parent and the amount): a lever that costs
+/// runs at most as often as the budget pays for, and when that binds the
+/// gap names it, not the cap.
 pub fn capacity_with(
     index: &Index,
     venture: &str,
     mandate: &Mandate,
     asks_a_day: Option<f64>,
+    budget: Option<(&str, u32)>,
 ) -> Option<Gap> {
     let base = Baseline::from_index(index, venture, mandate);
     if base.drift.len() < 2 {
@@ -1407,13 +1411,21 @@ pub fn capacity_with(
         let cap = f64::from(p.cap.count) * 86_400.0 / p.cap.per.as_secs().max(1) as f64;
         let (turns, why) = turns(mandate, &p.name);
         let mut runs_a_day = cap.min(turns);
-        let mut limit = if turns < cap { why } else { "the cap" };
+        let mut limit = if turns < cap { why } else { "the cap" }.to_string();
         // Each run of a lever that asks each time is an ask.
         let asks_each_time = !p.delegated && (!p.reversible || p.takes().is_some());
         if let (true, Some(quota)) = (asks_each_time, asks_a_day) {
             if quota < runs_a_day {
                 runs_a_day = quota;
-                limit = "the asks quota, shared by every venture, at most";
+                limit = "the asks quota, shared by every venture, at most".to_string();
+            }
+        }
+        // A lever that costs runs no more than the parent's budget pays.
+        if let (true, Some((parent, budget))) = (p.cost > 0, budget) {
+            let paid = f64::from(budget / p.cost);
+            if paid < runs_a_day {
+                runs_a_day = paid;
+                limit = format!("the budget of {budget} a day {parent} set");
             }
         }
         limits.insert(limit);

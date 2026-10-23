@@ -126,6 +126,14 @@ fn a_1_0_adoption_whose_directory_is_gone_is_reported() {
     let status = k.status().unwrap();
     assert!(status.contains("cannot read /nowhere/vanished"), "{status}");
     assert!(k.adopted().is_empty(), "nothing is permitted to it");
+    // It is not running: the first line cautions, and its row says so.
+    assert!(
+        status.starts_with("caution: 1 venture cannot run: vanished\n"),
+        "{status}"
+    );
+    let row = status.lines().find(|l| l.starts_with("vanished")).unwrap();
+    assert!(row.contains("cannot run"), "{row}");
+    assert!(!row.contains("running"), "{row}");
 }
 
 /// The measured reports that say an approved lever did not run, citing

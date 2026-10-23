@@ -402,6 +402,7 @@ ascent! {
     relation decision(Seq, String, Dk, Seq);
     relation ask(Seq, String, String);
     relation asked(Seq, String);
+    relation ineffective_ask(Seq, String);
     // an ask that code wrote, not a model
     relation code_ask(Seq);
     relation proposal(Seq, String, String);
@@ -525,6 +526,9 @@ ascent! {
     relation decided(Seq);
     decided(q) <-- decision(d, _, Dk::Approve, q), trusted(d);
     decided(q) <-- decision(d, _, Dk::Deny, q), trusted(d);
+    // A declared adoption answers the venture's ineffective asks before it.
+    decided(q) <-- ineffective_ask(q, v), decision(d, v, Dk::Adopt, _),
+        record(d, _, Claim::Declared, _), if d > q;
     relation open_ask(Seq, String);
     open_ask(q, v) <-- asked(q, v), !decided(q);
 
@@ -1267,8 +1271,16 @@ fn load_entry(p: &mut Rules, e: &Entry) {
             };
             p.decision.push((e.seq, venture, dk, target));
         }
-        Record::Ask { action, claim, .. } => {
+        Record::Ask {
+            action,
+            claim,
+            signal,
+            ..
+        } => {
             p.asked.push((e.seq, venture.clone()));
+            if let (Claim::Measured, Some(Signal::Ineffective { .. })) = (claim, signal) {
+                p.ineffective_ask.push((e.seq, venture.clone()));
+            }
             if *claim == Claim::Measured {
                 p.code_ask.push((e.seq,));
             }
