@@ -588,3 +588,42 @@ fn while_self_is_paused_every_row_says_so() {
     }
     assert!(!status.contains("running"), "{status}");
 }
+
+#[test]
+fn a_cap_that_still_binds_shows_in_the_row_whatever_the_state() {
+    // Monkey round 3: approving the saturation ask turned the row to
+    // asking and hid the cap, which still bound.
+    use avsmd::gate::Proof;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = kernel(tmp.path());
+    for _ in 0..3 {
+        k.append(Record::Action {
+            claim: Claim::Measured,
+            venture: "tomato".into(),
+            action: "water".into(),
+            proof: Proof {
+                venture: "tomato".into(),
+                action: "water".into(),
+                steps: vec![],
+            },
+            ok: true,
+            detail: String::new(),
+            payload: None,
+        })
+        .unwrap();
+    }
+    ask(
+        &mut k,
+        "tomato",
+        Signal::Pending {
+            intent: 1,
+            action: "water".into(),
+        },
+    );
+    let status = k.status().unwrap();
+    let row = status.lines().find(|l| l.starts_with("tomato")).unwrap();
+    assert!(row.contains("asking"), "{status}");
+    assert!(row.contains("(water cap 3/day spent"), "{status}");
+    let row = status.lines().find(|l| l.starts_with("trader")).unwrap();
+    assert!(!row.contains("cap"), "{status}");
+}

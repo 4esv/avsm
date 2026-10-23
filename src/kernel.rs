@@ -1090,6 +1090,24 @@ impl Kernel {
             if *state == gate::State::Implausible {
                 detail.push_str(&held_implausible(&index, &adopted, &v.name));
             }
+            // A cap that binds now, whatever the state says: approving the
+            // saturation ask answers it and leaves the cap as it is.
+            for p in v.mandate.permitted.iter().filter(|p| p.cap.count > 0) {
+                let per = p.cap.per.as_secs() as i64;
+                if index.used(&v.name, &p.name, now - per, now) >= p.cap.count {
+                    let first = index
+                        .runs_of_after(&v.name, now - per, now)
+                        .iter()
+                        .find(|(_, a)| *a == p.name)
+                        .map_or(now, |(at, _)| *at);
+                    detail.push_str(&format!(
+                        "  ({} cap {} spent; the next run may start in {})",
+                        p.name,
+                        p.cap,
+                        span((first + per - now).max(0))
+                    ));
+                }
+            }
             if let Some(note) = &v.note {
                 detail.push_str(&format!("  [{note}]"));
             }
