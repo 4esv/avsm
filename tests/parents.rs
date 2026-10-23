@@ -659,3 +659,50 @@ fn a_capacity_ask_names_the_parents_budget_when_it_binds() {
     );
     assert!(!question.contains("the cap"), "{question}");
 }
+
+#[test]
+fn a_lever_that_costs_runs_as_often_as_the_parents_budget_pays_for_it() {
+    // The same, with a cleanup that costs 2: five a day pay for two runs,
+    // and two runs free 50 a day, not the 125 five runs would.
+    let _clock = avsmd::clock::scoped(1_800_000_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(
+        tmp.path(),
+        "nightly: never\nforecast: {days: 2, seeds: 0}\n",
+    );
+    let (role, _) = quiet();
+    let mut k = kernel(&home, role);
+    let disk = venture(
+        tmp.path(),
+        "disk",
+        "purpose: Keep disk usage under 80 percent.\nmetric: disk_pct\n\
+         controller: {kind: threshold, above: 80, action: cleanup}\ncadence: 1h\nparent: ops\n\
+         permitted:\n- {name: cleanup, run: echo freed, cap: 20/hour, reversible: true, delegated: true, cost: 2, expects: down 25 within 1}\n",
+    );
+    script(&disk, "report", "cat value");
+    let ops = venture(
+        tmp.path(),
+        "ops",
+        "purpose: Share out the work.\nmetric: shell echo 1\ncontroller: {kind: model}\ncadence: 1h\n\
+         children: [disk]\npermitted:\n- {name: budget, cap: 9/day, reversible: true, delegated: true}\n",
+    );
+    k.add(&disk).unwrap();
+    k.add(&ops).unwrap();
+    let out = k
+        .propose("ops", "budget", Some("disk 5"))
+        .unwrap_or_else(|e| e);
+    assert!(ran(&out, "budget", "disk may spend 5 a day"), "{out}");
+    for i in 0..4 {
+        avsmd::clock::advance(3600);
+        std::fs::write(disk.join("value"), format!("{}\n", 10 + 20 * i)).unwrap();
+        k.report("disk", false);
+    }
+    let asked = k.check_capacity("disk").expect("a capacity ask");
+    let Record::Ask { question, .. } = &asked.record else {
+        panic!("{asked:?}")
+    };
+    assert!(
+        question.contains("at most 50/day: the budget"),
+        "{question}"
+    );
+}
