@@ -3406,15 +3406,7 @@ impl Kernel {
                     .map_or("no report yet".to_string(), |e| {
                         format!("{}  reported {}", e.record.summary(), ago(now() - e.at))
                     });
-                let lines: Vec<String> = theirs
-                    .iter()
-                    .rev()
-                    .take(12)
-                    .map(|e| e.line())
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
+                let lines = child_lines(&theirs, own, CHILD_LINES);
                 Some(ChildView {
                     name: c.clone(),
                     state: gate::state_in(&index, &self.adopted(), c).to_string(),
@@ -5604,6 +5596,62 @@ pub fn load_config(home: &Path) -> Result<Config, Exit> {
     Config::load(home).map_err(|e| Exit::new(exit::CONFIG, e))
 }
 
+/// How many of a child's records its parent's prompt shows.
+const CHILD_LINES: usize = 12;
+
+/// A child's recent records for its parent's prompt, oldest first, at most
+/// `n`: its metric readings, lever runs and refusals, asks and decisions
+/// first; each guard's and audit's readings collapsed to the latest, with
+/// how many in a row read the same; other reports only in what is left.
+fn child_lines(theirs: &[&Entry], metric: &str, n: usize) -> Vec<String> {
+    let side = |m: &str| m.starts_with("guard.") || m.starts_with(crate::mandate::AUDIT_PREFIX);
+    let mut first: Vec<(Seq, String)> = Vec::new();
+    let mut rest: Vec<(Seq, String)> = Vec::new();
+    // Per guard or audit: its latest line, the value it read, how many in
+    // a row read the same, and whether that run has ended.
+    let mut sides: BTreeMap<String, (Seq, String, Option<f64>, usize, bool)> = BTreeMap::new();
+    for e in theirs.iter().rev() {
+        match &e.record {
+            Record::Report {
+                metric: m, value, ..
+            } if side(m) => match sides.get_mut(m) {
+                None => {
+                    sides.insert(m.clone(), (e.seq, e.line(), *value, 1, false));
+                }
+                Some((_, _, v, same, ended)) => {
+                    if !*ended && *v == *value {
+                        *same += 1;
+                    } else {
+                        *ended = true;
+                    }
+                }
+            },
+            Record::Report { metric: m, .. } if m != metric => rest.push((e.seq, e.line())),
+            _ => first.push((e.seq, e.line())),
+        }
+    }
+    let mut collapsed: Vec<(Seq, String)> = sides
+        .into_values()
+        .map(|(seq, line, _, same, _)| {
+            let line = if same > 1 {
+                format!("{line}  (the last {same} readings the same)")
+            } else {
+                line
+            };
+            (seq, line)
+        })
+        .collect();
+    collapsed.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+    collapsed.truncate(n / 3);
+    let room = n.saturating_sub(collapsed.len());
+    let mut out: Vec<(Seq, String)> = first.into_iter().take(room).collect();
+    let left = room.saturating_sub(out.len());
+    out.extend(rest.into_iter().take(left));
+    out.extend(collapsed);
+    out.sort_by_key(|(s, _)| *s);
+    out.into_iter().map(|(_, l)| l).collect()
+}
+
 /// What holds a venture implausible, for its status row: each reading
 /// its mandate reads whose latest trusted report is flagged, why, and
 /// what clears it.
@@ -5682,6 +5730,72 @@ fn caution(states: &[(&str, gate::State)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::precision;
+
+    #[test]
+    fn a_childs_lines_prefer_its_metric_runs_and_asks_and_collapse_guard_readings() {
+        // Monkey round 3: the parent saw six lines of guard.restarts=0.
+        use crate::ledger::Ledger;
+        use crate::record::{Claim, Record};
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let put = |l: &mut Ledger, r: Record| l.append(r).unwrap();
+        put(
+            &mut ledger,
+            Record::report(Claim::Measured, "svc", "up", Some(1.0), ""),
+        );
+        for _ in 0..8 {
+            put(
+                &mut ledger,
+                Record::report(Claim::Measured, "svc", "guard.restarts", Some(0.0), ""),
+            );
+        }
+        put(
+            &mut ledger,
+            Record::report(Claim::Measured, "svc", "up", Some(0.0), ""),
+        );
+        put(
+            &mut ledger,
+            Record::Ask {
+                packet: None,
+                cites: vec![],
+                claim: Claim::Measured,
+                venture: "svc".into(),
+                action: Some("restart".into()),
+                question: "may I restart?".into(),
+                refusal: None,
+                payload: None,
+                signal: None,
+            },
+        );
+        for _ in 0..4 {
+            put(
+                &mut ledger,
+                Record::report(Claim::Measured, "svc", "guard.restarts", Some(0.0), ""),
+            );
+        }
+        let entries = ledger.all().unwrap();
+        let theirs: Vec<&crate::record::Entry> = entries.iter().collect();
+        let lines = super::child_lines(&theirs, "up", 6);
+        let guards: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("guard.restarts"))
+            .collect();
+        assert_eq!(guards.len(), 1, "{lines:#?}");
+        assert!(
+            guards[0].contains("the last 12 readings the same"),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("up=")).count(),
+            2,
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("may I restart?")),
+            "{lines:#?}"
+        );
+        // Oldest first.
+        assert!(lines[0].contains("up=1"), "{lines:#?}");
+    }
 
     #[test]
     fn precision_is_the_most_places_seen_capped_at_six() {
