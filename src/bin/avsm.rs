@@ -107,7 +107,18 @@ enum Command {
     },
     /// Check this machine's avsmd: its home, config, ledger, mandates and
     /// the daemon itself; change nothing, and say how to fix what fails
-    Doctor,
+    Doctor {
+        /// Check that the ledger still holds this head, exactly as the
+        /// digest's last line prints it: kept off this machine, it catches
+        /// a rewrite by the file's owner or a rewind
+        #[arg(long, value_name = "HEAD")]
+        since: Option<String>,
+        /// With avsmd stopped, back the ledger up whole and cut it just
+        /// before this record, keeping every record before it; the cut is
+        /// recorded. The one thing doctor writes
+        #[arg(long, value_name = "NUMBER", conflicts_with = "since")]
+        cut: Option<String>,
+    },
     /// Run the ventures in a home of their own over simulated days
     #[command(hide = true)]
     Simulate {
@@ -266,16 +277,34 @@ fn main() -> ExitCode {
     let home = cli.home.unwrap_or_else(avsmd::kernel::default_home);
     let remote = cli.remote;
     let args: Vec<String> = match cli.command {
-        Command::Doctor => {
+        Command::Doctor { since, cut } => {
             if remote.is_some() {
                 return done(Err(Exit::new(
                     exit::USAGE,
                     "doctor checks this machine; run it where avsmd runs",
                 )));
             }
+            if let Some(seq) = cut {
+                let seq = match seq.trim_start_matches('#').parse::<u64>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        return done(Err(Exit::new(
+                            exit::USAGE,
+                            format!("--cut takes a record number, not {seq:?}"),
+                        )))
+                    }
+                };
+                return done(avsmd::doctor::cut(&home, seq).map(|text| print!("{text}")));
+            }
+            let since = match since.as_deref().map(avsmd::doctor::parse_anchor) {
+                Some(Err(e)) => return done(Err(Exit::new(exit::USAGE, e))),
+                Some(Ok(anchor)) => Some(anchor),
+                None => None,
+            };
             let found = avsmd::doctor::doctor(
                 &home,
                 avsmd::kernel::old_home(|v| std::env::var_os(v)).as_deref(),
+                since.as_ref(),
             );
             print!("{}", found.out);
             return ExitCode::from(found.code);

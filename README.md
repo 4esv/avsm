@@ -299,6 +299,8 @@ A ledger that cannot be written stops everything that would write to it:
     avsmd -f other.yaml # read another config
     avsmd -d            # verbose diagnostics on standard error
     avsm doctor         # check the home, config, ledger, mandates and daemon
+    avsm doctor --since 1234:0123456789abcdef  # and that the ledger still holds this head
+    avsm doctor --cut 1234  # with avsmd stopped: back up, then cut just before #1234
 
 `avsm doctor` changes nothing. Each check it fails prints the command that
 fixes it, and it exits with the worst code it found. Both binaries exit as
@@ -309,18 +311,41 @@ this order: 65 a ledger that is not a database or whose chain is broken, 78 a
 config or mandate that does not hold, 77 a permission missing, 73 a home that
 is not a directory, 66 a home or mandate directory that is not there, 69 no
 avsmd answering. A sound ledger and no daemon running is 69. avsmd itself
-exits 75 when another is already answering. Records go to
+exits 75 when another is already running on the same home, and names its pid:
+each daemon holds a lock on `avsmd.lock` in the home for its life, so even with
+its socket deleted a second one does not start, and `avsm doctor` says the
+first is running but its socket is missing. Records go to
 standard output, diagnostics to standard error, and nothing is in color.
 `avsm tail --since <number>` prints every record after that one, for a script
 that follows the ledger.
 
-The ledger is `ledger.db` in the home, a SQLite file in WAL mode, for tools of
-your own to read; open it read-only. One table, `records`: `seq` (the record
+The ledger is `ledger.db` in the home, a SQLite file with a rollback journal
+and `synchronous=FULL`, for tools of your own to read; open it read-only. Every
+record is in the main file once it is written, so deleting `ledger.db-journal`
+loses nothing. A ledger written in WAL mode by an earlier avsmd is moved to
+this journal the first time avsmd opens it; no record is rewritten. One table, `records`: `seq` (the record
 number), `at` (unix seconds), `prev` and `hash` (SHA-256 hex, the chain),
 `weight` (always 1) and `record`, the record as JSON, whose `kind` (`report`,
 `proposal`, `action`, `ask` and so on), `claim` (`measured`, `declared` or
 `inferred`) and `venture` are always present. Triggers refuse every `UPDATE`
-and `DELETE`: the ledger is append-only.
+and `DELETE`, and every `INSERT` but the next record chained to the last: the
+ledger is append-only. A record that still does not read stops avsmd, which
+names it; `avsm doctor --cut <number>` copies the whole ledger to
+`ledger.db.before-cut-<number>-<time>` beside it, cuts it just before that
+record, keeping every record before it, and appends a declared record of the
+cut.
+
+What the chain proves, plainly: it catches corruption, an accidental edit and
+anyone who can change the file without rehashing it. It does not catch a
+rewrite by the file's owner, who can lift the triggers, change a record and
+rehash every one after it, and it cannot tell that records were cut off the
+end or that the file was put back from an older copy. An anchor kept off the
+machine catches all three. The digest ends with the head of the chain as
+`head <number>:<hash>`, the hash cut to its first 16 hex digits (64 bits); copy
+it somewhere the owner of this machine cannot edit (mail it, paste it into a
+ticket), and later `avsm doctor --since <number>:<hash>` fails with 65 unless
+the ledger still holds exactly that hash at that number. A bare hash of 16 to
+64 hex digits is looked for anywhere in the ledger.
 
 ## Ventures from one file
 
@@ -401,7 +426,8 @@ Each of these is in `examples/` and runs end to end with nothing but stubs.
     avsm digest
 
 says what the night did: actions, asks, cost, and one line per venture with its
-metric and how it moved. It is also written nightly as a record, so `avsm know
+metric and how it moved, and ends with the head of the chain to keep off the
+machine (see the ledger, above). It is also written nightly as a record, so `avsm know
 digest` finds it later. `avsm know <venture>` lists what avsm currently holds
 true about a venture, each fact with its age, who claimed it, and what it rests
 on; `avsm know <topic>` does the same across ventures. When a venture's records

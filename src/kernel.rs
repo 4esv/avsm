@@ -3589,7 +3589,22 @@ fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) ->
 ",
         if open > 0 { "  (avsm asks)" } else { "" }
     ));
+    out.push_str(&head_line(entries.last().copied()));
     out
+}
+
+/// The anchor line: the head as `seq:hash`, the hash cut to its first 16
+/// hex digits (64 bits), which a rewrite would have to match by search.
+/// Kept off the machine, it catches what the chain cannot: a rewrite by
+/// the file's owner, or a rewind (#44).
+fn head_line(head: Option<&Entry>) -> String {
+    let anchor = match head {
+        Some(e) => format!("{}:{}", e.seq, &e.hash[..e.hash.len().min(16)]),
+        None => format!("0:{}", &crate::record::GENESIS[..16]),
+    };
+    format!(
+        "head {anchor}; keep it off this machine and check it with: avsm doctor --since {anchor}\n"
+    )
 }
 
 /// The proof behind a record, from a snapshot of the ledger.
@@ -4389,6 +4404,10 @@ pub fn start(home: &Path) -> Result<(), Exit> {
     })?;
     let config = load_config(home)?;
     let sock = socket_path(home);
+    // One daemon per home, and a ledger it can read, before anything
+    // else: a second daemon must write nothing (#44).
+    let _lock = crate::doctor::hold_home(home)?;
+    crate::doctor::ledger_before_start(home)?;
     let listener = crate::protocol::bind(&sock).map_err(|e| {
         let code = if crate::protocol::alive(&sock) {
             exit::TEMPFAIL
@@ -4397,6 +4416,7 @@ pub fn start(home: &Path) -> Result<(), Exit> {
         };
         Exit::new(code, e)
     })?;
+    let ours = crate::lock::identity(&sock);
     let warden = WardenProcess::spawn(home)?;
     let roles = RolesProcess::spawn(home)?;
     log(&format!(
@@ -4446,8 +4466,11 @@ pub fn start(home: &Path) -> Result<(), Exit> {
         }
     };
     // No new commands: the socket goes first, and a command already
-    // waiting on the kernel is told the daemon is stopping.
-    let _ = std::fs::remove_file(&sock);
+    // waiting on the kernel is told the daemon is stopping. Only our own
+    // socket: one put in its place is another's.
+    if ours.is_some() && crate::lock::identity(&sock) == ours {
+        let _ = std::fs::remove_file(&sock);
+    }
     log("stopping");
     kernel
         .lock()

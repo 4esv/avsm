@@ -15,6 +15,7 @@ pub mod gate;
 pub mod index;
 pub mod kernel;
 pub mod ledger;
+pub mod lock;
 pub mod mandate;
 pub mod packet;
 pub mod pbo;

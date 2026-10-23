@@ -349,7 +349,8 @@ fn the_digest_says_what_the_night_did_and_is_written_as_a_record() {
         "{text}"
     );
     assert_eq!(lines[4], "open asks: 1  (avsm asks)", "{text}");
-    assert_eq!(lines.len(), 5, "under a screen: {text}");
+    assert!(lines[5].starts_with("head "), "the anchor: {text}");
+    assert_eq!(lines.len(), 6, "under a screen: {text}");
 
     let entry = k.record_digest().unwrap();
     assert_eq!(entry.record.venture(), "self");

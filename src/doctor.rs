@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::exit;
 use crate::ledger::Ledger;
-use crate::record::Entry;
+use crate::record::{Entry, Seq};
 use crate::venture::{self, Venture};
 
 /// The ledger file in a home.
@@ -56,16 +56,181 @@ fn sh(path: &Path) -> String {
     }
 }
 
+/// Why a ledger cannot be used: the text, and the first bad record when
+/// one is to blame (a file that is no database names none).
+struct Unsound {
+    text: String,
+    bad: Option<Seq>,
+}
+
+impl From<crate::ledger::LedgerError> for Unsound {
+    fn from(e: crate::ledger::LedgerError) -> Unsound {
+        Unsound {
+            text: e.to_string(),
+            bad: None,
+        }
+    }
+}
+
 /// Every entry of the home's ledger, read without writing: None when
-/// there is no ledger yet.
-fn read_ledger(home: &Path) -> Result<Option<Vec<Entry>>, String> {
+/// there is no ledger yet. The first record that does not read or does
+/// not chain is named.
+fn read_ledger(home: &Path) -> Result<Option<Vec<Entry>>, Unsound> {
     let path = home.join(LEDGER_FILE);
     if !path.is_file() {
         return Ok(None);
     }
-    let ledger = Ledger::open_read_only(&path).map_err(|e| e.to_string())?;
-    ledger.verify().map_err(|e| e.to_string())?;
-    ledger.all().map(Some).map_err(|e| e.to_string())
+    let ledger = Ledger::open_read_only(&path)?;
+    if let Some(t) = ledger.first_bad()? {
+        return Err(Unsound {
+            text: format!("ledger: {t}"),
+            bad: Some(t.seq),
+        });
+    }
+    Ok(Some(ledger.all()?))
+}
+
+/// The command that keeps what a ledger holds before its first bad
+/// record, or moves it aside when there is nothing before.
+fn cut_fix(home: &Path, bad: Option<Seq>) -> String {
+    match bad {
+        Some(seq) if seq > 1 => format!(
+            "avsm --home {} doctor --cut {seq}  # backs the ledger up, then keeps #1..#{}",
+            sh(home),
+            seq - 1
+        ),
+        _ => format!(
+            "mv {l} {l}.broken  # keeps it for a look; avsmd starts a new one",
+            l = sh(&home.join(LEDGER_FILE))
+        ),
+    }
+}
+
+/// A head kept off the machine, as the digest prints it: `seq:hash`, or
+/// a bare hash, with at least the 16 hex digits the digest shows.
+pub fn parse_anchor(text: &str) -> Result<(Option<Seq>, String), String> {
+    let (seq, hash) = match text.split_once(':') {
+        Some((seq, hash)) => (
+            Some(
+                seq.trim_start_matches('#')
+                    .parse::<Seq>()
+                    .map_err(|_| format!("{text:?} is not seq:hash, like 42:0123456789abcdef"))?,
+            ),
+            hash,
+        ),
+        None => (None, text),
+    };
+    if hash.len() < 16 || hash.len() > 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{text:?} is not seq:hash or a hash: the hash is 16 to 64 hex digits, as the digest prints it"
+        ));
+    }
+    Ok((seq, hash.to_ascii_lowercase()))
+}
+
+/// Take the home's lock for the daemon's life, or say who holds it.
+pub fn hold_home(home: &Path) -> Result<crate::lock::Held, exit::Exit> {
+    crate::lock::acquire(home).map_err(|r| match r {
+        crate::lock::Refused::Running(pid) => {
+            let who = pid.map_or("another avsmd".to_string(), |p| format!("avsmd (pid {p})"));
+            let sock = crate::kernel::socket_path(home);
+            let tail = if crate::protocol::alive(&sock) {
+                String::new()
+            } else {
+                format!(
+                    "; its socket {} is missing; restart it: kill {}",
+                    sock.display(),
+                    pid.map_or("<pid>".to_string(), |p| p.to_string())
+                )
+            };
+            exit::Exit::new(
+                exit::TEMPFAIL,
+                format!("{who} is already running on {}{tail}", home.display()),
+            )
+        }
+        crate::lock::Refused::Io(e) => exit::Exit::new(exit::CANTCREAT, e),
+    })
+}
+
+/// Before the daemon starts: open the ledger (which gives an older one
+/// the chain trigger and the rollback journal) and find its first bad
+/// record. One that does not read stops the start with the cut that keeps
+/// the history before it; a chain that breaks is logged with the same
+/// cut, and the self venture stops everything when it checks.
+pub fn ledger_before_start(home: &Path) -> Result<(), exit::Exit> {
+    let path = home.join(LEDGER_FILE);
+    let ledger = Ledger::open(&path)
+        .map_err(|e| exit::Exit::new(exit::DATAERR, format!("{}: {e}", path.display())))?;
+    let bad = ledger
+        .first_bad()
+        .map_err(|e| exit::Exit::new(exit::DATAERR, format!("{}: {e}", path.display())))?;
+    let Some(t) = bad else {
+        return Ok(());
+    };
+    let text = format!(
+        "the ledger {}: {t}\nto keep the records before it: {}",
+        path.display(),
+        cut_fix(home, Some(t.seq))
+    );
+    if t.what.starts_with("does not read") {
+        return Err(exit::Exit::new(exit::DATAERR, text));
+    }
+    eprintln!("avsmd: {text}");
+    Ok(())
+}
+
+/// `avsm doctor --cut <seq>`: with no daemon running, copy the ledger
+/// whole to a backup beside it, cut it just before `seq`, and record the
+/// cut as declared. The only thing doctor writes.
+pub fn cut(home: &Path, seq: Seq) -> Result<String, exit::Exit> {
+    let path = home.join(LEDGER_FILE);
+    if !path.is_file() {
+        return Err(exit::Exit::new(
+            exit::NOINPUT,
+            format!("no ledger at {}", path.display()),
+        ));
+    }
+    let _held = crate::lock::acquire(home).map_err(|r| match r {
+        crate::lock::Refused::Running(pid) => exit::Exit::new(
+            exit::TEMPFAIL,
+            format!(
+                "avsmd{} is running on {}; stop avsmd first",
+                pid.map_or(String::new(), |p| format!(" (pid {p})")),
+                home.display()
+            ),
+        ),
+        crate::lock::Refused::Io(e) => exit::Exit::new(exit::CANTCREAT, e),
+    })?;
+    let data = |e: crate::ledger::LedgerError| exit::Exit::new(exit::DATAERR, e.to_string());
+    let mut ledger = Ledger::open(&path).map_err(data)?;
+    let backup = home.join(format!(
+        "{LEDGER_FILE}.before-cut-{seq}-{}",
+        crate::clock::now()
+    ));
+    let last = ledger.len().map_err(data)?;
+    let cut = ledger.cut(seq, &backup).map_err(data)?;
+    let by = std::env::var("USER").unwrap_or_else(|_| "a human".to_string());
+    let note = format!(
+        "the ledger was cut before #{seq} by {by}: #{seq}..#{last} ({cut} records) removed, \
+         the whole ledger kept in {}",
+        backup.display()
+    );
+    let entry = ledger
+        .append(crate::record::Record::report(
+            crate::record::Claim::Declared,
+            crate::gate::SELF,
+            "cut",
+            Some(cut as f64),
+            &note,
+        ))
+        .map_err(data)?;
+    Ok(format!(
+        "backed up {} to {}\ncut {cut} records, #{seq}..#{last}; kept #1..#{}\n{}\n",
+        path.display(),
+        backup.display(),
+        seq - 1,
+        entry.line()
+    ))
 }
 
 /// The ventures a human adopted, self left out.
@@ -119,9 +284,12 @@ pub fn test(home: &Path) -> Found {
             return found;
         }
         Err(e) => {
-            found
-                .problems
-                .push(format!("the ledger in {}: {e}", home.display()));
+            found.problems.push(format!(
+                "the ledger in {}: {}; to keep the records before it: {}",
+                home.display(),
+                e.text,
+                cut_fix(home, e.bad)
+            ));
             found.code = exit::worst(found.code, exit::DATAERR);
             return found;
         }
@@ -175,7 +343,11 @@ fn find_daemon() -> Option<PathBuf> {
 /// ledger and its chain, each adopted mandate, the daemon, the warden
 /// and roles executable, network namespaces on Linux, and a leftover 1.0
 /// home. Every failure names the command that fixes it. Writes nothing.
-pub fn doctor(home: &Path, old_home: Option<&Path>) -> Found {
+pub fn doctor(
+    home: &Path,
+    old_home: Option<&Path>,
+    since: Option<&(Option<Seq>, String)>,
+) -> Found {
     let mut found = Found::default();
     let h = sh(home);
 
@@ -261,15 +433,39 @@ pub fn doctor(home: &Path, old_home: Option<&Path>) -> Found {
         Err(e) => {
             found.fail(
                 exit::DATAERR,
-                format!("the ledger {}: {e}", ledger.display()),
-                format!(
-                    "mv {l} {l}.broken  # keeps it for a look; avsmd starts a new one",
-                    l = sh(&ledger)
-                ),
+                format!("the ledger {}: {}", ledger.display(), e.text),
+                cut_fix(home, e.bad),
             );
             Vec::new()
         }
     };
+
+    // The head kept off the machine: is it still in the ledger?
+    if let Some((seq, hash)) = since {
+        let shown = match seq {
+            Some(s) => format!("{s}:{hash}"),
+            None => hash.clone(),
+        };
+        let held = Ledger::open_read_only(&ledger).and_then(|l| l.holds(*seq, hash));
+        match held {
+            Ok(Some(at)) => found.ok(format!("anchor {shown} held at #{at}")),
+            Ok(None) => found.fail(
+                exit::DATAERR,
+                format!(
+                    "anchor {shown} is not in the ledger: it was rewritten or rewound since that head was taken"
+                ),
+                format!(
+                    "ls -l {}*  # compare with a backup you trust; nothing here can say which chain is true",
+                    sh(&ledger)
+                ),
+            ),
+            Err(e) => found.fail(
+                exit::DATAERR,
+                format!("anchor {shown}: {e}"),
+                cut_fix(home, None),
+            ),
+        }
+    }
 
     // Each adopted mandate.
     let ventures = adopted(&entries);
@@ -309,6 +505,7 @@ pub fn doctor(home: &Path, old_home: Option<&Path>) -> Found {
 
     // The daemon.
     let sock = crate::kernel::socket_path(home);
+    let holder = crate::lock::holder(home);
     if crate::protocol::alive(&sock) {
         found.ok(format!("avsmd answering at {}", sock.display()));
         // What only the daemon can tell: its warden and roles processes
@@ -334,6 +531,19 @@ pub fn doctor(home: &Path, old_home: Option<&Path>) -> Found {
                 }
             }
         }
+    } else if let Some(pid) = holder {
+        let pid = if pid > 0 {
+            pid.to_string()
+        } else {
+            "?".to_string()
+        };
+        found.fail(
+            exit::UNAVAILABLE,
+            format!("avsmd is running (pid {pid}) but its socket is missing; restart it"),
+            format!(
+                "kill {pid}  # then, unless launchd or systemd starts it again: avsmd --home {h}"
+            ),
+        );
     } else {
         found.fail(
             exit::UNAVAILABLE,
