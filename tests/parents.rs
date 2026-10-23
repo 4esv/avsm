@@ -86,7 +86,8 @@ fn child(name: &str, extra: &str) -> String {
 }
 
 fn lines_of(k: &mut Kernel, venture: &str, lever: &str, payload: &str) -> String {
-    k.propose(venture, lever, Some(payload)).unwrap()
+    k.propose(venture, lever, Some(payload))
+        .unwrap_or_else(|e| e)
 }
 
 #[test]
@@ -110,14 +111,14 @@ fn a_budget_moves_between_two_children() {
     assert!(out.contains("farm may spend 0 a day"), "{out}");
     let out = k.propose("shop", "spend", None).unwrap();
     assert!(ran(&out, "spend", ""), "{out}");
-    let out = k.propose("shop", "spend", None).unwrap();
+    let out = k.propose("shop", "spend", None).unwrap_or_else(|e| e);
     assert!(
         out.contains(
             "spend refused: the parent's budget is 10 a day, 10 is spent and this costs 10"
         ),
         "{out}"
     );
-    let out = k.propose("farm", "spend", None).unwrap();
+    let out = k.propose("farm", "spend", None).unwrap_or_else(|e| e);
     assert!(
         out.contains("the parent's budget is 0 a day, 0 is spent and this costs 10"),
         "{out}"
@@ -133,7 +134,7 @@ fn a_budget_moves_between_two_children() {
         std::fs::read_to_string(farm.join("spent")).unwrap(),
         "spent\n"
     );
-    let out = k.propose("shop", "spend", None).unwrap();
+    let out = k.propose("shop", "spend", None).unwrap_or_else(|e| e);
     assert!(out.contains("the parent's budget is 0 a day"), "{out}");
     let seq = out
         .trim_start_matches('#')
@@ -201,7 +202,7 @@ fn a_child_paused_by_its_parent_cannot_act_and_its_run_stops() {
     assert!(k.status().unwrap().contains("shop         paused"));
     k.tick();
     assert_eq!(k.run_pid("shop"), None, "the run is stopped");
-    let out = k.propose("shop", "spend", None).unwrap();
+    let out = k.propose("shop", "spend", None).unwrap_or_else(|e| e);
     assert!(out.contains("spend refused: shop is paused"), "{out}");
 
     // The parent's resume is declared-only: it asks, a human approves.
@@ -309,7 +310,7 @@ fn shared_quotas_are_refused_before_the_gate_and_shown_in_why() {
     // Spend: 10 of 15, then no room for another 10.
     let out = k.propose("shop", "buy", None).unwrap();
     assert!(ran(&out, "buy", ""), "{out}");
-    let out = k.propose("shop", "buy", None).unwrap();
+    let out = k.propose("shop", "buy", None).unwrap_or_else(|e| e);
     assert!(
         out.contains(
             "buy refused before the gate: the spend quota is 15/day and 10 are already used"
@@ -332,7 +333,9 @@ fn shared_quotas_are_refused_before_the_gate_and_shown_in_why() {
     // Sends: one post goes, the second is refused.
     let out = k.propose("shop", "post", Some("{\"n\":1}")).unwrap();
     assert!(out.contains("outcome   #"), "{out}");
-    let out = k.propose("shop", "post", Some("{\"n\":2}")).unwrap();
+    let out = k
+        .propose("shop", "post", Some("{\"n\":2}"))
+        .unwrap_or_else(|e| e);
     assert!(
         out.contains(
             "post refused before the gate: the sends quota is 1/day and 1 are already used"
@@ -342,7 +345,7 @@ fn shared_quotas_are_refused_before_the_gate_and_shown_in_why() {
     assert_eq!(stub.seen().len(), 1);
     // Asks: two may be open, the third is not written.
     for lever in ["w1", "w2", "w3"] {
-        k.propose("shop", lever, None).unwrap();
+        k.propose("shop", lever, None).unwrap_or_else(|e| e);
     }
     let asks = k.asks().unwrap();
     assert_eq!(
@@ -354,7 +357,7 @@ fn shared_quotas_are_refused_before_the_gate_and_shown_in_why() {
         asks.contains("w1?") && asks.contains("w2?") && !asks.contains("w3?"),
         "{asks}"
     );
-    let out = k.propose("shop", "w3", None).unwrap();
+    let out = k.propose("shop", "w3", None).unwrap_or_else(|e| e);
     assert!(
         out.contains("w3 needs a decision, but the asks quota is used up; not asking"),
         "{out}"

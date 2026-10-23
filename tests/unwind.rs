@@ -368,7 +368,7 @@ fn only_the_declared_payload_passes_the_guard() {
     // A human's own sell of one share is still guarded.
     let out = k
         .propose("fund", "trade", Some(r#"{"side": "sell", "qty": 1}"#))
-        .unwrap();
+        .unwrap_or_else(|e| e);
     assert_eq!(trades(&dir).len(), 1, "{out}\n{}", lines(&k));
     assert!(refusals(&k, "trade")
         .iter()

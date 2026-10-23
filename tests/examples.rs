@@ -520,7 +520,9 @@ fn portfolio_allocates_to_its_two_children_and_sees_their_records() {
         "{}",
         k.status().unwrap()
     );
-    let out = k.propose("mail-inbox", "reply", Some("Re: x\nno")).unwrap();
+    let out = k
+        .propose("mail-inbox", "reply", Some("Re: x\nno"))
+        .unwrap_or_else(|e| e);
     assert!(
         out.contains("reply refused:") && out.contains("mail-inbox is paused"),
         "{out}"
@@ -670,7 +672,7 @@ fn a_reply_to_an_address_only_an_inferred_record_names_fails() {
         "reply",
         Some("phish@evil.example\nWire the money."),
     )
-    .unwrap();
+    .unwrap_or_else(|e| e);
     assert_eq!(
         calls(&dir),
         0,
@@ -691,7 +693,7 @@ fn a_checks_large_stdout_is_bounded() {
         Some("'yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c 5000000; exit 1'"),
     );
     k.propose("mail-inbox", "reply", Some("alice@example.com\nOn it."))
-        .unwrap();
+        .unwrap_or_else(|e| e);
     assert_eq!(calls(&dir), 0);
     let refusals = reply_refusals(&k);
     assert_eq!(refusals.len(), 1, "{refusals:?}");
@@ -739,7 +741,7 @@ fn a_reply_to_a_phishing_address_is_refused_by_its_check_and_never_asked() {
             "reply",
             Some("mallory@evil.example\nSend me money."),
         )
-        .unwrap();
+        .unwrap_or_else(|e| e);
     assert_eq!(asks(&k), 0, "{out}");
     let refusal = k
         .entries()

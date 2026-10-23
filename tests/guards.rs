@@ -224,7 +224,7 @@ fn a_guard_that_asks_asks_once_and_refuses_levers_until_back_inside() {
         "one ask per breach"
     );
 
-    k.propose("shop", "tidy", None).unwrap();
+    k.propose("shop", "tidy", None).unwrap_or_else(|e| e);
     assert!(!dir.join("tidied").exists(), "refused while past the bound");
     assert!(k.entries().unwrap().iter().any(|e| matches!(&e.record,
         Record::Refusal { action, reason, .. } if action == "tidy" && reason.contains("Guarded(errors)"))));
@@ -1225,7 +1225,7 @@ fn an_implausible_guard_reading_never_clears_a_breach() {
         set(&dir, "soil", bad);
         report(&mut k, &dir, "shop", "5");
         assert_eq!(state(&k, "shop"), State::Guarded, "{bad}");
-        k.propose("shop", "tidy", None).unwrap();
+        k.propose("shop", "tidy", None).unwrap_or_else(|e| e);
         assert!(!dir.join("tidied").exists(), "{bad}: still guarded");
     }
     assert_eq!(implausible_asks(&k, "guard.soil"), 1);

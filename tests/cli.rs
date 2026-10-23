@@ -329,7 +329,10 @@ fn approve_and_deny_answer_open_asks() {
     assert!(text.contains("rollback?"), "{text}");
 
     let err = handle(&mut kernel, &["approve", &first.to_string()]).unwrap_err();
-    assert!(err.contains("is not an open ask"), "{err}");
+    assert!(
+        err.contains(&format!("#{first} was already approved by #")),
+        "{err}"
+    );
 
     let text = handle(&mut kernel, &["deny", &second.to_string(), "too", "risky"]).unwrap();
     assert!(

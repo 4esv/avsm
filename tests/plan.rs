@@ -905,7 +905,7 @@ fn a_proposal_for_a_lever_past_its_cap_is_refused_and_never_asked() {
         ..Setup::default()
     });
     spend_the_cap(&mut f);
-    f.k.propose("shop", "deploy", None).unwrap();
+    f.k.propose("shop", "deploy", None).unwrap_or_else(|e| e);
     assert_eq!(deploy_asks(&f), 1, "{}", f.lines());
     assert!(cap_refusals(&f) > 0, "{}", f.lines());
 }

@@ -340,6 +340,11 @@ fn exit_codes_follow_sysexits() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let h = home.to_str().unwrap();
+    // A home that is not there: EX_NOINPUT, and it says so.
+    let out = avsm(tmp.path(), &["--home", h, "status"]);
+    assert_eq!(out.status.code(), Some(66), "{:?}", text(&out));
+    assert!(text(&out).1.contains("no home at"), "{:?}", text(&out));
+    std::fs::create_dir_all(&home).unwrap();
     // No daemon: EX_UNAVAILABLE.
     let out = avsm(tmp.path(), &["--home", h, "status"]);
     assert_eq!(out.status.code(), Some(69), "{:?}", text(&out));
@@ -587,7 +592,8 @@ fn avsmd_home_picks_the_home_and_home_flag_beats_it() {
         &["status"],
         &[("AVSM_HOME", home.to_str().unwrap())],
     );
-    assert_eq!(out.status.code(), Some(69), "{:?}", text(&out));
+    // The default home is not there: no home, not "not running".
+    assert_eq!(out.status.code(), Some(66), "{:?}", text(&out));
     // --home wins over the environment.
     let elsewhere = tmp.path().join("elsewhere");
     let out = run(
@@ -596,7 +602,7 @@ fn avsmd_home_picks_the_home_and_home_flag_beats_it() {
         &["--home", elsewhere.to_str().unwrap(), "status"],
         &env,
     );
-    assert_eq!(out.status.code(), Some(69), "{:?}", text(&out));
+    assert_eq!(out.status.code(), Some(66), "{:?}", text(&out));
     // -d: verbose diagnostics on standard error.
     let began = Instant::now();
     loop {

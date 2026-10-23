@@ -596,7 +596,9 @@ fn the_network_list_holds_adapters_to_their_hosts() {
         note,
         format!("http.status would reach {host}, which is not in the venture's network list")
     );
-    let out = k.propose("shut", "hook", Some("{\"a\":1}")).unwrap();
+    let out = k
+        .propose("shut", "hook", Some("{\"a\":1}"))
+        .unwrap_or_else(|e| e);
     assert!(
         out.contains(&format!(
             "hook did not run: hook would reach {host}, which is not in shut's network list"
@@ -635,7 +637,7 @@ fn a_levers_own_error_is_never_a_payload_check_refusal() {
     k.add(&venture(tmp.path(), "shut", &mandate)).unwrap();
     let out = k
         .propose("shut", "PayloadCheck", Some("{\"a\":1}"))
-        .unwrap();
+        .unwrap_or_else(|e| e);
     assert!(out.contains("PayloadCheck did not run: "), "{out}");
     let refusals: Vec<_> = k
         .entries()

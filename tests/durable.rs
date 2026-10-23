@@ -230,7 +230,7 @@ fn a_pending_intent_is_asked_about_past_the_asks_quota() {
     assert_eq!(spent.len(), 1);
     k.deny(spent[0], "not now").unwrap();
     // The quota is spent: an ordinary ask is not written.
-    let out = k.propose("shop", "wipe", None).unwrap();
+    let out = k.propose("shop", "wipe", None).unwrap_or_else(|e| e);
     assert!(out.contains("asks quota"), "{out}");
     assert!(k.open_asks().unwrap().is_empty(), "{out}");
     let intent = crash_mid_run(&mut k, "ship");
@@ -304,7 +304,7 @@ fn after_a_crash_a_pending_intent_is_asked_about_never_rerun() {
         assert_eq!(runs(&dir, "ships"), 0);
 
         // While pending, the gate refuses the lever; others still run.
-        let out = k.propose("shop", "ship", None).unwrap();
+        let out = k.propose("shop", "ship", None).unwrap_or_else(|e| e);
         assert!(
             out.contains(&format!("intent #{intent} has no outcome")),
             "{out}"
