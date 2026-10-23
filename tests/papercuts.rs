@@ -178,3 +178,64 @@ fn an_existing_home_and_ledger_are_left_as_they_are_and_doctor_warns() {
     let (_, out, _) = avsm_out(&home, &["doctor"]);
     assert!(!out.contains("warn  "), "{out}");
 }
+
+#[test]
+fn why_an_answered_ask_names_the_decision_that_answered_it() {
+    use avsmd::kernel::Kernel;
+    use avsmd::record::{Claim, Packet, Record};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = Kernel::open(&tmp.path().join("home")).unwrap();
+    let ask = |action: &str| Record::Ask {
+        packet: Some(Packet {
+            premises: vec![],
+            options: vec![],
+            reason: None,
+            policies: vec![],
+        }),
+        cites: vec![],
+        claim: Claim::Inferred,
+        venture: "counter".to_string(),
+        action: Some(action.to_string()),
+        question: format!("may I {action}?"),
+        refusal: None,
+        signal: None,
+        payload: None,
+    };
+    let first = k.append(ask("deploy")).unwrap().seq;
+    let second = k.append(ask("rollback")).unwrap().seq;
+    let third = k.append(ask("restart")).unwrap().seq;
+    let say = |k: &mut Kernel, args: &[&str]| {
+        k.handle(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap()
+    };
+    let open = say(&mut k, &["why", &first.to_string()]);
+    assert!(open.contains("Unanswered means no."), "{open}");
+    let approved = say(&mut k, &["approve", &first.to_string()]);
+    let denied = say(&mut k, &["deny", &second.to_string(), "too", "risky"]);
+    let seq_of = |line: &str| -> String {
+        line.trim_start_matches('#')
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let why = say(&mut k, &["why", &first.to_string()]);
+    assert!(!why.contains("Unanswered means no."), "{why}");
+    assert!(
+        why.contains(&format!(
+            "Answered by #{}: approved #{first}",
+            seq_of(&approved)
+        )),
+        "{why}"
+    );
+    let why = say(&mut k, &["why", &second.to_string()]);
+    assert!(
+        why.contains(&format!(
+            "Answered by #{}: denied #{second}: too risky",
+            seq_of(&denied)
+        )),
+        "{why}"
+    );
+    let why = say(&mut k, &["why", &third.to_string()]);
+    assert!(why.contains("Unanswered means no."), "{why}");
+}

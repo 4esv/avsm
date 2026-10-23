@@ -4039,6 +4039,29 @@ fn why_in(
         };
         return Ok(format!("{}\n{derivation}", entry.line()));
     }
+    // An ask a decision answered no longer waits: "Unanswered means no"
+    // is for the one still open.
+    if let Record::Ask { venture, .. } = &entry.record {
+        if !index.is_open(seq) {
+            let mut text = gate::why(entry);
+            if let Some(rest) = text.strip_suffix(&format!("{}\n", crate::record::UNANSWERED)) {
+                text = rest.to_string();
+            }
+            let decision = index.of(venture).find(|e| {
+                e.record.claim().authorizes()
+                    && matches!(&e.record, Record::Decision {
+                        verdict: Verdict::Approve { ask, .. } | Verdict::Deny { ask, .. }, ..
+                    } if *ask == seq)
+            });
+            match decision {
+                Some(d) => {
+                    text.push_str(&format!("Answered by #{}: {}\n", d.seq, d.record.summary()))
+                }
+                None => text.push_str("No longer open; no decision names it.\n"),
+            }
+            return Ok(text);
+        }
+    }
     // An outcome rests on its intent: the proof that let the run start.
     let mut text = match &entry.record {
         Record::Outcome { intent, .. } => match index.get(*intent) {
