@@ -73,6 +73,10 @@
 #     only the lines that are addresses the customers audit names, and the
 #     record is inferred: it tells the model whom to answer and vouches for
 #     nothing, so the check still reads the audit.
+#     The reading ./others is the rest: each non-customer unread mail as
+#     <n>@<domain>, its number and its sender's domain, nothing of what it
+#     says. With no audit, the warden keeps the lines that are addresses,
+#     at most 50; the model archives one as `mail <n>`.
 #   - trader and inbox declare better: up (grow the book) and better:
 #     down (less unread mail); capacity is checked only against a
 #     declared direction, never one guessed from the levers.
@@ -235,6 +239,7 @@ audits:
   - {name: customers, run: ./customers, worse: up, better: down, tolerance: 3}
 readings:
   - {name: waiting, run: ./waiting, lines: address, audit: customers}
+  - {name: unread-mail-n-at-domain, run: ./others, lines: address}
 permitted:
   - {name: reply, run: ./reply, cap: 5/day, reversible: false, takes: text, cost: 1, check: ./check-sender}
   - {name: archive, run: ./archive, cap: 10/day, reversible: true, takes: text, delegated: true}
@@ -296,6 +301,33 @@ print(len(senders))
 '
 EOF
 chmod +x "$V/inbox/waiting"
+# What a model may see of the rest: each unread mail from anyone who is not
+# a customer, as <n>@<domain>, the mail's number and its sender's domain,
+# which is an address to the warden and so a field it keeps. No subject, no
+# body, no user part: the domain is cut to letters, digits, dots and
+# hyphens before it is printed, and the warden keeps only lines that are
+# addresses. The reading's name is how the model learns to read it: archive
+# takes `mail <n>`.
+cat > "$V/inbox/others" <<'EOF'
+#!/bin/sh
+exec python3 -I -c '
+import json, os, re
+known = {l.strip().lower() for l in open("customers.txt") if l.strip()}
+d = "../../world/inbox"
+out = []
+for f in sorted(os.listdir(d)):
+    try:
+        with open(os.path.join(d, f)) as fh: m = json.load(fh)
+        frm, n = str(m.get("from", "")).lower(), int(m["id"])
+    except (OSError, ValueError, KeyError, TypeError): continue
+    host = frm.rpartition("@")[2]
+    if frm in known or not re.fullmatch(r"[a-z0-9.-]{1,100}", host): continue
+    out.append("%d@%s" % (n, host))
+for a in out: print(a)
+print(len(out))
+'
+EOF
+chmod +x "$V/inbox/others"
 fi
 if [ -n "$PLAN" ]; then
   sed 's/^controller: .*/controller: {kind: plan, explore: [water]}/' "$V/tomato/mandate.yaml" > "$V/tomato/plan.yaml"
