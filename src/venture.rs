@@ -56,6 +56,49 @@ impl Venture {
 /// the shell's to find. Also the venture's `report` file, when it exists
 /// and cannot be executed.
 pub fn missing_programs(dir: &Path, m: &Mandate) -> Vec<String> {
+    program_problems(dir, m)
+        .into_iter()
+        .map(|p| match p.hint {
+            Some(h) => format!("{}; {h}", p.text),
+            None => p.text,
+        })
+        .collect()
+}
+
+/// A program a venture runs that cannot run, and what to do about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramProblem {
+    pub text: String,
+    /// The command that fixes it, when one command does.
+    pub hint: Option<String>,
+    /// What to do, for a doctor's fix line.
+    pub fix: String,
+}
+
+/// Does the file start with `#!` and end its first line in a carriage
+/// return? The system then looks for an interpreter named `/bin/sh\r`.
+pub fn crlf_shebang(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 256];
+    let Ok(n) = std::fs::File::open(path).and_then(|mut f| f.read(&mut head)) else {
+        return false;
+    };
+    let head = &head[..n];
+    head.starts_with(b"#!")
+        && head
+            .iter()
+            .position(|b| *b == b'\n')
+            .is_some_and(|i| i > 0 && head[i - 1] == b'\r')
+}
+
+/// The command that turns a file's Windows line endings into Unix ones,
+/// keeping its mode.
+pub fn crlf_fix(path: &Path) -> String {
+    format!("perl -pi -e 's/\\r$//' {}", crate::doctor::sh(path))
+}
+
+/// `missing_programs`, each with its fix.
+pub fn program_problems(dir: &Path, m: &Mandate) -> Vec<ProgramProblem> {
     use std::os::unix::fs::PermissionsExt;
     let executable = |p: &Path| {
         std::fs::metadata(p).is_ok_and(|md| md.is_file() && md.permissions().mode() & 0o111 != 0)
@@ -79,25 +122,68 @@ pub fn missing_programs(dir: &Path, m: &Mandate) -> Vec<String> {
     for r in &m.readings {
         runs.push((format!("reading {}", r.name), &r.run));
     }
+    let d = crate::doctor::sh(dir);
     let mut out = Vec::new();
     for (what, run) in runs {
         let Some(word) = run.split_whitespace().next() else {
             continue;
         };
-        if word.contains('/') && !word.starts_with('/') && !executable(&dir.join(word)) {
-            out.push(format!(
-                "{what} runs {word}, which is not an executable file in {}",
-                dir.display()
-            ));
+        if !word.contains('/') || word.starts_with('/') {
+            continue;
+        }
+        let path = dir.join(word);
+        if !path.is_file() {
+            out.push(ProgramProblem {
+                text: format!(
+                    "{what} runs {word}, which is not an executable file in {}",
+                    dir.display()
+                ),
+                hint: None,
+                fix: format!(
+                    "create it in {d}, or fix the path in {d}/mandate.yaml and run: avsm add {d}"
+                ),
+            });
+        } else if !executable(&path) {
+            let fix = format!("chmod +x {}", crate::doctor::sh(&path));
+            out.push(ProgramProblem {
+                text: format!(
+                    "{what} runs {word}, which is there but not executable in {}",
+                    dir.display()
+                ),
+                hint: Some(fix.clone()),
+                fix,
+            });
+        }
+        if crlf_shebang(&path) {
+            let fix = crlf_fix(&path);
+            out.push(ProgramProblem {
+                text: format!(
+                    "{what} runs {word}, whose first line ends in a carriage return (Windows line endings), so it cannot start"
+                ),
+                hint: Some(fix.clone()),
+                fix,
+            });
         }
     }
     let report = dir.join("report");
     if report.is_file() && !executable(&report) {
-        out.push(format!(
-            "report is not executable in {}; chmod +x {}",
-            dir.display(),
-            report.display()
-        ));
+        let fix = format!("chmod +x {}", crate::doctor::sh(&report));
+        out.push(ProgramProblem {
+            text: format!("report is not executable in {}", dir.display()),
+            hint: Some(fix.clone()),
+            fix,
+        });
+    }
+    if crlf_shebang(&report) {
+        let fix = crlf_fix(&report);
+        out.push(ProgramProblem {
+            text: format!(
+                "report in {} has a first line that ends in a carriage return (Windows line endings), so it cannot start",
+                dir.display()
+            ),
+            hint: Some(fix.clone()),
+            fix,
+        });
     }
     out
 }

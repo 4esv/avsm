@@ -1273,8 +1273,14 @@ pub struct Ran {
     pub stderr: String,
     /// Exit code, if it exited on its own.
     pub code: Option<i32>,
-    /// Killed at the timeout.
+    /// Killed: at the timeout, or because avsmd was stopping (`stopped`).
     pub killed: bool,
+    /// Killed because avsmd or its warden was stopping, not because the
+    /// run took too long: the timeout is no part of the story.
+    pub stopped: bool,
+    /// The program could not be started at all; `stderr` says why and how
+    /// to fix it.
+    pub unstarted: bool,
 }
 
 impl Ran {
@@ -1290,7 +1296,11 @@ impl Ran {
             text.push_str(err);
         }
         let text = text.replace('\n', "  ");
-        if self.killed {
+        if self.unstarted {
+            tail(&text)
+        } else if self.killed && self.stopped {
+            tail(format!("killed: avsmd was stopping  {text}").trim())
+        } else if self.killed {
             tail(format!("killed after {}s  {text}", timeout.as_secs()).trim())
         } else if self.ok {
             tail(&text)
@@ -1431,9 +1441,10 @@ fn run_draining(
         Ok(c) => c,
         Err(e) => {
             return Ran {
-                stderr: format!("cannot run {program}: {e}"),
+                stderr: did_not_run(program, &e),
+                unstarted: true,
                 ..Ran::default()
-            }
+            };
         }
     };
     // Kept, and told to the daemon from the warden, until it is gone: a
@@ -1468,6 +1479,7 @@ fn run_draining(
     // The leader's exit, once it has exited.
     let mut exited = None;
     let mut killed = false;
+    let mut stopped = false;
     loop {
         if exited.is_none() {
             match child.try_wait() {
@@ -1485,6 +1497,7 @@ fn run_draining(
             break;
         }
         if began.elapsed() > timeout || drained.is_some_and(|d| d.elapsed() > DRAIN_GRACE) {
+            stopped = began.elapsed() <= timeout;
             signal_group(&child, libc::SIGKILL);
             let _ = child.kill();
             let _ = child.wait();
@@ -1511,6 +1524,30 @@ fn run_draining(
         stderr,
         code: status.and_then(|s| s.code()),
         killed: status.is_none(),
+        stopped: stopped && status.is_none(),
+        unstarted: false,
+    }
+}
+
+/// Why a program did not start, and the fix: the system's own words for
+/// it say "No such file or directory" even when the file is there and its
+/// first line names an interpreter that does not exist, as a `#!/bin/sh`
+/// with a Windows line ending does.
+fn did_not_run(program: &str, e: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    let path = Path::new(program);
+    match e.kind() {
+        ErrorKind::PermissionDenied => format!(
+            "did not run: {program} is not executable (permission denied); fix: chmod +x {program}"
+        ),
+        ErrorKind::NotFound if crate::venture::crlf_shebang(path) => format!(
+            "did not run: {program} starts with a Windows line ending (#!...\\r), so the system cannot find its interpreter; fix: {}",
+            crate::venture::crlf_fix(path)
+        ),
+        ErrorKind::NotFound => {
+            format!("did not run: {program} does not exist; fix: create it, or check the path")
+        }
+        _ => format!("did not run: {program}: {e}"),
     }
 }
 
@@ -1741,6 +1778,32 @@ mod tests {
             took < DRAIN_GRACE + Duration::from_secs(3),
             "took {took:?}, past the grace"
         );
+    }
+
+    #[test]
+    fn a_run_stopped_with_avsmd_is_not_blamed_on_its_timeout() {
+        let huge = Duration::from_secs(3_155_760_000);
+        let stopped = Ran {
+            killed: true,
+            stopped: true,
+            ..Ran::default()
+        };
+        let d = stopped.detail(huge);
+        assert!(
+            !d.contains("killed after") && d.contains("avsmd was stopping"),
+            "{d}"
+        );
+        let late = Ran {
+            killed: true,
+            ..Ran::default()
+        };
+        assert!(late.detail(huge).starts_with("killed after 3155760000s"));
+        let unstarted = Ran {
+            unstarted: true,
+            stderr: "did not run: x".into(),
+            ..Ran::default()
+        };
+        assert_eq!(unstarted.detail(huge), "did not run: x");
     }
 
     #[test]

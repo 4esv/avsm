@@ -62,7 +62,7 @@ impl Found {
 }
 
 /// Quote a path for a shell command line.
-fn sh(path: &Path) -> String {
+pub(crate) fn sh(path: &Path) -> String {
     let s = path.to_string_lossy();
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || "/._-~+@%:,".contains(c))
@@ -640,16 +640,12 @@ pub fn doctor(
         }
         match on_disk(v) {
             Disk::Same => {
-                let missing = venture::missing_programs(&dir, &v.mandate);
+                let missing = venture::program_problems(&dir, &v.mandate);
                 if missing.is_empty() {
                     found.ok(format!("mandate {name} at {}", dir.display()));
                 }
                 for p in missing {
-                    found.fail(
-                        exit::CONFIG,
-                        format!("{name}: {p}"),
-                        format!("create it in {d}, or fix the path in {d}/mandate.yaml and run: avsm add {d}"),
-                    );
+                    found.fail(exit::CONFIG, format!("{name}: {}", p.text), p.fix);
                 }
             }
             Disk::Changed => found.fail(

@@ -3580,6 +3580,9 @@ fn kill(rt: &mut Runtime) {
 /// reading, or None with a note saying why not.
 fn read_report(dir: &Path, report: &Path) -> (Option<f64>, String) {
     let ran = warden::run(dir, &report.to_string_lossy(), &[], "", REPORT_TIMEOUT);
+    if ran.unstarted {
+        return (None, format!("report {}", ran.detail(REPORT_TIMEOUT)));
+    }
     if !ran.ok {
         return (
             None,

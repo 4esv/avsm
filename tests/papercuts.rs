@@ -239,3 +239,83 @@ fn why_an_answered_ask_names_the_decision_that_answered_it() {
     let why = say(&mut k, &["why", &third.to_string()]);
     assert!(why.contains("Unanswered means no."), "{why}");
 }
+
+fn venture_with(parent: &Path, name: &str, report: &[u8], mode: u32) -> PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        "purpose: x\nmetric: count\ncontroller: {kind: threshold, above: 10, action: reset}\n\
+         cadence: 1h\npermitted:\n  - {name: reset, run: ./reset, cap: 3/day, reversible: true}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("reset"), "#!/bin/sh\ntrue\n").unwrap();
+    std::fs::set_permissions(dir.join("reset"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("report"), report).unwrap();
+    std::fs::set_permissions(dir.join("report"), std::fs::Permissions::from_mode(mode)).unwrap();
+    dir
+}
+
+#[test]
+fn a_report_that_cannot_run_says_it_did_not_run_why_and_the_fix() {
+    use avsmd::kernel::Kernel;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let mut k = Kernel::open(&home).unwrap();
+    let noexec = venture_with(tmp.path(), "noexec", b"#!/bin/sh\necho 3\n", 0o644);
+    let crlf = venture_with(tmp.path(), "crlf", b"#!/bin/sh\r\necho 3\r\n", 0o755);
+    let added = k.add(&noexec).unwrap();
+    assert!(
+        added.contains("warning: report is not executable") && added.contains("chmod +x"),
+        "{added}"
+    );
+    let added = k.add(&crlf).unwrap();
+    assert!(
+        added.contains("carriage return") && added.contains("perl -pi"),
+        "{added}"
+    );
+    k.report("noexec", false);
+    k.report("crlf", false);
+    let lines: Vec<String> = k.entries().unwrap().iter().map(|e| e.line()).collect();
+    let noexec_line = lines
+        .iter()
+        .find(|l| l.contains("noexec") && l.contains("report did not run"))
+        .unwrap_or_else(|| panic!("{lines:#?}"));
+    assert!(noexec_line.contains("permission denied") && noexec_line.contains("chmod +x"));
+    let crlf_line = lines
+        .iter()
+        .find(|l| l.contains("crlf") && l.contains("report did not run"))
+        .unwrap_or_else(|| panic!("{lines:#?}"));
+    assert!(crlf_line.contains("Windows line ending") && crlf_line.contains("perl -pi"));
+    for l in [noexec_line, crlf_line] {
+        assert!(!l.contains("exit -1") && !l.contains("os error"), "{l}");
+    }
+    drop(k);
+    // Doctor names the same fixes.
+    let (_, out, _) = avsm_out(&home, &["doctor"]);
+    assert!(out.contains("fix: chmod +x "), "{out}");
+    assert!(out.contains("fix: perl -pi -e 's/\\r$//' "), "{out}");
+    assert!(
+        !out.contains("create it in") || !out.contains("noexec: report"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_lever_that_exists_without_the_execute_bit_gets_chmod_not_create() {
+    use avsmd::kernel::Kernel;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let mut k = Kernel::open(&home).unwrap();
+    let dir = venture_with(tmp.path(), "lev", b"#!/bin/sh\necho 3\n", 0o755);
+    k.add(&dir).unwrap();
+    std::fs::set_permissions(dir.join("reset"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    drop(k);
+    let (_, out, _) = avsm_out(&home, &["doctor"]);
+    assert!(
+        out.contains("lever reset runs ./reset, which is there but not executable"),
+        "{out}"
+    );
+    assert!(out.contains("fix: chmod +x "), "{out}");
+    assert!(!out.contains("fix: create it"), "{out}");
+}
