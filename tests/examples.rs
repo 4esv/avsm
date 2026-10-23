@@ -424,7 +424,13 @@ fn paper_trader_halts_past_the_drawdown_cap() {
         .iter()
         .map(|e| e.record.summary())
         .collect();
-    assert!(got.iter().any(|s| s == "drawdown=12"), "{got:?}");
+    // The book may move once before the first report reads it: 8800 by
+    // at most 50 leaves the drawdown at 11 to 12, past ten either way.
+    assert!(
+        got.iter()
+            .any(|s| matches!(s.as_str(), "drawdown=11" | "drawdown=12")),
+        "{got:?}"
+    );
     assert!(got.iter().any(|s| s == "stop: done"), "{got:?}");
     assert!(
         k.status().unwrap().contains("paper-trader paused"),
