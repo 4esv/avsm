@@ -284,16 +284,45 @@ extern "C" fn look_at_stdout() {
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__mod_init_func")]
 static LOOK_AT_STDOUT: extern "C" fn() = look_at_stdout;
 
+/// The word in the place of the subcommand, past the global options.
+fn subcommand() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--home" || a == "--remote" {
+            args.next();
+        } else if !a.starts_with('-') {
+            return Some(a);
+        }
+    }
+    None
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
+            // There is no remove, and clap's nearest guess is resume.
+            if let Some(word) =
+                subcommand().filter(|w| matches!(w.as_str(), "remove" | "rm" | "delete"))
+            {
+                avsmd::protocol::elog(&format!(
+                    "avsm: there is no {word}: a venture stays in the ledger; stop it with avsm pause <venture>"
+                ));
+                return ExitCode::from(exit::USAGE);
+            }
             let _ = e.print();
             // `avsm approve #30` in zsh is `avsm approve`: # starts a comment.
             let numbered =
                 std::env::args().any(|a| matches!(a.as_str(), "approve" | "deny" | "why"));
             if e.kind() == ErrorKind::MissingRequiredArgument && numbered {
                 avsmd::protocol::elog("hint: zsh treats # as a comment; write 12 or '#12'");
+            }
+            // Without interactive_comments, zsh passes `# stop it` on.
+            if std::env::args().skip(1).any(|a| a.starts_with('#')) {
+                avsmd::protocol::elog(
+                    "hint: '#' arrived as an argument: zsh passes # and what follows on unless \
+                     setopt interactive_comments is set; leave the comment out",
+                );
             }
             return match e.kind() {
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => ExitCode::SUCCESS,

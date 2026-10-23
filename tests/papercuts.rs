@@ -401,6 +401,32 @@ fn a_missing_record_number_hints_at_zsh_comments() {
 }
 
 #[test]
+fn a_stray_hash_that_arrives_as_an_argument_hints_at_zsh() {
+    // zsh without interactive_comments passes `# stop it` as arguments.
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, _, err) = avsm_out(tmp.path(), &["pause", "water", "#", "stop", "it"]);
+    assert_eq!(code, Some(64), "{err}");
+    assert!(err.contains("hint: '#' arrived as an argument"), "{err}");
+}
+
+#[test]
+fn remove_rm_and_delete_say_there_is_no_remove_and_how_to_stop_one() {
+    // Monkey round 3: clap offered "did you mean resume" for these.
+    let tmp = tempfile::tempdir().unwrap();
+    for word in ["remove", "rm", "delete"] {
+        let (code, _, err) = avsm_out(tmp.path(), &[word, "w2"]);
+        assert_eq!(code, Some(64), "{word}: {err}");
+        assert!(
+            err.contains(&format!(
+                "there is no {word}: a venture stays in the ledger; stop it with avsm pause <venture>"
+            )),
+            "{word}: {err}"
+        );
+        assert!(!err.contains("resume"), "{word}: {err}");
+    }
+}
+
+#[test]
 fn add_says_what_is_wrong_with_the_path_without_os_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
