@@ -89,6 +89,18 @@ pub struct InferRequest {
 
 /// Something that infers over a context.
 pub trait Role {
+    /// The pid of the process behind this role, 0 when there is none.
+    fn pid(&self) -> u32 {
+        0
+    }
+    /// Is the process behind this role alive? Err says why not.
+    fn alive(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Start the process behind this role again; its new pid.
+    fn respawn(&mut self) -> Result<u32, String> {
+        Err("this role has no process to start".to_string())
+    }
     /// Decide for a venture. `infer` sends a prompt to a backend and
     /// returns its reply; a role may call it as often as it likes.
     /// `drill` answers `know <topic or venture>` and `why <record>` from
@@ -747,6 +759,7 @@ mod tests {
             check: None,
             expects: None,
             revoke_after: None,
+            timeout: None,
             fields: None,
         };
         Context {
@@ -1226,6 +1239,7 @@ mod tests {
             check: None,
             expects: None,
             revoke_after: None,
+            timeout: None,
             fields: None,
         });
         c.children = vec![ChildView {

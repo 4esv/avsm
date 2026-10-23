@@ -945,6 +945,14 @@ pub struct Permitted {
     /// or mistyped field before the check and the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<BTreeMap<String, FieldType>>,
+    /// How long one run may take before it is killed and its outcome
+    /// written as failed. Left out, the warden's default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_duration"
+    )]
+    pub timeout: Option<Duration>,
 }
 
 /// What `metric:` says: a word, a built-in metric like `shell <cmd>`, or
@@ -1244,6 +1252,27 @@ pub mod duration {
     }
 }
 
+/// An optional duration, written like `30s` when present.
+pub mod opt_duration {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+        match d {
+            Some(d) => duration::serialize(d, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+        match Option::<String>::deserialize(d)? {
+            Some(s) => humantime::parse_duration(s.trim())
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Why a mandate could not be read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
@@ -1320,6 +1349,7 @@ const ACTION_FIELDS: &[&str] = &[
     "expects",
     "revoke_after",
     "fields",
+    "timeout",
 ];
 
 /// Names no permitted action may take: they are built in.
@@ -3214,6 +3244,23 @@ fn check_action(position: usize, item: &Value) -> Result<(), MandateError> {
             ))
         }
     }
+    match map.get("timeout") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(t)) => match humantime::parse_duration(t.trim()) {
+            Ok(d) if !d.is_zero() => {}
+            _ => {
+                return fail(format!(
+                "{who} timeout is how long one run may take, a duration like 30s or 10m, not {t:?}"
+            ))
+            }
+        },
+        Some(other) => {
+            return fail(format!(
+                "{who} timeout is how long one run may take, a duration like 30s or 10m, not {}",
+                describe(other)
+            ))
+        }
+    }
     match map.get("revoke_after") {
         None | Some(Value::Null) => Ok(()),
         Some(value) => match value.as_u64() {
@@ -4070,7 +4117,7 @@ max_step: 5000
         ));
         assert_eq!(
             msg,
-            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes, cost, check, expects, revoke_after, fields"
+            "unknown field \"undo\" in permitted action \"deploy\"; a permitted action has these fields: name, run, adapter, cap, reversible, delegated, takes, cost, check, expects, revoke_after, fields, timeout"
         );
     }
 

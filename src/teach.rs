@@ -293,6 +293,12 @@ pub fn render(m: &Mandate) -> String {
         if let Some(n) = p.revoke_after {
             s.push_str(&format!(", delegation suspended after {n} misses in a row"));
         }
+        if let Some(t) = p.timeout {
+            s.push_str(&format!(
+                ", killed after {} a run",
+                humantime::format_duration(t)
+            ));
+        }
         line(s);
     }
     if !m.forbidden.is_empty() {

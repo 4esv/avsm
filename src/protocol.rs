@@ -8,11 +8,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::exit::{self, Exit};
 use crate::kernel::Kernel;
+use crate::ledger::Ledger;
+use crate::record::{Entry, Record, Seq};
 
 /// The kernel's answer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,14 +100,62 @@ pub fn bind(sock: &Path) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
-/// Answer commands until the listener closes. Each command runs with the
-/// kernel locked, one at a time. The socket knows nobody's name.
+/// How long a command waits, with the kernel free, for the outcome of a
+/// lever it started; past it, the answer says the lever is still running.
+pub const OUTCOME_WAIT: Duration = Duration::from_secs(60);
+
+/// Answer commands until the listener closes, each connection on a thread
+/// of its own. Each command runs with the kernel locked, one at a time.
+/// The socket knows nobody's name.
 pub fn serve(listener: UnixListener, kernel: Arc<Mutex<Kernel>>) {
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => answer(stream, &kernel, None),
+            Ok(stream) => {
+                let kernel = Arc::clone(&kernel);
+                std::thread::spawn(move || answer(stream, &kernel, None));
+            }
             Err(_) => return,
         }
+    }
+}
+
+/// Wait for the outcomes of the intents a command started, up to
+/// `OUTCOME_WAIT`, reading the ledger alone: one line each, or a line
+/// saying which lever is still running.
+fn outcomes(ledger: &Path, started: &[Seq]) -> String {
+    let Some(&first) = started.iter().min() else {
+        return String::new();
+    };
+    let Ok(ledger) = Ledger::open_read_only(ledger) else {
+        return String::new();
+    };
+    let began = Instant::now();
+    loop {
+        let found: Vec<Entry> = ledger
+            .after(first)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(
+                |e| matches!(&e.record, Record::Outcome { intent, .. } if started.contains(intent)),
+            )
+            .collect();
+        if found.len() >= started.len() || began.elapsed() >= OUTCOME_WAIT {
+            let mut out = String::new();
+            for e in &found {
+                out.push_str(&e.line());
+                out.push('\n');
+            }
+            for s in started {
+                let done = found
+                    .iter()
+                    .any(|e| matches!(&e.record, Record::Outcome { intent, .. } if intent == s));
+                if !done {
+                    out.push_str(&format!("intent #{s} is still running; see: avsm tail\n"));
+                }
+            }
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -135,8 +186,15 @@ pub fn answer<S: Read + Write>(mut stream: S, kernel: &Arc<Mutex<Kernel>>, by: O
                 } else {
                     kernel.handle_as(&args, by)
                 };
+                let started = kernel.take_started();
+                let ledger = kernel.home.join("ledger.db");
+                // The kernel is free while the levers it started run.
+                drop(kernel);
                 match handled {
-                    Ok(text) => Response { ok: true, text },
+                    Ok(mut text) => {
+                        text.push_str(&outcomes(&ledger, &started));
+                        Response { ok: true, text }
+                    }
                     Err(text) => Response { ok: false, text },
                 }
             }

@@ -80,7 +80,11 @@ run, and whether it can be undone. avsm never runs an irreversible action on a
 model's word. It asks instead; `avsm asks` lists the questions, `avsm approve
 <number>` and `avsm deny <number> <reason>` answer them. Write `delegated: true`
 on an irreversible action to let it run unasked; avsm then records its intent
-before and the outcome after.
+before and the outcome after. A lever runs apart from the daemon: while it
+runs, commands are answered and the other ventures go on. One run may take ten
+minutes, or what `timeout: 30s` on the lever says; past it the run is killed
+and its outcome written as failed. Pausing the venture stops a lever still
+running, and its outcome says so.
 
 A lever may take content: `takes: text`, `json`, `diff` or `file`. A model can
 then propose the text of an announcement or the diff of a change, and what it
@@ -284,7 +288,11 @@ avsmd runs in the foreground and never forks. `contrib/` holds a launchd agent
 at login and again if it dies; each file says how to install it. SIGTERM or
 SIGINT stops it cleanly within 10 seconds: no new commands, the work in flight
 finishes, a lever still running is sent SIGTERM and then SIGKILL if it lingers,
-and its outcome is written before avsmd exits 0.
+and its outcome is written before avsmd exits 0. A warden or roles process
+that dies is started again, and a measured report of self's says so; a lever
+it was running is asked about (`did reset happen?`), never run again blindly.
+A ledger that cannot be written stops everything that would write to it:
+`avsm status` and `avsm doctor` say so, and avsmd tries again every 30 seconds.
 
     avsmd -t            # test the config and every adopted mandate, and say what each allows
     avsmd -T            # print the config in force

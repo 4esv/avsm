@@ -3163,6 +3163,7 @@ mod tests {
             check: None,
             expects: None,
             revoke_after: None,
+            timeout: None,
             fields: None,
         }
     }

@@ -51,6 +51,7 @@ fn valid_fixture_parses_field_by_field() {
                 check: None,
                 expects: None,
                 revoke_after: None,
+                timeout: None,
                 fields: None,
             },
             Permitted {
@@ -68,6 +69,7 @@ fn valid_fixture_parses_field_by_field() {
                 check: None,
                 expects: None,
                 revoke_after: None,
+                timeout: None,
                 fields: None,
             },
         ],

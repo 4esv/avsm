@@ -26,7 +26,7 @@ use crate::packet;
 use crate::record::{self, Claim, Entry, Kind, Packet, Payload, Record, Seq, Signal, Verdict};
 use crate::role::{self, ChildView, Context, InferRequest, ModelRole, Role, SUMMARY};
 use crate::venture::{self, Venture};
-use crate::warden::{self, Failure, FromWarden, LocalWarden, ToWarden, Warden};
+use crate::warden::{self, Failure, FromWarden, LocalWarden, Started, ToWarden, Warden};
 
 mod escalate;
 mod expect;
@@ -51,6 +51,11 @@ pub const REPORT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// A `run` alive this long has its backoff forgiven.
 const STEADY: Duration = Duration::from_secs(600);
+/// While the ledger cannot be written, how often a tick tries again.
+const LEDGER_RETRY: Duration = Duration::from_secs(30);
+/// The first wait before starting a dead warden or roles process again
+/// when starting it failed; it doubles up to `MAX_BACKOFF`.
+const RESPAWN_BACKOFF: Duration = Duration::from_secs(1);
 /// A capacity episode closes after this many clean nightly checks in a
 /// row: a week.
 pub const QUIET_CHECKS: u32 = 7;
@@ -104,6 +109,43 @@ pub struct Kernel {
     /// A forecast branch ticks only the ventures it forecasts: the rest,
     /// self among them, are neither read nor cycled there.
     pub(crate) scope: Option<BTreeSet<String>>,
+    /// Set by the daemon alone: a lever runs apart in the warden and a
+    /// `report` program on a thread, so a slow one holds up neither the
+    /// socket nor the other ventures. A simulation and in-process callers
+    /// run each to its end.
+    pub apart: bool,
+    /// Lever runs going on apart: each intent with what it runs.
+    inflight: BTreeMap<Seq, Inflight>,
+    /// Why the ledger cannot be written, while it cannot.
+    fault: Option<Fault>,
+    /// A warden or roles process found dead and not yet started again.
+    dead: BTreeMap<&'static str, Dead>,
+    /// The intents the command being handled started apart, for the
+    /// socket to wait on the outcomes of once the kernel is free.
+    started: Vec<Seq>,
+}
+
+/// A lever run going on apart.
+struct Inflight {
+    venture: String,
+    action: String,
+    since: Instant,
+    /// Told to stop: its venture was paused.
+    cancelled: bool,
+}
+
+/// The ledger failing to take a write.
+struct Fault {
+    error: String,
+    since: i64,
+    retry_at: Instant,
+}
+
+/// A child process of the daemon found dead.
+struct Dead {
+    why: String,
+    retry_at: Instant,
+    backoff: Duration,
 }
 
 thread_local! {
@@ -124,6 +166,9 @@ impl Drop for Quiet {
     }
 }
 
+/// Where a reading from a `report` program running apart will come.
+type Coming = std::sync::mpsc::Receiver<(Option<f64>, String)>;
+
 /// What the kernel knows about a venture beyond the ledger.
 #[derive(Default)]
 struct Runtime {
@@ -137,6 +182,9 @@ struct Runtime {
     dead: bool,
     /// Something a human should know about how the run is running.
     note: Option<String>,
+    /// A `report` program running apart: since when, and where its
+    /// reading will come.
+    measuring: Option<(Instant, Coming)>,
 }
 
 /// Unix seconds now.
@@ -274,6 +322,11 @@ impl Kernel {
             packet_forecasts: RefCell::new(BTreeMap::new()),
             checked: crate::selfventure::Checked::default(),
             scope: None,
+            apart: false,
+            inflight: BTreeMap::new(),
+            fault: None,
+            dead: BTreeMap::new(),
+            started: Vec::new(),
         };
         kernel.reload()?;
         kernel.recover();
@@ -364,9 +417,45 @@ impl Kernel {
         venture::adopted(&self.ventures)
     }
 
-    /// Append a record now.
+    /// Append a record now. A failure is the ledger's fault until a write
+    /// goes through again: said once, shown by status, and nothing runs
+    /// while it lasts.
     pub fn append(&mut self, record: Record) -> Result<Entry, String> {
-        self.ledger.append(record).map_err(|e| e.to_string())
+        match self.ledger.append(record) {
+            Ok(e) => {
+                if let Some(f) = self.fault.take() {
+                    log(&format!(
+                        "the ledger takes writes again after {}",
+                        ago(now() - f.since)
+                    ));
+                }
+                Ok(e)
+            }
+            Err(e) => {
+                let e = e.to_string();
+                self.ledger_failed(&e);
+                Err(e)
+            }
+        }
+    }
+
+    /// The ledger failed: say so the first time, and try again after
+    /// `LEDGER_RETRY`.
+    fn ledger_failed(&mut self, error: &str) {
+        let retry_at = Instant::now() + LEDGER_RETRY;
+        match &mut self.fault {
+            Some(f) => f.retry_at = retry_at,
+            None => {
+                log(&format!(
+                    "the ledger cannot be written: {error}; nothing runs until it can. see: avsm doctor"
+                ));
+                self.fault = Some(Fault {
+                    error: error.to_string(),
+                    since: now(),
+                    retry_at,
+                });
+            }
+        }
     }
 
     /// Run one command from the socket. The first argument is the command.
@@ -378,6 +467,7 @@ impl Kernel {
     /// declared record the command writes.
     pub fn handle_as(&mut self, args: &[String], by: Option<&str>) -> Result<String, String> {
         self.by = by.map(str::to_string);
+        self.started.clear();
         let result = self.dispatch(args);
         self.by = None;
         result
@@ -407,6 +497,7 @@ impl Kernel {
             ("why", [seq]) => self.why(parse_seq(seq)?),
             ("know", [what]) => self.know(what),
             ("digest", []) => self.digest(),
+            ("doctor", []) => Ok(self.doctor()),
             ("forecast", rest) => {
                 let opts = crate::forecast::Options::parse(rest, self.config.forecast_settings())?;
                 let (outcome, written) = self.forecast(&opts, &[])?;
@@ -731,10 +822,13 @@ impl Kernel {
 
     /// One line per venture.
     pub fn status(&self) -> Result<String, String> {
+        let alarms = self.alarms();
         if self.ventures.is_empty() {
-            return Ok("no ventures; add one with: avsm add <directory>\n".to_string());
+            return Ok(alarms + "no ventures; add one with: avsm add <directory>\n");
         }
-        let index = self.index()?;
+        let index = self
+            .index()
+            .map_err(|e| format!("{alarms}cannot read the ledger: {e}"))?;
         let now = now();
         let adopted = self.adopted();
         let states: Vec<(&str, gate::State)> = self
@@ -742,7 +836,11 @@ impl Kernel {
             .values()
             .map(|v| (v.name.as_str(), gate::state_in(&index, &adopted, &v.name)))
             .collect();
-        let mut out = caution(&states);
+        let mut out = alarms;
+        let master = caution(&states);
+        if out.is_empty() || master != "all running\n" {
+            out.push_str(&master);
+        }
         for (v, (_, state)) in self.ventures.values().zip(&states) {
             let last = index
                 .of(&v.name)
@@ -760,6 +858,26 @@ impl Kernel {
             }
             if let Some(note) = self.runtime.get(&v.name).and_then(|rt| rt.note.as_deref()) {
                 detail.push_str(&format!("  ({note})"));
+            }
+            for (seq, f) in self.inflight.iter().filter(|(_, f)| f.venture == v.name) {
+                detail.push_str(&format!(
+                    "  ({} running {}, intent #{seq}{})",
+                    f.action,
+                    ago(f.since.elapsed().as_secs() as i64).trim_end_matches(" ago"),
+                    if f.cancelled { ", stopping" } else { "" }
+                ));
+            }
+            if let Some((since, _)) = self
+                .runtime
+                .get(&v.name)
+                .and_then(|rt| rt.measuring.as_ref())
+            {
+                if since.elapsed() >= Duration::from_secs(5) {
+                    detail.push_str(&format!(
+                        "  (report running {})",
+                        ago(since.elapsed().as_secs() as i64).trim_end_matches(" ago")
+                    ));
+                }
             }
             out.push_str(&format!("{:<12} {:<11} {detail}\n", v.name, state));
         }
@@ -919,7 +1037,7 @@ impl Kernel {
                 .collect();
             index
                 .pending()
-                .filter(|(s, _, _)| !asked.contains(s))
+                .filter(|(s, _, _)| !asked.contains(s) && !self.inflight.contains_key(s))
                 .map(|(s, v, a)| (s, v.to_string(), a.to_string()))
                 .collect()
         };
@@ -963,9 +1081,8 @@ impl Kernel {
                     }
                 }
             };
-            match self.append(record) {
-                Ok(e) => log(&e.line()),
-                Err(e) => log(&format!("{venture}: cannot write record: {e}")),
+            if let Ok(e) = self.append(record) {
+                log(&e.line());
             }
         }
     }
@@ -1087,7 +1204,22 @@ impl Kernel {
     /// declared decisions, and run the nightly cycle when its time comes.
     /// Problems are logged and never stop the pass.
     pub fn tick(&mut self) {
-        self.recover();
+        // Nothing runs while the ledger cannot record it; try again now
+        // and then.
+        if self
+            .fault
+            .as_ref()
+            .is_some_and(|f| Instant::now() < f.retry_at)
+        {
+            return;
+        }
+        self.watch();
+        self.settle_inflight();
+        // A dead warden cannot check an intent; it is checked once one is
+        // back.
+        if !self.dead.contains_key("warden") {
+            self.recover();
+        }
         let names: Vec<String> = self
             .ventures
             .keys()
@@ -1095,6 +1227,12 @@ impl Kernel {
             .cloned()
             .collect();
         let adopted = self.adopted();
+        // A ledger that cannot be read cannot be written either.
+        let unread = self.index().err();
+        if let Some(e) = unread {
+            self.ledger_failed(&format!("cannot read it: {e}"));
+            return;
+        }
         // Every state as the ledger stood when the pass began.
         let (halted, paused) = {
             let index = match self.index() {
@@ -1119,9 +1257,20 @@ impl Kernel {
                 return;
             }
             self.supervise(name, paused);
+            if paused {
+                self.cancel_inflight(name);
+            }
+            // A reading still coming, or a lever still running, holds this
+            // venture's next report; it holds no other venture's.
+            if self.reading_in(name, halted) || self.busy(name) {
+                continue;
+            }
             let due = self.runtime.entry(name.clone()).or_default().next_report <= now;
             if due && self.ventures[name].problem.is_none() {
                 self.report(name, halted);
+            }
+            if self.fault.is_some() {
+                return;
             }
         }
         if !halted && !stopping() {
@@ -1533,10 +1682,23 @@ impl Kernel {
             .entry(name.to_string())
             .or_default()
             .next_report = now() + cadence.max(1);
+        if self.apart {
+            if let Some(coming) = self.measure_apart(&v) {
+                self.runtime.entry(name.to_string()).or_default().measuring =
+                    Some((Instant::now(), coming));
+                return;
+            }
+        }
         let (value, note) = match self.measure(&v) {
             Some(m) => m,
             None => return,
         };
+        self.reported(&v, halted, value, note);
+    }
+
+    /// Write a venture's reading as its report and act on it.
+    fn reported(&mut self, v: &Venture, halted: bool, value: Option<f64>, note: String) {
+        let name = v.name.as_str();
         // A reading code does not believe is kept, marked, and never a
         // premise; the first of an episode asks.
         let metric = v.mandate.metric_name().to_string();
@@ -1561,12 +1723,10 @@ impl Kernel {
             facts: None,
         }) {
             Ok(e) => e,
-            Err(e) => {
-                log(&format!("{name}: cannot write report: {e}"));
-                return;
-            }
+            // The ledger's fault, said once by `append`.
+            Err(_) => return,
         };
-        let (readings, doubts) = self.read_guards(&v);
+        let (readings, doubts) = self.read_guards(v);
         if halted {
             return;
         }
@@ -1582,8 +1742,8 @@ impl Kernel {
             );
         }
         self.enforce_guards(name, readings);
-        self.check_audits(&v);
-        self.read_readings(&v);
+        self.check_audits(v);
+        self.read_readings(v);
         // Forecasts this report resolves are scored, by code, before
         // anything acts on it.
         let forecast = name != SELF && predict::predicts(&v.mandate);
@@ -1601,7 +1761,7 @@ impl Kernel {
         }
         // The forecast of a fresh adoption runs on its first trusted,
         // plausible reading, so the branches start from a value.
-        self.forecast_first_reading(&v, &metric, entry.seq);
+        self.forecast_first_reading(v, &metric, entry.seq);
         let plans = name != SELF && matches!(v.mandate.controller, Controller::Plan { .. });
         if name != SELF && (plans || v.mandate.early_warning) {
             self.early_warning(name, &metric);
@@ -1614,7 +1774,7 @@ impl Kernel {
         };
         let mut ran = None;
         for t in thresholds {
-            if self.threshold_fires(&v, &t) {
+            if self.threshold_fires(v, &t) {
                 self.forget_refusal();
                 let before = self.ledger_last();
                 self.act(name, &t.action, vec![entry.seq], Claim::Measured);
@@ -1713,36 +1873,247 @@ impl Kernel {
         }
         let dir = v.path.clone()?;
         let report = v.report()?;
-        let ran = warden::run(&dir, &report.to_string_lossy(), &[], "", REPORT_TIMEOUT);
-        if !ran.ok {
-            return Some((
-                None,
-                format!("report failed: {}", ran.detail(REPORT_TIMEOUT)),
+        Some(read_report(&dir, &report))
+    }
+
+    /// Start reading a venture's `report` program on a thread of its own,
+    /// when that is how its metric is read: where the reading will come.
+    /// None when it is read some other way, here and now.
+    fn measure_apart(&mut self, v: &Venture) -> Option<Coming> {
+        if (v.name == SELF && v.path.is_none())
+            || self.sim.is_some()
+            || v.mandate.metric_adapter().is_some()
+        {
+            return None;
+        }
+        let dir = v.path.clone()?;
+        let report = v.report()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_report(&dir, &report));
+        });
+        Some(rx)
+    }
+
+    /// Take a reading that came in from a `report` program running apart,
+    /// and write and act on it. True while one is still coming.
+    fn reading_in(&mut self, name: &str, halted: bool) -> bool {
+        let Some(rt) = self.runtime.get_mut(name) else {
+            return false;
+        };
+        let got = match &rt.measuring {
+            None => return false,
+            Some((_, coming)) => coming.try_recv(),
+        };
+        match got {
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                rt.measuring = None;
+                false
+            }
+            Ok((value, note)) => {
+                rt.measuring = None;
+                if let Some(v) = self.ventures.get(name).cloned() {
+                    self.reported(&v, halted, value, note);
+                }
+                false
+            }
+        }
+    }
+
+    /// The intents the last command started apart, whose outcomes are
+    /// still to come.
+    pub fn take_started(&mut self) -> Vec<Seq> {
+        std::mem::take(&mut self.started)
+    }
+
+    /// Does a venture have a lever running apart?
+    fn busy(&self, name: &str) -> bool {
+        self.inflight.values().any(|f| f.venture == name)
+    }
+
+    /// Keep each intent a start wrote with no outcome yet: its run goes on
+    /// apart.
+    fn track(&mut self, written: &[Entry]) {
+        for e in written {
+            if let Record::Intent {
+                venture, action, ..
+            } = &e.record
+            {
+                let done = written.iter().any(
+                    |o| matches!(&o.record, Record::Outcome { intent, .. } if *intent == e.seq),
+                );
+                if !done {
+                    self.started.push(e.seq);
+                    self.inflight.insert(
+                        e.seq,
+                        Inflight {
+                            venture: venture.clone(),
+                            action: action.clone(),
+                            since: Instant::now(),
+                            cancelled: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Forget the runs going on apart whose outcome is now in the ledger.
+    fn settle_inflight(&mut self) {
+        if self.inflight.is_empty() {
+            return;
+        }
+        let pending: BTreeSet<Seq> = match self.index() {
+            Ok(index) => index.pending().map(|(s, _, _)| s).collect(),
+            Err(_) => return,
+        };
+        self.inflight.retain(|s, _| pending.contains(s));
+    }
+
+    /// A paused venture's levers running apart are stopped: the warden
+    /// signals each and writes its outcome.
+    fn cancel_inflight(&mut self, name: &str) {
+        let todo: Vec<Seq> = self
+            .inflight
+            .iter()
+            .filter(|(_, f)| f.venture == name && !f.cancelled)
+            .map(|(s, _)| *s)
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        match self.warden.cancel(name) {
+            Ok(_) => {
+                for s in todo {
+                    if let Some(f) = self.inflight.get_mut(&s) {
+                        log(&format!(
+                            "{name}: paused; stopping {} (intent #{s})",
+                            f.action
+                        ));
+                        f.cancelled = true;
+                    }
+                }
+            }
+            Err(e) => log(&format!("{name}: paused, and cannot stop its lever: {e}")),
+        }
+    }
+
+    /// See that the warden and roles processes are alive. One found dead
+    /// is said, recorded as a measured report of self's, and started
+    /// again; a lever it was running is left to `recover`, which asks
+    /// whether it happened. Starting one again that fails is tried again,
+    /// each wait twice the last, and status says so meanwhile.
+    fn watch(&mut self) {
+        for which in ["warden", "roles"] {
+            let gone = match which {
+                "warden" => self.warden.alive(),
+                _ => self.role.alive(),
+            };
+            let Err(why) = gone else { continue };
+            let now_i = Instant::now();
+            if !self.dead.contains_key(which) {
+                log(&format!("the {which} process died: {why}"));
+                self.dead.insert(
+                    which,
+                    Dead {
+                        why: why.clone(),
+                        retry_at: now_i,
+                        backoff: RESPAWN_BACKOFF,
+                    },
+                );
+                if which == "warden" {
+                    // Its runs died with it: each intent is settled the
+                    // way a restart settles one, never run again blindly.
+                    for (s, f) in std::mem::take(&mut self.inflight) {
+                        log(&format!(
+                            "{}: {} (intent #{s}) was running in the dead warden",
+                            f.venture, f.action
+                        ));
+                    }
+                }
+            }
+            let Some(dead) = self.dead.get_mut(which) else {
+                continue;
+            };
+            if now_i < dead.retry_at {
+                continue;
+            }
+            let respawned = match which {
+                "warden" => self.warden.respawn(),
+                _ => self.role.respawn(),
+            };
+            match respawned {
+                Err(e) => {
+                    log(&format!("{e}; trying again in {}s", dead.backoff.as_secs()));
+                    dead.retry_at = now_i + dead.backoff;
+                    dead.backoff = (dead.backoff * 2).min(MAX_BACKOFF);
+                }
+                Ok(pid) => {
+                    let why = dead.why.clone();
+                    self.dead.remove(which);
+                    if which == "warden" {
+                        WARDEN_PID.store(pid as i32, Ordering::SeqCst);
+                    }
+                    log(&format!(
+                        "the {which} process respawned; warden pid {}, roles pid {}",
+                        self.warden.pid(),
+                        self.role.pid()
+                    ));
+                    let record = Record::report(
+                        Claim::Measured,
+                        SELF,
+                        which,
+                        None,
+                        &format!("the {which} process died ({why}); respawned as pid {pid}"),
+                    );
+                    if let Ok(e) = self.append(record) {
+                        log(&e.line());
+                    }
+                }
+            }
+        }
+    }
+
+    /// What a human must know before any venture: the ledger failing, a
+    /// warden or roles process dead. Empty when all is well.
+    fn alarms(&self) -> String {
+        let mut out = String::new();
+        if let Some(f) = &self.fault {
+            out.push_str(&format!(
+                "caution: the ledger cannot be written ({}): {}; nothing runs until it can\n",
+                ago(now() - f.since),
+                f.error
             ));
         }
-        // NaN and infinity parse but mean nothing; they are passed on so
-        // the report says so, and are never stored as a value.
-        let not_finite = ran
-            .stdout
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .and_then(|l| l.trim().parse::<f64>().ok())
-            .filter(|n| !n.is_finite());
-        match crate::adapter::number_from(&ran.stdout) {
-            Ok(n) => Some((Some(n), String::new())),
-            Err(_) if not_finite.is_some() => Some((
-                not_finite,
-                format!("report printed {}", not_finite.unwrap_or(f64::NAN)),
-            )),
-            Err(_) => Some((
-                None,
-                format!(
-                    "report did not print a number: {}",
-                    ran.detail(REPORT_TIMEOUT)
-                ),
-            )),
+        for (which, d) in &self.dead {
+            out.push_str(&format!(
+                "caution: the {which} process is gone ({}); avsmd is starting it again\n",
+                d.why
+            ));
         }
+        out
+    }
+
+    /// The daemon's part of `avsm doctor`: its pid, then one line per
+    /// check, `ok <what>` or `fail <what>`.
+    fn doctor(&mut self) -> String {
+        let mut out = format!("daemon {}\n", std::process::id());
+        let checks = [
+            ("warden", self.warden.alive(), self.warden.pid()),
+            ("roles", self.role.alive(), self.role.pid()),
+        ];
+        for (which, alive, pid) in checks {
+            match alive {
+                Ok(()) if pid == 0 => {}
+                Ok(()) => out.push_str(&format!("ok {which} pid {pid}\n")),
+                Err(why) => out.push_str(&format!("fail the {which} process is gone: {why}\n")),
+            }
+        }
+        if let Some(f) = &self.fault {
+            out.push_str(&format!("fail the ledger cannot be written: {}\n", f.error));
+        }
+        out
     }
 
     /// Try to take an action: gate it, and if allowed have the warden do
@@ -1763,6 +2134,14 @@ impl Kernel {
         ask_cites: Vec<Seq>,
     ) -> Vec<String> {
         let mut lines = Vec::new();
+        if let Some(f) = &self.fault {
+            // Fail closed: what cannot be recorded does not run.
+            lines.push(format!(
+                "{name}: {action} not run: the ledger cannot be written: {}",
+                f.error
+            ));
+            return lines;
+        }
         let candidate = Candidate {
             venture: name.to_string(),
             action: action.to_string(),
@@ -1835,9 +2214,14 @@ impl Kernel {
             return lines;
         }
         match judged {
-            Ok(_) => match self.warden.execute(&candidate) {
+            Ok(_) => match if self.apart {
+                self.warden.start(&candidate)
+            } else {
+                self.warden.execute(&candidate)
+            } {
                 Ok(written) => {
                     lines.extend(written.iter().map(Entry::line));
+                    self.track(&written);
                     self.judge(name);
                     // A changed mandate adopted: take it on afresh, as
                     // `avsm add` would.
@@ -2811,6 +3195,41 @@ fn kill(rt: &mut Runtime) {
     rt.started = None;
 }
 
+/// Run a venture's `report` program and read its last line as the
+/// reading, or None with a note saying why not.
+fn read_report(dir: &Path, report: &Path) -> (Option<f64>, String) {
+    let ran = warden::run(dir, &report.to_string_lossy(), &[], "", REPORT_TIMEOUT);
+    if !ran.ok {
+        return (
+            None,
+            format!("report failed: {}", ran.detail(REPORT_TIMEOUT)),
+        );
+    }
+    // NaN and infinity parse but mean nothing; they are passed on so the
+    // report says so, and are never stored as a value.
+    let not_finite = ran
+        .stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .and_then(|l| l.trim().parse::<f64>().ok())
+        .filter(|n| !n.is_finite());
+    match crate::adapter::number_from(&ran.stdout) {
+        Ok(n) => (Some(n), String::new()),
+        Err(_) if not_finite.is_some() => (
+            not_finite,
+            format!("report printed {}", not_finite.unwrap_or(f64::NAN)),
+        ),
+        Err(_) => (
+            None,
+            format!(
+                "report did not print a number: {}",
+                ran.detail(REPORT_TIMEOUT)
+            ),
+        ),
+    }
+}
+
 /// Can this process put a child in a network namespace of its own: as
 /// root with a new network namespace, or as anyone with a new user
 /// namespace around it? Found out by trying on a child that does nothing.
@@ -3410,6 +3829,11 @@ pub struct Process {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// How it was started, to start it again.
+    exe: PathBuf,
+    home: PathBuf,
+    what: String,
+    drop: bool,
 }
 
 impl Process {
@@ -3471,7 +3895,28 @@ impl Process {
             child,
             stdin,
             stdout,
+            exe: exe.to_path_buf(),
+            home: home.to_path_buf(),
+            what: what.to_string(),
+            drop,
         })
+    }
+
+    /// Is the child alive? Err says how it ended.
+    fn alive(&mut self) -> Result<(), String> {
+        match self.child.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(status)) => Err(format!("pid {} {status}", self.child.id())),
+            Err(e) => Err(format!("pid {}: {e}", self.child.id())),
+        }
+    }
+
+    /// Start the child again from the binary it was started from, in
+    /// place of this one; the new pid.
+    fn respawn(&mut self) -> Result<u32, String> {
+        let fresh = Process::spawn_exe(&self.exe, &self.home, &self.what, self.drop)?;
+        *self = fresh;
+        Ok(self.id())
     }
 
     fn send<T: Serialize>(&mut self, msg: &T) -> Result<(), String> {
@@ -3544,6 +3989,39 @@ impl WardenProcess {
 }
 
 impl Warden for WardenProcess {
+    fn start(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, Failure> {
+        self.0.send(&ToWarden::Start(candidate.clone()))?;
+        match self.0.recv::<FromWarden>()? {
+            FromWarden::Done(entries) => Ok(entries),
+            FromWarden::Refused { reason_key, detail } => {
+                Err(Failure::Refused { reason_key, detail })
+            }
+            FromWarden::Err(e) => Err(e.into()),
+            _ => Err("the warden answered the wrong question".to_string().into()),
+        }
+    }
+
+    fn cancel(&mut self, venture: &str) -> Result<u32, String> {
+        self.0.send(&ToWarden::Cancel(venture.to_string()))?;
+        match self.0.recv::<FromWarden>()? {
+            FromWarden::Cancelled(n) => Ok(n),
+            FromWarden::Err(e) => Err(e),
+            _ => Err("the warden answered the wrong question".to_string()),
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn alive(&mut self) -> Result<(), String> {
+        self.0.alive()
+    }
+
+    fn respawn(&mut self) -> Result<u32, String> {
+        self.0.respawn()
+    }
+
     fn check(&mut self, venture: &str, action: &str, payload: &Payload) -> Result<(), Failure> {
         self.0.send(&ToWarden::Check(
             venture.to_string(),
@@ -3629,6 +4107,18 @@ impl RolesProcess {
 }
 
 impl Role for RolesProcess {
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn alive(&mut self) -> Result<(), String> {
+        self.0.alive()
+    }
+
+    fn respawn(&mut self) -> Result<u32, String> {
+        self.0.respawn()
+    }
+
     fn decide(
         &mut self,
         ctx: &Context,
@@ -3665,11 +4155,54 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
     // outcome written; the warden then answers until the kernel hangs up.
     warden::drain_on_signals();
     let mut warden = LocalWarden::open(home)?;
+    let ledger = home.join("ledger.db");
+    // Lever runs going on apart, each on a thread of its own: the venture,
+    // and the flag that stops it.
+    let mut runs: Vec<(String, Arc<AtomicBool>, std::thread::JoinHandle<()>)> = Vec::new();
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
+        runs.retain(|(_, _, run)| !run.is_finished());
         let reply = match serde_json::from_str::<ToWarden>(line.trim()) {
+            Ok(ToWarden::Start(c)) => match warden.run_or_start(&c, true) {
+                Ok(Started::Done(e)) => FromWarden::Done(e),
+                Ok(Started::Running(e, job)) => {
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let stopped = Arc::clone(&stop);
+                    let ledger = ledger.clone();
+                    let venture = job.venture.clone();
+                    let run = std::thread::spawn(move || {
+                        let (ok, detail) = job.run(&|| stopped.load(Ordering::SeqCst));
+                        let wrote = Ledger::open(&ledger)
+                            .and_then(|mut l| l.append(job.outcome(ok, detail)))
+                            .map_err(|e| e.to_string());
+                        if let Err(e) = wrote {
+                            eprintln!(
+                                "avsmd: warden: cannot write the outcome of intent #{}: {e}",
+                                job.intent
+                            );
+                        }
+                    });
+                    runs.push((venture, stop, run));
+                    FromWarden::Done(e)
+                }
+                Err(Failure::Refused { reason_key, detail }) => {
+                    FromWarden::Refused { reason_key, detail }
+                }
+                Err(Failure::Error(e)) => FromWarden::Err(e),
+            },
+            Ok(ToWarden::Cancel(v)) => {
+                let mut n = 0;
+                for (_, stop, _) in runs
+                    .iter()
+                    .filter(|(of, _, run)| *of == v && !run.is_finished())
+                {
+                    stop.store(true, Ordering::SeqCst);
+                    n += 1;
+                }
+                FromWarden::Cancelled(n)
+            }
             Ok(ToWarden::Execute(c)) => match warden.execute(&c) {
                 Ok(e) => FromWarden::Done(e),
                 Err(Failure::Refused { reason_key, detail }) => {
@@ -3707,6 +4240,14 @@ pub fn warden_main(home: &Path) -> Result<(), String> {
         out.write_all(text.as_bytes())
             .and_then(|_| out.flush())
             .map_err(|e| e.to_string())?;
+    }
+    // The kernel hung up with runs still going: they drain, as on a stop,
+    // and each outcome is written before the warden goes.
+    if !runs.is_empty() {
+        warden::drain_now();
+    }
+    for (_, _, run) in runs {
+        let _ = run.join();
     }
     Ok(())
 }
@@ -3820,6 +4361,19 @@ impl Kernel {
             }
             kill(rt);
         }
+        // The levers running apart drain in the warden, which had the
+        // signal too; each outcome is waited for up to the deadline.
+        self.settle_inflight();
+        while !self.inflight.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            self.settle_inflight();
+        }
+        for (s, f) in &self.inflight {
+            log(&format!(
+                "{}: {} (intent #{s}) has no outcome yet; the next start asks whether it happened",
+                f.venture, f.action
+            ));
+        }
     }
 }
 
@@ -3858,6 +4412,7 @@ pub fn start(home: &Path) -> Result<(), Exit> {
     }
     let mut kernel = Kernel::with(home, Box::new(roles), Box::new(warden))?;
     kernel.forecasts = true;
+    kernel.apart = true;
     kernel.adopt_self()?;
     let kernel = Arc::new(Mutex::new(kernel));
     log(&format!("listening at {}", sock.display()));

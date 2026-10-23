@@ -311,6 +311,29 @@ pub fn doctor(home: &Path, old_home: Option<&Path>) -> Found {
     let sock = crate::kernel::socket_path(home);
     if crate::protocol::alive(&sock) {
         found.ok(format!("avsmd answering at {}", sock.display()));
+        // What only the daemon can tell: its warden and roles processes
+        // alive, and the ledger taking its writes. A daemon too old to
+        // say answers not ok, and is left at that.
+        let answer = crate::protocol::request(&sock, &["doctor".to_string()]);
+        if let Ok(crate::protocol::Response { ok: true, text }) = answer {
+            let pid = text
+                .lines()
+                .find_map(|l| l.strip_prefix("daemon "))
+                .unwrap_or("<avsmd pid>")
+                .trim()
+                .to_string();
+            for line in text.lines() {
+                if let Some(what) = line.strip_prefix("ok ") {
+                    found.ok(what);
+                } else if let Some(what) = line.strip_prefix("fail ") {
+                    found.fail(
+                        exit::UNAVAILABLE,
+                        what,
+                        format!("kill {pid} && avsmd --home {h}  # avsmd stops cleanly and starts afresh"),
+                    );
+                }
+            }
+        }
     } else {
         found.fail(
             exit::UNAVAILABLE,

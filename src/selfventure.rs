@@ -178,6 +178,7 @@ pub fn canary() -> Result<(), String> {
                 check: None,
                 expects: None,
                 revoke_after: None,
+                timeout: None,
                 fields: None,
             })
             .collect(),

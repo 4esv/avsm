@@ -70,6 +70,30 @@ pub trait Warden {
     fn read(&mut self, _venture: &str, metric: &str) -> Result<(Option<f64>, String), String> {
         Err(format!("this warden cannot read {metric}"))
     }
+    /// `execute`, except that a lever that runs a command or an adapter
+    /// may come back as soon as its intent is written: the run goes on
+    /// apart, and its outcome is written when it ends.
+    fn start(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, Failure> {
+        self.execute(candidate)
+    }
+    /// Stop every run of a venture's levers still going: each is
+    /// signalled, then killed, and its outcome written as failed. Returns
+    /// how many it stopped.
+    fn cancel(&mut self, _venture: &str) -> Result<u32, String> {
+        Ok(0)
+    }
+    /// The pid of the process behind this warden, 0 when there is none.
+    fn pid(&self) -> u32 {
+        0
+    }
+    /// Is the process behind this warden alive? Err says why not.
+    fn alive(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Start the process behind this warden again; its new pid.
+    fn respawn(&mut self) -> Result<u32, String> {
+        Err("this warden has no process to start".to_string())
+    }
 }
 
 /// Why `execute` wrote nothing. A refusal is the warden's own typed
@@ -204,6 +228,130 @@ impl Warden for LocalWarden {
     }
 
     fn execute(&mut self, candidate: &Candidate) -> Result<Vec<Entry>, Failure> {
+        match self.run_or_start(candidate, false)? {
+            Started::Done(written) => Ok(written),
+            // Only a start comes back running; should an execute ever, the
+            // run happens here, recorded, then done, as ever.
+            Started::Running(mut written, job) => {
+                let (ok, detail) = job.run(&|| false);
+                written.push(
+                    self.ledger
+                        .append(job.outcome(ok, detail))
+                        .map_err(|e| e.to_string())?,
+                );
+                Ok(written)
+            }
+        }
+    }
+
+    fn infer(&mut self, request: &InferRequest) -> Result<String, String> {
+        self.infer_now(request)
+    }
+
+    fn measure(&mut self, venture: &str) -> Result<(Option<f64>, String), String> {
+        self.measure_now(venture)
+    }
+
+    fn read(&mut self, venture: &str, metric: &str) -> Result<(Option<f64>, String), String> {
+        self.read_now(venture, metric)
+    }
+
+    fn confirm(&mut self, intent: Seq) -> Result<Option<(bool, String)>, String> {
+        self.confirm_now(intent)
+    }
+}
+
+/// What a start did: everything, or the intent of a run still to happen.
+pub enum Started {
+    Done(Vec<Entry>),
+    Running(Vec<Entry>, Box<Job>),
+}
+
+/// What a lever run pulls.
+#[derive(Clone, Debug)]
+enum Pull {
+    Run(String),
+    Adapter {
+        lever: adapter::Lever,
+        secret: Option<String>,
+        adapters: config::Adapters,
+    },
+    Nothing(String),
+}
+
+/// A lever run whose intent is written and which has not run yet: all
+/// it needs, owned, so it can run on a thread of its own.
+#[derive(Clone, Debug)]
+pub struct Job {
+    pub venture: String,
+    pub action: String,
+    /// The intent this run's outcome answers.
+    pub intent: Seq,
+    dir: PathBuf,
+    pull: Pull,
+    payload: Option<Payload>,
+    key: String,
+    proof: String,
+    timeout: Duration,
+}
+
+impl Job {
+    /// Pull the lever. `stop` says to stop it now: avsmd is stopping, or
+    /// the venture was paused. Returns whether it went well and one line
+    /// of what happened.
+    pub fn run(&self, stop: &dyn Fn() -> bool) -> (bool, String) {
+        match (&self.pull, &self.payload) {
+            (
+                Pull::Adapter {
+                    lever,
+                    secret,
+                    adapters,
+                },
+                Some(p),
+            ) => lever.run(
+                &self.dir,
+                secret.as_deref(),
+                adapters,
+                p,
+                &Occasion {
+                    venture: &self.venture,
+                    action: &self.action,
+                    proof: &self.proof,
+                },
+            ),
+            (Pull::Adapter { lever, .. }, None) => {
+                (false, format!("{} needs a payload", lever.name()))
+            }
+            (Pull::Run(run), p) => run_lever_until(
+                &self.dir,
+                run,
+                p.as_ref(),
+                Some(&self.key),
+                self.timeout,
+                stop,
+            ),
+            (Pull::Nothing(why), _) => (false, why.clone()),
+        }
+    }
+
+    /// The outcome of this run.
+    pub fn outcome(&self, ok: bool, detail: String) -> Record {
+        Record::Outcome {
+            claim: Claim::Measured,
+            venture: self.venture.clone(),
+            intent: self.intent,
+            ok,
+            detail,
+        }
+    }
+}
+
+impl LocalWarden {
+    /// Gate the action again and, if it passes, write its intent. With
+    /// `apart`, a lever that runs a command or an adapter comes back
+    /// running, for the caller to run and write the outcome of; else
+    /// everything is done here.
+    pub fn run_or_start(&mut self, candidate: &Candidate, apart: bool) -> Result<Started, Failure> {
         self.index
             .refresh(&self.ledger)
             .map_err(|e| e.to_string())?;
@@ -341,7 +489,7 @@ impl Warden for LocalWarden {
             written.push(started);
             written.push(done);
             if !ok {
-                return Ok(written);
+                return Ok(Started::Done(written));
             }
             written.push(append(Record::Decision {
                 claim: Claim::Declared,
@@ -353,7 +501,7 @@ impl Warden for LocalWarden {
                 },
                 by,
             })?);
-            return Ok(written);
+            return Ok(Started::Done(written));
         }
         if action == STOP && !parent_lever {
             // Stopping runs nothing: the record is the stop.
@@ -366,13 +514,13 @@ impl Warden for LocalWarden {
                 detail: String::new(),
                 payload: None,
             })?);
-            return Ok(written);
+            return Ok(Started::Done(written));
         }
         if action == RESUME && !parent_lever {
             let started = append(intent(proof, None))?;
             written.push(append(outcome(&started, true, String::new()))?);
             written.insert(0, started);
-            return Ok(written);
+            return Ok(Started::Done(written));
         }
         let v = ventures
             .get(&venture)
@@ -407,7 +555,7 @@ impl Warden for LocalWarden {
             let done = append(outcome(&started, true, call.describe()))?;
             written.push(started);
             written.push(done);
-            return Ok(written);
+            return Ok(Started::Done(written));
         }
         if perm.is_forecast() {
             // Recorded, then done, like research: the forecast forks the
@@ -422,7 +570,7 @@ impl Warden for LocalWarden {
                     "a forecast branch does not forecast".to_string(),
                 ))?);
                 written.insert(0, started);
-                return Ok(written);
+                return Ok(Started::Done(written));
             }
             let opts =
                 crate::forecast::Options::for_lever(&venture, self.config.forecast_settings());
@@ -449,7 +597,7 @@ impl Warden for LocalWarden {
                     written.push(append(record)?);
                 }
             }
-            return Ok(written);
+            return Ok(Started::Done(written));
         }
         if perm.is_research() {
             let question = payload.as_ref().map(Payload::text).unwrap_or_default();
@@ -479,7 +627,7 @@ impl Warden for LocalWarden {
             for record in research::records(&venture, &findings, seq) {
                 written.push(append(record)?);
             }
-            return Ok(written);
+            return Ok(Started::Done(written));
         }
         if let Some(lever) = perm.lever_adapter() {
             if let Some(host) = lever.host(&self.config.adapters) {
@@ -503,42 +651,55 @@ impl Warden for LocalWarden {
         if let (Some(check), Some(p), false) = (&perm.check, payload.as_ref(), self.keyless) {
             payload_check(&self.home, &dir, check, p, index, &venture)?;
         }
-        let proof_text = proof.to_string();
-        let sim = self.sim.as_deref();
-        let pull = |payload: Option<&Payload>| -> (bool, String) {
-            if let Some(sim) = sim {
-                return sim.pull(index, &venture, &v.mandate, &dir, &action, &key, payload);
-            }
-            match (perm.lever_adapter(), &perm.run, payload) {
-                (Some(lever), _, Some(p)) => lever.run(
-                    &dir,
-                    lever
-                        .key_name()
-                        .and_then(|k| self.keys.get(k))
-                        .map(String::as_str),
-                    &self.config.adapters,
-                    p,
-                    &Occasion {
-                        venture: &venture,
-                        action: &action,
-                        proof: &proof_text,
-                    },
-                ),
-                (Some(lever), _, None) => (false, format!("{} needs a payload", lever.name())),
-                (None, Some(run), p) => run_lever(&dir, run, p, Some(&key), ACTION_TIMEOUT),
-                (None, None, _) => (false, format!("{action} has no command and no adapter")),
-            }
+        let pull = match (perm.lever_adapter(), &perm.run) {
+            (Some(lever), _) => Pull::Adapter {
+                secret: lever.key_name().and_then(|k| self.keys.get(k)).cloned(),
+                lever,
+                adapters: self.config.adapters.clone(),
+            },
+            (None, Some(run)) => Pull::Run(run.clone()),
+            (None, None) => Pull::Nothing(format!("{action} has no command and no adapter")),
         };
+        let proof_text = proof.to_string();
         // Reversible or not, the intent is stored before the lever runs.
         let started = append(intent(proof, payload.clone()))?;
-        let (ok, detail) = pull(payload.as_ref());
+        let (ok, detail) = if let Some(sim) = self.sim.as_deref() {
+            sim.pull(
+                index,
+                &venture,
+                &v.mandate,
+                &dir,
+                &action,
+                &key,
+                payload.as_ref(),
+            )
+        } else {
+            let job = Job {
+                venture: venture.clone(),
+                action: action.clone(),
+                intent: started.seq,
+                dir,
+                pull,
+                payload,
+                key,
+                proof: proof_text,
+                timeout: perm.timeout.unwrap_or(ACTION_TIMEOUT),
+            };
+            if apart {
+                written.push(started);
+                return Ok(Started::Running(written, Box::new(job)));
+            }
+            job.run(&|| false)
+        };
         let done = append(outcome(&started, ok, detail))?;
         written.push(started);
         written.push(done);
-        Ok(written)
+        Ok(Started::Done(written))
     }
+}
 
-    fn infer(&mut self, request: &InferRequest) -> Result<String, String> {
+impl LocalWarden {
+    fn infer_now(&mut self, request: &InferRequest) -> Result<String, String> {
         if self.keyless {
             return Err("a forecast calls no backend".to_string());
         }
@@ -641,7 +802,7 @@ impl Warden for LocalWarden {
         }
     }
 
-    fn measure(&mut self, venture: &str) -> Result<(Option<f64>, String), String> {
+    fn measure_now(&mut self, venture: &str) -> Result<(Option<f64>, String), String> {
         if self.keyless {
             return Err("a forecast reads no adapter".to_string());
         }
@@ -652,7 +813,7 @@ impl Warden for LocalWarden {
         self.measure_in(&ventures, venture)
     }
 
-    fn read(&mut self, venture: &str, metric: &str) -> Result<(Option<f64>, String), String> {
+    fn read_now(&mut self, venture: &str, metric: &str) -> Result<(Option<f64>, String), String> {
         if self.keyless {
             // A forecast reads a guard from the world model's step, never
             // from the guard's command or adapter.
@@ -671,7 +832,7 @@ impl Warden for LocalWarden {
         self.read_in(&ventures, venture, metric)
     }
 
-    fn confirm(&mut self, intent: Seq) -> Result<Option<(bool, String)>, String> {
+    fn confirm_now(&mut self, intent: Seq) -> Result<Option<(bool, String)>, String> {
         if self.keyless {
             return Ok(None);
         }
@@ -1073,6 +1234,12 @@ pub fn drain_on_signals() {
     }
 }
 
+/// In the warden process: drain now, as a SIGTERM would. For when the
+/// kernel hangs up with runs still going.
+pub fn drain_now() {
+    DRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn draining() -> bool {
     DRAINING.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -1263,6 +1430,50 @@ pub fn run_lever(
     (ran.ok, ran.detail(timeout))
 }
 
+/// `run_lever`, stopped as a drain stops it once `stop` says so: the
+/// venture was paused. The outcome then says it was stopped, not timed
+/// out.
+pub fn run_lever_until(
+    dir: &Path,
+    command: &str,
+    payload: Option<&Payload>,
+    key: Option<&str>,
+    timeout: Duration,
+    stop: &dyn Fn() -> bool,
+) -> (bool, String) {
+    let (mut env, stdin): (Vec<(&str, String)>, String) = match payload {
+        Some(p) => (vec![("AVSM_PAYLOAD", p.takes().to_string())], p.text()),
+        None => (vec![], String::new()),
+    };
+    if let Some(k) = key {
+        env.push(("AVSM_KEY", k.to_string()));
+    }
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let ran = run_draining(
+        dir,
+        "sh",
+        &["-c", command],
+        &env,
+        &stdin,
+        timeout,
+        usize::MAX,
+        &|| draining() || stop(),
+    );
+    if !ran.ok && stop() && !draining() {
+        let detail = Ran {
+            killed: false,
+            code: ran.code.or(Some(-1)),
+            ..ran
+        }
+        .detail(timeout);
+        return (
+            false,
+            tail(&format!("stopped: its venture was paused  {detail}")),
+        );
+    }
+    (ran.ok, ran.detail(timeout))
+}
+
 /// The most an audit's note keeps of the lines above its number.
 pub const AUDIT_NOTE: usize = 2000;
 
@@ -1298,6 +1509,10 @@ pub fn now() -> i64 {
 #[serde(rename_all = "snake_case")]
 pub enum ToWarden {
     Execute(Candidate),
+    /// Execute, but a lever run goes on apart once its intent is written.
+    Start(Candidate),
+    /// Stop a venture's lever runs still going.
+    Cancel(String),
     Infer(InferRequest),
     Measure(String),
     Confirm(Seq),
@@ -1322,6 +1537,8 @@ pub enum FromWarden {
     Confirmed(Option<(bool, String)>),
     /// The check passed, or the lever has none.
     Checked,
+    /// How many runs a cancel stopped.
+    Cancelled(u32),
     Err(String),
 }
 
