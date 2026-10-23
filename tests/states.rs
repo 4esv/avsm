@@ -557,3 +557,34 @@ fn the_caution_line_counts_one_venture_in_the_singular() {
         "{status}"
     );
 }
+
+#[test]
+fn a_paused_venture_is_listed_apart_from_the_ones_that_need_you() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = kernel(tmp.path());
+    k.pause("tomato").unwrap();
+    let status = k.status().unwrap();
+    assert_eq!(status.lines().next(), Some("paused: tomato"), "{status}");
+    ask(&mut k, "trader", saturated());
+    let status = k.status().unwrap();
+    assert_eq!(
+        status.lines().next(),
+        Some("caution: 1 venture needs you: trader saturated; paused: tomato"),
+        "{status}"
+    );
+}
+
+#[test]
+fn while_self_is_paused_every_row_says_so() {
+    // A halted self runs no lever of any venture: a row saying running
+    // would be wrong.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = kernel(tmp.path());
+    k.pause("self").unwrap();
+    let status = k.status().unwrap();
+    for v in ["tomato", "trader"] {
+        let row = status.lines().find(|l| l.starts_with(v)).unwrap();
+        assert!(row.contains("paused (self)"), "{status}");
+    }
+    assert!(!status.contains("running"), "{status}");
+}

@@ -1022,11 +1022,27 @@ impl Kernel {
             .map_err(|e| format!("{alarms}cannot read the ledger: {e}"))?;
         let now = now();
         let adopted = self.adopted();
-        let states: Vec<(&str, gate::State)> = self
-            .ventures
-            .values()
-            .map(|v| (v.name.as_str(), gate::state_in(&index, &adopted, &v.name)))
-            .collect();
+        // A paused self runs no lever of any venture, and the tick treats
+        // every one as paused: so does its row.
+        let halted = gate::state_in(&index, &adopted, SELF) == gate::State::Paused;
+        let held_by = if self.foreign.is_empty() {
+            "self"
+        } else {
+            "alarm"
+        };
+        let held = |name: &str, s: gate::State| halted && name != SELF && s != gate::State::Paused;
+        let mut states: Vec<(&str, gate::State)> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        for v in self.ventures.values() {
+            let s = gate::state_in(&index, &adopted, &v.name);
+            if held(&v.name, s) {
+                states.push((v.name.as_str(), gate::State::Paused));
+                labels.push(format!("paused ({held_by})"));
+            } else {
+                states.push((v.name.as_str(), s));
+                labels.push(s.to_string());
+            }
+        }
         let mut out = alarms;
         let mut master = caution(&states);
         // A venture whose adopted mandate cannot be read runs nothing,
@@ -1056,7 +1072,7 @@ impl Kernel {
         if out.is_empty() || master != "all running\n" {
             out.push_str(&master);
         }
-        for (v, (_, state)) in self.ventures.values().zip(&states) {
+        for ((v, (_, state)), label) in self.ventures.values().zip(&states).zip(&labels) {
             // The metric's own latest reading, not another fact of the
             // venture (a guard's, an expectation's).
             let metric = v.mandate.metric_name();
@@ -1102,7 +1118,7 @@ impl Kernel {
             }
             let state = match &v.problem {
                 Some(_) => "cannot run".to_string(),
-                None => state.to_string(),
+                None => label.clone(),
             };
             out.push_str(&format!("{:<12} {:<11} {detail}\n", v.name, state));
         }
@@ -2449,8 +2465,9 @@ impl Kernel {
         let mut out = String::new();
         if !self.foreign.is_empty() {
             out.push_str(&format!(
-                "caution: records {} were not written by this avsmd while it ran; nothing runs \
-                 and every venture is paused. read them (avsm why {}), then: avsm resume self\n",
+                "caution: records {} were not written by this avsmd while it ran; no lever runs \
+                 and every venture is paused (reports go on: they are measurements, and nothing \
+                 acts on them). read them (avsm why {}), then: avsm resume self\n",
                 seqs(&self.foreign),
                 self.foreign[0]
             ));
@@ -4189,10 +4206,10 @@ fn why_in(
     // Its claim is what another writer put there: say who did not write it.
     if let Some(alarm) = index.alarm_naming(seq) {
         return Ok(format!(
-            "{}\n  not written by avsmd: the foreign-record alarm #{alarm} named it. \
-             another process wrote it into the ledger while avsmd ran; its claim ({}) is that \
-             process's word, not a human's or avsmd's, and nothing acts on it\n  \
-             read the alarm: avsm why {alarm}\n",
+            "{}
+  not written by avsmd: the foreign-record alarm #{alarm} named it.              another process wrote it into the ledger while avsmd ran; its claim ({}) is that              process's word, not a human's or avsmd's, and nothing acts on it
+               read the alarm: avsm why {alarm}
+",
             entry.line(),
             entry.record.claim()
         ));
@@ -5561,14 +5578,26 @@ fn clears_when(metric: &str, why: &str) -> String {
 }
 
 /// The master caution line: which ventures need a human, or that none do.
+/// A paused venture is listed apart: a human paused it, or self's pause
+/// holds it and the alarm line says so; it waits for a resume, not an
+/// answer.
 fn caution(states: &[(&str, gate::State)]) -> String {
     let need: Vec<String> = states
         .iter()
-        .filter(|(_, s)| *s != gate::State::Running)
+        .filter(|(_, s)| !matches!(s, gate::State::Running | gate::State::Paused))
         .map(|(v, s)| format!("{v} {s}"))
         .collect();
+    let paused: Vec<&str> = states
+        .iter()
+        .filter(|(_, s)| *s == gate::State::Paused)
+        .map(|(v, _)| *v)
+        .collect();
+    let paused = (!paused.is_empty()).then(|| format!("paused: {}", paused.join(", ")));
     if need.is_empty() {
-        return "all running\n".to_string();
+        return match paused {
+            Some(p) => format!("{p}\n"),
+            None => "all running\n".to_string(),
+        };
     }
     let n = need.len();
     let (noun, verb) = if n == 1 {
@@ -5576,7 +5605,11 @@ fn caution(states: &[(&str, gate::State)]) -> String {
     } else {
         ("ventures", "need")
     };
-    format!("caution: {n} {noun} {verb} you: {}\n", need.join(", "))
+    let paused = paused.map(|p| format!("; {p}")).unwrap_or_default();
+    format!(
+        "caution: {n} {noun} {verb} you: {}{paused}\n",
+        need.join(", ")
+    )
 }
 
 #[cfg(test)]

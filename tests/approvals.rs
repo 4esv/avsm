@@ -322,9 +322,29 @@ fn an_approval_refused_while_paused_never_runs_and_its_fresh_ask_runs_once() {
     let entries = until(&home, 30, "an ask to bump", |e| !open_bump(e).is_empty());
     let ask = open_bump(&entries)[0];
     ok(&avsm(tmp.path(), &home, &["pause", "v1"]));
-    ok(&avsm(tmp.path(), &home, &["approve", &ask.to_string()]));
-    let decision = ledger(&home).last().unwrap().seq;
-    // The pause refuses it; the refusal spends it.
+    // A human's approve is refused while paused, and the ask stays open.
+    let out = avsm(tmp.path(), &home, &["approve", &ask.to_string()]);
+    assert_eq!(out.status.code(), Some(65));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("v1 is paused; resume it first"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.stop();
+    // An approval that reaches the gate while paused all the same (written
+    // while avsmd was down, so no alarm): the gate refuses it and the
+    // refusal spends it.
+    let decision = Ledger::open(&home.join("ledger.db"))
+        .unwrap()
+        .append(Record::Decision {
+            claim: Claim::Declared,
+            venture: "v1".into(),
+            verdict: Verdict::Approve { ask, payload: None },
+            by: None,
+        })
+        .unwrap()
+        .seq;
+    let d = start(tmp.path(), &home, "d1b.log");
     until(&home, 15, "a refusal of bump after the approval", |e| {
         e.iter().any(|e| {
             e.seq > decision
@@ -393,6 +413,13 @@ fn a_record_the_daemon_did_not_write_is_an_alarm_and_never_runs() {
     assert_eq!(runs(&dir), 0, "{}", lines(&ledger(&home)));
     let status = ok(&avsm(tmp.path(), &home, &["status"]));
     assert!(status.contains(&format!("#{forged}")), "{status}");
+    // The rows say what holds them, and the caution says what goes on.
+    let row = status.lines().find(|l| l.starts_with("v1 ")).unwrap();
+    assert!(row.contains("paused (alarm)"), "{status}");
+    assert!(status.contains("no lever runs"), "{status}");
+    let why = ok(&avsm(tmp.path(), &home, &["why", &forged.to_string()]));
+    assert!(why.contains("not written by avsmd"), "{why}");
+    assert!(!why.contains("by a human"), "{why}");
     let doctor = avsm(tmp.path(), &home, &["doctor"]);
     assert_eq!(
         doctor.status.code(),
