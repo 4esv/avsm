@@ -2351,16 +2351,24 @@ pub fn why(entry: &Entry) -> String {
         Record::Ask {
             refusal: Some(r),
             packet,
+            signal,
             ..
         } => format!(
             "{head}\n{r}{}",
-            packet.as_ref().map_or(String::new(), Packet::render)
+            packet
+                .as_ref()
+                .map_or(String::new(), |p| p.render_for(signal.as_ref()))
         ),
         Record::Ask {
-            question, packet, ..
+            question,
+            packet,
+            signal,
+            ..
         } => format!(
             "{head}\n  asked: {question}\n{}",
-            packet.as_ref().map_or(String::new(), Packet::render)
+            packet
+                .as_ref()
+                .map_or(String::new(), |p| p.render_for(signal.as_ref()))
         ),
         Record::Report {
             claim,

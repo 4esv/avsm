@@ -590,6 +590,30 @@ fn while_self_is_paused_every_row_says_so() {
 }
 
 #[test]
+fn an_ineffective_venture_with_nothing_to_answer_says_what_restores_it() {
+    // Monkey round 3: a suspended lever with no open ask showed "needs
+    // you" and nothing to do about it.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = kernel(tmp.path());
+    ask(&mut k, "tomato", ineffective());
+    for q in gate::open_asks(&k.entries().unwrap()) {
+        k.deny(q, "keep it off").unwrap();
+    }
+    let status = k.status().unwrap();
+    let row = status.lines().find(|l| l.starts_with("tomato")).unwrap();
+    assert!(row.contains("ineffective"), "{status}");
+    let dir = tmp.path().join("tomato");
+    let dir = dir.canonicalize().unwrap_or(dir);
+    assert!(
+        row.contains(&format!(
+            "water is suspended and no ask is open; re-adopt to restore it: avsm add {}",
+            dir.display()
+        )),
+        "{status}"
+    );
+}
+
+#[test]
 fn a_cap_that_still_binds_shows_in_the_row_whatever_the_state() {
     // Monkey round 3: approving the saturation ask turned the row to
     // asking and hid the cap, which still bound.

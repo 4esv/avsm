@@ -495,6 +495,13 @@ impl Packet {
     /// The packet as a human reads it: premises, then options, then the
     /// reason labeled inferred, then the last line.
     pub fn render(&self) -> String {
+        self.render_for(None)
+    }
+
+    /// `render`, for the ask that carries `signal`: an ineffective
+    /// lever's ask runs no lever to be forecast, but approving it restores
+    /// the lever, which may then run at once.
+    pub fn render_for(&self, signal: Option<&Signal>) -> String {
         let mut out = String::from("  premises:\n");
         if self.premises.is_empty() {
             out.push_str("    none\n");
@@ -536,8 +543,16 @@ impl Packet {
                     "no forecast: forecasts are off or this one failed (the daemon's log says which)"
                         .to_string()
                 }
-                None => "no forecast: answering runs no lever, so there is nothing to forecast"
-                    .to_string(),
+                None => match signal {
+                    Some(Signal::Ineffective { action, .. }) if o.name == "approve" => format!(
+                        "approving restores {action}, and it may run at once; no forecast"
+                    ),
+                    Some(Signal::Ineffective { action, .. }) => {
+                        format!("{action} stays suspended, and nothing runs")
+                    }
+                    _ => "no forecast: answering runs no lever, so there is nothing to forecast"
+                        .to_string(),
+                },
             };
             out.push_str(&format!("    {}: {forecast}", o.name));
             if let Some(c) = &o.cost {
@@ -1485,6 +1500,39 @@ mod finite_opt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ineffective_asks_packet_says_approving_restores_the_lever() {
+        // Monkey round 3: it said "answering runs no lever", and approving
+        // ran the lever at once.
+        let option = |name: &str| PacketOption {
+            name: name.to_string(),
+            forecast: None,
+            cost: None,
+        };
+        let packet = Packet {
+            premises: vec![],
+            options: vec![option("approve"), option("deny")],
+            reason: None,
+            policies: vec![],
+        };
+        let signal = Signal::Ineffective {
+            action: "water".to_string(),
+            why: "no effect".to_string(),
+        };
+        let text = packet.render_for(Some(&signal));
+        assert!(!text.contains("runs no lever"), "{text}");
+        assert!(
+            text.contains("approve: approving restores water, and it may run at once"),
+            "{text}"
+        );
+        assert!(text.contains("deny: water stays suspended"), "{text}");
+        let other = Signal::Implausible {
+            metric: "count".to_string(),
+            why: "missing".to_string(),
+        };
+        assert!(packet.render_for(Some(&other)).contains("runs no lever"));
+    }
 
     fn report(v: f64) -> Record {
         Record::report(Claim::Measured, "counter", "count", Some(v), "")

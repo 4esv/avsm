@@ -1090,6 +1090,26 @@ impl Kernel {
             if *state == gate::State::Implausible {
                 detail.push_str(&held_implausible(&index, &adopted, &v.name));
             }
+            // Suspended with nothing to answer (denied, or suspended again
+            // with nothing new measured to ask on): a re-adoption restores
+            // it.
+            if *state == gate::State::Ineffective && index.open_of(&v.name).next().is_none() {
+                let levers: Vec<&str> = v
+                    .mandate
+                    .permitted
+                    .iter()
+                    .filter(|p| index.suspended(&v.name, &p.name))
+                    .map(|p| p.name.as_str())
+                    .collect();
+                if let Some(dir) = &v.path {
+                    detail.push_str(&format!(
+                        "  ({} {} suspended and no ask is open; re-adopt to restore it: avsm add {})",
+                        levers.join(", "),
+                        if levers.len() == 1 { "is" } else { "are" },
+                        crate::doctor::sh(dir)
+                    ));
+                }
+            }
             // A cap that binds now, whatever the state says: approving the
             // saturation ask answers it and leaves the cap as it is.
             for p in v.mandate.permitted.iter().filter(|p| p.cap.count > 0) {
@@ -1178,10 +1198,11 @@ impl Kernel {
             }
             if let Record::Ask {
                 packet: Some(packet),
+                signal,
                 ..
             } = &e.record
             {
-                out.push_str(&packet.render());
+                out.push_str(&packet.render_for(signal.as_ref()));
             }
         }
         Ok(out)
