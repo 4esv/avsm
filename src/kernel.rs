@@ -4384,7 +4384,7 @@ fn why_in(
     if let Some(alarm) = index.alarm_naming(seq) {
         return Ok(format!(
             "{}
-  not written by avsmd: the foreign-record alarm #{alarm} named it.              another process wrote it into the ledger while avsmd ran; its claim ({}) is that              process's word, not a human's or avsmd's, and nothing acts on it
+  not written by avsmd: the foreign-record alarm #{alarm} named it. another process wrote it into the ledger while avsmd ran; its claim ({}) is that process's word, not a human's or avsmd's, and nothing acts on it
                read the alarm: avsm why {alarm}
 ",
             entry.line(),

@@ -428,6 +428,14 @@ fn why_on_a_record_the_alarm_named_says_avsmd_did_not_write_it() {
     );
     assert!(!text.contains("by a human"), "{text}");
     assert!(text.contains(&format!("avsm why {alarm}")), "{text}");
+    // The sentence runs on, not a run of spaces where a continuation was
+    // dropped.
+    assert!(
+        text.contains("named it. another process wrote it"),
+        "{text}"
+    );
+    assert!(!text.contains("named it.  "), "{text}");
+    assert!(!text.contains("is that  "), "{text}");
 }
 
 /// Monkey round 3: the digest of a venture whose mandate cannot be read
