@@ -686,3 +686,36 @@ fn a_cap_that_still_binds_shows_in_the_row_whatever_the_state() {
     let row = status.lines().find(|l| l.starts_with("trader")).unwrap();
     assert!(!row.contains("cap"), "{status}");
 }
+
+#[test]
+fn a_spent_cap_with_nothing_waiting_says_running_cap_spent_not_saturated() {
+    use avsmd::gate::Proof;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = kernel(tmp.path());
+    for _ in 0..3 {
+        k.append(Record::Action {
+            claim: Claim::Measured,
+            venture: "tomato".into(),
+            action: "water".into(),
+            proof: Proof {
+                venture: "tomato".into(),
+                action: "water".into(),
+                steps: vec![],
+            },
+            ok: true,
+            detail: String::new(),
+            payload: None,
+        })
+        .unwrap();
+    }
+    // No ask is open, so nothing waits and the controller wants nothing:
+    // the venture is running, not saturated, and the row says the cap is
+    // spent.
+    let status = k.status().unwrap();
+    let row = status.lines().find(|l| l.starts_with("tomato")).unwrap();
+    assert!(
+        row.contains("running (cap spent; nothing waiting)"),
+        "{status}"
+    );
+    assert!(row.contains("(water cap 3/day spent"), "{status}");
+}

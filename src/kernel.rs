@@ -1116,9 +1116,11 @@ impl Kernel {
             }
             // A cap that binds now, whatever the state says: approving the
             // saturation ask answers it and leaves the cap as it is.
+            let mut cap_spent = false;
             for p in v.mandate.permitted.iter().filter(|p| p.cap.count > 0) {
                 let per = p.cap.per.as_secs() as i64;
                 if index.used(&v.name, &p.name, now - per, now) >= p.cap.count {
+                    cap_spent = true;
                     let first = index
                         .runs_of_after(&v.name, now - per, now)
                         .iter()
@@ -1158,8 +1160,14 @@ impl Kernel {
                     ));
                 }
             }
+            // Saturated is a state only while the controller wants to act
+            // and its lever is refused: a spent cap with nothing waiting is
+            // still running, and the row says so.
             let state = match &v.problem {
                 Some(_) => "cannot run".to_string(),
+                None if *state == gate::State::Running && cap_spent => {
+                    "running (cap spent; nothing waiting)".to_string()
+                }
                 None => label.clone(),
             };
             out.push_str(&format!("{:<12} {:<11} {detail}\n", v.name, state));
