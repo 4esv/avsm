@@ -1698,6 +1698,14 @@ pub fn stretch(stretches: &mut Vec<(f64, usize)>, x: f64) {
     }
 }
 
+/// The venture of an entry the index holds, empty when it holds none.
+fn venture_of(index: &Index, seq: Seq) -> String {
+    index
+        .get(seq)
+        .map(|e| e.record.venture().to_string())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1741,12 +1749,4 @@ mod tests {
             "nor one past its head"
         );
     }
-}
-
-/// The venture of an entry the index holds, empty when it holds none.
-fn venture_of(index: &Index, seq: Seq) -> String {
-    index
-        .get(seq)
-        .map(|e| e.record.venture().to_string())
-        .unwrap_or_default()
 }
