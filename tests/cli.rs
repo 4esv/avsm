@@ -475,6 +475,43 @@ fn the_digest_of_a_venture_whose_mandate_cannot_be_read_names_its_last_adopted_m
     assert!(!line.contains("no report"), "{digest}");
 }
 
+/// The digest of a venture whose adopted mandate cannot be read, and
+/// whose ledger names no later mandate with a metric, says it cannot run
+/// rather than a stray "name : no report".
+#[test]
+fn the_digest_of_a_venture_whose_mandate_cannot_be_read_says_so() {
+    use avsmd::record::Verdict;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    {
+        let mut kernel = Kernel::open(&home).unwrap();
+        // No adopted text and no file on disk: the venture cannot run,
+        // and nothing names a metric to show in its place.
+        kernel
+            .append(Record::Decision {
+                claim: Claim::Declared,
+                venture: "broken".to_string(),
+                verdict: Verdict::Adopt {
+                    mandate: "0000".to_string(),
+                    path: tmp.path().join("gone").to_string_lossy().into_owned(),
+                    text: None,
+                },
+                by: None,
+            })
+            .unwrap();
+    }
+    let kernel = Kernel::open(&home).unwrap();
+    let digest = kernel.digest().unwrap();
+    let line = digest
+        .lines()
+        .find(|l| l.starts_with("broken"))
+        .unwrap_or_else(|| panic!("{digest}"));
+    assert_eq!(
+        line, "broken: cannot run (its mandate cannot be read)",
+        "{digest}"
+    );
+}
+
 /// The README walkthrough: add examples/counter, watch the count cross the
 /// threshold, read the proof. The count is seeded at 10 so it crosses on
 /// the first report.

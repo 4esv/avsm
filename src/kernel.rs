@@ -4276,6 +4276,13 @@ fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) ->
         let metric = last_adopted
             .as_deref()
             .unwrap_or_else(|| v.mandate.metric_name());
+        // A venture whose adopted mandate cannot be read, with no later
+        // mandate that names a metric: it cannot run, and there is no
+        // reading to show.
+        if v.problem.is_some() && last_adopted.is_none() {
+            out.push_str(&format!("{name}: cannot run (its mandate cannot be read)\n"));
+            continue;
+        }
         let reading = |e: &&Entry| -> Option<f64> {
             match &e.record {
                 Record::Report {
