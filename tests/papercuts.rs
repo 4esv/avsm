@@ -427,6 +427,26 @@ fn remove_rm_and_delete_say_there_is_no_remove_and_how_to_stop_one() {
 }
 
 #[test]
+fn list_stop_and_logs_name_the_command_that_does_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (word, tip) in [
+        ("list", "see every venture with avsm status"),
+        (
+            "stop",
+            "stop a venture with avsm pause <venture> (avsmd itself stops on SIGTERM)",
+        ),
+        ("logs", "read the ledger with avsm tail"),
+    ] {
+        let (code, _, err) = avsm_out(tmp.path(), &[word]);
+        assert_eq!(code, Some(64), "{word}: {err}");
+        assert!(
+            err.contains(&format!("there is no {word}: {tip}")),
+            "{word}: {err}"
+        );
+    }
+}
+
+#[test]
 fn add_help_says_what_a_venture_is_and_names_report_and_cadence() {
     let out = Command::new(env!("CARGO_BIN_EXE_avsm"))
         .arg("add")

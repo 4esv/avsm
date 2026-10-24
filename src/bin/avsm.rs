@@ -323,13 +323,23 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
-            // There is no remove, and clap's nearest guess is resume.
-            if let Some(word) =
-                subcommand().filter(|w| matches!(w.as_str(), "remove" | "rm" | "delete"))
-            {
-                avsmd::protocol::elog(&format!(
-                    "avsm: there is no {word}: a venture stays in the ledger; stop it with avsm pause <venture>"
-                ));
+            // There is no remove, list, stop or logs, and clap's nearest
+            // guess would mislead.
+            if let Some(word) = subcommand().filter(|w| {
+                matches!(
+                    w.as_str(),
+                    "remove" | "rm" | "delete" | "list" | "stop" | "logs"
+                )
+            }) {
+                let tip = match word.as_str() {
+                    "list" => "see every venture with avsm status",
+                    "stop" => {
+                        "stop a venture with avsm pause <venture> (avsmd itself stops on SIGTERM)"
+                    }
+                    "logs" => "read the ledger with avsm tail",
+                    _ => "a venture stays in the ledger; stop it with avsm pause <venture>",
+                };
+                avsmd::protocol::elog(&format!("avsm: there is no {word}: {tip}"));
                 return ExitCode::from(exit::USAGE);
             }
             let _ = e.print();
