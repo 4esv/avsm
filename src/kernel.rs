@@ -4280,7 +4280,9 @@ fn digest_text(index: &Index, ventures: &BTreeMap<String, Venture>, now: i64) ->
         // mandate that names a metric: it cannot run, and there is no
         // reading to show.
         if v.problem.is_some() && last_adopted.is_none() {
-            out.push_str(&format!("{name}: cannot run (its mandate cannot be read)\n"));
+            out.push_str(&format!(
+                "{name}: cannot run (its mandate cannot be read)\n"
+            ));
             continue;
         }
         let reading = |e: &&Entry| -> Option<f64> {
