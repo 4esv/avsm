@@ -586,11 +586,16 @@ pub fn doctor(
 
     // The home.
     match std::fs::metadata(home) {
-        Ok(m) if !m.is_dir() => found.fail(
-            exit::CANTCREAT,
-            format!("{} is not a directory", home.display()),
-            format!("mv {h} {h}.moved && avsmd --home {h}"),
-        ),
+        Ok(m) if !m.is_dir() => {
+            // A home that is not a directory ends the check: 73, and only
+            // the home message, not a bogus config read that follows it.
+            found.fail(
+                exit::CANTCREAT,
+                format!("{} is not a directory", home.display()),
+                format!("mv {h} {h}.moved && avsmd --home {h}"),
+            );
+            return found;
+        }
         Ok(m) => {
             // SAFETY: geteuid has no preconditions.
             let me = unsafe { libc::geteuid() };

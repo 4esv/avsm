@@ -690,3 +690,14 @@ fn a_mandate_yaml_left_in_the_home_is_named_not_read() {
     let (_, out, _) = avsm_out(&home, &["doctor"]);
     assert!(out.contains(note), "{out}");
 }
+
+#[test]
+fn doctor_on_a_home_that_is_a_file_exits_73_with_only_the_home_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::write(&home, "not a directory\n").unwrap();
+    let (code, out, _) = avsm_out(&home, &["doctor"]);
+    assert_eq!(code, Some(73), "{out}");
+    assert!(out.contains("is not a directory"), "{out}");
+    assert!(!out.contains("config.yaml"), "{out}");
+}
