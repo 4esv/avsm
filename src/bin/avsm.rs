@@ -28,6 +28,28 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Take on a venture: a directory with a mandate.yaml in it
+    ///
+    /// A venture is a directory holding a mandate.yaml and, unless the
+    /// metric is a built-in adapter, an executable program named 'report'
+    /// that prints the metric's number.
+    ///
+    /// The mandate's required fields:
+    ///
+    ///   purpose     why the venture runs
+    ///   metric      the number its report prints, or a built-in adapter
+    ///   controller  how it acts on the metric: a threshold, or a model
+    ///   permitted   the levers it may run, each with a cap and whether it is reversible
+    ///   cadence     how often it reads the metric
+    ///
+    /// A minimal mandate:
+    ///
+    /// purpose: Keep the counter below ten.
+    /// metric: count
+    /// controller: {kind: threshold, above: 10, action: reset}
+    /// cadence: 10s
+    /// permitted:
+    ///   - {name: reset, run: ./reset, cap: 60/hour, reversible: true}
+    #[command(verbatim_doc_comment)]
     Add {
         /// The venture directory
         dir: PathBuf,

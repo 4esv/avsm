@@ -427,6 +427,20 @@ fn remove_rm_and_delete_say_there_is_no_remove_and_how_to_stop_one() {
 }
 
 #[test]
+fn add_help_says_what_a_venture_is_and_names_report_and_cadence() {
+    let out = Command::new(env!("CARGO_BIN_EXE_avsm"))
+        .arg("add")
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout).into_owned();
+    for word in ["report", "cadence", "mandate.yaml", "purpose", "permitted"] {
+        assert!(help.contains(word), "{word}: {help}");
+    }
+}
+
+#[test]
 fn add_says_what_is_wrong_with_the_path_without_os_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
