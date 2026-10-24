@@ -214,8 +214,10 @@ impl Kernel {
                                         metric: EXPECTATION.to_string(),
                                         value: Some(observed),
                                         note: format!(
-                                            "{} expects {expects}; {metric} moved {observed:+} (noise {noise})",
-                                            perm.name
+                                            "{} expects {expects}; {metric} moved {:+} (noise {})",
+                                            perm.name,
+                                            crate::forecast::round(observed),
+                                            crate::forecast::round(noise)
                                         ),
                                         source: None,
                                         confidence: None,
@@ -231,16 +233,22 @@ impl Kernel {
                                 effect,
                                 noise,
                             } => Run::Ineffective(format!(
-                                "no effect: {} expects {expects}; {metric} moved {observed:+}, {effect:+} net of drift, against noise {noise}",
-                                perm.name
+                                "no effect: {} expects {expects}; {metric} moved {:+}, {:+} net of drift, against noise {}",
+                                perm.name,
+                                crate::forecast::round(observed),
+                                crate::forecast::round(effect),
+                                crate::forecast::round(noise)
                             )),
                             Judgement::WrongDirection {
                                 observed,
                                 effect,
                                 noise,
                             } => Run::Ineffective(format!(
-                                "wrong direction: {} expects {expects}; {metric} moved {observed:+}, {effect:+} net of drift, against noise {noise}",
-                                perm.name
+                                "wrong direction: {} expects {expects}; {metric} moved {:+}, {:+} net of drift, against noise {}",
+                                perm.name,
+                                crate::forecast::round(observed),
+                                crate::forecast::round(effect),
+                                crate::forecast::round(noise)
                             )),
                         }
                     } else {
@@ -278,7 +286,11 @@ impl Kernel {
                             let expects = perm.expects.as_ref().expect("pooled");
                             format!(
                                 "no effect across {} runs: {} expects {expects}; {metric} moved {:+} a run the right way on average, net of drift, and at most {:+} by chance against noise {}",
-                                p.runs, perm.name, p.mean, p.bound, p.noise
+                                p.runs,
+                                perm.name,
+                                crate::forecast::round(p.mean),
+                                crate::forecast::round(p.bound),
+                                crate::forecast::round(p.noise)
                             )
                         }
                         Some(Run::Ineffective(why) | Run::Frozen(why, _)) if misses.len() == 1 => {

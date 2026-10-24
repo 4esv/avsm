@@ -1173,13 +1173,20 @@ impl Fit {
 }
 
 /// How many decimal places a reading has, at most `MAX_PLACES`.
-fn places(x: f64) -> u32 {
+pub(crate) fn places(x: f64) -> u32 {
     (0..MAX_PLACES)
         .find(|p| {
             let scale = 10f64.powi(*p as i32);
             ((x * scale).round() / scale - x).abs() <= 1e-9 * x.abs().max(1.0)
         })
         .unwrap_or(MAX_PLACES)
+}
+
+/// A number rounded to the precision its readings show, at most
+/// `MAX_PLACES` decimal places.
+pub(crate) fn round(x: f64) -> f64 {
+    let scale = 10f64.powi(places(x) as i32);
+    (x * scale).round() / scale
 }
 
 /// The fit of each metric of a venture a forecast shows: the target,
@@ -2218,6 +2225,16 @@ mod tests {
         assert!(!target.thin(&mid, 1));
         target.steps = MIN_SAMPLES - 1;
         assert!(target.thin(&mid, 1));
+    }
+
+    #[test]
+    fn a_number_rounds_to_the_precision_its_readings_show_at_most_two_places() {
+        assert_eq!(round(3.0), 3.0);
+        assert_eq!(round(20.5), 20.5);
+        assert_eq!(round(7.137), 7.14);
+        assert_eq!(round(-0.25), -0.25);
+        // A computed noise, not a reading: two places, not the full float.
+        assert_eq!(round(0.816_496_580_927_726_1), 0.82);
     }
 
     #[test]
