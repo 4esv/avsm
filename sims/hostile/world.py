@@ -302,3 +302,16 @@ if first_of_day:
         f" | equity={equity:.0f} price={mk['price']:.2f} shares={book['shares']} | inbox={inbox} breaches={len(s['breaches'])}")
 s["day"] = DAY
 save(s)
+
+# --- what the sensors say, as the readings avsm takes ---------------------
+# A simulation never runs a venture's report: it takes these lines, as
+# `venture/metric=number`, for the step's readings. A sensor that is
+# missing, or says something that is not a number, gives none.
+inbox_n = len(os.listdir(p("inbox"))) if os.path.isdir(p("inbox")) else 0
+for name, path in (("tomato/moisture", "moisture"), ("trader/equity", "equity"), ("garden/temperature", "temp")):
+    try:
+        with open(p("sensors", path)) as f: v = float(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        continue
+    if math.isfinite(v): print(f"{name}={v}")
+print(f"inbox/unread={inbox_n}")

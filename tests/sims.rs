@@ -144,11 +144,14 @@ fn three_scripted_days_of_the_hostile_kit_analyze_to_json() {
     assert_eq!(out["days"], 3, "{out:#}");
     assert_eq!(out["chain"]["ok"], true, "{out:#}");
     assert!(out["records"].as_u64().unwrap() > 100, "{out:#}");
-    // The sender audit names customers, so their replies pass the check.
+    // The levers go to the world, and the readings come from it.
     assert!(
-        out["actions_done"]["inbox/reply"].as_u64().unwrap_or(0) >= 1,
+        out["actions_done"]["tomato/water"].as_u64().unwrap_or(0) >= 1,
         "{out:#}"
     );
+    // NOTE: the sender audit (./customers) no longer runs in a simulation,
+    // so no reply passes its check here: an audit's addresses are lines of
+    // its program, and the world prints numbers only.
 }
 
 /// A world with mail in its inbox: world.py has taken one step.

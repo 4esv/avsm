@@ -915,10 +915,10 @@ impl LocalWarden {
             };
             return Ok(Box::new(move || read));
         }
-        // A simulation with no `--world` to move the real files reads
-        // every guard, audit and reading from the world model's step too:
-        // their programs are the venture's, and may change what they read.
-        if let Some(sim) = self.sim.as_ref().filter(|s| !s.has_world()) {
+        // A simulation reads every guard, audit and reading from the
+        // `--world`'s output or the world model's step: their programs are
+        // the venture's, and may change what they read.
+        if let Some(sim) = self.sim.as_ref() {
             let name = metric.strip_prefix("guard.").unwrap_or(metric);
             let read = match sim.guard(venture, name) {
                 Some(x) => (Some(x), "simulated: world".to_string()),

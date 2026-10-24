@@ -8,9 +8,24 @@ use avsmd::record::Record;
 use avsmd::simulate::{run, Human, Plan};
 
 /// The world the simulation runs the vent in: it opens the vent as the
-/// real lever would, writing the time it opened for the report to read.
-const WORLD: &str = "[ \"$AVSM_LEVER\" = greenhouse/vent ] || exit 0; \
-     echo \"$AVSM_NOW\" > vented; echo \"vent opened at $AVSM_NOW\"";
+/// real lever would, writing the time it opened, and says the temperature
+/// the way examples/greenhouse/report works it out (a daily curve, less
+/// what the vent did), for avsm takes its readings from the world.
+fn world(dir: &Path) -> String {
+    format!(
+        "cd {}; \
+         if [ \"$AVSM_LEVER\" = greenhouse/vent ]; then \
+           echo \"$AVSM_NOW\" > vented; echo \"vent opened at $AVSM_NOW\"; exit 0; fi; \
+         [ -z \"$AVSM_LEVER\" ] || exit 0; \
+         vented=$(cat vented 2>/dev/null || echo 0); \
+         awk -v now=\"$AVSM_NOW\" -v vented=\"$vented\" 'BEGIN {{ \
+           m = int((now % 86400) / 60); d = m - 840; if (d < 0) d = -d; \
+           if (d > 720) d = 1440 - d; t = 18 + 16 * (720 - d) / 720; age = now - vented; \
+           if (age >= 0 && age < 7200) t -= 8 * (1 - age / 7200); \
+           printf \"temperature=%.1f\\n\", t }}'",
+        dir.display()
+    )
+}
 
 fn copy_example(to: &Path) {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/greenhouse");
@@ -36,7 +51,7 @@ fn the_temperature_follows_the_clock_and_the_vent_lowers_it() {
         human: Human::ApproveAll,
         start: Some(start),
         add: vec![dir.clone()],
-        world: Some(WORLD.to_string()),
+        world: Some(world(&dir)),
     };
     let mut out = Vec::new();
     run(&home, &plan, &mut out).unwrap();

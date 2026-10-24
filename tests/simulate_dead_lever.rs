@@ -27,6 +27,7 @@ case "$AVSM_DAY" in
   8) if [ $(( (AVSM_NOW / 7200) % 2 )) -eq 1 ]; then s=5; else s=95; fi ;;
 esac
 echo $s > sensor
+echo "moisture=$s"
 "#;
 
 #[test]

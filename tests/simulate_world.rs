@@ -66,7 +66,7 @@ fn a_script_lever_goes_to_the_world_and_never_runs() {
     let _c = clock();
     let (_tmp, home, dir) = setup("");
     let world =
-        "[ -n \"$AVSM_LEVER\" ] || exit 0; echo \"$AVSM_LEVER $AVSM_KEY\" >> world.log; echo moved";
+        "[ -n \"$AVSM_LEVER\" ] || { echo count=3; exit 0; }; echo \"$AVSM_LEVER $AVSM_KEY\" >> world.log; echo moved";
     let mut out = Vec::new();
     run(&home, &plan(&dir, Some(world)), &mut out).unwrap();
     let text = String::from_utf8(out).unwrap();

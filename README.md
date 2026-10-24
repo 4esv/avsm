@@ -495,14 +495,17 @@ No lever runs for real.
 with the simulated time in `AVSM_NOW` and the day in `AVSM_DAY`, and what it
 prints is shown. Every lever run goes to it instead of the lever, with
 `AVSM_LEVER` set to `venture/lever` (for example `blog/post`), `AVSM_KEY`, and
-the payload on standard input; a world that fails stops the simulation. Without
-`--world`, a lever steps the venture's world model and the reports come from its
-state; unless the mandate names a `world:`, that is a baseline learned from the
+the payload on standard input; a world that fails stops the simulation. Readings
+come from the world too: any line it prints as `name=number` or
+`venture/name=number` is the reading of that metric, guard, audit or reading for
+that step, and where it prints none the reading comes from the same baseline as
+without `--world`. Without `--world`, a lever steps the venture's world model and
+the reports come from its state; unless the mandate names a `world:`, that is a baseline learned from the
 ledger, which replays the steps the venture's own readings have shown, so a
 venture with little history gives a flat one. It starts from the ledger's last
 reading, and a venture with none in the simulation's home reads nothing and
-says so: without `--world`, no `report`, guard, audit or reading program of a
-venture runs, since a program may change what it reads. A simulation exits 70 when it
+says so: with or without `--world`, no `report`, guard, audit or reading program
+of a venture runs, since a program may change what it reads. A simulation exits 70 when it
 cannot run or its world fails. The world is not avsm's and leaves no record; the
 text it prints is escaped before it reaches your terminal.
 

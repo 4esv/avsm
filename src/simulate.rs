@@ -81,6 +81,9 @@ pub(crate) struct Simulation {
     states: Mutex<BTreeMap<String, (Value, i64)>>,
     /// Each venture's guard readings from its world model's last step.
     guards: Mutex<BTreeMap<String, BTreeMap<String, f64>>>,
+    /// What the `--world` command printed as readings at its last run:
+    /// `name=number` or `venture/name=number`, one a line.
+    told: Mutex<BTreeMap<String, f64>>,
     /// A forecast branch's seed, mixed into every step's; None for
     /// `avsm simulate`, whose steps stay as they were.
     seed: Option<u64>,
@@ -92,6 +95,7 @@ impl Simulation {
             world,
             states: Mutex::new(BTreeMap::new()),
             guards: Mutex::new(BTreeMap::new()),
+            told: Mutex::new(BTreeMap::new()),
             seed: None,
         }
     }
@@ -118,8 +122,37 @@ impl Simulation {
         self.world.is_some()
     }
 
-    /// A guard reading the venture's world model gave at its last step.
+    /// Keep the readings the `--world` command printed this step, in place
+    /// of the last: any line `name=number` or `venture/name=number`.
+    pub(crate) fn tell(&self, printed: &str) {
+        let mut told = BTreeMap::new();
+        for line in printed.lines() {
+            let Some((key, value)) = line.trim().split_once('=') else {
+                continue;
+            };
+            if let Ok(x) = value.trim().parse::<f64>() {
+                if x.is_finite() {
+                    told.insert(key.trim().to_string(), x);
+                }
+            }
+        }
+        *self.told.lock().unwrap_or_else(|e| e.into_inner()) = told;
+    }
+
+    /// A reading the `--world` command printed for this venture's name.
+    fn told(&self, venture: &str, name: &str) -> Option<f64> {
+        let told = self.told.lock().unwrap_or_else(|e| e.into_inner());
+        told.get(&format!("{venture}/{name}"))
+            .or_else(|| told.get(name))
+            .copied()
+    }
+
+    /// A guard, audit or reading: what the `--world` command printed for
+    /// it, else what the venture's world model gave at its last step.
     pub(crate) fn guard(&self, venture: &str, name: &str) -> Option<f64> {
+        if let Some(x) = self.told(venture, name) {
+            return Some(x);
+        }
         let guards = self.guards.lock().unwrap_or_else(|e| e.into_inner());
         guards.get(venture)?.get(name).copied()
     }
@@ -189,9 +222,8 @@ impl Simulation {
         }
     }
 
-    /// Read a venture's metric from its world model's state, when there
-    /// is no `--world` to move the real files. None means read it for
-    /// real: there is a `--world`. The baseline starts from the ledger's
+    /// Read a venture's metric: from what the `--world` printed, else from
+    /// its world model's state. Always Some: nothing is read for real. The baseline starts from the ledger's
     /// last trusted, plausible reading; with none it says so, and never
     /// runs the report program to get one: that program is the venture's,
     /// and may change what it reads (a counter counts its runs).
@@ -202,8 +234,10 @@ impl Simulation {
         mandate: &Mandate,
         dir: &Path,
     ) -> Option<(Option<f64>, String)> {
-        if self.world.is_some() {
-            return None;
+        // With a `--world`, what it printed for the metric is the reading;
+        // where it printed none, the same baseline as without one.
+        if let Some(x) = self.told(venture, mandate.metric_name()) {
+            return Some((Some(x), "simulated: world".to_string()));
         }
         let now = clock::now();
         let model = world::model_for(index, venture, mandate, Some(dir));
@@ -238,6 +272,12 @@ fn say(out: &mut dyn Write, text: &str) {
 /// ledger line, the human's answers, and the digest each simulated day.
 pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> {
     if home == default_home() {
+        if std::env::var_os("AVSMD_HOME").is_some_and(|h| Path::new(&h) == home) {
+            return Err(format!(
+                "refusing to simulate in {0}: {0} is your AVSMD_HOME; pass a --home other than it, or unset AVSMD_HOME",
+                home.display()
+            ));
+        }
         return Err(format!(
             "refusing to simulate in {}: that is your real home; pass --home <a directory for the simulation>",
             home.display()
@@ -289,7 +329,7 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
     };
     clock::set(start);
     let sim = Arc::new(Simulation::new(plan.world.clone()));
-    let mut kernel = Kernel::simulated(home, sim)?;
+    let mut kernel = Kernel::simulated(home, sim.clone())?;
     // Forecasts at add and before a ratchet ask, as avsmd makes
     // them, when config.yaml asks for them. Each branch runs on its own
     // thread's clock with a keyless warden, and never forecasts itself.
@@ -332,7 +372,9 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
                 .env("AVSM_DAY", ((clock::now() - start) / 86_400).to_string())
                 .output()
                 .map_err(|e| format!("cannot run the world ({cmd}): {e}"))?;
-            for line in String::from_utf8_lossy(&ran.stdout).lines() {
+            let printed = String::from_utf8_lossy(&ran.stdout).into_owned();
+            sim.tell(&printed);
+            for line in printed.lines() {
                 say(out, &format!("  world: {line}\n"));
             }
             if !ran.status.success() {
