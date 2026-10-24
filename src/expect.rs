@@ -229,6 +229,62 @@ pub fn judge_change(expects: &Expects, observed: f64, drift: f64, noise: f64) ->
     }
 }
 
+/// The standard deviation of a step for each unit of its median size,
+/// when the steps are normal about nothing (1 / 0.6745).
+const SPREAD: f64 = 1.4826;
+
+/// The point `z` such that a standard normal exceeds it with chance `p`
+/// (Abramowitz and Stegun 26.2.23, for 0 < p < 1/2).
+fn upper_point(p: f64) -> f64 {
+    let t = (-2.0 * p.ln()).sqrt();
+    t - (2.515517 + 0.802853 * t + 0.010328 * t * t)
+        / (1.0 + 1.432788 * t + 0.189269 * t * t + 0.001308 * t * t * t)
+}
+
+/// What many runs together show of a lever that no run showed alone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pooled {
+    /// The mean effect the right way, net of drift, over the runs.
+    pub mean: f64,
+    /// The noise the runs were judged against, pooled.
+    pub noise: f64,
+    /// The most the lever's effect can be, at the significance ALPHA:
+    /// the mean and the band the mean of that many runs strays by.
+    pub bound: f64,
+    pub runs: usize,
+}
+
+/// Do the runs together show no effect? `runs` holds, for each judged run
+/// since the lever was last restored, its effect the right way (net of
+/// drift) and the noise it was judged against. One run is read against
+/// the noise, and a metric that strays by the noise on its own makes a
+/// run that "meets" by chance as often as one that misses, so misses in
+/// a row never come. The mean of k runs strays by 1/sqrt(k) of what one
+/// does. The runs show no effect when the most their mean can be, at the
+/// significance ALPHA (one-sided), is still within the noise: the least
+/// a single run counts as an effect by. That takes about 12 runs when
+/// the lever does nothing and the noise is all there is, and never
+/// happens while the mean is a noise or more. Nothing is shown when the
+/// noise is not known.
+pub fn pooled(runs: &[(f64, f64)]) -> Option<Pooled> {
+    let k = runs.len();
+    if k == 0 {
+        return None;
+    }
+    let mean = runs.iter().map(|r| r.0).sum::<f64>() / k as f64;
+    let noise = (runs.iter().map(|r| r.1 * r.1).sum::<f64>() / k as f64).sqrt();
+    if noise <= 0.0 {
+        return None;
+    }
+    let bound = mean + upper_point(ALPHA) * SPREAD * noise / (k as f64).sqrt();
+    (bound < noise).then_some(Pooled {
+        mean,
+        noise,
+        bound,
+        runs: k,
+    })
+}
+
 /// An effect read the way the lever expects it: positive is the right way.
 pub fn toward(expects: &Expects, effect: f64) -> f64 {
     match expects.direction {
@@ -452,6 +508,30 @@ mod tests {
             horizon(2, &varied, &ran, &[20.0, 20.0], 2, unbounded),
             Horizon::Thin
         );
+    }
+
+    #[test]
+    fn many_runs_inside_the_noise_show_no_effect_where_one_does_not() {
+        assert!((upper_point(0.01) - 2.326).abs() < 0.01);
+        let runs = |effect: f64, n: usize| vec![(effect, 1.0); n];
+        // A run of nothing: about 12 of them say so, 3 do not.
+        assert_eq!(pooled(&[]), None);
+        assert_eq!(pooled(&runs(0.0, 3)), None);
+        let found = (1..30).find(|n| pooled(&runs(0.0, *n)).is_some()).unwrap();
+        assert!((11..=13).contains(&found), "{found}");
+        // A mean of a noise or more never does, however many runs.
+        assert_eq!(pooled(&runs(1.0, 1000)), None);
+        assert_eq!(pooled(&runs(3.0, 1000)), None);
+        // Half a noise takes longer; the wrong way sooner.
+        let half = (1..400).find(|n| pooled(&runs(0.5, *n)).is_some()).unwrap();
+        assert!(half > 3 * found, "{half}");
+        let wrong = (1..30).find(|n| pooled(&runs(-1.0, *n)).is_some()).unwrap();
+        assert!(wrong < found, "{wrong}");
+        // No noise known says nothing.
+        assert_eq!(pooled(&[(0.0, 0.0); 50]), None);
+        // The noise is pooled as independent strays are.
+        let p = pooled(&[(0.0, 3.0), (0.0, 4.0)].repeat(10)).unwrap();
+        assert!((p.noise - (12.5f64).sqrt()).abs() < 1e-12 && p.runs == 20);
     }
 
     #[test]

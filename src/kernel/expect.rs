@@ -43,6 +43,17 @@
 //! the lever: the first reading that differs judges it. Repeated longer
 //! than that, the sensor would have refreshed, and the miss stands.
 //!
+//! Runs add up. Read one at a time against the noise, runs of a lever that
+//! does nothing on a metric that strays on its own meet by chance as
+//! often as they miss, and a hit ends a run of misses. So the effect of
+//! every judged run since the lever was last restored is kept, and once
+//! the most their mean can be at ALPHA (`expect::pooled`) is within the
+//! noise, the lever is ineffective, whatever the runs said one by one.
+//! A lever that has run on every report has no step of the metric to
+//! learn a drift or noise from; its runs are not judged one by one, but
+//! the raw change after each, against the median step of the reports
+//! before it, is evidence all the same, and adds up the same way.
+//!
 //! Absence of evidence is not evidence of no effect. A run whose history
 //! is too thin to judge by, fewer than `world::MIN_SAMPLES` steps the
 //! metric took on its own to learn its drift from, or too few steps to
@@ -102,6 +113,10 @@ impl Kernel {
             }
             self.hold_on_faults(venture, &perm.name, &metric);
             let mut memo: Vec<(Seq, Run)> = Vec::new();
+            // What each run did, as the evidence runs add up to, those
+            // judged now and those judged before.
+            let mut fresh: Vec<(Seq, (f64, f64))> = Vec::new();
+            let mut effects: Vec<(f64, f64)> = Vec::new();
             let mut records: Vec<Record> = Vec::new();
             let mut ask: Option<(String, Option<Seq>)> = None;
             let mut cites: Vec<Seq> = Vec::new();
@@ -118,6 +133,7 @@ impl Kernel {
                     }
                     if let Some(known) = self.judged.get(&intent) {
                         seen.push(known.clone());
+                        effects.extend(self.effects.get(&intent));
                         continue;
                     }
                     let Some((outcome, ok)) = index.settled(intent) else {
@@ -159,6 +175,7 @@ impl Kernel {
                     let past_stuck = index.get(intent).is_some_and(
                         |e| matches!(&e.record, Record::Intent { proof, .. } if proof.past_stuck()),
                     );
+                    let mut evidence = None;
                     let result = if !ok {
                         Run::Failed
                     } else if past_stuck || (baseline && perm.expects.is_some()) {
@@ -184,6 +201,7 @@ impl Kernel {
                         if let Some((d, learned)) = seen.late.filter(|(d, l)| d != l) {
                             late.push((intent, d, learned));
                         }
+                        evidence = seen.evidence;
                         match seen.judgement {
                             Judgement::Waiting => break,
                             _ if seen.doubted || seen.thin => Run::Unjudged,
@@ -228,6 +246,10 @@ impl Kernel {
                     } else {
                         Run::Hit
                     };
+                    if let Some(e) = evidence {
+                        fresh.push((intent, e));
+                        effects.push(e);
+                    }
                     memo.push((intent, result.clone()));
                     seen.push(result);
                 }
@@ -243,15 +265,26 @@ impl Kernel {
                         _ => break,
                     }
                 }
-                if misses.len() >= needed
-                    && !misses.is_empty()
-                    && !index.suspended(venture, &perm.name)
-                {
-                    let why = match misses[0] {
-                        Run::Ineffective(why) | Run::Frozen(why, _) if misses.len() == 1 => {
+                // Runs that each met or missed by chance, against a noise
+                // that strays as far on its own, add up: together they
+                // show no effect (`expect::pooled`), a miss of the lever
+                // however many misses it is borne.
+                let pooled = perm.expects.as_ref().and_then(|_| expect::pooled(&effects));
+                let counted = misses.len() >= needed && !misses.is_empty();
+                if (counted || pooled.is_some()) && !index.suspended(venture, &perm.name) {
+                    let why = match misses.first() {
+                        _ if !counted => {
+                            let p = pooled.as_ref().expect("pooled or counted");
+                            let expects = perm.expects.as_ref().expect("pooled");
+                            format!(
+                                "no effect across {} runs: {} expects {expects}; {metric} moved {:+} a run the right way on average, net of drift, and at most {:+} by chance against noise {}",
+                                p.runs, perm.name, p.mean, p.bound, p.noise
+                            )
+                        }
+                        Some(Run::Ineffective(why) | Run::Frozen(why, _)) if misses.len() == 1 => {
                             why.clone()
                         }
-                        Run::Ineffective(why) | Run::Frozen(why, _) => {
+                        Some(Run::Ineffective(why) | Run::Frozen(why, _)) => {
                             format!("{} misses in a row; the last: {why}", misses.len())
                         }
                         _ => format!("{} runs in a row failed", misses.len()),
@@ -294,6 +327,7 @@ impl Kernel {
                 }
             }
             self.judged.extend(memo);
+            self.effects.extend(fresh);
             for record in records {
                 if let Err(e) = self.append(record) {
                     log(&format!("{venture}: cannot write expectation: {e}"));
@@ -529,6 +563,9 @@ struct Seen {
     /// horizon showed its effect, and the delay its lever's runs had
     /// shown before.
     late: Option<(usize, usize)>,
+    /// What the run did the right way, net of drift, and the noise it was
+    /// judged against, at the span that judged it: what runs add up to.
+    evidence: Option<(f64, f64)>,
 }
 
 /// One span a run is judged over.
@@ -691,6 +728,7 @@ fn judged(
         doubted: false,
         thin: true,
         late: None,
+        evidence: None,
     };
     let w = match index.horizon(
         venture,
@@ -733,7 +771,25 @@ fn judged(
         .filter(|d| d.gap > 0)
         .count();
     if quiet < world::MIN_SAMPLES {
-        return Some(thin);
+        // A lever that has run on every report has no step of the metric
+        // to learn its drift or its noise from. No run is judged hit or
+        // miss, but what each did is still evidence for runs to add up
+        // to (`expect::pooled`): the raw change against the median step
+        // of the last reports before it, the run steps and all.
+        let evidence = match first {
+            Span::Read {
+                observed,
+                doubted: false,
+                ..
+            } => {
+                let series = index.series(venture, mandate.metric_name());
+                let b = series.partition_point(|(s, _)| *s < intent);
+                let before: Vec<f64> = series[..b].iter().map(|(_, x)| *x).collect();
+                Some((expect::toward(expects, observed), expect::noise(&before)))
+            }
+            _ => None,
+        };
+        return Some(Seen { evidence, ..thin });
     }
     let (judgement, doubted) = match first {
         Span::Waiting => return None,
@@ -748,11 +804,21 @@ fn judged(
             doubted,
         ),
     };
+    let evidence = match first {
+        Span::Read {
+            observed,
+            drift,
+            noise,
+            doubted: false,
+        } => Some((expect::toward(expects, observed - drift), noise)),
+        _ => None,
+    };
     let seen = |judgement| Seen {
         judgement,
         doubted,
         thin: false,
         late: None,
+        evidence,
     };
     let wrong_way = match judgement {
         Judgement::NoEffect { .. } => false,
@@ -804,6 +870,7 @@ fn judged(
                         doubted,
                         thin: false,
                         late: Some((d, learned)),
+                        evidence: Some((expect::toward(expects, observed - drift), noise)),
                     });
                 }
             }

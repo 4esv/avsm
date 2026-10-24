@@ -2388,3 +2388,81 @@ fn a_new_adoption_answers_the_open_ineffective_ask_and_the_state_moves_on() {
     f.report_tomorrow(3.0);
     assert_ne!(state(&f), avsmd::gate::State::Ineffective);
 }
+
+/// A stationary metric, 88 to 92 in a scramble the seed fixes (the round-4
+/// tester's `88 + RANDOM%5`), read hourly. Each run of a lever that works
+/// lowers it for good by `fall`; one that does nothing lowers it by 0.
+/// Returns the number of reports it took to suspend the lever, if it did,
+/// and how many times it ran.
+fn noisy_runs(seed: u64, fall: f64, reports: usize) -> (Option<usize>, usize) {
+    let mut f = fixture_in(
+        "controller: {kind: threshold, above: 10, action: boost}\ncadence: 1h\n",
+        "{name: boost, run: 'exit 0', cap: 99/day, reversible: true, expects: down within 3}",
+    );
+    let mut state = seed;
+    let mut noise = move || {
+        state = (state * 1_103_515_245 + 12_345) % 2_147_483_648;
+        ((state / 65_536) % 5) as f64
+    };
+    // The level starts high enough that a hundred runs never bring it
+    // under the threshold, so the lever runs from the first report: no
+    // step of the metric is free of a run to learn its drift from.
+    let level = 1_088.0;
+    let mut stock = 0.0;
+    let mut seen = 0;
+    for i in 0..reports {
+        f.report(level + noise() - stock);
+        if f.intents() > seen {
+            // The run at this report shows from the next one.
+            seen = f.intents();
+            stock += fall;
+        }
+        if f.suspended() {
+            return (Some(i + 1), f.intents());
+        }
+    }
+    (None, f.intents())
+}
+
+const SEEDS: std::ops::Range<u64> = 1..4;
+
+#[test]
+fn a_lever_that_does_nothing_on_a_stationary_noisy_metric_is_suspended() {
+    let _c = clock();
+    // Single runs read against the noise are a coin toss: some fall by
+    // more than the median step by chance and "meet", and a hit breaks a
+    // run of misses. Together their mean change is inside the band.
+    for seed in SEEDS {
+        let (at, runs) = noisy_runs(seed, 0.0, 90);
+        assert!(at.is_some(), "seed {seed}: never suspended, {runs} runs");
+        assert!(
+            runs <= 30,
+            "seed {seed}: {runs} runs before it was suspended"
+        );
+    }
+}
+
+#[test]
+fn a_lever_that_works_on_a_noisy_metric_is_never_suspended() {
+    let _c = clock();
+    // Each run lowers the metric by 6, three times the noise or so.
+    for seed in SEEDS {
+        let (at, runs) = noisy_runs(seed, 6.0, 90);
+        assert_eq!(at, None, "seed {seed}: suspended after {runs} runs");
+        assert!(
+            runs >= 20,
+            "seed {seed}: only {runs} runs: the lever was held"
+        );
+    }
+}
+
+#[test]
+fn a_lever_that_barely_works_on_a_noisy_metric_is_not_suspended_early() {
+    let _c = clock();
+    // A fall of 1.5 a run is about the noise's median step: a false stop
+    // costs more than a redundant run, so it is never said to do nothing.
+    for seed in SEEDS {
+        let (at, runs) = noisy_runs(seed, 1.5, 90);
+        assert_eq!(at, None, "seed {seed}: suspended after {runs} runs");
+    }
+}

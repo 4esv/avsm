@@ -90,6 +90,9 @@ pub struct Kernel {
     refusals: refusals::Tally,
     /// How each run of a lever with expectations went, once judged.
     judged: BTreeMap<Seq, expect::Run>,
+    /// What each judged run did, the right way, net of drift, and the
+    /// noise it was judged against: the evidence runs add up to.
+    effects: BTreeMap<Seq, (f64, f64)>,
     /// Set only by `simulate`, when it builds the kernel: lever runs go to
     /// the simulation world, never to the levers. No config can set it.
     sim: Option<Arc<crate::simulate::Simulation>>,
@@ -352,6 +355,7 @@ impl Kernel {
             namespaces: None,
             refusals: refusals::Tally::default(),
             judged: BTreeMap::new(),
+            effects: BTreeMap::new(),
             sim: None,
             forecasts: false,
             forecasting: Vec::new(),

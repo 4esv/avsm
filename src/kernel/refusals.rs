@@ -30,6 +30,10 @@ const SATURATED: &str = "; the limits cannot keep up";
 /// limit running out, so it may pass by itself.
 const WAITING: &str = "; the run before it has not been judged yet, which holds it too, so this may pass without a change";
 /// What answering a saturation ask does.
+/// What answering a saturation ask does while the lever's runs have not
+/// shown the effect it expects: more room only means more runs of a lever
+/// not shown to work, so no advice to raise a limit.
+const APPROVING_UNPROVEN: &str = "; approving only records that you saw this and changes no limit; the runs have not shown the expected effect yet, so a higher cap would only give a lever not shown to work more runs: wait for the runs to be judged";
 const APPROVING: &str = "; approving only records that you saw this and changes no limit: to give the lever room, raise the cap, budget or quota named above and run avsm add";
 
 /// The question of a saturation ask.
@@ -47,7 +51,9 @@ fn saturation_question(
             if n == 1 { "" } else { "s" },
         ),
         None if waiting => {
-            format!("{metric} is past {bound} and {lever} is refused: {detail}{WAITING}{APPROVING}")
+            format!(
+                "{metric} is past {bound} and {lever} is refused: {detail}{WAITING}{APPROVING_UNPROVEN}"
+            )
         }
         None => {
             format!("{metric} is past {bound} and {lever} is refused: {detail}{SATURATED}{APPROVING}")
@@ -460,6 +466,11 @@ mod tests {
         assert!(!waited.contains("cannot keep up"), "{waited}");
         assert!(waited.contains("not been judged yet"), "{waited}");
         assert!(waited.contains("approving only records"), "{waited}");
+        assert!(!waited.contains("raise the cap"), "{waited}");
+        assert!(
+            waited.contains("have not shown the expected effect"),
+            "{waited}"
+        );
         let failed = said(true, Some((2, "exit 1")));
         assert!(failed.contains("fix reset") && !failed.contains("cannot keep up"));
     }
