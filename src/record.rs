@@ -550,6 +550,12 @@ impl Packet {
                     Some(Signal::Ineffective { action, .. }) => {
                         format!("{action} stays suspended, and nothing runs")
                     }
+                    Some(Signal::Implausible { metric, .. }) if o.name == "approve" => format!(
+                        "approving vouches for this reading of {metric}, so it counts"
+                    ),
+                    Some(Signal::Implausible { metric, .. }) => {
+                        format!("the reading of {metric} stays implausible, and nothing acts on it")
+                    }
                     _ => "no forecast: answering runs no lever, so there is nothing to forecast"
                         .to_string(),
                 },
@@ -1531,7 +1537,15 @@ mod tests {
             metric: "count".to_string(),
             why: "missing".to_string(),
         };
-        assert!(packet.render_for(Some(&other)).contains("runs no lever"));
+        let text = packet.render_for(Some(&other));
+        assert!(
+            text.contains("approve: approving vouches for this reading of count, so it counts"),
+            "{text}"
+        );
+        assert!(
+            text.contains("deny: the reading of count stays implausible, and nothing acts on it"),
+            "{text}"
+        );
     }
 
     fn report(v: f64) -> Record {
