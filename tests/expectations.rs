@@ -2466,3 +2466,41 @@ fn a_lever_that_barely_works_on_a_noisy_metric_is_not_suspended_early() {
         assert_eq!(at, None, "seed {seed}: suspended after {runs} runs");
     }
 }
+
+/// The tomato dead at 14.8 after one run of boost: it read 8 when the
+/// lever was found ineffective, the human said no, and the sensor froze.
+/// A human who approves each stuck ask vouches for the frozen run.
+fn frozen_and_vouched() -> Fixture {
+    let mut f = tomato();
+    for v in [40.0, 42.0, 41.0, 43.0, 40.0] {
+        f.report(v);
+    }
+    f.report(20.0); // crosses: boost runs
+    assert_eq!(f.intents(), 1);
+    f.report(8.0); // down where up 5 was expected
+    assert!(f.suspended(), "{:#?}", f.entries());
+    let ask = f.ineffective()[0].seq;
+    f.k.deny(ask, "no").unwrap();
+    for i in 0..300 {
+        f.report(14.8);
+        if i % 5 == 0 {
+            f.approve_open(implausible_ask);
+        }
+    }
+    f
+}
+
+#[test]
+fn a_vouched_frozen_value_then_a_step_to_a_held_value_asks_nothing_on_its_account() {
+    let _c = clock();
+    let mut f = frozen_and_vouched();
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.ineffective());
+    // The run went on vouched for, flagged no more, and is no history: the
+    // metric's repeats are not ordinary, so a step to 30 held is not
+    // evidence yet, as a stuck sensor reads exactly that.
+    f.report(30.0);
+    f.report(30.0);
+    assert_eq!(f.ineffective().len(), 1, "{:#?}", f.ineffective());
+    assert!(f.suspended());
+    assert_eq!(f.intents(), 1, "no runs while suspended");
+}

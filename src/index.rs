@@ -120,13 +120,15 @@ pub struct Index {
     /// metric, by number.
     series: HashMap<String, HashMap<String, Vec<(Seq, f64)>>>,
     /// The same series as stretches of exactly equal readings: value and
-    /// how many, oldest first, with the readings a stuck ask's approval
-    /// vouched for among them.
+    /// how many, oldest first. The readings a stuck ask's approval vouched
+    /// for are not among them: an approval vouches for its run, not for
+    /// what is ordinary.
     stretches: HashMap<String, HashMap<String, Vec<(f64, usize)>>>,
-    /// Readings flagged implausible that a declared approval of a stuck
-    /// ask about their metric vouched for, per venture and metric, by
-    /// number.
-    vouched: HashMap<String, HashMap<String, Vec<(Seq, f64)>>>,
+    /// The value of the run of exact repeats a declared approval of a stuck
+    /// ask vouched for, per venture and metric, while the metric still
+    /// reads it: its next repeats are the run's, vouched for, and no part
+    /// of the series. Any other reading ends it.
+    vouched: HashMap<String, HashMap<String, f64>>,
     /// Reports of what a run did to the metric, by the intent they cite.
     expected: HashSet<Seq>,
     /// Every intent per venture and action, by number.
@@ -279,7 +281,28 @@ impl Index {
             } => {
                 // An implausible report is never a premise: not for what a
                 // run did to the metric, not for a peak.
-                if let (Some(x), true, None) = (value, claim.authorizes(), implausible) {
+                // A reading of the value a stuck ask's approval vouched for,
+                // right after the run, continues that run: it is neither
+                // flagged nor a step of the metric. Any other valued reading
+                // ends it.
+                let mut continues = false;
+                if let (Some(x), true) = (value, claim.authorizes()) {
+                    let run = self
+                        .vouched
+                        .get(&venture)
+                        .and_then(|m| m.get(metric))
+                        .copied();
+                    if run == Some(*x) {
+                        continues = true;
+                    } else if run.is_some() && x.is_finite() {
+                        if let Some(m) = self.vouched.get_mut(&venture) {
+                            m.remove(metric);
+                        }
+                    }
+                }
+                if let (Some(x), true, None, false) =
+                    (value, claim.authorizes(), implausible, continues)
+                {
                     let list = self
                         .series
                         .entry(venture.clone())
@@ -637,7 +660,7 @@ impl Index {
             return;
         };
         let from = seqs.partition_point(|s| *s < first);
-        let mut run = Vec::new();
+        let (mut run, mut broken) = (Vec::new(), false);
         for (s, value) in seqs[from..]
             .iter()
             .take_while(|s| **s < decision)
@@ -645,30 +668,19 @@ impl Index {
         {
             match value {
                 None => continue,
-                Some(v) if v != x => break,
-                Some(_) => run.push((s, x)),
+                Some(v) if v != x => {
+                    broken = true;
+                    break;
+                }
+                Some(_) => run.push(s),
             }
         }
-        let list = self
-            .vouched
-            .entry(venture.clone())
-            .or_default()
-            .entry(metric.clone())
-            .or_default();
-        let before = list.len();
-        for r in run {
-            let i = list.partition_point(|(s, _)| *s < r.0);
-            if list.get(i).is_none_or(|(s, _)| *s != r.0) {
-                list.insert(i, r);
-            }
-        }
-        if list.len() > before {
-            self.restretch(&venture, &metric);
+        if !broken && !run.is_empty() {
+            self.vouched.entry(venture).or_default().insert(metric, x);
         }
     }
 
-    /// Build a metric's stretches again from its plausible readings and
-    /// the ones vouched for, by number.
+    /// Build a metric's stretches again from its plausible readings.
     /// Take a report the foreign-record alarm named out of every reading
     /// the index keeps: avsmd did not write it, whatever it says.
     fn retract(&mut self, venture: &str, seq: Seq) {
@@ -764,16 +776,9 @@ impl Index {
             .get(venture)
             .and_then(|m| m.get(metric))
             .unwrap_or(&empty);
-        let vouched = self
-            .vouched
-            .get(venture)
-            .and_then(|m| m.get(metric))
-            .unwrap_or(&empty);
-        let mut all: Vec<(Seq, f64)> = series.iter().chain(vouched).copied().collect();
-        all.sort_by_key(|(s, _)| *s);
         let mut st = Vec::new();
-        for (_, v) in all {
-            stretch(&mut st, v);
+        for (_, v) in series {
+            stretch(&mut st, *v);
         }
         self.stretches
             .entry(venture.to_string())
@@ -781,14 +786,13 @@ impl Index {
             .insert(metric.to_string(), st);
     }
 
-    /// The latest reading of a metric a stuck ask's approval vouched for:
-    /// a run of repeats is judged from after it.
-    pub fn last_vouched(&self, venture: &str, metric: &str) -> Option<Seq> {
+    /// The value of the run of repeats a stuck ask's approval vouched for,
+    /// while the metric still reads it: more of it are the run's.
+    pub fn vouched_run(&self, venture: &str, metric: &str) -> Option<f64> {
         self.vouched
             .get(venture)
             .and_then(|m| m.get(metric))
-            .and_then(|l| l.last())
-            .map(|(s, _)| *s)
+            .copied()
     }
 
     /// A declared decision on a canary ask, counted once for whoever gave
@@ -957,7 +961,7 @@ impl Index {
 
     /// The trusted reports of a venture's metric with a value, as
     /// stretches of exactly equal readings, oldest first: the plausible
-    /// ones and those a stuck ask's approval vouched for.
+    /// ones, and not those a stuck ask's approval vouched for.
     pub fn stretches(&self, venture: &str, metric: &str) -> &[(f64, usize)] {
         self.stretches
             .get(venture)

@@ -887,10 +887,10 @@ fn stuck_at_60() -> (Kernel, PathBuf, tempfile::TempDir, Seq) {
 
 #[test]
 fn a_declared_approval_vouches_for_a_stuck_run_and_a_denial_for_none() {
-    // Approving a stuck ask says the run is real: its repeats join the
-    // history as zero steps, and the run after the approval starts over.
-    // The two flagged 60s make 5 repeats in 9 steps: a run of 11 more has
-    // chance 6/11 * 7/12 * ... * 16/21 = 0.012, of 12 0.0096.
+    // Approving a stuck ask says the run is real: it is not flagged again,
+    // and neither are the repeats that go on after the approval, but none
+    // of them is history. Another run is judged by what the metric did
+    // unvouched.
     let (mut k, dir, _tmp, ask) = stuck_at_60();
     report(&mut k, &dir, "counter", "60");
     assert!(
@@ -903,17 +903,22 @@ fn a_declared_approval_vouches_for_a_stuck_run_and_a_denial_for_none() {
     }
     let f = flags(&k, "counter", "count");
     assert!(f[f.len() - 12..].iter().all(Option::is_none), "{f:?}");
-    // The history still says how rare a run is: one long enough is
-    // stuck again.
-    report(&mut k, &dir, "counter", "60");
+    // The run goes on, vouched for, as long as the metric reads 60.
+    for _ in 0..40 {
+        report(&mut k, &dir, "counter", "60");
+    }
     let f = flags(&k, "counter", "count");
-    assert!(
-        f.last()
-            .unwrap()
-            .as_deref()
-            .is_some_and(|w| w.contains("after 5 repeats in 9 steps, a run of 12")),
-        "{f:?}"
-    );
+    assert!(f[f.len() - 52..].iter().all(Option::is_none), "{f:?}");
+    assert_eq!(implausible_asks(&k, "count"), 1, "no ask for it again");
+    // Once it moves, 60 held again is a new run, judged by the history.
+    for v in ["61", "62"] {
+        report(&mut k, &dir, "counter", v);
+    }
+    for _ in 0..30 {
+        report(&mut k, &dir, "counter", "60");
+    }
+    let f = flags(&k, "counter", "count");
+    assert!(f.last().unwrap().is_some(), "{f:?}");
 
     // Approving a jump anchors the next step on it.
     let none = "{kind: threshold, above: 900, action: reset}";
@@ -967,15 +972,73 @@ fn a_second_approval_of_the_ask_vouches_for_the_run_once() {
         })
         .unwrap();
     drop(ledger);
+    let before = history_steps(&k);
     for _ in 0..13 {
         report(&mut k, &dir, "counter", "60");
     }
     let f = flags(&k, "counter", "count");
+    assert!(f[f.len() - 13..].iter().all(Option::is_none), "{f:?}");
+    assert_eq!(history_steps(&k), before, "the run is no history");
+}
+
+/// How many readings the stuck test's history holds for the counter.
+fn history_steps(k: &Kernel) -> usize {
+    k.index()
+        .unwrap()
+        .stretches("counter", "count")
+        .iter()
+        .map(|(_, n)| n)
+        .sum()
+}
+
+/// A human who approves every stuck ask as it comes.
+fn approve_open_stuck(k: &mut Kernel) {
+    let open: Vec<Seq> = signals(k, |s| matches!(s, Signal::Implausible { .. }))
+        .iter()
+        .map(|e| e.seq)
+        .filter(|q| k.index().unwrap().is_open(*q))
+        .collect();
+    for q in open {
+        k.approve(q, None).unwrap();
+    }
+}
+
+#[test]
+fn a_vouched_stuck_run_never_makes_repeats_ordinary() {
+    let (mut k, dir, _tmp, ask) = stuck_at_60();
+    let before = history_steps(&k);
+    k.approve(ask, None).unwrap();
+    for _ in 0..300 {
+        report(&mut k, &dir, "counter", "60");
+        approve_open_stuck(&mut k);
+    }
+    let f = flags(&k, "counter", "count");
+    assert!(f[f.len() - 300..].iter().all(Option::is_none), "{f:?}");
+    assert_eq!(history_steps(&k), before, "300 vouched repeats: no history");
+    assert_eq!(implausible_asks(&k, "count"), 1);
+}
+
+#[test]
+fn a_stuck_fault_at_another_value_is_flagged_after_a_vouched_run() {
+    let (mut k, dir, _tmp, ask) = stuck_at_60();
+    k.approve(ask, None).unwrap();
+    for _ in 0..300 {
+        report(&mut k, &dir, "counter", "60");
+        approve_open_stuck(&mut k);
+    }
+    // The metric moves, and then sticks at 62: as stuck as it would be
+    // had the run at 60 never been vouched for.
+    for v in ["61", "62", "61", "63"] {
+        report(&mut k, &dir, "counter", v);
+    }
+    for _ in 0..40 {
+        report(&mut k, &dir, "counter", "62");
+    }
+    let f = flags(&k, "counter", "count");
     assert!(
-        f.last()
-            .unwrap()
-            .as_deref()
-            .is_some_and(|w| w.contains("after 5 repeats in 9 steps, a run of 12")),
+        f[f.len() - 2..]
+            .iter()
+            .all(|w| w.as_deref().is_some_and(|w| w.starts_with("stuck"))),
         "{f:?}"
     );
 }
