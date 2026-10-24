@@ -73,6 +73,17 @@ pub(crate) fn sh(path: &Path) -> String {
     }
 }
 
+/// A mandate.yaml sitting directly in the home is never read: a venture
+/// lives in a directory of its own. Say so, once, so a novice is not left
+/// guessing why it was ignored.
+fn home_mandate_note(home: &Path, found: &mut Found) {
+    if home.join("mandate.yaml").is_file() {
+        found.note(
+            "mandate.yaml in the home is not read: a venture lives in its own directory; add it with avsm add <dir>",
+        );
+    }
+}
+
 /// Why a ledger cannot be used: the text, and the first bad record when
 /// one is to blame (a file that is no database names none).
 struct Unsound {
@@ -475,6 +486,7 @@ fn on_disk(v: &Venture) -> Disk {
 /// is the text on disk. Prints each mandate's teachback. Writes nothing.
 pub fn test(home: &Path) -> Found {
     let mut found = Found::default();
+    home_mandate_note(home, &mut found);
     if let Some(e) = crate::protocol::socket_too_long(&crate::kernel::socket_path(home)) {
         found.problems.push(e);
         found.code = exit::worst(found.code, exit::USAGE);
@@ -570,6 +582,7 @@ pub fn doctor(
 ) -> Found {
     let mut found = Found::default();
     let h = sh(home);
+    home_mandate_note(home, &mut found);
 
     // The home.
     match std::fs::metadata(home) {

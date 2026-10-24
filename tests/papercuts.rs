@@ -661,3 +661,32 @@ fn pausing_twice_and_resuming_a_running_venture_record_nothing() {
         "{tail}"
     );
 }
+
+#[test]
+fn a_mandate_yaml_left_in_the_home_is_named_not_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("mandate.yaml"),
+        "purpose: x\nmetric: count\ncontroller: {kind: model}\ncadence: 1h\npermitted: []\n",
+    )
+    .unwrap();
+    let note =
+        "mandate.yaml in the home is not read: a venture lives in its own directory; add it with avsm add <dir>";
+
+    // avsmd -t names it.
+    let out = Command::new(env!("CARGO_BIN_EXE_avsmd"))
+        .arg("--home")
+        .arg(&home)
+        .arg("-t")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains(note), "{text}");
+
+    // avsm doctor names it too.
+    let (_, out, _) = avsm_out(&home, &["doctor"]);
+    assert!(out.contains(note), "{out}");
+}
