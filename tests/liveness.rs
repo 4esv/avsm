@@ -54,6 +54,10 @@ impl Daemon {
 
     /// The pid the daemon logged for its warden or roles process.
     fn pid_of(&self, what: &str) -> i32 {
+        // The socket can answer before the log shows the pids on a loaded host.
+        wait_for("the pids in the log", Duration::from_secs(10), || {
+            self.log().contains("warden pid")
+        });
         let log = self.log();
         let line = log
             .lines()
@@ -124,6 +128,7 @@ fn left_under(dir: &Path) -> Vec<String> {
 /// Wait until nothing runs under `dir`, or fail naming what does, with
 /// the daemon's log.
 fn none_left(what: &str, dir: &Path, within: Duration, log: &dyn Fn() -> String) {
+    let within = patience(within);
     let began = Instant::now();
     loop {
         let left = left_under(dir);
@@ -171,8 +176,22 @@ fn start(tmp: &Path, home: &Path) -> Daemon {
     start_with(Path::new(env!("CARGO_BIN_EXE_avsmd")), tmp, home)
 }
 
+/// A deadline for waiting on an event, stretched by how loaded the host is
+/// (#60): the 1-minute load average per cpu, never under 1x or over 4x.
+/// Only for waits that end on the event; a window that proves a daemon
+/// answers or reports in a time is not stretched.
+fn patience(d: Duration) -> Duration {
+    let mut load = [0f64; 1];
+    // SAFETY: getloadavg fills at most the 1 slot given.
+    let got = unsafe { libc::getloadavg(load.as_mut_ptr(), 1) };
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+    let factor = if got == 1 { load[0] / cpus } else { 1.0 };
+    d.mul_f64(factor.clamp(1.0, 4.0))
+}
+
 /// Poll `ok` until it holds, or fail after `within`.
 fn wait_for(what: &str, within: Duration, mut ok: impl FnMut() -> bool) {
+    let within = patience(within);
     let began = Instant::now();
     while !ok() {
         assert!(began.elapsed() < within, "timed out waiting for {what}");
@@ -400,6 +419,11 @@ fn a_hung_metric_leaves_status_answering_and_another_venture_reporting() {
     });
     let out = timed(tmp.path(), &home, &["status"], Duration::from_secs(2));
     assert!(out.status.success(), "{}", text(&out));
+    // Steady's first report can lag the add on a loaded host (#60); count
+    // its cadence from that report.
+    wait_for("steady's first report", Duration::from_secs(30), || {
+        reports(&home, "steady") >= 1
+    });
     let before = reports(&home, "steady");
     std::thread::sleep(Duration::from_secs(4));
     let after = reports(&home, "steady");
@@ -592,8 +616,11 @@ fn a_warden_that_cannot_be_respawned_shows_in_status_and_doctor() {
     let copy = bin.join("avsmd");
     std::fs::copy(env!("CARGO_BIN_EXE_avsmd"), &copy).unwrap();
     let d = start_with(&copy, tmp.path(), &home);
-    std::fs::rename(&copy, bin.join("gone")).unwrap();
+    // The socket is bound before the warden is spawned, so take its pid
+    // (which waits for it) before the binary goes away, or the first warden
+    // could fail to start instead of being killed.
     let warden = d.pid_of("warden");
+    std::fs::rename(&copy, bin.join("gone")).unwrap();
     // SAFETY: kill has no memory preconditions.
     unsafe {
         libc::kill(warden, libc::SIGKILL);
@@ -857,13 +884,24 @@ fn a_hung_metric_adapter_leaves_status_answering_and_its_venture_held() {
     wait_for("the hung metric to start", Duration::from_secs(30), || {
         dir.join("started").exists()
     });
+    // Steady's first report can lag the add on a loaded host (#60), so the
+    // window opens at that report and counts its cadence from there; a
+    // venture the hung adapter held would still never get past it.
+    wait_for("steady's first report", Duration::from_secs(30), || {
+        reports(&home, "steady") >= 1
+    });
     let before = reports(&home, "steady");
     for _ in 0..3 {
         let out = timed(tmp.path(), &home, &["status"], Duration::from_secs(2));
         assert!(out.status.success(), "{}", text(&out));
         std::thread::sleep(Duration::from_secs(1));
     }
-    assert!(reports(&home, "steady") >= before + 2, "{}", d.log());
+    // Reports land on whole-second ticks, so allow the window a few ticks'
+    // slack; the hung reading must still be there when they have.
+    wait_for("steady's next two reports", Duration::from_secs(8), || {
+        reports(&home, "steady") >= before + 2
+    });
+    assert!(dir.join("started").exists(), "{}", d.log());
     // Held, not reported as missing each second: one reading at a time.
     let shelled = entries(&home)
         .iter()
@@ -1116,6 +1154,7 @@ fn group_alive(pgid: i32) -> bool {
 
 /// Wait until none of `groups` has a process left, or fail naming them.
 fn groups_gone(what: &str, groups: &[i32], within: Duration, log: &dyn Fn() -> String) {
+    let within = patience(within);
     let began = Instant::now();
     while groups.iter().any(|g| group_alive(*g)) {
         let left: Vec<&i32> = groups.iter().filter(|g| group_alive(**g)).collect();
