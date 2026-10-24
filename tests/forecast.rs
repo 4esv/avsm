@@ -1882,3 +1882,114 @@ fn a_stationary_metric_whose_forecast_spreads_wildly_says_so() {
         "{line}"
     );
 }
+
+/// A venture read every five seconds.
+const FAST: &str = "controller: {kind: model}\ncadence: 5s\n";
+
+#[test]
+fn a_guard_the_forecast_never_read_has_no_breach_probability_of_zero() {
+    let _c = clock();
+    let mut f = fixture("");
+    let dir = f.venture(
+        "restarter",
+        "temp",
+        "controller: {kind: model}\ncadence: 5s\nguards:\n- {name: heat, run: cat value, above: 90, then: ask}\n",
+    );
+    script(&dir, "report", "cat value");
+    let rising: Vec<f64> = (0..60).map(|i| 100.0 + i as f64).collect();
+    f.history("restarter", &rising, 5);
+    let opts = f.opts(&["restarter"], 2, 4);
+    let (outcome, _) = f.k.forecast(&opts, &[]).unwrap();
+    let render = outcome.render();
+    // The venture's temp sits above the guard's bound, and the branches
+    // read nothing of the guard: no "p=0" beside that.
+    assert!(!render.contains("heat breach p=0"), "{render}");
+    assert!(render.contains("guard.heat breach p unknown"), "{render}");
+    for s in &outcome.summaries {
+        assert!(s.guards.iter().all(|g| g.name != "guard.heat"), "{s:?}");
+        assert_eq!(s.unread, ["guard.heat"]);
+    }
+}
+
+/// A counter that counts its reads every 5s, with a threshold controller
+/// that resets it when it passes 10.
+const COUNTER: &str = "controller: {kind: threshold, above: 10, action: reset}\ncadence: 5s\n\
+     permitted:\n- {name: reset, run: echo 0 > value, cap: 20000/day, reversible: true, delegated: true, expects: down 10 within 1}\n";
+
+/// Tick a real venture every 5s for `n` ticks.
+fn run_for(f: &mut Fixture, n: usize) {
+    for _ in 0..n {
+        f.now += 5;
+        avsmd::clock::set(f.now);
+        f.k.tick();
+    }
+}
+
+#[test]
+fn a_lever_that_resets_the_metric_every_report_keeps_the_forecast_where_it_holds_it() {
+    let _c = clock();
+    let mut f = fixture("");
+    let dir = f.venture("counter", "count", COUNTER);
+    script(
+        &dir,
+        "report",
+        "n=$(( $(cat value) + 1 )); echo $n > value; echo $n",
+    );
+    run_for(&mut f, 130);
+    let ran = f
+        .entries()
+        .iter()
+        .filter(|e| matches!(&e.record, Record::Intent { action, .. } if action == "reset"))
+        .count();
+    assert!(ran >= 10, "the reset ran {ran} times");
+    let opts = f.opts(&["counter"], 2, 6);
+    let (outcome, _) = f.k.forecast(&opts, &[]).unwrap();
+    for s in outcome.summaries.iter().filter(|s| s.policy == Policy::All) {
+        let m = &s.metrics[0];
+        // The history never passed 11; a reset every report holds it there.
+        assert!(
+            m.thin || m.quantiles.p95 <= 12.0,
+            "forecast {:?} of a counter held at 11 by its reset",
+            m.quantiles
+        );
+    }
+}
+
+#[test]
+fn a_five_second_metric_is_forecast_at_its_true_rate_a_day() {
+    let _c = clock();
+    let mut f = fixture("");
+    f.venture("pile", "pile", FAST);
+    // +1 a report, every 5s: 17,280 a day.
+    let rising: Vec<f64> = (1..=120).map(|i| i as f64).collect();
+    f.history("pile", &rising, 5);
+    // The rate the capacity check reads from the same history.
+    let drift = {
+        let index = f.k.index().unwrap();
+        let base = avsmd::world::Baseline::from_index(
+            &index,
+            "pile",
+            &avsmd::mandate::Mandate::parse(&format!("purpose: Grow.\nmetric: pile\n{FAST}"))
+                .unwrap(),
+        );
+        base.drift_per_day()
+    };
+    assert!((drift - 17_280.0).abs() < 1.0, "{drift}");
+    let opts = f.opts(&["pile"], 2, 6);
+    let (outcome, _) = f.k.forecast(&opts, &[]).unwrap();
+    let s = outcome
+        .summaries
+        .iter()
+        .find(|s| s.policy == Policy::All)
+        .unwrap();
+    let m = &s.metrics[0];
+    // From the last report at +120 and the true rate, 17,280 a day, the
+    // branch's clock runs two days: the forecast says the
+    // value then, within 1% of it, or says it cannot.
+    let want = 120.0 + 0.2 * (2.0 * 86_400.0);
+    assert!(
+        m.thin || (m.quantiles.p50 - want).abs() < 0.01 * want,
+        "p50 {} where the true rate puts {want}: {m:?}",
+        m.quantiles.p50
+    );
+}

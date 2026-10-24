@@ -205,6 +205,9 @@ pub struct Summary {
     pub variant: Option<String>,
     pub metrics: Vec<Envelope>,
     pub guards: Vec<Event>,
+    /// The guards no branch read: the world model gave no reading of
+    /// them, so no probability of a breach is said, not a probability of 0.
+    pub unread: Vec<String>,
     pub reached: Reached,
 }
 
@@ -352,6 +355,11 @@ impl Outcome {
             }
             for g in &s.guards {
                 line.push_str(&format!("; {} breach p={}", g.name, record::round(g.p)));
+            }
+            for g in &s.unread {
+                line.push_str(&format!(
+                    "; {g} breach p unknown (no forecast of the guard)"
+                ));
             }
             line.push_str(&format!(
                 "; asks p50 {}, refusals p50 {}, halts p50 {}, delegations p50 {}, spend p50 {}",
@@ -1262,9 +1270,15 @@ fn aggregate(
                     })
                     .collect();
                 let n = seeds.len().max(1) as f64;
+                // A guard is forecast from what the branches read of it. One
+                // they never read has no probability of a breach to give.
+                let read = |g: &crate::mandate::Guard| {
+                    seeds.iter().any(|p| p.last.contains_key(&g.metric()))
+                };
                 let guards = m
                     .guards
                     .iter()
+                    .filter(|g| read(g))
                     .map(|g| Event {
                         name: g.metric(),
                         p: seeds
@@ -1274,6 +1288,12 @@ fn aggregate(
                             / n,
                     })
                     .collect();
+                let unread = m
+                    .guards
+                    .iter()
+                    .filter(|g| !read(g))
+                    .map(|g| g.metric())
+                    .collect();
                 let col =
                     |f: fn(&Trace) -> f64| qs(&seeds.iter().map(|p| f(p)).collect::<Vec<_>>());
                 summaries.push(Summary {
@@ -1282,6 +1302,7 @@ fn aggregate(
                     variant: variant.label.clone(),
                     metrics,
                     guards,
+                    unread,
                     reached: Reached {
                         spend: col(|p| p.spend),
                         asks: col(|p| p.asks),
@@ -1385,7 +1406,11 @@ fn aggregate(
                     };
                     let from = &sweep.values[v - 1];
                     let to = &sweep.values[v];
-                    for (ga, gb) in a.guards.iter().zip(&b.guards) {
+                    for (ga, gb) in a
+                        .guards
+                        .iter()
+                        .filter_map(|ga| Some((ga, b.guards.iter().find(|g| g.name == ga.name)?)))
+                    {
                         if (ga.p > 0.5) != (gb.p > 0.5) {
                             marks.push(format!(
                                 "{name} {} {from} -> {to}: {} breach p {} -> {} ({})",

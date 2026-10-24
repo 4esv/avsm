@@ -342,6 +342,7 @@ mod tests {
                 thin: false,
             }],
             guards: vec![],
+            unread: vec![],
             reached: Reached {
                 spend: zero,
                 asks: zero,

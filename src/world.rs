@@ -219,6 +219,78 @@ pub struct Baseline {
     /// which the value reverts to, when the history holds enough of
     /// every hour.
     pub levels: Option<[f64; 24]>,
+    /// Per lever that brings the metric back from the edge of what it has
+    /// reached to a level it lands on whatever the drift (a reset): where
+    /// it lets the metric go and what it lands on. Learnt by `from_index`.
+    pub holds: BTreeMap<String, Hold>,
+}
+
+/// A lever that holds the metric to one side of an edge: the metric rises
+/// (or falls) to `edge` and no further, since a run brings it back to one
+/// of `lands`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Hold {
+    /// The edge of the metric's history the lever fires at: its highest
+    /// reading when the lever lowers it, its lowest when it raises it.
+    pub edge: f64,
+    /// True when the lever lowers the metric, and `edge` is a ceiling.
+    pub ceiling: bool,
+    /// The readings a run left the metric at, at its horizon.
+    pub lands: Vec<f64>,
+}
+
+impl Hold {
+    /// Learn it from a lever's runs, each the reading before and the
+    /// reading at the horizon, against the readings (any order). A hold
+    /// when, with at least `MIN_SAMPLES` runs, the typical run moves the
+    /// metric across at least half the width of its usual range (the 5th
+    /// to the 95th percentile of the readings, so a stray reading does
+    /// not widen it) and begins in the outer fifth of that range, on the
+    /// side it moves away from: the metric reaches the edge and the lever
+    /// takes it back. The edge is where the runs began, 9 in 10 of them
+    /// short of it.
+    fn learn(runs: &[(f64, f64)], readings: &[f64]) -> Option<Hold> {
+        let mut sorted: Vec<f64> = readings.iter().copied().filter(|x| x.is_finite()).collect();
+        sorted.sort_by(f64::total_cmp);
+        if runs.len() < MIN_SAMPLES || sorted.len() < MIN_SAMPLES {
+            return None;
+        }
+        let q = |v: &[f64], p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+        let (lo, hi) = (q(&sorted, 0.05), q(&sorted, 0.95));
+        let width = hi - lo;
+        if width.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            return None;
+        }
+        let moves = median(runs.iter().map(|(b, a)| a - b).collect())?;
+        if moves.abs() < width / 2.0 {
+            return None;
+        }
+        let ceiling = moves < 0.0;
+        let mut before: Vec<f64> = runs.iter().map(|(b, _)| *b).collect();
+        before.sort_by(f64::total_cmp);
+        let typical = q(&before, 0.5);
+        let at_edge = if ceiling {
+            typical >= hi - width / 5.0
+        } else {
+            typical <= lo + width / 5.0
+        };
+        if !at_edge {
+            return None;
+        }
+        Some(Hold {
+            edge: q(&before, if ceiling { 0.9 } else { 0.1 }),
+            ceiling,
+            lands: runs.iter().map(|(_, a)| *a).collect(),
+        })
+    }
+
+    fn hold(&self, x: f64) -> f64 {
+        if self.ceiling {
+            x.min(self.edge)
+        } else {
+            x.max(self.edge)
+        }
+    }
 }
 
 const HOUR: i64 = 3_600;
@@ -568,9 +640,11 @@ impl Baseline {
                 }
             }
         }
+        let readings: Vec<f64> = series.iter().map(|(_, v)| *v).collect();
         for p in &mandate.permitted {
             let within = p.expects.map_or(1, |e| e.within.max(1)) as usize;
             let mut samples = Vec::new();
+            let mut runs = Vec::new();
             for &intent in index.intents_of(venture, &p.name) {
                 let Some((outcome, true)) = index.settled(intent) else {
                     continue;
@@ -600,6 +674,9 @@ impl Baseline {
                     (Some(b0), Some(t)) => b.integrate(at(b0.0), at(t.0) - at(b0.0)),
                     _ => b.integrate(at(intent), period * within as i64),
                 };
+                if let (Some(b0), Some(t)) = (base, then) {
+                    runs.push((b0.1, t.1));
+                }
                 match (said.get(&intent), base, then) {
                     (Some(x), _, _) => samples.push(*x - carried),
                     (None, Some(b0), Some(t)) => samples.push(t.1 - b0.1 - carried),
@@ -608,6 +685,9 @@ impl Baseline {
             }
             if !samples.is_empty() {
                 b.effects.insert(p.name.clone(), samples);
+            }
+            if let Some(hold) = Hold::learn(&runs, &readings) {
+                b.holds.insert(p.name.clone(), hold);
             }
         }
         b
@@ -764,6 +844,11 @@ impl WorldModel for Baseline {
                 let i = (splitmix64(&mut rng) % self.noise.len() as u64) as usize;
                 x += self.noise[i] * (dt as f64).sqrt();
             }
+            // A lever that brings the metric back from the edge of its
+            // history whenever it gets there: the metric goes no further.
+            for hold in self.holds.values() {
+                x = hold.hold(x);
+            }
             // A cyclic metric reverts to its level for the hour.
             if let Some(levels) = &self.levels {
                 let to = self.level(levels, now + dt);
@@ -774,8 +859,11 @@ impl WorldModel for Baseline {
         }
         if let Some(a) = action {
             let samples = self.effects.get(&a.name).map_or(&[][..], Vec::as_slice);
-            // Fewer than MIN_SAMPLES runs: no effect known, persistence.
-            if samples.len() >= MIN_SAMPLES {
+            if let Some(hold) = self.holds.get(&a.name) {
+                // A reset lands where it landed, not so far from here.
+                x = hold.lands[(splitmix64(&mut rng) % hold.lands.len() as u64) as usize];
+            } else if samples.len() >= MIN_SAMPLES {
+                // Fewer than MIN_SAMPLES runs: no effect known, persistence.
                 x += samples[(splitmix64(&mut rng) % samples.len() as u64) as usize];
             }
             x = self.bound(x);

@@ -90,11 +90,17 @@ pub(crate) struct Simulation {
     /// A forecast branch's seed, mixed into every step's; None for
     /// `avsm simulate`, whose steps stay as they were.
     seed: Option<u64>,
+    /// A forecast branch's baselines, each learnt once from the ledger the
+    /// branch forked: the branch's own simulated readings, an hour apart,
+    /// are not history, and a baseline relearnt from them drifts from the
+    /// venture it models.
+    frozen: Mutex<BTreeMap<String, world::Baseline>>,
 }
 
 impl Simulation {
     pub(crate) fn new(world: Option<String>) -> Simulation {
         Simulation {
+            frozen: Mutex::new(BTreeMap::new()),
             world,
             states: Mutex::new(BTreeMap::new()),
             guards: Mutex::new(BTreeMap::new()),
@@ -111,6 +117,25 @@ impl Simulation {
             seed: Some(seed),
             ..Simulation::new(None)
         }
+    }
+
+    /// The venture's world model: a branch's baseline is the one learnt
+    /// when it first asked, else the model of the index as it stands.
+    fn model(
+        &self,
+        index: &Index,
+        venture: &str,
+        mandate: &Mandate,
+        dir: &Path,
+    ) -> Box<dyn world::WorldModel> {
+        if self.seed.is_none() || mandate.world.is_some() {
+            return world::model_for(index, venture, mandate, Some(dir));
+        }
+        let mut frozen = self.frozen.lock().unwrap_or_else(|e| e.into_inner());
+        let base = frozen
+            .entry(venture.to_string())
+            .or_insert_with(|| world::Baseline::from_index(index, venture, mandate));
+        Box::new(base.clone())
     }
 
     /// A step's seed, mixed with the branch's when there is one.
@@ -228,7 +253,7 @@ impl Simulation {
                 format!("simulated: world  {detail}").trim().to_string(),
             );
         }
-        let model = world::model_for(index, venture, mandate, Some(dir));
+        let model = self.model(index, venture, mandate, dir);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let state = states.get(venture).map_or(Value::Null, |(s, _)| s.clone());
         let act = Action {
@@ -271,12 +296,21 @@ impl Simulation {
             return Some((Some(x), "simulated: world".to_string()));
         }
         let now = clock::now();
-        let model = world::model_for(index, venture, mandate, Some(dir));
+        let model = self.model(index, venture, mandate, dir);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let (state, at) = states
-            .get(venture)
-            .cloned()
-            .unwrap_or((Value::Null, now - mandate.cadence.as_secs() as i64));
+        // The first step runs from the ledger's last reading, however long
+        // ago: a forecast whose clock jumps an hour past a 5s venture's
+        // last report has covered an hour, not one cadence.
+        let last = index
+            .fit_series(venture, mandate.metric_name())
+            .last()
+            .and_then(|(s, _)| index.get(*s))
+            .map(|e| e.at)
+            .filter(|t| *t < now);
+        let (state, at) = states.get(venture).cloned().unwrap_or((
+            Value::Null,
+            last.unwrap_or(now - mandate.cadence.as_secs() as i64),
+        ));
         let seed = self.salt(world::mix(world::seed_of(venture), now as u64));
         match model.step(&state, None, seed, now, now - at) {
             Ok(next) => {
