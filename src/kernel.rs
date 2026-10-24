@@ -1508,12 +1508,38 @@ impl Kernel {
         if self.paused_by_declared(name)? {
             return Ok(format!("{name} is already paused\n"));
         }
+        // An approval the gate has not yet run is spent by this pause: the
+        // rule stands, and the human is told.
+        let spent: Vec<String> = {
+            let index = self.index()?;
+            index
+                .unacted()
+                .filter_map(|d| {
+                    let decision = index.get(d)?;
+                    let Record::Decision {
+                        venture,
+                        verdict: Verdict::Approve { ask, .. },
+                        ..
+                    } = &decision.record
+                    else {
+                        return None;
+                    };
+                    if venture != name {
+                        return None;
+                    }
+                    let lever = index.get(*ask)?.record.action()?.to_string();
+                    Some(format!(
+                        "warning: approval #{d} for {lever} has not run and is spent by this pause; approve again after resume\n"
+                    ))
+                })
+                .collect()
+        };
         let entry = self.append(self.decision(name, Verdict::Pause))?;
         // What it runs is stopped now, not at the next tick: a tick can
         // wait behind a forecast.
         self.cancel_inflight(name);
         self.stop_reading(name);
-        Ok(entry.line() + "\n")
+        Ok(entry.line() + "\n" + &spent.concat())
     }
 
     /// Let a paused venture run again.
@@ -1538,13 +1564,22 @@ impl Kernel {
         // its bound will pause it again at the next reading.
         if let (Some(v), Ok(index)) = (self.ventures.get(name), self.index()) {
             for g in &v.mandate.guards {
-                let Some(&(_, x)) = index.series(name, &g.metric()).last() else {
+                // The latest reading of the guard, and how old it is: a
+                // paused venture reads no guard, so what a lever has done
+                // since may not show.
+                let Some(&(seq, x)) = index.series(name, &g.metric()).last() else {
                     continue;
                 };
                 if g.breached(x) {
                     let (above, bound) = g.bound();
+                    let age = index.get(seq).map_or(0, |e| now() - e.at);
+                    let stale = if age > v.mandate.cadence.as_secs() as i64 {
+                        format!(", last read {}", ago(age))
+                    } else {
+                        String::new()
+                    };
                     out.push_str(&format!(
-                        "warning: guard {} is still past its bound ({x} {} {bound}); the guard will pause it again\n",
+                        "warning: guard {} is still past its bound ({x} {} {bound}{stale}); the guard will pause it again\n",
                         g.name,
                         if above { ">" } else { "<" }
                     ));

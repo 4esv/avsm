@@ -179,6 +179,40 @@ fn a_second_approval_of_one_ask_runs_nothing() {
     assert_eq!(runs(&dir), 1, "{}", lines(&k.entries().unwrap()));
 }
 
+#[test]
+fn pausing_with_an_approval_not_yet_run_says_it_is_spent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path());
+    let dir = venture(tmp.path(), "v1", "9/hour");
+    let mut k = kernel(&home);
+    k.add(&dir).unwrap();
+    k.tick();
+    let ask = *bump_asks(&k).first().expect("an ask to bump");
+    // Pausing with nothing approved says nothing of the kind.
+    let plain = k.pause("v1").unwrap();
+    assert!(!plain.contains("warning"), "{plain}");
+    k.resume("v1").unwrap();
+    let approved = k.approve(ask, None).unwrap();
+    let decision: Seq = approved
+        .split('#')
+        .nth(1)
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|t| t.parse().ok())
+        .expect("the approval's number");
+    // Before the gate's next tick runs it: the pause spends it.
+    let said = k.pause("v1").unwrap();
+    assert!(
+        said.contains(&format!(
+            "warning: approval #{decision} for bump has not run and is spent by this pause; approve again after resume"
+        )),
+        "{said}"
+    );
+    k.tick();
+    k.resume("v1").unwrap();
+    k.tick();
+    assert_eq!(runs(&dir), 0, "the spending rule stands");
+}
+
 // ----- through the real binaries -----
 
 struct Daemon(Child);

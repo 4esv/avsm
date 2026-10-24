@@ -721,6 +721,58 @@ fn resume_while_a_guard_is_past_its_bound_warns_and_still_resumes() {
 }
 
 #[test]
+fn the_resume_warning_says_how_old_the_guard_reading_it_rests_on_is() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = bare(tmp.path());
+    let dir = tmp.path().join("disk");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mandate.yaml"),
+        "purpose: p\nmetric: shell echo 3\ncontroller: {kind: model}\ncadence: 1h\n\
+         permitted:\n  - {name: water, run: \"echo w\", cap: 3/day, reversible: true}\n\
+         guards:\n  - {name: size, run: \"echo 2000000\", above: 1000000}\n",
+    )
+    .unwrap();
+    k.add(&dir).unwrap();
+    let old = avsmd::clock::now() - 7200;
+    k.ledger
+        .append_at(
+            Record::report(Claim::Measured, "disk", "guard.size", Some(2_000_000.0), ""),
+            old,
+        )
+        .unwrap();
+    k.pause("disk").unwrap();
+    let said = k.resume("disk").unwrap();
+    assert!(
+        said.contains("(2000000 > 1000000, last read 2h ago); the guard will pause it again"),
+        "{said}"
+    );
+    // A reading within the cadence carries no age.
+    k.pause("disk").unwrap();
+    k.append(Record::report(
+        Claim::Measured,
+        "disk",
+        "guard.size",
+        Some(2_000_000.0),
+        "",
+    ))
+    .unwrap();
+    let said = k.resume("disk").unwrap();
+    assert!(said.contains("(2000000 > 1000000); the guard"), "{said}");
+    // Once it reads inside its bound the warning is gone.
+    k.pause("disk").unwrap();
+    k.append(Record::report(
+        Claim::Measured,
+        "disk",
+        "guard.size",
+        Some(40.0),
+        "",
+    ))
+    .unwrap();
+    assert!(!k.resume("disk").unwrap().contains("warning"));
+}
+
+#[test]
 fn a_cap_that_still_binds_shows_in_the_row_whatever_the_state() {
     // Monkey round 3: approving the saturation ask turned the row to
     // asking and hid the cap, which still bound.
