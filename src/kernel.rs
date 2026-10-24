@@ -4597,6 +4597,21 @@ fn span(s: i64) -> String {
     }
 }
 
+/// A duration as a person reads it: 500ms, 1.5s, 12s, 3m.
+fn waiting(d: Duration) -> String {
+    if d < Duration::from_secs(1) {
+        return format!("{}ms", d.as_millis());
+    }
+    if d < Duration::from_secs(60) {
+        let secs = (d.as_secs_f64() * 10.0).round() / 10.0;
+        if secs == secs.trunc() {
+            return format!("{}s", secs as i64);
+        }
+        return format!("{secs}s");
+    }
+    span(d.as_secs() as i64)
+}
+
 /// One line of `tail`: a record dated after now is marked, so the future
 /// a clock that ran ahead wrote is never read as the past.
 fn tail_line(e: &Entry) -> String {
@@ -5123,8 +5138,8 @@ fn read_apart(
         match r.done.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 return FromWarden::Pending(format!(
-                    "{PENDING} after {}s",
-                    r.since.elapsed().as_secs()
+                    "{PENDING} after {}",
+                    waiting(r.since.elapsed())
                 ));
             }
             Ok((at, answer)) => {
@@ -5174,7 +5189,7 @@ fn read_apart(
                     done: rx,
                 },
             );
-            FromWarden::Pending(format!("{PENDING} after {}s", QUICK.as_secs()))
+            FromWarden::Pending(format!("{PENDING} after {}", waiting(QUICK)))
         }
     }
 }
@@ -5906,6 +5921,16 @@ mod tests {
         assert_eq!(precision([1.0, 2.0].into_iter()), 0);
         assert_eq!(precision(std::iter::empty()), 0);
         assert_eq!(precision([0.1234567891].into_iter()), 6);
+    }
+
+    #[test]
+    fn a_pending_read_names_the_real_elapsed_time_not_whole_seconds() {
+        use std::time::Duration;
+        assert_eq!(super::waiting(Duration::from_millis(500)), "500ms");
+        assert_eq!(super::waiting(Duration::from_millis(999)), "999ms");
+        assert_eq!(super::waiting(Duration::from_millis(1500)), "1.5s");
+        assert_eq!(super::waiting(Duration::from_secs(12)), "12s");
+        assert_eq!(super::waiting(Duration::from_secs(90)), "1m");
     }
 
     #[test]
