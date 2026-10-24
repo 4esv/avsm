@@ -195,7 +195,8 @@ impl Simulation {
     fn told(&self, venture: &str, name: &str) -> Option<f64> {
         let told = self.told.lock().unwrap_or_else(|e| e.into_inner());
         let bare = name
-            .strip_prefix(crate::mandate::READING_PREFIX)
+            .strip_prefix(crate::mandate::AUDIT_PREFIX)
+            .or_else(|| name.strip_prefix(crate::mandate::READING_PREFIX))
             .unwrap_or(name);
         [name, bare]
             .into_iter()
@@ -559,5 +560,19 @@ mod tests {
             edited("A title\nA body\n"),
             format!("A title\nA body\n\n{EDIT}\n")
         );
+    }
+
+    #[test]
+    fn the_number_form_accepts_a_bare_audit_or_reading_name() {
+        // A line `name=number` names the metric, guard, audit or reading
+        // for that step: a bare audit or reading name counts, as the
+        // lines form already accepted it, and the prefixed form wins.
+        let sim = Simulation::new(None);
+        sim.tell("customers=2\nwaiting=3\n");
+        assert_eq!(sim.guard("shop", "audit.customers"), Some(2.0));
+        assert_eq!(sim.guard("shop", "reading.waiting"), Some(3.0));
+        sim.tell("audit.customers=4\nreading.waiting=5\n");
+        assert_eq!(sim.guard("shop", "audit.customers"), Some(4.0));
+        assert_eq!(sim.guard("shop", "reading.waiting"), Some(5.0));
     }
 }
