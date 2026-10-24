@@ -226,11 +226,23 @@ fn venture(
 /// so the scan counted against `timeout: 2s`, and another venture's first
 /// report came after the window a test allows it. Paying it here, where
 /// no clock runs, keeps these tests about the daemon.
+///
+/// NOTE: on Linux another test thread's fork can still hold the file's
+/// write end open for a moment, and exec then fails with ETXTBSY; that
+/// passes, so it is tried again.
 fn warm(script: &Path) {
-    let ran = Command::new(script)
-        .env("AVSM_WARM", "1")
-        .output()
-        .expect("warm a script");
+    let began = Instant::now();
+    let ran = loop {
+        match Command::new(script).env("AVSM_WARM", "1").output() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && began.elapsed() < Duration::from_secs(10) =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => break other.expect("warm a script"),
+        }
+    };
     assert!(ran.status.success(), "{script:?} did not exit when warm");
 }
 
