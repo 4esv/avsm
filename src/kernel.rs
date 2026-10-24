@@ -5514,6 +5514,7 @@ impl Kernel {
             .map(|(g, _)| g)
             .collect();
         let killed = crate::groups::end(&left, deadline);
+        crate::forecast::remove_own_scratch();
         if killed > 0 {
             log(&format!(
                 "killed {killed} process {} that ignored the stop",
@@ -5559,6 +5560,24 @@ pub fn start(home: &Path) -> Result<(), Exit> {
     // still alive to end it itself; each group this one starts is
     // written down for the next.
     let me = crate::groups::Daemon::of(std::process::id() as i32);
+    for path in crate::groups::unreadable(home) {
+        log(&format!(
+            "{} does not read as a group avsmd started: a process it names is not ended; \
+             remove the file, and end that process yourself if it still runs",
+            path.display()
+        ));
+    }
+    let swept = crate::forecast::sweep_scratch();
+    if swept > 0 {
+        log(&format!(
+            "removed {swept} forecast scratch {} a dead avsmd left",
+            if swept == 1 {
+                "directory"
+            } else {
+                "directories"
+            }
+        ));
+    }
     let left = crate::groups::left_by_the_dead(home);
     if !left.is_empty() {
         log(&format!(

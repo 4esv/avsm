@@ -569,6 +569,56 @@ impl Scratch {
     }
 }
 
+/// The scratch directories in `base` and the pid each names.
+fn scratch_dirs(base: &Path) -> Vec<(i32, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let pid = name.strip_prefix("avsm-forecast-")?.split('-').next()?;
+            Some((pid.parse::<i32>().ok()?, e.path()))
+        })
+        .collect()
+}
+
+/// Remove the scratch directories in `base` of a pid that is not alive
+/// and not this process's. A forecast killed outright leaves its own.
+pub fn sweep_scratch_in(base: &Path) -> usize {
+    let me = std::process::id() as i32;
+    let mut removed = 0;
+    for (pid, dir) in scratch_dirs(base) {
+        if pid == me || pid <= 1 {
+            continue;
+        }
+        // SAFETY: kill with signal 0 only checks.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !alive && std::fs::remove_dir_all(&dir).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// `sweep_scratch_in` the temporary directory.
+pub fn sweep_scratch() -> usize {
+    sweep_scratch_in(&std::env::temp_dir())
+}
+
+/// On a drain: this process's scratch directories, whichever forecast
+/// the stop caught in the middle.
+pub fn remove_own_scratch() {
+    let me = std::process::id() as i32;
+    for (pid, dir) in scratch_dirs(&std::env::temp_dir()) {
+        if pid == me {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);

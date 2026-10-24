@@ -342,6 +342,23 @@ fn read_kept(dir: &Path) -> Vec<(PathBuf, Kept)> {
         .collect()
 }
 
+/// The files in `<home>/groups` that do not read as a group. They name
+/// no group avsmd could end, so a start leaves them out of what it reaps;
+/// a human is told instead.
+pub fn unreadable(home: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(home.join(KEPT_DIR)) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter(|p| read_one(p).is_none())
+        .collect();
+    found.sort();
+    found
+}
+
 /// Forget the groups gone for longer than `RECENT`.
 fn prune(dir: &Path) {
     for (path, k) in read_kept(dir) {

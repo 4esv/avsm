@@ -650,6 +650,18 @@ pub fn doctor(
         ),
     }
 
+    // A file in groups/ that does not read: the daemon cannot tell what it
+    // started, and leaves any process it names alone.
+    for path in crate::groups::unreadable(home) {
+        found.warn(
+            format!(
+                "{} does not read as a group avsmd started; a process it names is not ended at a start",
+                path.display()
+            ),
+            format!("rm {}  # and end that process yourself if it still runs", sh(&path)),
+        );
+    }
+
     // The ledger and its chain.
     let ledger = home.join(LEDGER_FILE);
     let journal = home.join(format!("{LEDGER_FILE}-journal"));

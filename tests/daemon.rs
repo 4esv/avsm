@@ -751,3 +751,78 @@ fn status_answers_and_guards_tick_while_a_forecast_runs() {
     assert_eq!(counts(&home, "guard.load").1, 6, "{stdout}");
     assert!(held > Duration::from_secs(1), "too quick to show anything");
 }
+
+#[test]
+fn a_groups_file_that_does_not_read_is_said_once_noted_by_doctor_and_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join("groups")).unwrap();
+    std::fs::write(home.join("config.yaml"), NEVER).unwrap();
+    let bad = home.join("groups").join("broken.json");
+    std::fs::write(&bad, "{ not json").unwrap();
+    let h = home.to_str().unwrap();
+    let (out, _) = text(&avsm(tmp.path(), &["--home", h, "doctor"]));
+    assert!(
+        out.contains("broken.json does not read as a group avsmd started"),
+        "{out}"
+    );
+    let sock = avsmd::kernel::socket_path(&home);
+    let _d = start(tmp.path(), &["--home", h], &[], &sock);
+    let log = std::fs::read_to_string(tmp.path().join("daemon.log")).unwrap();
+    assert_eq!(
+        log.matches("broken.json does not read as a group").count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        bad.exists(),
+        "a file that does not read is not the daemon's to delete"
+    );
+}
+
+/// A pid that is certainly not alive: a child that has been waited for.
+fn dead_pid() -> u32 {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+#[test]
+fn forecast_scratch_of_a_dead_avsmd_is_swept_at_start_and_ones_own_at_drain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.yaml"), NEVER).unwrap();
+    let dead = scratch.join(format!("avsm-forecast-{}-1-0", dead_pid()));
+    let alive = scratch.join(format!("avsm-forecast-{}-1-0", std::process::id()));
+    let other = scratch.join("something-else");
+    for d in [&dead, &alive, &other] {
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+    }
+    let sock = avsmd::kernel::socket_path(&home);
+    let h = home.to_str().unwrap();
+    let t = scratch.to_str().unwrap();
+    let mut daemon = start(tmp.path(), &["--home", h], &[("TMPDIR", t)], &sock);
+    assert!(!dead.exists(), "the dead avsmd's scratch is swept at start");
+    assert!(alive.exists(), "a live pid's scratch is not touched");
+    assert!(other.exists());
+    // A forecast caught by the stop leaves its scratch; the drain removes it.
+    // Served: the signal handlers are in.
+    let _ = avsm(tmp.path(), &["--home", h, "status"]);
+    let mine = scratch.join(format!("avsm-forecast-{}-1-0", daemon.0.id()));
+    std::fs::create_dir_all(mine.join("sub")).unwrap();
+    // SAFETY: kill has no memory preconditions.
+    unsafe {
+        libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM);
+    }
+    daemon.0.wait().unwrap();
+    assert!(
+        !mine.exists(),
+        "the drain removes its own scratch: {}",
+        std::fs::read_to_string(tmp.path().join("daemon.log")).unwrap()
+    );
+    assert!(alive.exists());
+}
