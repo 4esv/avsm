@@ -208,10 +208,30 @@ fn venture(
         ("report", format!("#!/bin/sh\n{reads}\n")),
         ("reset", format!("#!/bin/sh\n{lever}\n")),
     ] {
+        let body = body.replacen('\n', "\n[ -z \"$AVSM_WARM\" ] || exit 0\n", 1);
         std::fs::write(dir.join(file), body).unwrap();
         std::fs::set_permissions(dir.join(file), std::fs::Permissions::from_mode(0o755)).unwrap();
+        warm(&dir.join(file));
     }
     dir
+}
+
+/// Run a script once with `AVSM_WARM` set, which a script from `venture`
+/// obeys by exiting before it does anything.
+///
+/// WARNING: on macOS the first exec of a file just written waits on the
+/// system's execution policy scan, one file at a time: 0.7s to 3s on an
+/// Intel Mac on macOS 26, 5s to 9s with the other tests running, against
+/// 35ms the second time. The daemon starts a lever's timer at the spawn,
+/// so the scan counted against `timeout: 2s`, and another venture's first
+/// report came after the window a test allows it. Paying it here, where
+/// no clock runs, keeps these tests about the daemon.
+fn warm(script: &Path) {
+    let ran = Command::new(script)
+        .env("AVSM_WARM", "1")
+        .output()
+        .expect("warm a script");
+    assert!(ran.status.success(), "{script:?} did not exit when warm");
 }
 
 /// A lever that says it started and its pid, then hangs.
