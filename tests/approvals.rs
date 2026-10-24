@@ -626,3 +626,56 @@ fn a_report_that_calls_setsid_to_approve_is_refused_on_linux_and_documented_on_m
     }
     d.stop();
 }
+
+#[test]
+fn reports_go_on_during_a_foreign_alarm_and_a_forged_record_is_never_a_reading() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, dir) = daemon_home(tmp.path());
+    let d = start(tmp.path(), &home, "d.log");
+    ok(&avsm(tmp.path(), &home, &["add", dir.to_str().unwrap()]));
+    until(&home, 30, "a report of n", |e| {
+        e.iter()
+            .any(|e| matches!(&e.record, Record::Report { venture, metric, .. } if venture == "v1" && metric == "n"))
+    });
+    // A forged "measured" reading of the metric, appended by another writer.
+    let forged = Ledger::open(&home.join("ledger.db"))
+        .unwrap()
+        .append(Record::report(
+            Claim::Measured,
+            "v1",
+            "n",
+            Some(1.0),
+            "forged",
+        ))
+        .unwrap()
+        .seq;
+    let entries = until(&home, 15, "an alarm citing the forged record", |e| {
+        e.iter().any(|e| {
+            matches!(&e.record, Record::Report { venture, metric, cites, .. }
+                if venture == "self" && metric == "foreign" && cites.contains(&forged))
+        })
+    });
+    let alarm = entries
+        .iter()
+        .find(|e| matches!(&e.record, Record::Report { metric, .. } if metric == "foreign"))
+        .unwrap()
+        .seq;
+    // Reports are measurements and go on while everything is paused.
+    let after = |e: &[Entry]| {
+        e.iter()
+            .filter(|e| {
+                e.seq > alarm
+                    && matches!(&e.record, Record::Report { venture, metric, value: Some(x), .. }
+                if venture == "v1" && metric == "n" && *x == 5.0)
+            })
+            .count()
+    };
+    let entries = until(&home, 20, "reports after the alarm", |e| after(e) >= 3);
+    assert!(after(&entries) >= 3, "{}", lines(&entries));
+    // The forged record is not the venture's reading: status, digest and
+    // know all read the daemon's 5.
+    let status = ok(&avsm(tmp.path(), &home, &["status"]));
+    let row = status.lines().find(|l| l.starts_with("v1 ")).unwrap();
+    assert!(row.contains("n=5"), "{status}");
+    d.stop();
+}

@@ -375,6 +375,8 @@ impl Index {
                 if metric == FOREIGN && *claim == Claim::Measured && venture == crate::gate::SELF {
                     for c in cites {
                         self.foreign.entry(*c).or_insert(seq);
+                        let v = venture_of(self, *c);
+                        self.retract(&v, *c);
                     }
                     self.cite(cites.clone());
                 }
@@ -667,6 +669,94 @@ impl Index {
 
     /// Build a metric's stretches again from its plausible readings and
     /// the ones vouched for, by number.
+    /// Take a report the foreign-record alarm named out of every reading
+    /// the index keeps: avsmd did not write it, whatever it says.
+    fn retract(&mut self, venture: &str, seq: Seq) {
+        let Some(Record::Report { metric, .. }) = self.get(seq).map(|e| &e.record) else {
+            return;
+        };
+        let metric = metric.clone();
+        let venture = venture.to_string();
+        if let Some(list) = self
+            .series
+            .get_mut(&venture)
+            .and_then(|m| m.get_mut(&metric))
+        {
+            list.retain(|(s, _)| *s != seq);
+        }
+        self.restretch(&venture, &metric);
+        let peak = self
+            .series(&venture, &metric)
+            .iter()
+            .map(|(_, x)| *x)
+            .filter(|x| x.is_finite())
+            .reduce(f64::max);
+        let peaks = self.peaks.entry(venture.clone()).or_default();
+        match peak {
+            Some(p) => {
+                peaks.insert(metric.clone(), p);
+            }
+            None => {
+                peaks.remove(&metric);
+            }
+        }
+        if let Some(list) = self
+            .doubted
+            .get_mut(&venture)
+            .and_then(|m| m.get_mut(&metric))
+        {
+            list.retain(|s| *s != seq);
+        }
+        // The latest trusted report left, with a value and without.
+        let mut latest_valued = None;
+        let mut latest_any = None;
+        let seqs: Vec<Seq> = self.of.get(&venture).cloned().unwrap_or_default();
+        for s in seqs.into_iter().rev() {
+            if self.foreign.contains_key(&s) {
+                continue;
+            }
+            let Some(Record::Report {
+                claim,
+                metric: m,
+                value,
+                implausible,
+                ..
+            }) = self.get(s).map(|e| &e.record)
+            else {
+                continue;
+            };
+            if *m != metric || !claim.authorizes() {
+                continue;
+            }
+            if latest_any.is_none() {
+                latest_any = Some((s, implausible.is_some()));
+            }
+            if latest_valued.is_none() && value.is_some() {
+                latest_valued = Some(s);
+            }
+            if latest_any.is_some() && latest_valued.is_some() {
+                break;
+            }
+        }
+        let reports = self.reports.entry(venture.clone()).or_default();
+        match latest_valued {
+            Some(s) => {
+                reports.insert(metric.clone(), s);
+            }
+            None => {
+                reports.remove(&metric);
+            }
+        }
+        match latest_any {
+            Some(f) => {
+                self.flagged.insert((venture, metric), f);
+            }
+            None => {
+                self.flagged.remove(&(venture, metric));
+            }
+        }
+    }
+
     fn restretch(&mut self, venture: &str, metric: &str) {
         let empty = Vec::new();
         let series = self
@@ -1500,11 +1590,15 @@ impl Index {
 
     /// A venture's records, oldest first.
     pub fn of(&self, venture: &str) -> impl DoubleEndedIterator<Item = &Entry> + '_ {
+        // A report the foreign-record alarm named is no reading of it.
         self.of
             .get(venture)
             .into_iter()
             .flat_map(|s| s.iter())
             .filter_map(|s| self.get(*s))
+            .filter(|e| {
+                !(matches!(e.record, Record::Report { .. }) && self.foreign.contains_key(&e.seq))
+            })
     }
 
     /// When a venture's inferred records were written, oldest first.
@@ -1647,4 +1741,12 @@ mod tests {
             "nor one past its head"
         );
     }
+}
+
+/// The venture of an entry the index holds, empty when it holds none.
+fn venture_of(index: &Index, seq: Seq) -> String {
+    index
+        .get(seq)
+        .map(|e| e.record.venture().to_string())
+        .unwrap_or_default()
 }

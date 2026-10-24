@@ -298,6 +298,31 @@ fn a_new_adoption_answers_the_open_saturation_ask() {
 }
 
 #[test]
+fn a_report_the_foreign_alarm_named_is_no_reading_anywhere() {
+    let mut fx = Fx::new();
+    fx.report(Claim::Measured, "count", 70.0, false);
+    let real = fx.report(Claim::Measured, "count", 71.0, false);
+    let forged = fx.report(Claim::Measured, "count", 1.0, true);
+    let forged_big = fx.report(Claim::Measured, "count", 9000.0, false);
+    let mut alarm = Record::report(Claim::Measured, "self", "foreign", Some(2.0), "not ours");
+    if let Record::Report { cites, .. } = &mut alarm {
+        cites.extend([forged, forged_big]);
+    }
+    let entries = fx.ledger.all().unwrap();
+    let before = Index::from_entries(&entries);
+    assert_eq!(before.latest_report(V, "count"), Some(forged_big));
+    fx.put(alarm);
+    let entries = fx.ledger.all().unwrap();
+    let index = Index::from_entries(&entries);
+    assert_eq!(index.latest_report(V, "count"), Some(real));
+    assert_eq!(index.series(V, "count").len(), 2);
+    assert_eq!(index.peak(V, "count"), Some(71.0));
+    assert_eq!(index.flagged(V, "count"), Some(false));
+    assert!(index.of(V).all(|e| e.seq != forged && e.seq != forged_big));
+    assert_eq!(fx.state(), State::Running);
+}
+
+#[test]
 fn a_suspended_lever_is_ineffective() {
     let mut fx = Fx::new();
     let q = fx.signal(Claim::Measured, "no effect", Some(ineffective()));

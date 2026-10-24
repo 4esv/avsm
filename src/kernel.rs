@@ -1698,15 +1698,20 @@ impl Kernel {
                 }
             };
             let halted = gate::state_in(&index, &adopted, SELF) == State::Paused;
-            let paused: Vec<bool> = names
+            // Each venture: held by its own pause, and held at all (its
+            // own, or self's, which an alarm sets).
+            let paused: Vec<(bool, bool)> = names
                 .iter()
-                .map(|name| halted || gate::state_in(&index, &adopted, name) == State::Paused)
+                .map(|name| {
+                    let own = gate::state_in(&index, &adopted, name) == State::Paused;
+                    (own, halted || own)
+                })
                 .collect();
             (halted, paused)
         };
         let now = now();
         self.close_stale_refusals();
-        for (name, paused) in names.iter().zip(paused) {
+        for (name, (own, paused)) in names.iter().zip(paused) {
             // Draining: what is in flight finishes; nothing new starts.
             if stopping() {
                 return;
@@ -1714,6 +1719,11 @@ impl Kernel {
             self.supervise(name, paused);
             if paused {
                 self.cancel_inflight(name);
+            }
+            // Only a venture's own pause stops a reading under way: a halt
+            // by self or an alarm stops levers, not measurements, and
+            // reports go on.
+            if own {
                 self.stop_reading(name);
             } else if let Some(rt) = self.runtime.get_mut(name) {
                 rt.held = false;
