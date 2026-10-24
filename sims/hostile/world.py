@@ -315,3 +315,30 @@ for name, path in (("tomato/moisture", "moisture"), ("trader/equity", "equity"),
         continue
     if math.isfinite(v): print(f"{name}={v}")
 print(f"inbox/unread={inbox_n}")
+
+# The inbox's audit and readings, which avsm does not run in a simulation
+# either: the customers audit (the shop's forty customers, the human's mail
+# rule) and the two readings a model may see, waiting and the others. A
+# number is `name=n`; its lines are `name: a@b c@d`, which avsm validates
+# as it does a real audit's and reading's.
+KNOWN = {f"customer{i}@example.com" for i in range(1, 41)}
+senders, others = set(), []
+if os.path.isdir(p("inbox")):
+    for f in sorted(os.listdir(p("inbox"))):
+        try:
+            with open(p("inbox", f)) as fh: m = json.load(fh)
+            frm, n = str(m.get("from", "")).lower(), int(m["id"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if frm in KNOWN:
+            senders.add(frm)
+            continue
+        host = frm.rpartition("@")[2]
+        if re.fullmatch(r"[a-z0-9.-]{1,100}", host): others.append(f"{n}@{host}")
+waiting = sorted(senders)
+print(f"inbox/audit.customers={len(waiting)}")
+print("inbox/audit.customers: " + " ".join(waiting))
+print(f"inbox/waiting={len(waiting)}")
+print("inbox/waiting: " + " ".join(waiting))
+print(f"inbox/unread-mail-n-at-domain={len(others)}")
+print("inbox/unread-mail-n-at-domain: " + " ".join(others))

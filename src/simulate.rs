@@ -84,6 +84,9 @@ pub(crate) struct Simulation {
     /// What the `--world` command printed as readings at its last run:
     /// `name=number` or `venture/name=number`, one a line.
     told: Mutex<BTreeMap<String, f64>>,
+    /// The lines it printed for an audit or reading, as `name: a@b c@d` or
+    /// `venture/name: ...`, unvalidated: whoever uses them validates.
+    said: Mutex<BTreeMap<String, String>>,
     /// A forecast branch's seed, mixed into every step's; None for
     /// `avsm simulate`, whose steps stay as they were.
     seed: Option<u64>,
@@ -96,6 +99,7 @@ impl Simulation {
             states: Mutex::new(BTreeMap::new()),
             guards: Mutex::new(BTreeMap::new()),
             told: Mutex::new(BTreeMap::new()),
+            said: Mutex::new(BTreeMap::new()),
             seed: None,
         }
     }
@@ -117,34 +121,61 @@ impl Simulation {
         }
     }
 
-    /// Does a `--world` command take the lever runs?
-    pub(crate) fn has_world(&self) -> bool {
-        self.world.is_some()
-    }
-
     /// Keep the readings the `--world` command printed this step, in place
     /// of the last: any line `name=number` or `venture/name=number`.
     pub(crate) fn tell(&self, printed: &str) {
         let mut told = BTreeMap::new();
+        let mut said = BTreeMap::new();
         for line in printed.lines() {
-            let Some((key, value)) = line.trim().split_once('=') else {
-                continue;
-            };
-            if let Ok(x) = value.trim().parse::<f64>() {
-                if x.is_finite() {
-                    told.insert(key.trim().to_string(), x);
+            let line = line.trim();
+            if let Some((key, value)) = line.split_once('=') {
+                if let Ok(x) = value.trim().parse::<f64>() {
+                    if x.is_finite() {
+                        told.insert(key.trim().to_string(), x);
+                    }
+                }
+            } else if let Some((key, rest)) = line.split_once(':') {
+                let key = key.trim();
+                if !key.is_empty() && !key.contains(char::is_whitespace) {
+                    said.insert(key.to_string(), rest.trim().to_string());
                 }
             }
         }
         *self.told.lock().unwrap_or_else(|e| e.into_inner()) = told;
+        *self.said.lock().unwrap_or_else(|e| e.into_inner()) = said;
+    }
+
+    /// The lines the `--world` command printed for an audit or reading
+    /// (`metric` as the ledger names it, `audit.customers`), as the world
+    /// said them: whitespace between fields, not yet validated.
+    pub(crate) fn lines(&self, venture: &str, metric: &str) -> Option<String> {
+        let said = self.said.lock().unwrap_or_else(|e| e.into_inner());
+        let bare = metric
+            .strip_prefix(crate::mandate::AUDIT_PREFIX)
+            .or_else(|| metric.strip_prefix(crate::mandate::READING_PREFIX))
+            .unwrap_or(metric);
+        [metric, bare]
+            .into_iter()
+            .flat_map(|m| [format!("{venture}/{m}"), m.to_string()])
+            .find_map(|k| said.get(&k).cloned())
+    }
+
+    /// Did the `--world` command print a reading of this metric at its
+    /// last run? Without a `--world`, never.
+    pub(crate) fn world_told(&self, venture: &str, metric: &str) -> bool {
+        self.told(venture, metric).is_some()
     }
 
     /// A reading the `--world` command printed for this venture's name.
     fn told(&self, venture: &str, name: &str) -> Option<f64> {
         let told = self.told.lock().unwrap_or_else(|e| e.into_inner());
-        told.get(&format!("{venture}/{name}"))
-            .or_else(|| told.get(name))
-            .copied()
+        let bare = name
+            .strip_prefix(crate::mandate::READING_PREFIX)
+            .unwrap_or(name);
+        [name, bare]
+            .into_iter()
+            .flat_map(|n| [format!("{venture}/{n}"), n.to_string()])
+            .find_map(|k| told.get(&k).copied())
     }
 
     /// A guard, audit or reading: what the `--world` command printed for

@@ -918,10 +918,10 @@ impl LocalWarden {
         // A simulation reads every guard, audit and reading from the
         // `--world`'s output or the world model's step: their programs are
         // the venture's, and may change what they read.
-        if let Some(sim) = self.sim.as_ref() {
+        if let Some(sim) = self.sim.clone() {
             let name = metric.strip_prefix("guard.").unwrap_or(metric);
             let read = match sim.guard(venture, name) {
-                Some(x) => (Some(x), "simulated: world".to_string()),
+                Some(x) => (Some(x), self.simulated_note(&sim, venture, metric)?),
                 None => (
                     None,
                     format!("simulated: the world model gives no {metric}"),
@@ -980,6 +980,66 @@ fn known<T: Send + 'static>(answer: T) -> Result<Work<T>, String> {
 }
 
 impl LocalWarden {
+    /// The note of a simulated audit or reading with a number: the lines
+    /// the `--world` printed for it, validated as the warden validates a
+    /// real one's, else just where the number came from. An audit's lines
+    /// are addresses of senders, kept as `from <address>`, at most
+    /// `Reading::MAX_FIELDS`, each address-shaped and at most
+    /// `Reading::MAX_FIELD` long: the sender audit a payload check reads.
+    /// A reading's go through the reading's own `keep`, naming the latest
+    /// audit's note when it has one.
+    fn simulated_note(
+        &mut self,
+        sim: &crate::simulate::Simulation,
+        venture: &str,
+        metric: &str,
+    ) -> Result<String, String> {
+        use crate::mandate::{Lines, Reading, AUDIT_PREFIX, READING_PREFIX};
+        let plain = "simulated: world".to_string();
+        let Some(said) = sim.lines(venture, metric) else {
+            return Ok(plain);
+        };
+        let fields = said.split_whitespace().collect::<Vec<_>>().join("\n");
+        if metric.starts_with(AUDIT_PREFIX) {
+            let mut seen: Vec<String> = Vec::new();
+            for f in fields.lines() {
+                let f = f.to_lowercase();
+                if f.chars().count() <= Reading::MAX_FIELD
+                    && Lines::Address.holds(&f)
+                    && !seen.contains(&f)
+                {
+                    seen.push(f);
+                }
+            }
+            seen.truncate(Reading::MAX_FIELDS);
+            let note: Vec<String> = seen.iter().map(|a| format!("from {a}")).collect();
+            return Ok(note.join("  "));
+        }
+        let Some(name) = metric.strip_prefix(READING_PREFIX) else {
+            return Ok(plain);
+        };
+        self.index
+            .refresh(&self.ledger)
+            .map_err(|e| e.to_string())?;
+        let ventures = venture::from_adoptions(self.index.adoptions());
+        let Some(r) = ventures
+            .get(venture)
+            .and_then(|v| v.mandate.readings.iter().find(|r| r.name == name))
+        else {
+            return Ok(plain);
+        };
+        let named: Option<String> = r.audit.as_deref().map(|a| {
+            let at = self
+                .index
+                .latest_report(venture, &format!("{AUDIT_PREFIX}{a}"));
+            match at.and_then(|s| self.index.get(s)).map(|e| &e.record) {
+                Some(Record::Report { note, .. }) => note.clone(),
+                _ => String::new(),
+            }
+        });
+        Ok(r.keep(&fields, named.as_deref()))
+    }
+
     /// Read a guard's or an audit's command or built-in metric.
     fn read_in(
         &self,

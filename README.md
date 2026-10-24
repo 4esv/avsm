@@ -498,7 +498,10 @@ prints is shown. Every lever run goes to it instead of the lever, with
 the payload on standard input; a world that fails stops the simulation. Readings
 come from the world too: any line it prints as `name=number` or
 `venture/name=number` is the reading of that metric, guard, audit or reading for
-that step, and where it prints none the reading comes from the same baseline as
+that step. A line `name: a@b c@d` (or `venture/name: ...`) gives an audit's or a
+reading's lines, kept as the warden keeps a real one's: only address-shaped fields,
+at most 254 characters each and 50 of them, an audit's as `from <address>` for
+a payload check to read. Where the world prints no reading the reading comes from the same baseline as
 without `--world`. Without `--world`, a lever steps the venture's world model and
 the reports come from its state; unless the mandate names a `world:`, that is a baseline learned from the
 ledger, which replays the steps the venture's own readings have shown, so a
