@@ -610,6 +610,20 @@ mod tests {
     }
 
     #[test]
+    fn a_world_gives_an_audits_note_as_it_prints_it() {
+        let sim = Simulation::new(Some("true".to_string()));
+        sim.tell("trader/audit.book=3\ntrader/audit.book> shares 5  cash 10.00\n");
+        assert_eq!(sim.guard("trader", "audit.book"), Some(3.0));
+        assert_eq!(
+            sim.note("trader", "audit.book").as_deref(),
+            Some("shares 5  cash 10.00")
+        );
+        sim.tell("");
+        assert_eq!(sim.guard("trader", "audit.book"), None);
+        assert_eq!(sim.note("trader", "audit.book"), None);
+    }
+
+    #[test]
     fn the_number_form_accepts_a_bare_audit_or_reading_name() {
         // A line `name=number` names the metric, guard, audit or reading
         // for that step: a bare audit or reading name counts, as the

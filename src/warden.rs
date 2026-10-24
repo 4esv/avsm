@@ -1000,14 +1000,16 @@ impl LocalWarden {
     ) -> Result<String, String> {
         use crate::mandate::{Lines, Reading, AUDIT_PREFIX, READING_PREFIX};
         let plain = "simulated: world".to_string();
+        if metric.starts_with(AUDIT_PREFIX) {
+            if let Some(note) = sim.note(venture, metric) {
+                return Ok(note);
+            }
+        }
         let Some(said) = sim.lines(venture, metric) else {
             return Ok(plain);
         };
         let fields = said.split_whitespace().collect::<Vec<_>>().join("\n");
         if metric.starts_with(AUDIT_PREFIX) {
-            if let Some(note) = sim.note(venture, metric) {
-                return Ok(note);
-            }
             let mut seen: Vec<String> = Vec::new();
             for f in fields.lines() {
                 let f = f.to_lowercase();
