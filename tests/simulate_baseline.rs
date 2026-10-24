@@ -136,7 +136,7 @@ fn a_frozen_baseline_never_finds_a_lever_ineffective() {
 }
 
 #[test]
-fn a_silent_world_leaves_the_baseline_answering_and_no_lever_ineffective() {
+fn a_silent_world_reads_as_missing_never_as_the_baseline() {
     let _c = clock();
     let tmp = tempfile::tempdir().unwrap();
     let home = home_in(tmp.path());
@@ -147,7 +147,8 @@ fn a_silent_world_leaves_the_baseline_answering_and_no_lever_ineffective() {
          expects: down within 2}",
     );
     wobbling_history(&home, &dir);
-    // The world prints no reading, so the baseline answers: no evidence.
+    // The world prints no reading: with a `--world` it is reality, and
+    // what it gives no reading of is missing, as a failed report is.
     let plan = Plan {
         days: 1,
         step: 3600,
@@ -160,26 +161,62 @@ fn a_silent_world_leaves_the_baseline_answering_and_no_lever_ineffective() {
     run(&home, &plan, &mut out).unwrap();
     let text = String::from_utf8(out).unwrap();
     let k = avsmd::kernel::Kernel::open(&home).unwrap();
-    let entries = k.entries().unwrap();
-    let ineffective = entries
+    let after: Vec<_> = k
+        .entries()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.at >= START)
+        .filter_map(|e| match e.record {
+            Record::Report {
+                venture,
+                metric,
+                value,
+                note,
+                ..
+            } if venture == "janitor" && metric == "usage" => Some((value, note)),
+            _ => None,
+        })
+        .collect();
+    assert!(after.len() > 5, "{text}");
+    for (value, note) in &after {
+        assert_eq!(*value, None, "{note}\n{text}");
+        assert!(note.contains("the world printed no reading"), "{note}");
+    }
+}
+
+#[test]
+fn a_world_that_prints_nan_gives_an_implausible_reading() {
+    let _c = clock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_in(tmp.path());
+    let dir = tmp.path().join("janitor");
+    janitor(
+        &dir,
+        "{name: clean, run: 'true', cap: 6/hour, reversible: true, delegated: true}",
+    );
+    wobbling_history(&home, &dir);
+    let plan = Plan {
+        days: 1,
+        step: 3600,
+        human: Human::Away,
+        start: Some(START),
+        add: vec![dir],
+        world: Some("echo janitor/usage=nan".to_string()),
+    };
+    let mut out = Vec::new();
+    run(&home, &plan, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let k = avsmd::kernel::Kernel::open(&home).unwrap();
+    let doubted = k
+        .entries()
+        .unwrap()
         .iter()
+        .filter(|e| e.at >= START)
         .filter(|e| {
-            matches!(
-                &e.record,
-                Record::Ask {
-                    signal: Some(Signal::Ineffective { .. }),
-                    ..
-                }
-            )
+            matches!(&e.record, Record::Report { metric, implausible: Some(_), .. } if metric == "usage")
         })
         .count();
-    assert_eq!(ineffective, 0, "{text}");
-    assert!(!k.index().unwrap().suspended("janitor", "clean"), "{text}");
-    let runs = entries
-        .iter()
-        .filter(|e| matches!(&e.record, Record::Intent { action, .. } if action == "clean"))
-        .count();
-    assert!(runs > 1, "the lever keeps running: {runs}\n{text}");
+    assert!(doubted > 5, "{doubted}\n{text}");
 }
 
 #[test]

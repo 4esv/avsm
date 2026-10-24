@@ -87,6 +87,9 @@ pub(crate) struct Simulation {
     /// The lines it printed for an audit or reading, as `name: a@b c@d` or
     /// `venture/name: ...`, unvalidated: whoever uses them validates.
     said: Mutex<BTreeMap<String, String>>,
+    /// The notes it printed for an audit, as `venture/audit.name> text`:
+    /// the lines above a real audit's number, joined as the warden joins them.
+    noted: Mutex<BTreeMap<String, String>>,
     /// A forecast branch's seed, mixed into every step's; None for
     /// `avsm simulate`, whose steps stay as they were.
     seed: Option<u64>,
@@ -106,6 +109,7 @@ impl Simulation {
             guards: Mutex::new(BTreeMap::new()),
             told: Mutex::new(BTreeMap::new()),
             said: Mutex::new(BTreeMap::new()),
+            noted: Mutex::new(BTreeMap::new()),
             seed: None,
         }
     }
@@ -151,13 +155,28 @@ impl Simulation {
     pub(crate) fn tell(&self, printed: &str) {
         let mut told = BTreeMap::new();
         let mut said = BTreeMap::new();
+        let mut noted = BTreeMap::new();
         for line in printed.lines() {
             let line = line.trim();
+            if let Some((key, text)) = line.split_once('>') {
+                let key = key.trim();
+                if !key.is_empty() && !key.contains(|c: char| c.is_whitespace() || "=:".contains(c))
+                {
+                    let text: String = text
+                        .trim()
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(crate::warden::AUDIT_NOTE)
+                        .collect();
+                    noted.insert(key.to_string(), text);
+                    continue;
+                }
+            }
             if let Some((key, value)) = line.split_once('=') {
+                // `nan` and an absurd number are readings too: the world's
+                // way of injecting a sensor fault the ledger must doubt.
                 if let Ok(x) = value.trim().parse::<f64>() {
-                    if x.is_finite() {
-                        told.insert(key.trim().to_string(), x);
-                    }
+                    told.insert(key.trim().to_string(), x);
                 }
             } else if let Some((key, rest)) = line.split_once(':') {
                 let key = key.trim();
@@ -168,6 +187,16 @@ impl Simulation {
         }
         *self.told.lock().unwrap_or_else(|e| e.into_inner()) = told;
         *self.said.lock().unwrap_or_else(|e| e.into_inner()) = said;
+        *self.noted.lock().unwrap_or_else(|e| e.into_inner()) = noted;
+    }
+
+    /// The note the `--world` command printed for an audit, as
+    /// `venture/audit.name> text`.
+    pub(crate) fn note(&self, venture: &str, metric: &str) -> Option<String> {
+        let noted = self.noted.lock().unwrap_or_else(|e| e.into_inner());
+        [format!("{venture}/{metric}"), metric.to_string()]
+            .into_iter()
+            .find_map(|k| noted.get(&k).cloned())
     }
 
     /// The lines the `--world` command printed for an audit or reading
@@ -185,10 +214,10 @@ impl Simulation {
             .find_map(|k| said.get(&k).cloned())
     }
 
-    /// Did the `--world` command print a reading of this metric at its
-    /// last run? Without a `--world`, never.
-    pub(crate) fn world_told(&self, venture: &str, metric: &str) -> bool {
-        self.told(venture, metric).is_some()
+    /// Is there a `--world`? Then it is reality: what it gives no reading
+    /// of reads as missing, never as the baseline.
+    pub(crate) fn has_world(&self) -> bool {
+        self.world.is_some()
     }
 
     /// A reading the `--world` command printed for this venture's name.
@@ -205,10 +234,11 @@ impl Simulation {
     }
 
     /// A guard, audit or reading: what the `--world` command printed for
-    /// it, else what the venture's world model gave at its last step.
+    /// it (none where it printed none); without a `--world`, what the
+    /// venture's world model gave at its last step.
     pub(crate) fn guard(&self, venture: &str, name: &str) -> Option<f64> {
-        if let Some(x) = self.told(venture, name) {
-            return Some(x);
+        if self.has_world() {
+            return self.told(venture, name);
         }
         let guards = self.guards.lock().unwrap_or_else(|e| e.into_inner());
         guards.get(venture)?.get(name).copied()
@@ -291,10 +321,22 @@ impl Simulation {
         mandate: &Mandate,
         dir: &Path,
     ) -> Option<(Option<f64>, String)> {
-        // With a `--world`, what it printed for the metric is the reading;
-        // where it printed none, the same baseline as without one.
-        if let Some(x) = self.told(venture, mandate.metric_name()) {
-            return Some((Some(x), "simulated: world".to_string()));
+        // With a `--world`, what it printed for the metric is the reading
+        // (`nan` or an absurd number included, as a faulty sensor gives
+        // them); where it printed none the reading is missing, as a failed
+        // report is. The baseline is only for runs without a `--world`.
+        if self.has_world() {
+            return Some(match self.told(venture, mandate.metric_name()) {
+                Some(x) if x.is_finite() => (Some(x), "simulated: world".to_string()),
+                Some(x) => (Some(x), format!("simulated: world printed {x}")),
+                None => (
+                    None,
+                    format!(
+                        "simulated: the world printed no reading of {}",
+                        mandate.metric_name()
+                    ),
+                ),
+            });
         }
         let now = clock::now();
         let model = self.model(index, venture, mandate, dir);
@@ -572,7 +614,7 @@ mod tests {
         // A line `name=number` names the metric, guard, audit or reading
         // for that step: a bare audit or reading name counts, as the
         // lines form already accepted it, and the prefixed form wins.
-        let sim = Simulation::new(None);
+        let sim = Simulation::new(Some("true".to_string()));
         sim.tell("customers=2\nwaiting=3\n");
         assert_eq!(sim.guard("shop", "audit.customers"), Some(2.0));
         assert_eq!(sim.guard("shop", "reading.waiting"), Some(3.0));

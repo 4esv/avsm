@@ -304,16 +304,22 @@ s["day"] = DAY
 save(s)
 
 # --- what the sensors say, as the readings avsm takes ---------------------
-# A simulation never runs a venture's report: it takes these lines, as
-# `venture/metric=number`, for the step's readings. A sensor that is
-# missing, or says something that is not a number, gives none.
+# A simulation never runs a venture's report: the world is reality, and it
+# prints each reading as `venture/metric=number`, faults included. A sensor
+# that is missing prints no line (avsm reads that as missing, as a failed
+# report); NaN prints `nan`; an absurd number prints as it is; text that is
+# not a number prints `nan`.
 inbox_n = len(os.listdir(p("inbox"))) if os.path.isdir(p("inbox")) else 0
-for name, path in (("tomato/moisture", "moisture"), ("trader/equity", "equity"), ("garden/temperature", "temp")):
+price = None
+for name, path in (("tomato/moisture", "moisture"), ("trader/equity", "equity"), ("garden/temperature", "temp"), ("price", "price")):
     try:
-        with open(p("sensors", path)) as f: v = float(f.read().strip())
-    except (FileNotFoundError, ValueError):
+        with open(p("sensors", path)) as f: text = f.read().strip()
+    except FileNotFoundError:
         continue
-    if math.isfinite(v): print(f"{name}={v}")
+    try: v = float(text.splitlines()[-1]) if text else float("nan")
+    except ValueError: v = float("nan")
+    if name == "price": price = v; continue
+    print(f"{name}={v}")
 print(f"inbox/unread={inbox_n}")
 
 # The inbox's audit and readings, which avsm does not run in a simulation
@@ -342,3 +348,14 @@ print(f"inbox/waiting={len(waiting)}")
 print("inbox/waiting: " + " ".join(waiting))
 print(f"inbox/unread-mail-n-at-domain={len(others)}")
 print("inbox/unread-mail-n-at-domain: " + " ".join(others))
+
+# The trader's broker statement (the audit book and the exposure guard):
+# shares and cash as the broker holds them, the price and equity from the
+# exchange. With no price or equity the exchange is down: no statement.
+if os.path.exists(p("sensors", "equity")) and price is not None and math.isfinite(price):
+    bk = s["book"]
+    held = bk["shares"] * price
+    exposure = held / equity * 100 if equity else 0
+    print(f"trader/exposure={exposure:.2f}")
+    print(f"trader/audit.book={exposure:.2f}")
+    print(f"trader/audit.book> shares {bk['shares']}  cash {bk['cash']:.2f}  price {price:.2f}  equity {equity:.2f}")

@@ -922,6 +922,10 @@ impl LocalWarden {
             let name = metric.strip_prefix("guard.").unwrap_or(metric);
             let read = match sim.guard(venture, name) {
                 Some(x) => (Some(x), self.simulated_note(&sim, venture, metric)?),
+                None if sim.has_world() => (
+                    None,
+                    format!("simulated: the world printed no reading of {metric}"),
+                ),
                 None => (
                     None,
                     format!("simulated: the world model gives no {metric}"),
@@ -1001,6 +1005,9 @@ impl LocalWarden {
         };
         let fields = said.split_whitespace().collect::<Vec<_>>().join("\n");
         if metric.starts_with(AUDIT_PREFIX) {
+            if let Some(note) = sim.note(venture, metric) {
+                return Ok(note);
+            }
             let mut seen: Vec<String> = Vec::new();
             for f in fields.lines() {
                 let f = f.to_lowercase();

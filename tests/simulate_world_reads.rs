@@ -104,7 +104,7 @@ fn with_a_world_the_report_never_runs_and_the_world_gives_the_reading() {
 }
 
 #[test]
-fn with_a_silent_world_the_report_does_not_run_either() {
+fn with_a_silent_world_the_report_does_not_run_and_the_reading_is_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let (dir, world) = venture(tmp.path(), "true");
     let home = tmp.path().join("simhome");
@@ -121,7 +121,11 @@ fn with_a_silent_world_the_report_does_not_run_either() {
         "88\n",
         "{text}"
     );
-    assert!(text.contains("no reading yet to start from"), "{text}");
+    assert!(
+        text.contains("count=?") && text.contains("the world printed no reading of count"),
+        "a silent world reads as missing, not as the baseline:\n{text}"
+    );
+    assert!(!text.contains("simulated: baseline"), "{text}");
 }
 
 #[test]

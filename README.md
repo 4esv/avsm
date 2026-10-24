@@ -501,8 +501,12 @@ come from the world too: any line it prints as `name=number` or
 that step. A line `name: a@b c@d` (or `venture/name: ...`) gives an audit's or a
 reading's lines, kept as the warden keeps a real one's: only address-shaped fields,
 at most 254 characters each and 50 of them, an audit's as `from <address>` for
-a payload check to read. Where the world prints no reading the reading comes from the same baseline as
-without `--world`. Without `--world`, a lever steps the venture's world model and
+a payload check to read. A line `name> text` gives an audit's note as it is (the lines
+above a real audit's number, at most 2000 characters). With `--world`, the world is
+reality: a metric, guard, audit or reading it prints no line for this step reads as
+missing, as a failed report does, never as the baseline, so a world injects a missing
+sensor by printing nothing, a NaN by printing `nan` and an absurd one by printing the
+number. The baseline is only for runs without `--world`. Without `--world`, a lever steps the venture's world model and
 the reports come from its state; unless the mandate names a `world:`, that is a baseline learned from the
 ledger, which replays the steps the venture's own readings have shown, so a
 venture with little history gives a flat one. It starts from the ledger's last
