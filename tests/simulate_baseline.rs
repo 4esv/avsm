@@ -41,6 +41,25 @@ fn history(home: &Path, dir: &Path) {
     }
 }
 
+/// Like `history`, but the readings wobble, so no sensor is found stuck:
+/// only the baseline's own judgment of the lever is left to doubt.
+fn wobbling_history(home: &Path, dir: &Path) {
+    avsmd::clock::set(START - 12 * 3600);
+    let mut k = avsmd::kernel::Kernel::open(home).unwrap();
+    k.add(dir).unwrap();
+    for x in [89.0, 91.0, 88.0, 92.0, 89.0, 90.0, 88.0, 91.0, 89.0, 90.0] {
+        avsmd::clock::advance(3600);
+        k.append(Record::report(
+            Claim::Measured,
+            "janitor",
+            "usage",
+            Some(x),
+            "",
+        ))
+        .unwrap();
+    }
+}
+
 /// A cleanup venture whose usage reads 89 and stays there unless
 /// something moves it, with one delegated lever under `lever`.
 fn janitor(dir: &Path, lever: &str) {
@@ -89,6 +108,53 @@ fn a_frozen_baseline_never_finds_a_lever_ineffective() {
         start: Some(START),
         add: vec![dir],
         world: None,
+    };
+    let mut out = Vec::new();
+    run(&home, &plan, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let k = avsmd::kernel::Kernel::open(&home).unwrap();
+    let entries = k.entries().unwrap();
+    let ineffective = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.record,
+                Record::Ask {
+                    signal: Some(Signal::Ineffective { .. }),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(ineffective, 0, "{text}");
+    assert!(!k.index().unwrap().suspended("janitor", "clean"), "{text}");
+    let runs = entries
+        .iter()
+        .filter(|e| matches!(&e.record, Record::Intent { action, .. } if action == "clean"))
+        .count();
+    assert!(runs > 1, "the lever keeps running: {runs}\n{text}");
+}
+
+#[test]
+fn a_silent_world_leaves_the_baseline_answering_and_no_lever_ineffective() {
+    let _c = clock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_in(tmp.path());
+    let dir = tmp.path().join("janitor");
+    janitor(
+        &dir,
+        "{name: clean, run: 'true', cap: 6/hour, reversible: true, delegated: true, \
+         expects: down within 2}",
+    );
+    wobbling_history(&home, &dir);
+    // The world prints no reading, so the baseline answers: no evidence.
+    let plan = Plan {
+        days: 1,
+        step: 3600,
+        human: Human::Away,
+        start: Some(START),
+        add: vec![dir],
+        world: Some("true".to_string()),
     };
     let mut out = Vec::new();
     run(&home, &plan, &mut out).unwrap();

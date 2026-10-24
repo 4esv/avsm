@@ -89,8 +89,13 @@ impl Kernel {
         // the metric sits frozen. What it reads after a run is the model
         // agreeing with itself, no evidence of what the lever does, so the
         // run's expectation is not judged: neither a hit nor a miss.
-        let baseline =
-            self.sim.as_ref().is_some_and(|s| !s.has_world()) && v.mandate.world.is_none();
+        // A `--world` that printed no reading for the metric leaves the
+        // baseline answering, and that is no evidence either.
+        let baseline = self
+            .sim
+            .as_ref()
+            .is_some_and(|s| !s.world_told(venture, &metric))
+            && v.mandate.world.is_none();
         for perm in &v.mandate.permitted {
             if perm.expects.is_none() && perm.revoke_after.is_none() {
                 continue;
