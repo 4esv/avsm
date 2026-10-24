@@ -44,6 +44,9 @@ pub struct Ledger {
     /// Where each append is noted, number and hash, when someone keeps
     /// count of what this process wrote.
     track: Option<Written>,
+    /// Opened read-only from a file still in WAL mode: one this version
+    /// has not opened (every open since #44 leaves the rollback journal).
+    unopened: bool,
 }
 
 /// The records a process appended, by number and hash, noted as each
@@ -189,7 +192,9 @@ impl Ledger {
             Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI)?
         };
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        Ok(Ledger::bare(conn))
+        let mut ledger = Ledger::bare(conn);
+        ledger.unopened = true;
+        Ok(ledger)
     }
 
     /// A ledger on a connection, with no file identity and nothing seen.
@@ -199,6 +204,7 @@ impl Ledger {
             file: None,
             seen: None,
             track: None,
+            unopened: false,
         }
     }
 
@@ -469,10 +475,17 @@ impl Ledger {
     /// The append-only triggers that must be in the schema, and are not:
     /// each name here is one someone dropped. Dropping one is how the
     /// file's owner edits an append-only ledger, and a later open would
-    /// re-create it silently, so a read-only open checks this first.
+    /// re-create it silently, so a read-only open checks this first. The
+    /// chain trigger is expected only once this version has opened the file.
     pub fn missing_triggers(&self) -> Result<Vec<&'static str>, LedgerError> {
         let mut missing = Vec::new();
+        // A ledger no open of this version has touched still has 1.0's
+        // two triggers; the chain trigger is added by the first open.
+        let unopened = self.unopened;
         for name in TRIGGERS {
+            if unopened && name == "records_chain" {
+                continue;
+            }
             let there = self
                 .conn
                 .query_row(

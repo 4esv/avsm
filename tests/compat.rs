@@ -392,3 +392,32 @@ fn the_digest_counts_only_what_is_dated_up_to_now() {
     }
     assert!(ahead_asks > 0 && ahead_runs > 0, "the ledger reaches ahead");
 }
+
+#[test]
+fn a_1_0_ledger_not_yet_opened_by_2_0_is_not_missing_a_trigger_it_never_had() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = open_copy(tmp.path());
+    let db = home.join("ledger.db");
+    // Before its first 2.0 start: records_chain never existed here.
+    let ledger = Ledger::open_read_only(&db).unwrap();
+    assert_eq!(ledger.missing_triggers().unwrap(), Vec::<&str>::new());
+    drop(ledger);
+    // A trigger 1.0 did have is still noticed when dropped.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("DROP TRIGGER records_no_update")
+        .unwrap();
+    drop(conn);
+    let ledger = Ledger::open_read_only(&db).unwrap();
+    assert_eq!(ledger.missing_triggers().unwrap(), ["records_no_update"]);
+    drop(ledger);
+    // Once 2.0 has opened it, the chain trigger exists and dropping it is
+    // noticed.
+    let copy = open_copy(&tmp.path().join("again"));
+    let db = copy.join("ledger.db");
+    drop(Ledger::open(&db).unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("DROP TRIGGER records_chain").unwrap();
+    drop(conn);
+    let ledger = Ledger::open_read_only(&db).unwrap();
+    assert_eq!(ledger.missing_triggers().unwrap(), ["records_chain"]);
+}
