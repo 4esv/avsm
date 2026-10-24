@@ -656,6 +656,28 @@ pub fn doctor(
                 ledger.display(),
                 entries.len()
             ));
+            // The three append-only triggers, asked for read-only before
+            // anything re-creates them: a dropped one is how the file's
+            // owner edits an append-only ledger, and the next open would
+            // put it back silently.
+            match Ledger::open_read_only(&ledger).and_then(|l| l.missing_triggers()) {
+                Ok(missing) => {
+                    for name in missing {
+                        found.fail(
+                            exit::DATAERR,
+                            format!(
+                                "the ledger is missing its trigger {name}: someone dropped it, which is how an owner edits an append-only ledger"
+                            ),
+                            "check with avsm doctor --since <your last anchor>",
+                        );
+                    }
+                }
+                Err(e) => found.fail(
+                    exit::DATAERR,
+                    format!("the ledger {}: {}", ledger.display(), e),
+                    cut_fix(home, None),
+                ),
+            }
             entries
         }
         Ok(None) => {

@@ -214,6 +214,32 @@ fn the_digest_carries_the_head_and_doctor_since_catches_an_owner_rewrite() {
     }
 }
 
+#[test]
+fn doctor_names_a_dropped_trigger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = adopted_home(tmp.path());
+    let h = home.to_str().unwrap();
+
+    // Healthy: all three triggers are there, so doctor names none (the
+    // daemon not running is the only failure).
+    let out = avsm(tmp.path(), &["--home", h, "doctor"]);
+    let (stdout, _) = text(&out);
+    assert_eq!(out.status.code(), Some(69), "{stdout}");
+    assert!(!stdout.contains("missing its trigger"), "{stdout}");
+
+    // The owner drops one trigger: doctor names it, read-only, before
+    // anything puts it back.
+    let conn = rusqlite::Connection::open(home.join("ledger.db")).unwrap();
+    conn.execute_batch("DROP TRIGGER records_no_delete")
+        .unwrap();
+    drop(conn);
+    let out = avsm(tmp.path(), &["--home", h, "doctor"]);
+    let (stdout, _) = text(&out);
+    assert_eq!(out.status.code(), Some(65), "{stdout}");
+    assert!(stdout.contains("records_no_delete"), "{stdout}");
+    assert!(stdout.contains("missing its trigger"), "{stdout}");
+}
+
 /// The last row's seq and hash, read straight from the file.
 fn last(conn: &rusqlite::Connection) -> (i64, String) {
     conn.query_row(

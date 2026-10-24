@@ -109,6 +109,11 @@ BEGIN
 END;
 ";
 
+/// The three triggers that make a ledger append-only, by name. Opening an
+/// existing ledger re-creates any that are missing, so a dropped trigger
+/// is found only by asking before the open: [`Ledger::missing_triggers`].
+const TRIGGERS: [&str; 3] = ["records_no_update", "records_no_delete", "records_chain"];
+
 /// The journal every ledger file keeps: the rollback journal, emptied at
 /// each commit, so a commit is in the main file when it returns.
 const JOURNAL: &str = "truncate";
@@ -459,6 +464,29 @@ impl Ledger {
         Ok(self
             .conn
             .query_row("PRAGMA schema_version", [], |row| row.get(0))?)
+    }
+
+    /// The append-only triggers that must be in the schema, and are not:
+    /// each name here is one someone dropped. Dropping one is how the
+    /// file's owner edits an append-only ledger, and a later open would
+    /// re-create it silently, so a read-only open checks this first.
+    pub fn missing_triggers(&self) -> Result<Vec<&'static str>, LedgerError> {
+        let mut missing = Vec::new();
+        for name in TRIGGERS {
+            let there = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                    [name],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !there {
+                missing.push(name);
+            }
+        }
+        Ok(missing)
     }
 
     /// Check only the entries after entry `seq`, whose hash is `prev`, as
