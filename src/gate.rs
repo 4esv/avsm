@@ -403,6 +403,10 @@ ascent! {
     relation ask(Seq, String, String);
     relation asked(Seq, String);
     relation ineffective_ask(Seq, String);
+    relation saturated_ask(Seq, String);
+    // a measured ask doubting a metric, and a measured plausible reading
+    relation doubt_ask(Seq, String, String);
+    relation plausible_reading(Seq, String, String);
     // an ask that code wrote, not a model
     relation code_ask(Seq);
     relation proposal(Seq, String, String);
@@ -529,6 +533,10 @@ ascent! {
     // A declared adoption answers the venture's ineffective asks before it.
     decided(q) <-- ineffective_ask(q, v), decision(d, v, Dk::Adopt, _),
         record(d, _, Claim::Declared, _), if d > q;
+    decided(q) <-- saturated_ask(q, v), decision(d, v, Dk::Adopt, _),
+        record(d, _, Claim::Declared, _), if d > q;
+    // A plausible measured reading of the metric ends an implausible ask.
+    decided(q) <-- doubt_ask(q, v, m), plausible_reading(r, v, m), if r > q;
     relation open_ask(Seq, String);
     open_ask(q, v) <-- asked(q, v), !decided(q);
 
@@ -1259,8 +1267,16 @@ fn load_entry(p: &mut Rules, e: &Entry) {
         Record::Report {
             metric,
             value: Some(val),
+            claim,
+            implausible,
             ..
-        } => p.report.push((e.seq, venture, metric.clone(), Num(*val))),
+        } => {
+            if *claim == Claim::Measured && implausible.is_none() {
+                p.plausible_reading
+                    .push((e.seq, venture.clone(), metric.clone()));
+            }
+            p.report.push((e.seq, venture, metric.clone(), Num(*val)));
+        }
         Record::Decision { verdict, .. } => {
             let (dk, target) = match verdict {
                 Verdict::Approve { ask, .. } => (Dk::Approve, *ask),
@@ -1280,6 +1296,15 @@ fn load_entry(p: &mut Rules, e: &Entry) {
             p.asked.push((e.seq, venture.clone()));
             if let (Claim::Measured, Some(Signal::Ineffective { .. })) = (claim, signal) {
                 p.ineffective_ask.push((e.seq, venture.clone()));
+            }
+            match (claim, signal) {
+                (Claim::Measured, Some(Signal::Saturated { .. })) => {
+                    p.saturated_ask.push((e.seq, venture.clone()));
+                }
+                (Claim::Measured, Some(Signal::Implausible { metric, .. })) => {
+                    p.doubt_ask.push((e.seq, venture.clone(), metric.clone()));
+                }
+                _ => {}
             }
             if *claim == Claim::Measured {
                 p.code_ask.push((e.seq,));

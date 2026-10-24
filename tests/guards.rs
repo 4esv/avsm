@@ -629,13 +629,16 @@ fn implausible_reports_are_kept_never_a_premise_and_ask_once_an_episode() {
         report(&mut k, &dir, "counter", "FAIL");
         assert_eq!(implausible(&k), 1, "{what}: once an episode");
         // A plausible report ends the episode; the next implausible one
-        // starts another, which asks only once the first is answered.
+        // starts another, which asks again: the first ask is answered.
         // The first report back is unconfirmed, still the episode; the
         // next, agreeing, confirms it.
         report(&mut k, &dir, "counter", "5");
         report(&mut k, &dir, "counter", "6");
         let first = signals(&k, |s| matches!(s, Signal::Implausible { .. }))[0].seq;
-        k.deny(first, "seen").unwrap();
+        assert!(
+            !k.index().unwrap().is_open(first),
+            "{what}: the plausible report answered it"
+        );
         report(&mut k, &dir, "counter", "FAIL");
         assert_eq!(implausible(&k), 2, "{what}: a new episode asks");
     }
@@ -978,11 +981,11 @@ fn a_second_approval_of_the_ask_vouches_for_the_run_once() {
 }
 
 #[test]
-fn an_approval_vouches_for_the_run_its_ask_flagged_not_a_later_one() {
-    // The ask is about the first run of 60. The metric moves on, then
-    // sits at 60 again and that run is flagged too, with the ask still
-    // open. Approving it vouches for the first run only: the second is
-    // still the run, and still stuck.
+fn a_run_that_ends_in_a_plausible_reading_closes_its_ask_and_the_next_run_asks_anew() {
+    // The ask is about the first run of 60. The metric moves on: the
+    // plausible readings answer the ask, so there is nothing left to
+    // approve for that run. Sitting at 60 again is another episode with
+    // an ask of its own.
     let (mut k, dir, _tmp, ask) = stuck_at_60();
     for v in [
         "61", "62", "60", "60", "60", "60", "60", "60", "60", "60", "60", "60",
@@ -991,16 +994,11 @@ fn an_approval_vouches_for_the_run_its_ask_flagged_not_a_later_one() {
     }
     let f = flags(&k, "counter", "count");
     assert!(f[f.len() - 2..].iter().all(Option::is_some), "{f:?}");
-    k.approve(ask, None).unwrap();
-    report(&mut k, &dir, "counter", "60");
-    let f = flags(&k, "counter", "count");
-    assert!(
-        f.last()
-            .unwrap()
-            .as_deref()
-            .is_some_and(|w| w.starts_with("stuck")),
-        "{f:?}"
-    );
+    assert!(!k.index().unwrap().is_open(ask), "answered by the move on");
+    assert!(k.approve(ask, None).is_err());
+    let asks = signals(&k, |s| matches!(s, Signal::Implausible { .. }));
+    assert_eq!(asks.len(), 2, "{asks:?}");
+    assert!(k.index().unwrap().is_open(asks[1].seq));
 }
 
 #[test]

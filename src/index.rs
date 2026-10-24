@@ -136,6 +136,10 @@ pub struct Index {
     settled: HashMap<Seq, (Seq, bool)>,
     /// Measured asks that say a lever is ineffective, per venture and lever.
     ineffective: HashMap<(String, String), Vec<Seq>>,
+    /// Measured asks that say a lever is saturated, per venture and lever.
+    saturated: HashMap<(String, String), Vec<Seq>>,
+    /// Measured asks that doubt a metric's reading, per venture and metric.
+    doubts: HashMap<(String, String), Vec<Seq>>,
     /// Measured reports that suspend a restored lever again without an
     /// ask, per venture and lever.
     relapses: HashMap<(String, String), Vec<Seq>>,
@@ -306,6 +310,21 @@ impl Index {
                         *peak = peak.max(*x);
                     }
                 }
+                // A plausible measured reading of a metric ends the episode
+                // an implausible ask opened: the ask is answered.
+                if let (Claim::Measured, Some(_), None) = (claim, value, implausible) {
+                    let stale: Vec<Seq> = self
+                        .doubts
+                        .get(&(venture.clone(), metric.clone()))
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|q| self.open.contains(q))
+                        .collect();
+                    for q in stale {
+                        self.decide(q);
+                    }
+                }
                 if let (true, Some(_)) = (claim.authorizes(), implausible) {
                     let list = self
                         .doubted
@@ -425,12 +444,13 @@ impl Index {
                         path,
                         text,
                     } if *claim == Claim::Declared => {
-                        // A new adoption answers every ineffective ask of
-                        // the venture still open: the suspension it asked
-                        // about ended with it.
+                        // A new adoption answers every ineffective and
+                        // saturated ask of the venture still open: the
+                        // suspension or the cap it asked about ended with it.
                         let stale: Vec<Seq> = self
                             .ineffective
                             .iter()
+                            .chain(self.saturated.iter())
                             .filter(|((v, _), _)| *v == venture)
                             .flat_map(|(_, asks)| asks.iter().copied())
                             .filter(|q| self.open.contains(q))
@@ -457,6 +477,19 @@ impl Index {
                 {
                     self.ineffective
                         .entry((venture.clone(), action.clone()))
+                        .or_default()
+                        .push(seq);
+                }
+                if let (Claim::Measured, Some(Signal::Saturated { action, .. })) = (claim, signal) {
+                    self.saturated
+                        .entry((venture.clone(), action.clone()))
+                        .or_default()
+                        .push(seq);
+                }
+                if let (Claim::Measured, Some(Signal::Implausible { metric, .. })) = (claim, signal)
+                {
+                    self.doubts
+                        .entry((venture.clone(), metric.clone()))
                         .or_default()
                         .push(seq);
                 }

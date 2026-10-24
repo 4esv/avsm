@@ -237,17 +237,64 @@ fn a_flagged_reading_of_a_metric_the_mandate_no_longer_reads_never_holds_it() {
 }
 
 #[test]
-fn an_open_implausible_ask_whose_metric_is_trusted_again_is_asking() {
+fn a_plausible_reading_of_the_metric_closes_its_implausible_ask() {
     let mut fx = Fx::new();
     fx.report(Claim::Measured, "count", 4000.0, true);
-    fx.signal(Claim::Measured, "doubt", Some(implausible()));
+    let q = fx.signal(Claim::Measured, "doubt", Some(implausible()));
+    assert_eq!(fx.state(), State::Implausible);
+    // A flagged reading does not close it, nor does a plausible reading of
+    // another metric.
+    fx.report(Claim::Measured, "count", 4001.0, true);
+    fx.report(Claim::Measured, "guard.spend", 1.0, false);
     assert_eq!(fx.state(), State::Implausible);
     fx.report(Claim::Measured, "count", 5.0, false);
-    assert_eq!(
-        fx.state(),
-        State::Asking,
-        "the reading is trusted again; the ask is still open"
+    let entries = fx.ledger.all().unwrap();
+    assert!(!Index::from_entries(&entries).is_open(q));
+    assert!(!gate::reference::open_asks(&entries).contains(&q));
+    assert_eq!(fx.state(), State::Running);
+}
+
+#[test]
+fn only_a_measured_reading_closes_an_implausible_ask() {
+    let mut fx = Fx::new();
+    fx.report(Claim::Measured, "count", 4000.0, true);
+    let q = fx.signal(Claim::Measured, "doubt", Some(implausible()));
+    fx.report(Claim::Inferred, "count", 5.0, false);
+    let entries = fx.ledger.all().unwrap();
+    assert!(Index::from_entries(&entries).is_open(q));
+    assert!(gate::reference::open_asks(&entries).contains(&q));
+}
+
+#[test]
+fn a_new_adoption_answers_the_open_saturation_ask() {
+    let mut fx = Fx::new();
+    let q = fx.signal(Claim::Measured, "full", Some(saturated()));
+    assert_eq!(fx.state(), State::Saturated);
+    let entries = fx.ledger.all().unwrap();
+    assert!(Index::from_entries(&entries).is_open(q));
+    assert!(gate::reference::open_asks(&entries).contains(&q));
+    // An inferred adoption answers nothing.
+    fx.decide(
+        Claim::Inferred,
+        Verdict::Adopt {
+            mandate: Mandate::hash(MANDATE),
+            path: "/v".to_string(),
+            text: None,
+        },
     );
+    assert_eq!(fx.state(), State::Saturated);
+    fx.decide(
+        Claim::Declared,
+        Verdict::Adopt {
+            mandate: Mandate::hash(MANDATE),
+            path: "/v".to_string(),
+            text: None,
+        },
+    );
+    let entries = fx.ledger.all().unwrap();
+    assert!(!Index::from_entries(&entries).is_open(q));
+    assert!(!gate::reference::open_asks(&entries).contains(&q));
+    assert_eq!(fx.state(), State::Running);
 }
 
 #[test]

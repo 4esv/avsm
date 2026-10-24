@@ -413,3 +413,27 @@ fn the_stderr_only_lines_have_records() {
     // A lever needing a decision with no room to ask is saturation too.
     assert_eq!(saturation_asks(&k).len(), 1);
 }
+
+#[test]
+fn re_adopting_the_mandate_answers_the_open_saturation_ask() {
+    let _c = clock();
+    let (tmp, mut k) = counter("asks: 5/day");
+    for _ in 0..5 {
+        k.report("counter", false);
+    }
+    let asks = saturation_asks(&k);
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = asks[0].seq;
+    assert!(k.index().unwrap().is_open(ask));
+    // The human raises the cap and adopts the mandate again.
+    let dir = tmp.path().join("counter");
+    let text = std::fs::read_to_string(dir.join("mandate.yaml")).unwrap();
+    std::fs::write(dir.join("mandate.yaml"), text.replace("1/day", "9/day")).unwrap();
+    k.add(&dir).unwrap();
+    assert!(
+        !k.index().unwrap().is_open(ask),
+        "the cap it asked about is gone"
+    );
+    let status = k.status().unwrap();
+    assert!(!status.contains("saturated"), "{status}");
+}
