@@ -1493,6 +1493,9 @@ impl Kernel {
     /// Stop a venture until a human resumes it. The next tick stops its run.
     pub fn pause(&mut self, name: &str) -> Result<String, String> {
         self.known(name)?;
+        if self.paused_by_declared(name)? {
+            return Ok(format!("{name} is already paused\n"));
+        }
         let entry = self.append(self.decision(name, Verdict::Pause))?;
         // What it runs is stopped now, not at the next tick: a tick can
         // wait behind a forecast.
@@ -1504,6 +1507,9 @@ impl Kernel {
     /// Let a paused venture run again.
     pub fn resume(&mut self, name: &str) -> Result<String, String> {
         self.known(name)?;
+        if !self.paused(name)? {
+            return Ok(format!("{name} is not paused\n"));
+        }
         let entry = self.append(self.decision(name, Verdict::Resume))?;
         // A human resuming self has seen the alarm: what it named stays
         // spent, and the kernel acts again.
@@ -1534,6 +1540,81 @@ impl Kernel {
             }
         }
         Ok(out)
+    }
+
+    /// Is the venture paused now, as the records tell it? A guard's stop,
+    /// self's alarm and a parent's pause all hold it, not only a declared
+    /// pause.
+    fn paused(&self, name: &str) -> Result<bool, String> {
+        let index = self.index()?;
+        Ok(gate::state_in(&index, &self.adopted(), name) == State::Paused)
+    }
+
+    /// Is the venture paused by a human's declared pause, as against a
+    /// guard's stop, self's alarm or a parent's pause? Pausing one of
+    /// those still records the human's decision; a second declared pause
+    /// records nothing.
+    fn paused_by_declared(&self, name: &str) -> Result<bool, String> {
+        if !self.paused(name)? {
+            return Ok(false);
+        }
+        let index = self.index()?;
+        let mut pause: Option<Seq> = None;
+        let mut resume: Option<Seq> = None;
+        let mut declared = false;
+        for seq in index.pause_sources(name) {
+            let Some(e) = index.get(seq) else { continue };
+            match &e.record {
+                Record::Decision {
+                    claim,
+                    verdict: Verdict::Pause,
+                    ..
+                } => {
+                    if pause.is_none_or(|p| seq > p) {
+                        pause = Some(seq);
+                        declared = *claim == Claim::Declared;
+                    }
+                }
+                Record::Decision {
+                    verdict: Verdict::Resume,
+                    ..
+                } => {
+                    if resume.is_none_or(|r| seq > r) {
+                        resume = Some(seq);
+                    }
+                }
+                Record::Action { action, .. } if action == crate::gate::STOP => {
+                    if pause.is_none_or(|p| seq > p) {
+                        pause = Some(seq);
+                        declared = false;
+                    }
+                }
+                Record::Action {
+                    action,
+                    payload: Some(Payload::Text { text }),
+                    ..
+                } => {
+                    let call = crate::mandate::ParentCall::parse(action, text).ok();
+                    match call {
+                        Some(crate::mandate::ParentCall::Pause { .. })
+                            if pause.is_none_or(|p| seq > p) =>
+                        {
+                            pause = Some(seq);
+                            declared = false;
+                        }
+                        Some(crate::mandate::ParentCall::Resume { .. })
+                            if resume.is_none_or(|r| seq > r) =>
+                        {
+                            resume = Some(seq);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(p) = pause else { return Ok(false) };
+        Ok(declared && resume.is_none_or(|r| p > r))
     }
 
     fn entry(&self, seq: Seq) -> Result<Entry, String> {

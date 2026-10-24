@@ -601,3 +601,63 @@ fn avsmd_dash_capital_t_prints_the_forecast_and_canary_defaults() {
     assert!(out.contains("canary_asks:\n  every: 7\n"), "{out}");
     assert!(!out.contains("canary_asks: null"), "{out}");
 }
+
+#[test]
+fn pausing_twice_and_resuming_a_running_venture_record_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let _daemon = start(&home);
+    let dir = counter_venture(tmp.path());
+    assert!(avsm(&home, &["add", dir.to_str().unwrap()]).0);
+
+    // The first pause writes the declared pause.
+    let (ok, out) = avsm(&home, &["pause", "counter"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("counter      declared  decision  paused"),
+        "{out}"
+    );
+
+    // The second pause writes nothing and says so.
+    let (ok, out) = avsm(&home, &["pause", "counter"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("counter is already paused"), "{out}");
+
+    let (_, tail, _) = avsm_out(&home, &["tail", "1000"]);
+    assert_eq!(
+        tail.lines()
+            .filter(|l| l.contains("decision  paused"))
+            .count(),
+        1,
+        "{tail}"
+    );
+
+    // Resuming writes the declared resume.
+    let (ok, out) = avsm(&home, &["resume", "counter"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("counter      declared  decision  resumed"),
+        "{out}"
+    );
+
+    // Resuming a running venture writes nothing and says so.
+    let (ok, out) = avsm(&home, &["resume", "counter"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("counter is not paused"), "{out}");
+
+    let (_, tail, _) = avsm_out(&home, &["tail", "1000"]);
+    assert_eq!(
+        tail.lines()
+            .filter(|l| l.contains("decision  paused"))
+            .count(),
+        1,
+        "{tail}"
+    );
+    assert_eq!(
+        tail.lines()
+            .filter(|l| l.contains("decision  resumed"))
+            .count(),
+        1,
+        "{tail}"
+    );
+}
