@@ -445,10 +445,15 @@ pub fn run(home: &Path, plan: &Plan, out: &mut dyn Write) -> Result<(), String> 
             }
             if !ran.status.success() {
                 kernel.shutdown();
+                let stderr = String::from_utf8_lossy(&ran.stderr);
+                let detail = match stderr.trim() {
+                    "" => format!("exit {}", ran.status.code().unwrap_or(-1)),
+                    e => e.to_string(),
+                };
                 return Err(format!(
                     "the world failed at {}: {}",
                     clock::local().format("%Y-%m-%d %H:%M"),
-                    String::from_utf8_lossy(&ran.stderr).trim()
+                    detail
                 ));
             }
         }

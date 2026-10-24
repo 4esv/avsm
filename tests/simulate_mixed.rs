@@ -92,3 +92,23 @@ fn the_mixed_human_denies_every_third_ask_and_edits_what_runs() {
         "{err}"
     );
 }
+
+#[test]
+fn a_world_that_fails_with_no_stderr_names_its_exit_status() {
+    std::env::set_var("TZ", "UTC");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let plan = Plan {
+        days: 1,
+        step: 3600,
+        human: Human::Away,
+        start: Some(1_767_225_600),
+        add: vec![],
+        world: Some("exit 5".to_string()),
+    };
+    let err = run(&home, &plan, &mut Vec::new()).unwrap_err();
+    assert!(err.contains("the world failed"), "{err}");
+    assert!(err.contains("exit 5"), "{err}");
+    assert!(!err.trim_end().ends_with(':'), "{err}");
+}
