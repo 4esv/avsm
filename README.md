@@ -22,8 +22,8 @@ not because the model is good. You wake up to work done, not work to do.
 
 Or from source:
 
-    git clone https://github.com/4esv/avsm
-    cd avsm
+    git clone https://github.com/4esv/avsmd
+    cd avsmd
     cargo install --path .
 
 Two binaries: `avsmd`, the daemon, and `avsm`, which gives it commands. No
